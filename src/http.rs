@@ -89,14 +89,14 @@ pub fn error_chain(e: &dyn std::error::Error) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{Read, Write};
 
     use super::*;
 
     /// One-shot server that answers with the raw request it received, so the test
     /// can assert on exactly what went over the wire.
-    fn echo_server() -> String {
+    pub(crate) fn echo_server() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -113,7 +113,6 @@ mod tests {
 
     #[test]
     fn execute_sends_params_headers_auth_and_json_body() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let req = Request {
             method: "post".into(),
@@ -122,6 +121,7 @@ mod tests {
             headers: vec![KeyValue::new("X-Trace", "1")],
             body: Body::Json { text: "{\"n\":1}".into() },
             auth: Auth::Bearer { token: "t0k".into() },
+            ..Default::default()
         };
         let net = crate::net::Network { proxy: crate::net::ProxyMode::None, ..Default::default() };
         let client = rt.block_on(crate::net::build_client(net)).unwrap();

@@ -55,6 +55,10 @@ impl Default for Network {
 }
 
 pub async fn build_client(net: Network) -> Result<reqwest::Client, String> {
+    // reqwest is built with `rustls-no-provider` (ring cross-compiles to Windows with just
+    // clang; aws-lc-rs needs cmake/nasm). Installing is idempotent, and doing it here covers
+    // every client, including the PAC fetcher below.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut b = reqwest::Client::builder()
         .timeout(Duration::from_secs(net.timeout_secs.max(1)))
         .tls_danger_accept_invalid_certs(net.insecure);

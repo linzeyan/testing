@@ -19,6 +19,12 @@ pub struct Request {
     pub body: Body,
     #[serde(skip_serializing_if = "Auth::is_none")]
     pub auth: Auth,
+    /// JavaScript run before sending (may edit the request and variables).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub pre_request: String,
+    /// JavaScript run on the response (`pm.test`, variable capture).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tests: String,
 }
 
 impl Default for Request {
@@ -30,6 +36,8 @@ impl Default for Request {
             headers: Vec::new(),
             body: Body::None,
             auth: Auth::None,
+            pre_request: String::new(),
+            tests: String::new(),
         }
     }
 }
@@ -144,6 +152,9 @@ impl Request {
                     Auth::Basic { username: r(username), password: r(password) }
                 }
             },
+            // Scripts have already run by the time a request is resolved for the wire.
+            pre_request: String::new(),
+            tests: String::new(),
         };
         (req, missing)
     }
@@ -185,6 +196,8 @@ mod tests {
             headers: vec![off],
             body: Body::Json { text: "{\n  \"name\": \"測試\"\n}".into() },
             auth: Auth::Basic { username: "u".into(), password: "{{pw}}".into() },
+            pre_request: "pm.environment.set(\"ts\", Date.now());".into(),
+            tests: "pm.test(\"ok\", function () {\n    pm.response.to.have.status(200);\n});\n".into(),
         };
         let text = toml::to_string_pretty(&req).unwrap();
         assert_eq!(toml::from_str::<Request>(&text).unwrap(), req, "{text}");

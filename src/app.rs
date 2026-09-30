@@ -8,6 +8,8 @@ use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use crate::http;
 use crate::model::{Auth, Body, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
+use crate::runner::{self, Outcome, Vars};
+use crate::script::{Changes, TestResult};
 use crate::store::{Node, State, Workspace};
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
@@ -19,7 +21,7 @@ const RED: Color32 = Color32::from_rgb(220, 80, 80);
 const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
 
 enum Msg {
-    Response(PathBuf, Result<http::Response, String>),
+    Response(PathBuf, Box<Outcome>),
     Status(String),
 }
 
@@ -34,12 +36,21 @@ enum ReqTab {
     Headers,
     Body,
     Auth,
+    Scripts,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum ScriptTab {
+    Pre,
+    Post,
 }
 
 #[derive(PartialEq, Clone, Copy)]
 enum RespTab {
     Body,
     Headers,
+    Tests,
+    Console,
 }
 
 struct Open {
@@ -69,6 +80,13 @@ struct ResponseView {
     text: String,
     raw_size: usize,
     line_starts: Vec<usize>,
+}
+
+/// What the response pane shows for the last run of the open request.
+struct Shown {
+    result: Result<ResponseView, String>,
+    tests: Vec<TestResult>,
+    logs: Vec<String>,
 }
 
 enum NameKind {
@@ -114,10 +132,13 @@ pub struct App {
     envs: Vec<String>,
     active_env: Option<String>,
     vars: HashMap<String, String>,
+    /// `pm.globals`: session-only, like Postman's globals without a workspace sync.
+    globals: HashMap<String, String>,
     open: Option<Open>,
     req_tab: ReqTab,
+    script_tab: ScriptTab,
     resp_tab: RespTab,
-    response: Option<Result<ResponseView, String>>,
+    response: Option<Shown>,
     pending: Option<Pending>,
     status: String,
     dialog: Option<Dialog>,
@@ -142,8 +163,10 @@ impl App {
             ws,
             active_env: None,
             vars: HashMap::new(),
+            globals: HashMap::new(),
             open: None,
             req_tab: ReqTab::Params,
+            script_tab: ScriptTab::Post,
             resp_tab: RespTab::Body,
             response: None,
             pending: None,
@@ -259,19 +282,15 @@ impl App {
             return;
         }
         let (cell, net) = (self.client.clone(), self.network.clone());
-        let (req, missing) = open.draft.resolved(&self.vars);
-        self.status = if missing.is_empty() {
-            String::new()
-        } else {
-            format!("Undefined variables sent as-is: {}", missing.join(", "))
-        };
-        let (path, tx, ctx) = (open.path.clone(), self.tx.clone(), ctx.clone());
+        let vars = Vars { env: self.vars.clone(), globals: self.globals.clone() };
+        self.status.clear();
+        let (path, name, req, tx, ctx) = (open.path.clone(), open.name(), open.draft.clone(), self.tx.clone(), ctx.clone());
         let task = self.rt.spawn(async move {
-            let result = match cell.get_or_init(|| net::build_client(net)).await {
-                Ok(client) => http::execute(client.clone(), req).await,
-                Err(e) => Err(format!("Network settings: {e}")),
+            let outcome = match cell.get_or_init(|| net::build_client(net)).await {
+                Ok(client) => runner::run(client.clone(), name, req, vars).await,
+                Err(e) => Outcome::failed(format!("Network settings: {e}")),
             };
-            let _ = tx.send(Msg::Response(path, result));
+            let _ = tx.send(Msg::Response(path, Box::new(outcome)));
             ctx.request_repaint();
         });
         self.pending = Some(Pending { path: open.path.clone(), started: Instant::now(), abort: task.abort_handle() });
@@ -286,22 +305,69 @@ impl App {
 
     fn receive(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
-            let (path, result) = match msg {
+            let (path, outcome) = match msg {
                 Msg::Status(s) => {
                     self.status = s;
                     continue;
                 }
-                Msg::Response(path, result) => (path, result),
+                Msg::Response(path, outcome) => (path, *outcome),
             };
             if self.pending.as_ref().is_some_and(|p| p.path == path) {
                 self.pending = None;
             }
+            // Variable writes apply even if the user switched away meanwhile.
+            self.apply_changes(outcome.env, outcome.globals);
+            if !outcome.tests.is_empty() {
+                let passed = outcome.tests.iter().filter(|t| t.passed).count();
+                self.status = format!("Tests: {passed}/{} passed", outcome.tests.len());
+            }
             // Only the open request's response is kept: bodies can be MBs and RAM is the constraint.
             if self.open.as_ref().is_some_and(|o| o.path == path) {
-                self.response = Some(result.map(into_view));
-                self.resp_tab = RespTab::Body;
+                let failed = outcome.response.is_err() || outcome.tests.iter().any(|t| !t.passed);
+                self.resp_tab = if failed && !outcome.tests.is_empty() { RespTab::Tests } else { RespTab::Body };
+                self.response = Some(Shown { result: outcome.response.map(into_view), tests: outcome.tests, logs: outcome.logs });
             }
         }
+    }
+
+    /// `pm.environment.set` lands in the gitignored secret file: like Postman's "current
+    /// value" it stays on this machine, and it survives restarts so chained tokens keep working.
+    fn apply_changes(&mut self, env: Changes, globals: Changes) {
+        let mut globals = globals;
+        if !env.is_empty() {
+            match self.active_env.clone() {
+                Some(name) => {
+                    let (shared, mut secret) = self.ws.load_env(&name);
+                    for (key, value) in &env {
+                        secret.retain(|kv| &kv.key != key);
+                        if let Some(v) = value {
+                            secret.push(KeyValue::new(key.clone(), v.clone()));
+                        }
+                    }
+                    match self.ws.save_env(&name, &shared, &secret) {
+                        Ok(()) => self.set_env(Some(name)),
+                        Err(e) => self.status = format!("Saving environment: {e}"),
+                    }
+                }
+                None => {
+                    self.status = "No environment selected: pm.environment.set was stored as a global".into();
+                    globals.extend(env);
+                }
+            }
+        }
+        for (key, value) in globals {
+            match value {
+                Some(v) => self.globals.insert(key, v),
+                None => self.globals.remove(&key),
+            };
+        }
+    }
+
+    /// Everything `{{name}}` can resolve to, with the same precedence as the runner.
+    fn all_vars(&self) -> HashMap<String, String> {
+        let mut all = self.globals.clone();
+        all.extend(self.vars.clone());
+        all
     }
 
     fn submit_name(&mut self) {
@@ -468,6 +534,7 @@ impl App {
     }
 
     fn main_area(&mut self, ui: &mut egui::Ui) {
+        let all_vars = self.all_vars();
         let Some(open) = &mut self.open else {
             ui.centered_and_justified(|ui| ui.weak("Select a request on the left, or create one with \"+ Request\"."));
             return;
@@ -519,8 +586,9 @@ impl App {
                         .clicked();
                 }
             });
-            let (_, missing) = open.draft.resolved(&self.vars);
-            if !missing.is_empty() {
+            let (_, missing) = open.draft.resolved(&all_vars);
+            // A pre-request script may define them; only warn when nothing could.
+            if !missing.is_empty() && open.draft.pre_request.trim().is_empty() {
                 let hint = if self.active_env.is_none() { " (no environment selected)" } else { "" };
                 ui.colored_label(ORANGE, format!("Undefined: {}{hint}", missing.join(", ")));
             }
@@ -533,6 +601,8 @@ impl App {
                 let dot = |none: bool, name: &str| if none { name.to_owned() } else { format!("{name} ●") };
                 ui.selectable_value(&mut self.req_tab, ReqTab::Body, dot(matches!(open.draft.body, Body::None), "Body"));
                 ui.selectable_value(&mut self.req_tab, ReqTab::Auth, dot(matches!(open.draft.auth, Auth::None), "Auth"));
+                let no_scripts = open.draft.pre_request.trim().is_empty() && open.draft.tests.trim().is_empty();
+                ui.selectable_value(&mut self.req_tab, ReqTab::Scripts, dot(no_scripts, "Scripts"));
             });
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.req_tab {
@@ -540,6 +610,7 @@ impl App {
                 ReqTab::Headers => kv_table(ui, "headers", &mut open.draft.headers),
                 ReqTab::Body => body_editor(ui, &mut open.draft.body),
                 ReqTab::Auth => auth_editor(ui, &mut open.draft.auth),
+                ReqTab::Scripts => scripts_editor(ui, &mut self.script_tab, &mut open.draft),
             });
         });
 
@@ -556,11 +627,7 @@ impl App {
                 None => {
                     ui.weak(format!("Press Send or {} to see the response.", ui.ctx().format_shortcut(&SEND)));
                 }
-                Some(Err(e)) => {
-                    ui.colored_label(RED, "Request failed");
-                    ui.add(egui::Label::new(RichText::new(e).monospace()).selectable(true));
-                }
-                Some(Ok(view)) => response_ui(ui, view, &mut self.resp_tab),
+                Some(shown) => response_ui(ui, shown, &mut self.resp_tab),
             }
         });
 
@@ -978,25 +1045,136 @@ fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth) {
     }
 }
 
-fn response_ui(ui: &mut egui::Ui, view: &ResponseView, tab: &mut RespTab) {
-    let h = &view.head;
+const PRE_SNIPPETS: &[(&str, &str)] = &[
+    ("Set a request header", "pm.request.headers.upsert({ key: \"X-Request-Id\", value: Date.now() });\n"),
+    ("Set an environment variable", "pm.environment.set(\"timestamp\", Date.now());\n"),
+    ("Log a variable", "console.log(pm.environment.get(\"host\"));\n"),
+];
+
+const POST_SNIPPETS: &[(&str, &str)] = &[
+    ("Status code is 200", "pm.test(\"Status code is 200\", function () {\n    pm.response.to.have.status(200);\n});\n"),
+    ("Response time is below 500 ms", "pm.test(\"Response time is below 500 ms\", function () {\n    pm.expect(pm.response.responseTime).to.be.below(500);\n});\n"),
+    ("JSON body has a property", "pm.test(\"Body has id\", function () {\n    const json = pm.response.json();\n    pm.expect(json).to.have.property(\"id\");\n});\n"),
+    ("Header is present", "pm.test(\"Content-Type is present\", function () {\n    pm.response.to.have.header(\"Content-Type\");\n});\n"),
+    ("Save a JSON value to the environment", "pm.environment.set(\"token\", pm.response.json().token);\n"),
+];
+
+fn scripts_editor(ui: &mut egui::Ui, tab: &mut ScriptTab, req: &mut Request) {
+    let mut insert = None;
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{} {}", h.status, h.reason)).strong().color(status_color(h.status)));
-        ui.weak(format!("{} ms", h.elapsed.as_millis()));
-        ui.weak(human_size(view.raw_size));
-        ui.weak(&h.version);
+        let label = |name: &str, s: &str| if s.trim().is_empty() { name.to_owned() } else { format!("{name} ●") };
+        ui.selectable_value(tab, ScriptTab::Pre, label("Pre-request", &req.pre_request));
+        ui.selectable_value(tab, ScriptTab::Post, label("Post-response", &req.tests));
         ui.separator();
-        ui.selectable_value(tab, RespTab::Body, "Body");
-        ui.selectable_value(tab, RespTab::Headers, format!("Headers ({})", h.headers.len()));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("Copy").on_hover_text("Copy body").clicked() {
-                ui.ctx().copy_text(view.text.clone());
+        let snippets = if *tab == ScriptTab::Pre { PRE_SNIPPETS } else { POST_SNIPPETS };
+        ui.menu_button("Snippets", |ui| {
+            for (name, code) in snippets {
+                if ui.button(*name).clicked() {
+                    insert = Some(*code);
+                    ui.close();
+                }
             }
         });
     });
+    let (text, hint) = match tab {
+        ScriptTab::Pre => (&mut req.pre_request, "// Runs before the request is sent.\n// pm.request, pm.environment, pm.variables, console.log"),
+        ScriptTab::Post => (&mut req.tests, "// Runs after the response arrives.\n// pm.test(name, fn), pm.expect(...), pm.response.json()"),
+    };
+    if let Some(code) = insert {
+        if !text.is_empty() {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push('\n');
+        }
+        text.push_str(code);
+    }
+    ui.add(egui::TextEdit::multiline(text).code_editor().hint_text(hint).desired_rows(12).desired_width(f32::INFINITY));
+}
+
+const GREEN: Color32 = Color32::from_rgb(80, 180, 100);
+
+fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
+    let passed = shown.tests.iter().filter(|t| t.passed).count();
+    ui.horizontal(|ui| {
+        match &shown.result {
+            Ok(view) => {
+                let h = &view.head;
+                ui.label(RichText::new(format!("{} {}", h.status, h.reason)).strong().color(status_color(h.status)));
+                ui.weak(format!("{} ms", h.elapsed.as_millis()));
+                ui.weak(human_size(view.raw_size));
+                ui.weak(&h.version);
+                ui.separator();
+                ui.selectable_value(tab, RespTab::Body, "Body");
+                ui.selectable_value(tab, RespTab::Headers, format!("Headers ({})", h.headers.len()));
+            }
+            Err(_) => {
+                ui.colored_label(RED, "Request failed");
+                ui.separator();
+                ui.selectable_value(tab, RespTab::Body, "Error");
+            }
+        }
+        if !shown.tests.is_empty() {
+            let color = if passed == shown.tests.len() { GREEN } else { RED };
+            let label = RichText::new(format!("Tests ({passed}/{})", shown.tests.len())).color(color);
+            ui.selectable_value(tab, RespTab::Tests, label);
+        }
+        if !shown.logs.is_empty() {
+            ui.selectable_value(tab, RespTab::Console, format!("Console ({})", shown.logs.len()));
+        }
+        if let Ok(view) = &shown.result {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Copy").on_hover_text("Copy body").clicked() {
+                    ui.ctx().copy_text(view.text.clone());
+                }
+            });
+        }
+    });
     ui.separator();
-    match tab {
-        RespTab::Body => {
+    // A tab from the previous run may not exist in this one; fall back to the body.
+    let current = match *tab {
+        RespTab::Tests if shown.tests.is_empty() => RespTab::Body,
+        RespTab::Console if shown.logs.is_empty() => RespTab::Body,
+        RespTab::Headers if shown.result.is_err() => RespTab::Body,
+        t => t,
+    };
+    match (current, &shown.result) {
+        (RespTab::Tests, _) => {
+            egui::ScrollArea::vertical().id_salt("response-tests").auto_shrink(false).show(ui, |ui| {
+                for t in &shown.tests {
+                    ui.horizontal(|ui| {
+                        let (badge, color) = if t.passed { ("PASS", GREEN) } else { ("FAIL", RED) };
+                        ui.label(RichText::new(badge).monospace().strong().color(color));
+                        ui.add(egui::Label::new(t.name.as_str()).selectable(true));
+                    });
+                    if let Some(e) = &t.error {
+                        ui.add(egui::Label::new(RichText::new(e).monospace().weak()).selectable(true));
+                    }
+                }
+            });
+        }
+        (RespTab::Console, _) => {
+            egui::ScrollArea::vertical().id_salt("response-console").auto_shrink(false).show(ui, |ui| {
+                for line in &shown.logs {
+                    ui.add(egui::Label::new(RichText::new(line).monospace()).selectable(true));
+                }
+            });
+        }
+        (_, Err(e)) => {
+            ui.add(egui::Label::new(RichText::new(e).monospace()).selectable(true));
+        }
+        (RespTab::Headers, Ok(view)) => {
+            egui::ScrollArea::vertical().id_salt("response-headers").auto_shrink(false).show(ui, |ui| {
+                egui::Grid::new("resp-headers").num_columns(2).striped(true).show(ui, |ui| {
+                    for (k, v) in &view.head.headers {
+                        ui.add(egui::Label::new(RichText::new(k).strong()).selectable(true));
+                        ui.add(egui::Label::new(v.as_str()).selectable(true));
+                        ui.end_row();
+                    }
+                });
+            });
+        }
+        (_, Ok(view)) => {
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
             egui::ScrollArea::both()
                 .id_salt("response-body")
@@ -1014,17 +1192,6 @@ fn response_ui(ui: &mut egui::Ui, view: &ResponseView, tab: &mut RespTab) {
                     }
                 });
         }
-        RespTab::Headers => {
-            egui::ScrollArea::vertical().id_salt("response-headers").auto_shrink(false).show(ui, |ui| {
-                egui::Grid::new("resp-headers").num_columns(2).striped(true).show(ui, |ui| {
-                    for (k, v) in &h.headers {
-                        ui.add(egui::Label::new(RichText::new(k).strong()).selectable(true));
-                        ui.add(egui::Label::new(v.as_str()).selectable(true));
-                        ui.end_row();
-                    }
-                });
-            });
-        }
     }
 }
 
@@ -1038,7 +1205,7 @@ fn short_method(m: &str) -> &str {
 
 fn method_color(m: &str) -> Color32 {
     match m {
-        "GET" => Color32::from_rgb(80, 180, 100),
+        "GET" => GREEN,
         "POST" => ORANGE,
         "PUT" => Color32::from_rgb(70, 140, 230),
         "PATCH" => Color32::from_rgb(170, 110, 220),
@@ -1049,7 +1216,7 @@ fn method_color(m: &str) -> Color32 {
 
 fn status_color(status: u16) -> Color32 {
     match status {
-        200..=299 => Color32::from_rgb(80, 180, 100),
+        200..=299 => GREEN,
         300..=399 => Color32::from_rgb(70, 140, 230),
         400..=499 => ORANGE,
         _ => RED,

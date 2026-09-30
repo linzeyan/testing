@@ -4,6 +4,8 @@ mod app;
 mod http;
 mod model;
 mod net;
+mod runner;
+mod script;
 mod store;
 
 use std::path::PathBuf;
@@ -14,10 +16,6 @@ use eframe::egui_wgpu::WgpuSetup;
 use eframe::wgpu;
 
 fn main() -> eframe::Result {
-    // reqwest is built with `rustls-no-provider`: ring cross-compiles to Windows with
-    // just clang, while aws-lc-rs drags in cmake/nasm.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     let use_glow = std::env::args().any(|a| a == "--glow");
     let mut options = eframe::NativeOptions {
         renderer: if use_glow { eframe::Renderer::Glow } else { eframe::Renderer::Wgpu },
