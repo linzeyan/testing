@@ -66,6 +66,10 @@ pub struct Output {
 }
 
 const PRELUDE: &str = r#"
+chai.Assertion.addMethod('jsonSchema', function (schema) {
+  var errors = __schemaErrors(JSON.stringify(schema), JSON.stringify(this._obj));
+  this.assert(!errors, 'expected value to match JSON schema:\n' + errors, 'expected value not to match JSON schema');
+});
 var __in = JSON.parse(__input);
 var __out = { tests: [], logs: [], env: {}, globals: {}, locals: {}, request: null };
 function __str(v) {
@@ -158,7 +162,8 @@ if (__in.response) {
         jsonBody: function (path) {
           var json = JSON.parse(__res.body);
           if (arguments.length > 0) chai.expect(json).to.have.nested.property(path);
-        }
+        },
+        jsonSchema: function (schema) { chai.expect(JSON.parse(__res.body)).to.have.jsonSchema(schema); }
       },
       be: {}
     }
@@ -209,6 +214,12 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
         ctx.eval::<(), _>("globalThis.self = globalThis;")
             .map_err(caught)?;
         ctx.eval::<(), _>(CHAI).map_err(caught)?;
+        ctx.globals()
+            .set(
+                "__schemaErrors",
+                rquickjs::Function::new(ctx.clone(), schema_errors).map_err(caught)?,
+            )
+            .map_err(caught)?;
         ctx.eval::<(), _>(PRELUDE).map_err(caught)?;
         // The user's script may throw; keep whatever it recorded before that.
         let error = ctx
@@ -220,6 +231,24 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
         out.error = error;
         Ok(out)
     })
+}
+
+/// Native because JSON Schema validation in JS would mean vendoring Ajv (~120 KB) into
+/// every script run. Returns "" when valid, else one line per violation.
+fn schema_errors(schema: String, instance: String) -> String {
+    let parse = |s: &str| serde_json::from_str::<serde_json::Value>(s);
+    let (Ok(schema), Ok(instance)) = (parse(&schema), parse(&instance)) else {
+        return "value is not JSON".into();
+    };
+    let validator = match jsonschema::validator_for(&schema) {
+        Ok(v) => v,
+        Err(e) => return format!("invalid schema: {e}"),
+    };
+    validator
+        .iter_errors(&instance)
+        .map(|e| format!("{} {e}", e.instance_path()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn exception(
@@ -333,6 +362,43 @@ mod tests {
         // Chaining: the token captured here is what the next request's {{token}} resolves to.
         assert_eq!(out.env["token"], Some("abc".into()));
         assert_eq!(out.logs, ["got [1,2]"]);
+    }
+
+    #[test]
+    fn json_schema_contract_checks_report_the_violating_path() {
+        let (req, env) = (request(), HashMap::new());
+        let body = r#"{"id": 7, "tags": ["a", 3]}"#;
+        let resp = ScriptResponse {
+            code: 200,
+            status: "OK",
+            time: 1,
+            headers: &[],
+            body,
+        };
+        let out = run(
+            r#"
+            var schema = { type: "object", required: ["id", "tags"],
+              properties: { id: { type: "integer" }, tags: { type: "array", items: { type: "string" } } } };
+            pm.test("contract", function () { pm.response.to.have.jsonSchema(schema); });
+            pm.test("id only", function () {
+              pm.expect(pm.response.json()).to.have.jsonSchema({ required: ["id"] });
+            });
+            pm.test("bad schema", function () { pm.response.to.have.jsonSchema({ type: 12 }); });
+            "#,
+            &input(&req, &env, Some(resp)),
+        );
+        assert_eq!(out.error, None);
+        let passed: Vec<_> = out.tests.iter().map(|t| t.passed).collect();
+        assert_eq!(passed, [false, true, false]);
+        let why = out.tests[0].error.as_deref().unwrap();
+        assert!(why.contains("/tags/1") && why.contains("string"), "{why}");
+        assert!(
+            out.tests[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("invalid schema")
+        );
     }
 
     #[test]

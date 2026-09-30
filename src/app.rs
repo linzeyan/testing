@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
 use crate::http;
+use crate::loadtest::{self, Stats};
 use crate::model::{self, Auth, Body, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
 use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
@@ -101,6 +102,22 @@ struct StreamSession {
 impl Drop for StreamSession {
     fn drop(&mut self) {
         self.abort.abort();
+    }
+}
+
+/// Load-test pane for the open request; replaces the response pane while shown.
+struct LoadView {
+    vus: usize,
+    secs: u64,
+    stats: Option<Arc<std::sync::Mutex<Stats>>>,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for LoadView {
+    fn drop(&mut self) {
+        if let Some(a) = &self.abort {
+            a.abort();
+        }
     }
 }
 
@@ -209,6 +226,7 @@ pub struct App {
     stream: Option<StreamSession>,
     /// Methods of the last `.proto` the gRPC picker looked at; recompiled only on change.
     grpc_methods: Option<(String, Result<Vec<String>, String>)>,
+    load: Option<LoadView>,
     status: String,
     dialog: Option<Dialog>,
     env_editor: Option<EnvEditor>,
@@ -243,6 +261,7 @@ impl App {
             pending: None,
             stream: None,
             grpc_methods: None,
+            load: None,
             status: String::new(),
             dialog: None,
             env_editor: None,
@@ -338,6 +357,7 @@ impl App {
                 });
                 self.response = None;
                 self.stream = None;
+                self.load = None;
                 self.save_state();
             }
             Err(e) => self.status = e,
@@ -824,6 +844,7 @@ impl App {
             return;
         };
         let (mut send, mut save, mut cancel) = (false, false, false);
+        let (mut toggle_load, mut start_load) = (false, false);
         let pending = self.pending.as_ref().filter(|p| p.path == open.path);
         let streaming = model::is_streaming(&open.draft.method);
         let session = self.stream.as_mut().filter(|s| s.path == open.path);
@@ -845,6 +866,11 @@ impl App {
                             .add_enabled(open.dirty(), egui::Button::new("Save"))
                             .on_hover_text(ui.ctx().format_shortcut(&SAVE))
                             .clicked();
+                        if !streaming {
+                            toggle_load = ui
+                                .selectable_label(self.load.is_some(), "⚡ Load test")
+                                .clicked();
+                        }
                     });
                 });
                 ui.horizontal(|ui| {
@@ -972,6 +998,10 @@ impl App {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
                 return;
             }
+            if let Some(view) = self.load.as_mut() {
+                start_load = load_ui(ui, view);
+                return;
+            }
             if streaming {
                 match session {
                     Some(s) => stream_ui(ui, s),
@@ -1001,6 +1031,55 @@ impl App {
         }
         if send {
             self.send(ui.ctx());
+        }
+        if toggle_load {
+            self.load = match self.load.take() {
+                Some(_) => None,
+                None => Some(LoadView {
+                    vus: 10,
+                    secs: 30,
+                    stats: None,
+                    abort: None,
+                }),
+            };
+        }
+        if start_load {
+            self.start_load(ui.ctx());
+        }
+    }
+
+    /// Variables are resolved once up front: every virtual user sends the identical request.
+    fn start_load(&mut self, ctx: &egui::Context) {
+        let (Some(open), Some(view)) = (&self.open, &self.load) else {
+            return;
+        };
+        let (req, _) = open.draft.resolved(&self.all_vars());
+        let stats = Arc::new(std::sync::Mutex::new(Stats::default()));
+        let (vus, secs) = (view.vus, view.secs);
+        let (cell, net, tx, s) = (
+            self.client.clone(),
+            self.network.clone(),
+            self.tx.clone(),
+            stats.clone(),
+        );
+        let ctx = ctx.clone();
+        let task = self.rt.spawn(async move {
+            match cell.get_or_init(|| net::build_client(net)).await {
+                Ok(client) => {
+                    loadtest::run(client.clone(), req, vus, Duration::from_secs(secs), s).await
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Status(format!("Network settings: {e}")));
+                    let mut s = s.lock().unwrap();
+                    s.finished = Some(s.started.elapsed());
+                }
+            }
+            ctx.request_repaint();
+        });
+        let view = self.load.as_mut().unwrap();
+        view.stats = Some(stats);
+        if let Some(old) = view.abort.replace(task.abort_handle()) {
+            old.abort();
         }
     }
 
@@ -1875,6 +1954,10 @@ const POST_SNIPPETS: &[(&str, &str)] = &[
         "pm.test(\"Body has id\", function () {\n    const json = pm.response.json();\n    pm.expect(json).to.have.property(\"id\");\n});\n",
     ),
     (
+        "Body matches a JSON schema",
+        "const schema = {\n    type: \"object\",\n    required: [\"id\"],\n    properties: {\n        id: { type: \"integer\" }\n    }\n};\npm.test(\"Body matches the schema\", function () {\n    pm.response.to.have.jsonSchema(schema);\n});\n",
+    ),
+    (
         "Header is present",
         "pm.test(\"Content-Type is present\", function () {\n    pm.response.to.have.header(\"Content-Type\");\n});\n",
     ),
@@ -1996,6 +2079,100 @@ fn grpc_bar(
         }
     });
     error
+}
+
+/// Returns true when Start was pressed.
+fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
+    let running = view
+        .stats
+        .as_ref()
+        .is_some_and(|s| s.lock().unwrap().finished.is_none());
+    let mut start = false;
+    ui.horizontal(|ui| {
+        ui.strong("Load test");
+        ui.separator();
+        ui.add_enabled_ui(!running, |ui| {
+            ui.label("Virtual users");
+            ui.add(egui::DragValue::new(&mut view.vus).range(1..=500));
+            ui.label("Duration (s)");
+            ui.add(egui::DragValue::new(&mut view.secs).range(1..=3600));
+        });
+        if running {
+            if ui.button("Stop").clicked()
+                && let Some(a) = view.abort.take()
+            {
+                a.abort();
+                if let Some(s) = &view.stats {
+                    let mut s = s.lock().unwrap();
+                    s.finished = Some(s.started.elapsed());
+                }
+            }
+        } else {
+            start = ui.button("▶ Start").clicked();
+        }
+    });
+    ui.weak("Sends the current draft (variables resolved once). Scripts are skipped.");
+    ui.separator();
+    let Some(stats) = &view.stats else {
+        return start;
+    };
+    let s = stats.lock().unwrap();
+    let elapsed = s.elapsed().as_secs_f64();
+    if running {
+        ui.add(egui::ProgressBar::new((elapsed / view.secs as f64) as f32).show_percentage());
+        ui.ctx().request_repaint_after(Duration::from_millis(250));
+    }
+    let errors = s.error_count();
+    egui::Grid::new("load-stats").striped(true).show(ui, |ui| {
+        let mut row = |k: &str, v: String| {
+            ui.label(k);
+            ui.monospace(v);
+            ui.end_row();
+        };
+        row("Requests", s.count.to_string());
+        row(
+            "Throughput",
+            format!("{:.1} req/s", s.count as f64 / elapsed.max(0.001)),
+        );
+        let pct = if s.count > 0 {
+            errors as f64 * 100.0 / s.count as f64
+        } else {
+            0.0
+        };
+        row("Errors", format!("{errors} ({pct:.1}%)"));
+        if s.count > 0 {
+            row(
+                "Mean",
+                format!("{:.1} ms", s.sum_us as f64 / s.count as f64 / 1000.0),
+            );
+            for p in [50.0, 90.0, 95.0, 99.0] {
+                row(&format!("p{p}"), format!("{:.1} ms", s.percentile_ms(p)));
+            }
+            row("Max", format!("{:.1} ms", s.max_us as f64 / 1000.0));
+        }
+    });
+    if !s.statuses.is_empty() {
+        ui.add_space(6.0);
+        ui.strong("Status codes");
+        for (code, n) in &s.statuses {
+            ui.horizontal(|ui| {
+                ui.colored_label(status_color(*code), code.to_string());
+                ui.monospace(n.to_string());
+            });
+        }
+    }
+    if !s.errors.is_empty() {
+        ui.add_space(6.0);
+        ui.strong("Errors");
+        for (msg, n) in &s.errors {
+            ui.horizontal(|ui| {
+                ui.monospace(n.to_string());
+                ui.colored_label(RED, msg.lines().next().unwrap_or_default())
+                    .on_hover_text(msg.as_str());
+            });
+        }
+    }
+    start
 }
 
 impl StreamSession {

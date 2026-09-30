@@ -3,6 +3,7 @@
 mod app;
 mod grpc;
 mod http;
+mod loadtest;
 mod model;
 mod net;
 mod runner;

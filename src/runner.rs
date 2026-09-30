@@ -112,11 +112,7 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
     merged.extend(vars.data.clone());
     merged.extend(locals.clone());
     let (wire, _) = req.resolved(&merged);
-    let response = if wire.method.eq_ignore_ascii_case("GRPC") {
-        grpc::call(client.grpc, wire).await
-    } else {
-        http::execute(client.http, wire).await
-    };
+    let response = send(&client, wire).await;
 
     if let Ok(resp) = &response
         && !req.tests.trim().is_empty()
@@ -157,6 +153,15 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
     }
     out.response = response;
     out
+}
+
+/// Sends an already-resolved request with the client its protocol needs.
+pub async fn send(client: &net::Clients, req: Request) -> Result<http::Response, String> {
+    if req.method.eq_ignore_ascii_case("GRPC") {
+        grpc::call(client.grpc.clone(), req).await
+    } else {
+        http::execute(client.http.clone(), req).await
+    }
 }
 
 /// One row of the collection runner's results. Bodies are deliberately not kept:
