@@ -94,19 +94,24 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// One-shot server that answers with the raw request it received, so the test
+    /// Server that answers each request with the raw request it received, so tests
     /// can assert on exactly what went over the wire.
     pub(crate) fn echo_server() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = vec![0; 16 * 1024];
-            let n = stream.read(&mut buf).unwrap();
-            let body = &buf[..n];
-            let head = format!("HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n", body.len());
-            stream.write_all(head.as_bytes()).unwrap();
-            stream.write_all(body).unwrap();
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = vec![0; 16 * 1024];
+                let n = stream.read(&mut buf).unwrap();
+                let body = &buf[..n];
+                // `connection: close` so the client never reuses a socket we're about to drop.
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            }
         });
         format!("{addr}/users") // no scheme on purpose: must default to http
     }

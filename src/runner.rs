@@ -1,7 +1,9 @@
-//! One request end to end: pre-request script → variable resolution → HTTP → tests.
-//! Shared by the Send button and (later) the collection runner.
+//! One request end to end: pre-request script → variable resolution → HTTP → tests,
+//! and the collection runner that loops it over requests and data rows.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::time::Duration;
 
 use crate::http;
 use crate::model::{KeyValue, Request};
@@ -11,6 +13,21 @@ use crate::script::{self, Changes, Output, ScriptResponse, TestResult, WireReque
 pub struct Vars {
     pub env: HashMap<String, String>,
     pub globals: HashMap<String, String>,
+    /// Current data-file row; empty outside the collection runner.
+    pub data: HashMap<String, String>,
+}
+
+/// Exposed to scripts as `pm.info`.
+pub struct Info {
+    pub name: String,
+    pub iteration: usize,
+    pub count: usize,
+}
+
+impl Info {
+    pub fn single(name: String) -> Self {
+        Self { name, iteration: 0, count: 1 }
+    }
 }
 
 pub struct Outcome {
@@ -29,7 +46,7 @@ impl Outcome {
 }
 
 /// Must run on a multi-threaded tokio runtime: scripts are CPU-bound and use `block_in_place`.
-pub async fn run(client: reqwest::Client, name: String, mut req: Request, mut vars: Vars) -> Outcome {
+pub async fn run(client: reqwest::Client, info: &Info, mut req: Request, mut vars: Vars) -> Outcome {
     let mut out = Outcome {
         response: Err(String::new()),
         tests: Vec::new(),
@@ -45,7 +62,12 @@ pub async fn run(client: reqwest::Client, name: String, mut req: Request, mut va
             url: req.url.clone(),
             headers: req.headers.iter().filter(|h| h.enabled && !h.key.is_empty()).map(|h| (h.key.clone(), h.value.clone())).collect(),
         };
-        let input = script::Input { name: &name, env: &vars.env, globals: &vars.globals, locals: &locals, request: &wire, response: None };
+        let input = script::Input {
+            name: &info.name,
+            iteration: info.iteration,
+            iteration_count: info.count,
+            data: &vars.data,
+            env: &vars.env, globals: &vars.globals, locals: &locals, request: &wire, response: None };
         let result = tokio::task::block_in_place(|| script::run(&req.pre_request, &input));
         let error = result.error.clone();
         let edited = absorb(&mut out, &mut vars, &mut locals, result);
@@ -60,9 +82,10 @@ pub async fn run(client: reqwest::Client, name: String, mut req: Request, mut va
         }
     }
 
-    // Precedence like Postman: request-local > environment > globals.
+    // Precedence like Postman: request-local > data row > environment > globals.
     let mut merged = vars.globals.clone();
     merged.extend(vars.env.clone());
+    merged.extend(vars.data.clone());
     merged.extend(locals.clone());
     let (wire, _) = req.resolved(&merged);
     let response = http::execute(client, wire).await;
@@ -78,7 +101,12 @@ pub async fn run(client: reqwest::Client, name: String, mut req: Request, mut va
             headers: &resp.headers,
             body: &resp.body,
         };
-        let input = script::Input { name: &name, env: &vars.env, globals: &vars.globals, locals: &locals, request: &wire, response: Some(sr) };
+        let input = script::Input {
+            name: &info.name,
+            iteration: info.iteration,
+            iteration_count: info.count,
+            data: &vars.data,
+            env: &vars.env, globals: &vars.globals, locals: &locals, request: &wire, response: Some(sr) };
         let result = tokio::task::block_in_place(|| script::run(&req.tests, &input));
         let error = result.error.clone();
         absorb(&mut out, &mut vars, &mut locals, result);
@@ -88,6 +116,101 @@ pub async fn run(client: reqwest::Client, name: String, mut req: Request, mut va
     }
     out.response = response;
     out
+}
+
+/// One row of the collection runner's results. Bodies are deliberately not kept:
+/// a long data-driven run must not accumulate megabytes per request.
+pub struct RunItem {
+    pub iteration: usize,
+    pub name: String,
+    pub method: String,
+    /// (status code, elapsed ms) or the request error.
+    pub status: Result<(u16, u128), String>,
+    pub tests: Vec<TestResult>,
+}
+
+pub struct RunPlan {
+    pub requests: Vec<(String, Request)>,
+    /// Data rows; when empty, `iterations` plain iterations run instead.
+    pub data: Vec<HashMap<String, String>>,
+    pub iterations: usize,
+    pub delay: Duration,
+}
+
+/// Runs every request for every iteration, chaining variable writes between requests.
+/// Returns the accumulated env/global changes for the caller to persist.
+pub async fn run_collection(
+    client: reqwest::Client,
+    plan: RunPlan,
+    mut vars: Vars,
+    mut on_item: impl FnMut(RunItem),
+) -> (Changes, Changes) {
+    let (mut env, mut globals) = (Changes::new(), Changes::new());
+    let count = if plan.data.is_empty() { plan.iterations.max(1) } else { plan.data.len() };
+    let mut first = true;
+    for iteration in 0..count {
+        vars.data = plan.data.get(iteration).cloned().unwrap_or_default();
+        for (name, req) in &plan.requests {
+            if !first && !plan.delay.is_zero() {
+                tokio::time::sleep(plan.delay).await;
+            }
+            first = false;
+            let info = Info { name: name.clone(), iteration, count };
+            let out = run(client.clone(), &info, req.clone(), vars.clone()).await;
+            for (k, v) in &out.env {
+                apply_one(&mut vars.env, k, v);
+            }
+            for (k, v) in &out.globals {
+                apply_one(&mut vars.globals, k, v);
+            }
+            env.extend(out.env);
+            globals.extend(out.globals);
+            on_item(RunItem {
+                iteration,
+                name: name.clone(),
+                method: req.method.clone(),
+                status: out.response.map(|r| (r.status, r.elapsed.as_millis())),
+                tests: out.tests,
+            });
+        }
+    }
+    (env, globals)
+}
+
+fn apply_one(map: &mut HashMap<String, String>, k: &str, v: &Option<String>) {
+    match v {
+        Some(v) => map.insert(k.to_owned(), v.clone()),
+        None => map.remove(k),
+    };
+}
+
+/// Reads a runner data file: CSV with a header row, or a JSON array of objects.
+/// Non-string JSON values are passed on as their JSON text, like Postman.
+pub fn load_data(path: &Path) -> Result<Vec<HashMap<String, String>>, String> {
+    let shown = path.display();
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{shown}: {e}"))?;
+    let is_json = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
+    if is_json {
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_str(&text).map_err(|e| format!("{shown}: expected an array of objects: {e}"))?;
+        return Ok(rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|(k, v)| (k, if let serde_json::Value::String(s) = v { s } else { v.to_string() }))
+                    .collect()
+            })
+            .collect());
+    }
+    let mut reader = csv::ReaderBuilder::new().trim(csv::Trim::Headers).from_reader(text.as_bytes());
+    let headers = reader.headers().map_err(|e| format!("{shown}: {e}"))?.clone();
+    reader
+        .records()
+        .map(|rec| {
+            let rec = rec.map_err(|e| format!("{shown}: {e}"))?;
+            Ok(headers.iter().zip(rec.iter()).map(|(h, v)| (h.to_owned(), v.to_owned())).collect())
+        })
+        .collect()
 }
 
 /// Folds one script's output into the running state; returns its edited request.
@@ -139,8 +262,9 @@ mod tests {
         let vars = Vars {
             env: HashMap::from([("stage".to_owned(), "qa".to_owned())]),
             globals: HashMap::from([("base".to_owned(), addr)]),
+            data: HashMap::new(),
         };
-        let out = rt.block_on(run(client, "t".into(), req, vars));
+        let out = rt.block_on(run(client, &Info::single("t".into()), req, vars));
 
         let wire = out.response.unwrap().body.to_lowercase();
         // A variable set by the pre-request script resolves in the same request.
@@ -154,11 +278,79 @@ mod tests {
     }
 
     #[test]
+    fn collection_run_chains_requests_and_iterates_data_rows() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let client = rt.block_on(build_client(Network { proxy: ProxyMode::None, ..Default::default() })).unwrap();
+        let base = crate::http::tests::echo_server();
+        let login = Request {
+            url: format!("{base}/login/{{{{user}}}}"),
+            // The echo server returns the request line, e.g. "GET /users/login/ann HTTP/1.1".
+            tests: r#"pm.environment.set("session", pm.response.text().split(" ")[1].split("/").pop());"#.into(),
+            ..Default::default()
+        };
+        let profile = Request {
+            url: format!("{base}/me"),
+            headers: vec![KeyValue::new("X-Session", "{{session}}")],
+            tests: r#"
+                pm.test("session sent", function () {
+                    pm.expect(pm.response.text().toLowerCase()).to.include("x-session: " + pm.iterationData.get("user"));
+                });
+                pm.test("iteration", function () { pm.expect(pm.info.iteration).to.be.below(pm.info.iterationCount); });
+            "#
+            .into(),
+            ..Default::default()
+        };
+        let plan = RunPlan {
+            requests: vec![("Login".into(), login), ("Profile".into(), profile)],
+            data: vec![
+                HashMap::from([("user".to_owned(), "ann".to_owned())]),
+                HashMap::from([("user".to_owned(), "bob".to_owned())]),
+            ],
+            iterations: 99, // ignored: data rows decide the count
+            delay: Duration::ZERO,
+        };
+        let mut items = Vec::new();
+        let (env, _) = rt.block_on(run_collection(client, plan, Vars::default(), |item| items.push(item)));
+
+        let order: Vec<_> = items.iter().map(|i| (i.iteration, i.name.as_str())).collect();
+        assert_eq!(order, [(0, "Login"), (0, "Profile"), (1, "Login"), (1, "Profile")]);
+        for item in &items {
+            assert!(item.status.is_ok(), "{}: {:?}", item.name, item.status);
+            assert!(item.tests.iter().all(|t| t.passed), "{}: {:?}", item.name, item.tests);
+        }
+        // The last write wins and is handed back for persisting.
+        assert_eq!(env["session"], Some("bob".into()));
+    }
+
+    #[test]
+    fn data_files_load_from_csv_and_json() {
+        let dir = std::env::temp_dir().join(format!("apitool-data-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("users.csv");
+        std::fs::write(&csv, "user, note\nann,\"hello, world\"\nbob,\"multi\nline\"\n").unwrap();
+        let rows = load_data(&csv).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["note"], "hello, world");
+        assert_eq!(rows[1]["note"], "multi\nline");
+
+        let json = dir.join("users.json");
+        std::fs::write(&json, r#"[{"user":"ann","age":30,"tags":["a"]}]"#).unwrap();
+        let rows = load_data(&json).unwrap();
+        assert_eq!(rows[0]["user"], "ann");
+        assert_eq!(rows[0]["age"], "30");
+        assert_eq!(rows[0]["tags"], r#"["a"]"#);
+
+        std::fs::write(&json, r#"{"not":"an array"}"#).unwrap();
+        assert!(load_data(&json).unwrap_err().contains("array of objects"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn failing_pre_request_script_blocks_the_send() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let client = rt.block_on(build_client(Network { proxy: ProxyMode::None, ..Default::default() })).unwrap();
         let req = Request { url: "http://127.0.0.1:9/".into(), pre_request: "throw new Error('nope')".into(), ..Default::default() };
-        let out = rt.block_on(run(client, "t".into(), req, Vars::default()));
+        let out = rt.block_on(run(client, &Info::single("t".into()), req, Vars::default()));
         let err = out.response.err().unwrap();
         assert!(err.contains("Pre-request script failed") && err.contains("nope"), "{err}");
     }

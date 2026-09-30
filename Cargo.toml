@@ -1,10 +1,11 @@
 [package]
 name = "apitool"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
 base64 = "0.23"
+csv = "1"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "glow", "default_fonts", "accesskit"] }
 memmap2 = "0.9.11"
 memory-stats = "1.2.0"

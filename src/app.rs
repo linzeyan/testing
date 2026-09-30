@@ -8,7 +8,7 @@ use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use crate::http;
 use crate::model::{Auth, Body, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
-use crate::runner::{self, Outcome, Vars};
+use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
 use crate::store::{Node, State, Workspace};
 
@@ -23,6 +23,8 @@ const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
 enum Msg {
     Response(PathBuf, Box<Outcome>),
     Status(String),
+    RunItem(u64, RunItem),
+    RunDone(u64, Changes, Changes),
 }
 
 /// Built lazily on first use (a PAC file may need downloading) and replaced wholesale when
@@ -124,6 +126,34 @@ struct EnvEditor {
 enum TreeAction {
     Open(PathBuf),
     Dialog(Dialog),
+    Run(PathBuf),
+}
+
+/// Collection runner pane. Settings persist while the pane is open; results are summaries only.
+struct RunnerView {
+    scope: PathBuf,
+    title: String,
+    iterations: usize,
+    data_path: String,
+    delay_ms: u64,
+    only_failures: bool,
+    error: String,
+    run: Option<RunState>,
+}
+
+struct RunState {
+    id: u64,
+    started: Instant,
+    finished: Option<Duration>,
+    total: usize,
+    items: Vec<RunItem>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl RunState {
+    fn running(&self) -> bool {
+        self.finished.is_none()
+    }
 }
 
 pub struct App {
@@ -143,6 +173,8 @@ pub struct App {
     status: String,
     dialog: Option<Dialog>,
     env_editor: Option<EnvEditor>,
+    runner: Option<RunnerView>,
+    next_run_id: u64,
     network: Network,
     network_editor: Option<Network>,
     allow_close: bool,
@@ -173,6 +205,8 @@ impl App {
             status: String::new(),
             dialog: None,
             env_editor: None,
+            runner: None,
+            next_run_id: 0,
             network: state.network,
             network_editor: None,
             allow_close: false,
@@ -282,12 +316,12 @@ impl App {
             return;
         }
         let (cell, net) = (self.client.clone(), self.network.clone());
-        let vars = Vars { env: self.vars.clone(), globals: self.globals.clone() };
+        let vars = Vars { env: self.vars.clone(), globals: self.globals.clone(), data: HashMap::new() };
         self.status.clear();
         let (path, name, req, tx, ctx) = (open.path.clone(), open.name(), open.draft.clone(), self.tx.clone(), ctx.clone());
         let task = self.rt.spawn(async move {
             let outcome = match cell.get_or_init(|| net::build_client(net)).await {
-                Ok(client) => runner::run(client.clone(), name, req, vars).await,
+                Ok(client) => runner::run(client.clone(), &runner::Info::single(name), req, vars).await,
                 Err(e) => Outcome::failed(format!("Network settings: {e}")),
             };
             let _ = tx.send(Msg::Response(path, Box::new(outcome)));
@@ -308,6 +342,20 @@ impl App {
             let (path, outcome) = match msg {
                 Msg::Status(s) => {
                     self.status = s;
+                    continue;
+                }
+                Msg::RunItem(id, item) => {
+                    if let Some(run) = self.runner.as_mut().and_then(|r| r.run.as_mut()).filter(|r| r.id == id) {
+                        run.items.push(item);
+                    }
+                    continue;
+                }
+                Msg::RunDone(id, env, globals) => {
+                    // Persist chained variables even if the runner pane was closed meanwhile.
+                    self.apply_changes(env, globals);
+                    if let Some(run) = self.runner.as_mut().and_then(|r| r.run.as_mut()).filter(|r| r.id == id) {
+                        run.finished = Some(run.started.elapsed());
+                    }
                     continue;
                 }
                 Msg::Response(path, outcome) => (path, *outcome),
@@ -514,7 +562,10 @@ impl App {
                 self.dialog = Some(Dialog::name(NameKind::NewRequest(root.clone()), ""));
             }
             if ui.small_button("+ Folder").clicked() {
-                self.dialog = Some(Dialog::name(NameKind::NewFolder(root), ""));
+                self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
+            }
+            if ui.small_button("▶ Run").on_hover_text("Run the whole collection").clicked() {
+                self.open_runner(root);
             }
         });
         let mut actions = Vec::new();
@@ -527,13 +578,25 @@ impl App {
         });
         for action in actions {
             match action {
-                TreeAction::Open(path) => self.request_open(path),
+                TreeAction::Open(path) => {
+                    if self.runner.as_ref().and_then(|r| r.run.as_ref()).is_some_and(RunState::running) {
+                        self.status = "The collection runner is still running; cancel it first.".into();
+                        continue;
+                    }
+                    self.runner = None;
+                    self.request_open(path);
+                }
                 TreeAction::Dialog(d) => self.dialog = Some(d),
+                TreeAction::Run(path) => self.open_runner(path),
             }
         }
     }
 
     fn main_area(&mut self, ui: &mut egui::Ui) {
+        if self.runner.is_some() {
+            self.runner_ui(ui);
+            return;
+        }
         let all_vars = self.all_vars();
         let Some(open) = &mut self.open else {
             ui.centered_and_justified(|ui| ui.weak("Select a request on the left, or create one with \"+ Request\"."));
@@ -787,6 +850,196 @@ impl App {
 }
 
 impl App {
+    fn open_runner(&mut self, scope: PathBuf) {
+        if self.runner.as_ref().and_then(|r| r.run.as_ref()).is_some_and(RunState::running) {
+            self.status = "The collection runner is already running.".into();
+            return;
+        }
+        let title = if scope == self.ws.collections() {
+            "Whole collection".to_owned()
+        } else {
+            self.display_name(&scope)
+        };
+        // Keep the previous settings when re-opening, which is how people iterate on a run.
+        let prev = self.runner.take();
+        self.runner = Some(RunnerView {
+            scope,
+            title,
+            iterations: prev.as_ref().map_or(1, |p| p.iterations),
+            data_path: prev.as_ref().map(|p| p.data_path.clone()).unwrap_or_default(),
+            delay_ms: prev.as_ref().map_or(0, |p| p.delay_ms),
+            only_failures: false,
+            error: String::new(),
+            run: None,
+        });
+    }
+
+    /// "Folder/Request" relative to the collections root, without the extension.
+    fn display_name(&self, path: &Path) -> String {
+        let rel = path.strip_prefix(self.ws.collections()).unwrap_or(path);
+        rel.with_extension("").to_string_lossy().replace('\\', "/")
+    }
+
+    fn start_run(&mut self, ctx: &egui::Context) {
+        let Some(view) = &self.runner else { return };
+        let mut paths = Vec::new();
+        requests_in(&self.tree, &view.scope, &mut paths);
+        let mut requests = Vec::new();
+        let mut error = String::new();
+        for path in &paths {
+            match self.ws.load_request(path) {
+                Ok(req) => requests.push((self.display_name(path), req)),
+                Err(e) => error = e,
+            }
+        }
+        let data = match view.data_path.trim() {
+            "" => Ok(Vec::new()),
+            p => runner::load_data(Path::new(p)).and_then(|rows| {
+                if rows.is_empty() { Err(format!("{p}: no data rows")) } else { Ok(rows) }
+            }),
+        };
+        let data = match data {
+            Ok(d) => d,
+            Err(e) => {
+                error = e;
+                Vec::new()
+            }
+        };
+        if requests.is_empty() && error.is_empty() {
+            error = "No requests to run here.".into();
+        }
+        let view = self.runner.as_mut().expect("runner open");
+        view.error = error;
+        if !view.error.is_empty() {
+            return;
+        }
+        if self.open.as_ref().is_some_and(Open::dirty) {
+            self.status = "Note: the runner uses saved files; unsaved edits are not included.".into();
+        }
+        let count = if data.is_empty() { view.iterations.max(1) } else { data.len() };
+        let plan = RunPlan { requests, data, iterations: view.iterations, delay: Duration::from_millis(view.delay_ms) };
+        let total = plan.requests.len() * count;
+
+        self.next_run_id += 1;
+        let id = self.next_run_id;
+        let (cell, net) = (self.client.clone(), self.network.clone());
+        let vars = Vars { env: self.vars.clone(), globals: self.globals.clone(), data: HashMap::new() };
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        let task = self.rt.spawn(async move {
+            let client = match cell.get_or_init(|| net::build_client(net)).await {
+                Ok(c) => c.clone(),
+                Err(e) => {
+                    let _ = tx.send(Msg::Status(format!("Network settings: {e}")));
+                    let _ = tx.send(Msg::RunDone(id, Changes::new(), Changes::new()));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let (item_tx, item_ctx) = (tx.clone(), ctx.clone());
+            let (env, globals) = runner::run_collection(client, plan, vars, move |item| {
+                let _ = item_tx.send(Msg::RunItem(id, item));
+                item_ctx.request_repaint();
+            })
+            .await;
+            let _ = tx.send(Msg::RunDone(id, env, globals));
+            ctx.request_repaint();
+        });
+        view.run = Some(RunState { id, started: Instant::now(), finished: None, total, items: Vec::new(), abort: task.abort_handle() });
+    }
+
+    fn runner_ui(&mut self, ui: &mut egui::Ui) {
+        let (mut start, mut close) = (false, false);
+        let Some(view) = &mut self.runner else { return };
+        let running = view.run.as_ref().is_some_and(RunState::running);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.heading(format!("Run: {}", view.title));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close = ui.button("Close").clicked();
+            });
+        });
+        ui.add_enabled_ui(!running, |ui| {
+            egui::Grid::new("runner-settings").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Data file");
+                ui.add(
+                    egui::TextEdit::singleline(&mut view.data_path)
+                        .hint_text("Optional CSV (with header row) or JSON array; one iteration per row")
+                        .desired_width(480.0),
+                );
+                ui.end_row();
+                ui.label("Iterations");
+                let has_data = !view.data_path.trim().is_empty();
+                ui.add_enabled(!has_data, egui::DragValue::new(&mut view.iterations).range(1..=10_000))
+                    .on_disabled_hover_text("Set by the number of data rows");
+                ui.end_row();
+                ui.label("Delay");
+                ui.add(egui::DragValue::new(&mut view.delay_ms).range(0..=60_000).suffix(" ms"));
+                ui.end_row();
+            });
+        });
+        if !view.error.is_empty() {
+            ui.colored_label(RED, view.error.as_str());
+        }
+        ui.horizontal(|ui| {
+            if running {
+                if ui.button("Cancel").clicked() {
+                    let run = view.run.as_mut().expect("running");
+                    run.abort.abort();
+                    run.finished = Some(run.started.elapsed());
+                    self.status = "Run cancelled; variable changes from it were discarded.".into();
+                }
+            } else {
+                let label = RichText::new("▶ Run").strong().color(Color32::WHITE);
+                start = ui.add(egui::Button::new(label).fill(Color32::from_rgb(40, 110, 200))).clicked();
+            }
+            ui.checkbox(&mut view.only_failures, "Failures only");
+        });
+        ui.separator();
+
+        if let Some(run) = &view.run {
+            let done = run.items.len();
+            let failed = run.items.iter().filter(|i| item_failed(i)).count();
+            let (tests_passed, tests_total) = run.items.iter().fold((0, 0), |(p, t), i| {
+                (p + i.tests.iter().filter(|x| x.passed).count(), t + i.tests.len())
+            });
+            let elapsed = run.finished.unwrap_or_else(|| run.started.elapsed());
+            ui.add(egui::ProgressBar::new(done as f32 / run.total.max(1) as f32).text(format!("{done}/{}", run.total)));
+            ui.horizontal(|ui| {
+                ui.label(format!("{:.1} s", elapsed.as_secs_f32()));
+                ui.separator();
+                ui.colored_label(if failed == 0 { GREEN } else { RED }, format!("{failed} failed requests"));
+                ui.separator();
+                let color = if tests_passed == tests_total { GREEN } else { RED };
+                ui.colored_label(color, format!("Tests {tests_passed}/{tests_total}"));
+                if run.finished.is_some() && done < run.total {
+                    ui.separator();
+                    ui.colored_label(ORANGE, "cancelled");
+                }
+            });
+            if running {
+                ui.ctx().request_repaint_after(Duration::from_millis(250));
+            }
+            ui.separator();
+            // ponytail: plain ScrollArea renders every row; switch to show_rows if runs reach tens of thousands.
+            egui::ScrollArea::vertical().id_salt("runner-results").auto_shrink(false).stick_to_bottom(running).show(ui, |ui| {
+                for item in run.items.iter().filter(|i| !view.only_failures || item_failed(i)) {
+                    run_item_ui(ui, item);
+                }
+            });
+        } else {
+            ui.weak("Requests run in the order shown on the left, with the selected environment.");
+        }
+
+        if close {
+            if let Some(run) = self.runner.as_ref().and_then(|r| r.run.as_ref()).filter(|r| r.running()) {
+                run.abort.abort();
+            }
+            self.runner = None;
+        } else if start {
+            self.start_run(ui.ctx());
+        }
+    }
+
     fn network_editor_ui(&mut self, ctx: &egui::Context) {
         let Some(net) = &mut self.network_editor else { return };
         let (mut apply, mut cancel) = (false, false);
@@ -865,6 +1118,56 @@ impl App {
     }
 }
 
+fn requests_in(nodes: &[Node], scope: &Path, out: &mut Vec<PathBuf>) {
+    for node in nodes {
+        match node {
+            Node::Folder { children, .. } => requests_in(children, scope, out),
+            Node::Request { path, .. } if path.starts_with(scope) => out.push(path.clone()),
+            Node::Request { .. } => {}
+        }
+    }
+}
+
+fn item_failed(item: &RunItem) -> bool {
+    item.status.is_err() || item.tests.iter().any(|t| !t.passed)
+}
+
+fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
+    ui.horizontal(|ui| {
+        ui.weak(format!("#{:<3}", item.iteration + 1));
+        ui.label(RichText::new(format!("{:<5}", short_method(&item.method))).monospace().small().color(method_color(&item.method)));
+        ui.label(item.name.as_str());
+        match &item.status {
+            Ok((code, ms)) => {
+                ui.label(RichText::new(code.to_string()).strong().color(status_color(*code)));
+                ui.weak(format!("{ms} ms"));
+            }
+            Err(_) => {
+                ui.colored_label(RED, "ERROR");
+            }
+        }
+        if !item.tests.is_empty() {
+            let passed = item.tests.iter().filter(|t| t.passed).count();
+            let color = if passed == item.tests.len() { GREEN } else { RED };
+            ui.colored_label(color, format!("{passed}/{} tests", item.tests.len()));
+        }
+    });
+    let indent = 28.0;
+    if let Err(e) = &item.status {
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            ui.add(egui::Label::new(RichText::new(e).monospace().color(RED)).selectable(true));
+        });
+    }
+    for t in item.tests.iter().filter(|t| !t.passed) {
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            let text = format!("FAIL {}: {}", t.name, t.error.as_deref().unwrap_or(""));
+            ui.add(egui::Label::new(RichText::new(text).monospace().color(RED)).selectable(true));
+        });
+    }
+}
+
 fn tree_ui(ui: &mut egui::Ui, nodes: &[Node], selected: Option<&Path>, actions: &mut Vec<TreeAction>) {
     for node in nodes {
         match node {
@@ -885,6 +1188,11 @@ fn tree_ui(ui: &mut egui::Ui, nodes: &[Node], selected: Option<&Path>, actions: 
                     item("New folder", Dialog::name(NameKind::NewFolder(path.clone()), ""));
                     item("Rename", Dialog::name(NameKind::Rename(path.clone()), name.as_str()));
                     item("Delete", Dialog::Delete(path.clone()));
+                    ui.separator();
+                    if ui.button("Run folder").clicked() {
+                        actions.push(TreeAction::Run(path.clone()));
+                        ui.close();
+                    }
                 });
             }
             Node::Request { name, path, method } => {

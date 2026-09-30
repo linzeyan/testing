@@ -30,6 +30,10 @@ pub struct ScriptResponse<'a> {
 #[derive(Serialize)]
 pub struct Input<'a> {
     pub name: &'a str,
+    pub iteration: usize,
+    pub iteration_count: usize,
+    /// Current row of the runner's data file (`pm.iterationData`).
+    pub data: &'a HashMap<String, String>,
     pub env: &'a HashMap<String, String>,
     pub globals: &'a HashMap<String, String>,
     pub locals: &'a HashMap<String, String>,
@@ -87,7 +91,12 @@ function __findHeader(list, name) {
   return -1;
 }
 var pm = {
-  info: { requestName: __in.name },
+  info: { requestName: __in.name, iteration: __in.iteration, iterationCount: __in.iteration_count },
+  iterationData: {
+    get: function (k) { return __has(__in.data, k) ? __in.data[k] : undefined; },
+    has: function (k) { return __has(__in.data, k); },
+    toObject: function () { return Object.assign({}, __in.data); }
+  },
   environment: __scope(__in.env, __out.env),
   globals: __scope(__in.globals, __out.globals),
   expect: chai.expect,
@@ -114,6 +123,7 @@ var __locals = __in.locals;
 pm.variables = {
   get: function (k) {
     if (__has(__locals, k)) return __locals[k];
+    if (__has(__in.data, k)) return __in.data[k];
     if (__has(__in.env, k)) return __in.env[k];
     return __in.globals[k];
   },
@@ -236,7 +246,7 @@ mod tests {
 
     fn input<'a>(req: &'a WireRequest, env: &'a HashMap<String, String>, response: Option<ScriptResponse<'a>>) -> Input<'a> {
         static EMPTY: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(HashMap::new);
-        Input { name: "t", env, globals: &EMPTY, locals: &EMPTY, request: req, response }
+        Input { name: "t", iteration: 0, iteration_count: 1, data: &EMPTY, env, globals: &EMPTY, locals: &EMPTY, request: req, response }
     }
 
     #[test]
