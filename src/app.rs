@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
 use crate::http;
-use crate::model::{Auth, Body, KeyValue, METHODS, Request};
+use crate::model::{self, Auth, Body, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
 use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
 use crate::store::{Node, State, Workspace};
+use crate::stream::{self, Event};
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
@@ -25,7 +26,11 @@ enum Msg {
     Status(String),
     RunItem(u64, RunItem),
     RunDone(u64, Changes, Changes),
+    Stream(u64, Event),
 }
+
+/// Stream events kept per session; older ones scroll away so a chatty socket can't grow RAM.
+const MAX_EVENTS: usize = 5000;
 
 /// Built lazily on first use (a PAC file may need downloading) and replaced wholesale when
 /// network settings change, so in-flight requests keep the client they started with.
@@ -63,7 +68,11 @@ struct Open {
 
 impl Open {
     fn name(&self) -> String {
-        self.path.file_stem().unwrap_or_default().to_string_lossy().into_owned()
+        self.path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
     }
     fn dirty(&self) -> bool {
         self.saved != self.draft
@@ -74,6 +83,25 @@ struct Pending {
     path: PathBuf,
     started: Instant,
     abort: tokio::task::AbortHandle,
+}
+
+/// A live (or just ended) WebSocket/SSE connection for the open request.
+struct StreamSession {
+    id: u64,
+    path: PathBuf,
+    started: Instant,
+    events: VecDeque<(Duration, Event)>,
+    /// WebSocket only; dropping it makes the task send a Close frame.
+    outgoing: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    live: bool,
+    compose: String,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for StreamSession {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
 }
 
 struct ResponseView {
@@ -104,14 +132,22 @@ enum Next {
 }
 
 enum Dialog {
-    Name { kind: NameKind, name: String, error: String },
+    Name {
+        kind: NameKind,
+        name: String,
+        error: String,
+    },
     Delete(PathBuf),
     Unsaved(Next),
 }
 
 impl Dialog {
     fn name(kind: NameKind, name: impl Into<String>) -> Self {
-        Self::Name { kind, name: name.into(), error: String::new() }
+        Self::Name {
+            kind,
+            name: name.into(),
+            error: String::new(),
+        }
     }
 }
 
@@ -170,6 +206,7 @@ pub struct App {
     resp_tab: RespTab,
     response: Option<Shown>,
     pending: Option<Pending>,
+    stream: Option<StreamSession>,
     status: String,
     dialog: Option<Dialog>,
     env_editor: Option<EnvEditor>,
@@ -202,6 +239,7 @@ impl App {
             resp_tab: RespTab::Body,
             response: None,
             pending: None,
+            stream: None,
             status: String::new(),
             dialog: None,
             env_editor: None,
@@ -242,7 +280,12 @@ impl App {
         self.client = SharedClient::default();
         self.save_state();
         // Build right away so a bad proxy/PAC/cert shows up now, not on the next Send.
-        let (cell, net, tx, ctx) = (self.client.clone(), self.network.clone(), self.tx.clone(), ctx.clone());
+        let (cell, net, tx, ctx) = (
+            self.client.clone(),
+            self.network.clone(),
+            self.tx.clone(),
+            ctx.clone(),
+        );
         self.rt.spawn(async move {
             let msg = match cell.get_or_init(|| net::build_client(net)).await {
                 Ok(_) => "Network settings applied".to_owned(),
@@ -285,8 +328,13 @@ impl App {
     fn force_open(&mut self, path: PathBuf) {
         match self.ws.load_request(&path) {
             Ok(req) => {
-                self.open = Some(Open { path, saved: req.clone(), draft: req });
+                self.open = Some(Open {
+                    path,
+                    saved: req.clone(),
+                    draft: req,
+                });
                 self.response = None;
+                self.stream = None;
                 self.save_state();
             }
             Err(e) => self.status = e,
@@ -295,7 +343,9 @@ impl App {
 
     /// Returns false if the save failed, so callers never drop unsaved work.
     fn save(&mut self) -> bool {
-        let Some(open) = &mut self.open else { return true };
+        let Some(open) = &mut self.open else {
+            return true;
+        };
         match self.ws.save_request(&open.path, &open.draft) {
             Ok(()) => {
                 open.saved = open.draft.clone();
@@ -312,22 +362,93 @@ impl App {
 
     fn send(&mut self, ctx: &egui::Context) {
         let Some(open) = &self.open else { return };
+        if model::is_streaming(&open.draft.method) {
+            return self.connect(ctx);
+        }
         if self.pending.is_some() {
             return;
         }
         let (cell, net) = (self.client.clone(), self.network.clone());
-        let vars = Vars { env: self.vars.clone(), globals: self.globals.clone(), data: HashMap::new() };
+        let vars = Vars {
+            env: self.vars.clone(),
+            globals: self.globals.clone(),
+            data: HashMap::new(),
+        };
         self.status.clear();
-        let (path, name, req, tx, ctx) = (open.path.clone(), open.name(), open.draft.clone(), self.tx.clone(), ctx.clone());
+        let (path, name, req, tx, ctx) = (
+            open.path.clone(),
+            open.name(),
+            open.draft.clone(),
+            self.tx.clone(),
+            ctx.clone(),
+        );
         let task = self.rt.spawn(async move {
             let outcome = match cell.get_or_init(|| net::build_client(net)).await {
-                Ok(client) => runner::run(client.clone(), &runner::Info::single(name), req, vars).await,
+                Ok(client) => {
+                    runner::run(client.clone(), &runner::Info::single(name), req, vars).await
+                }
                 Err(e) => Outcome::failed(format!("Network settings: {e}")),
             };
             let _ = tx.send(Msg::Response(path, Box::new(outcome)));
             ctx.request_repaint();
         });
-        self.pending = Some(Pending { path: open.path.clone(), started: Instant::now(), abort: task.abort_handle() });
+        self.pending = Some(Pending {
+            path: open.path.clone(),
+            started: Instant::now(),
+            abort: task.abort_handle(),
+        });
+    }
+
+    /// Streams skip scripts: pre-request/tests are per-response, a stream has no single response.
+    fn connect(&mut self, ctx: &egui::Context) {
+        let Some(open) = &self.open else { return };
+        self.next_run_id += 1;
+        let id = self.next_run_id;
+        let (req, _) = open.draft.resolved(&self.all_vars());
+        let is_ws = req.method.eq_ignore_ascii_case("WS");
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cell, net, tx, ctx) = (
+            self.client.clone(),
+            self.network.clone(),
+            self.tx.clone(),
+            ctx.clone(),
+        );
+        let task = self.rt.spawn(async move {
+            let emit = |e| {
+                let _ = tx.send(Msg::Stream(id, e));
+                ctx.request_repaint();
+            };
+            match cell.get_or_init(|| net::build_client(net)).await {
+                Ok(client) if is_ws => stream::websocket(client.clone(), req, out_rx, emit).await,
+                Ok(client) => stream::sse(client.clone(), req, emit).await,
+                Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
+            }
+        });
+        self.stream = Some(StreamSession {
+            id,
+            path: open.path.clone(),
+            started: Instant::now(),
+            events: VecDeque::new(),
+            outgoing: is_ws.then_some(out_tx),
+            live: true,
+            compose: self
+                .stream
+                .take()
+                .map(|s| s.compose.clone())
+                .unwrap_or_default(),
+            abort: task.abort_handle(),
+        });
+    }
+
+    fn disconnect(&mut self) {
+        let Some(s) = &mut self.stream else { return };
+        if s.outgoing.take().is_none() {
+            // SSE has no close handshake; dropping the connection is how clients stop.
+            s.abort.abort();
+            s.events
+                .push_back((s.started.elapsed(), Event::Closed("disconnected".into())));
+        }
+        s.live = false;
     }
 
     fn cancel(&mut self) {
@@ -345,7 +466,12 @@ impl App {
                     continue;
                 }
                 Msg::RunItem(id, item) => {
-                    if let Some(run) = self.runner.as_mut().and_then(|r| r.run.as_mut()).filter(|r| r.id == id) {
+                    if let Some(run) = self
+                        .runner
+                        .as_mut()
+                        .and_then(|r| r.run.as_mut())
+                        .filter(|r| r.id == id)
+                    {
                         run.items.push(item);
                     }
                     continue;
@@ -353,8 +479,26 @@ impl App {
                 Msg::RunDone(id, env, globals) => {
                     // Persist chained variables even if the runner pane was closed meanwhile.
                     self.apply_changes(env, globals);
-                    if let Some(run) = self.runner.as_mut().and_then(|r| r.run.as_mut()).filter(|r| r.id == id) {
+                    if let Some(run) = self
+                        .runner
+                        .as_mut()
+                        .and_then(|r| r.run.as_mut())
+                        .filter(|r| r.id == id)
+                    {
                         run.finished = Some(run.started.elapsed());
+                    }
+                    continue;
+                }
+                Msg::Stream(id, event) => {
+                    if let Some(s) = self.stream.as_mut().filter(|s| s.id == id) {
+                        if matches!(event, Event::Closed(_) | Event::Error(_)) {
+                            s.live = false;
+                            s.outgoing = None;
+                        }
+                        if s.events.len() == MAX_EVENTS {
+                            s.events.pop_front();
+                        }
+                        s.events.push_back((s.started.elapsed(), event));
                     }
                     continue;
                 }
@@ -372,8 +516,16 @@ impl App {
             // Only the open request's response is kept: bodies can be MBs and RAM is the constraint.
             if self.open.as_ref().is_some_and(|o| o.path == path) {
                 let failed = outcome.response.is_err() || outcome.tests.iter().any(|t| !t.passed);
-                self.resp_tab = if failed && !outcome.tests.is_empty() { RespTab::Tests } else { RespTab::Body };
-                self.response = Some(Shown { result: outcome.response.map(into_view), tests: outcome.tests, logs: outcome.logs });
+                self.resp_tab = if failed && !outcome.tests.is_empty() {
+                    RespTab::Tests
+                } else {
+                    RespTab::Body
+                };
+                self.response = Some(Shown {
+                    result: outcome.response.map(into_view),
+                    tests: outcome.tests,
+                    logs: outcome.logs,
+                });
             }
         }
     }
@@ -398,7 +550,8 @@ impl App {
                     }
                 }
                 None => {
-                    self.status = "No environment selected: pm.environment.set was stored as a global".into();
+                    self.status =
+                        "No environment selected: pm.environment.set was stored as a global".into();
                     globals.extend(env);
                 }
             }
@@ -419,7 +572,9 @@ impl App {
     }
 
     fn submit_name(&mut self) {
-        let Some(Dialog::Name { kind, name, error }) = &mut self.dialog else { return };
+        let Some(Dialog::Name { kind, name, error }) = &mut self.dialog else {
+            return;
+        };
         let name = name.trim().to_owned();
         let result = match kind {
             NameKind::NewRequest(dir) => self.ws.create_request(dir, &name).map(Some),
@@ -459,12 +614,20 @@ fn into_view(mut head: http::Response) -> ResponseView {
     let body = std::mem::take(&mut head.body);
     let raw_size = body.len();
     let looks_json = head.is_json() || body.trim_start().starts_with(['{', '[']);
-    let text = looks_json.then(|| http::pretty_json(&body)).flatten().unwrap_or(body);
+    let text = looks_json
+        .then(|| http::pretty_json(&body))
+        .flatten()
+        .unwrap_or(body);
     let line_starts = std::iter::once(0)
         .chain(text.match_indices('\n').map(|(i, _)| i + 1))
         .filter(|&i| i < text.len())
         .collect();
-    ResponseView { head, text, raw_size, line_starts }
+    ResponseView {
+        head,
+        text,
+        raw_size,
+        line_starts,
+    }
 }
 
 impl eframe::App for App {
@@ -475,18 +638,24 @@ impl eframe::App for App {
             self.save();
         }
         if ui.input_mut(|i| i.consume_shortcut(&SEND)) {
-            self.send(ui.ctx());
+            match self.stream.as_mut().filter(|s| s.live) {
+                Some(s) => s.send_compose(),
+                None => self.send(ui.ctx()),
+            }
         }
         if ui.input(|i| i.viewport().close_requested())
             && !self.allow_close
             && self.open.as_ref().is_some_and(Open::dirty)
         {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.dialog = Some(Dialog::Unsaved(Next::Quit));
         }
 
         self.status_bar(ui);
-        egui::Panel::left("sidebar").default_size(260.0).show(ui, |ui| self.sidebar(ui));
+        egui::Panel::left("sidebar")
+            .default_size(260.0)
+            .show(ui, |ui| self.sidebar(ui));
         egui::CentralPanel::default().show(ui, |ui| self.main_area(ui));
         self.dialog_ui(ui.ctx());
         self.env_editor_ui(ui.ctx());
@@ -508,13 +677,21 @@ impl App {
                 if self.network.insecure {
                     label = RichText::new(format!("⚙ {proxy} · TLS verify OFF")).color(RED);
                 }
-                if ui.small_button(label).on_hover_text("Network settings").clicked() {
+                if ui
+                    .small_button(label)
+                    .on_hover_text("Network settings")
+                    .clicked()
+                {
                     self.network_editor = Some(self.network.clone());
                 }
                 ui.separator();
                 if let Some(m) = memory_stats::memory_stats() {
                     ui.weak(format!("RAM {:.0} MB", mb(m.physical_mem)))
-                        .on_hover_text(format!("private {:.0} MB\n{}", mb(m.virtual_mem), self.renderer));
+                        .on_hover_text(format!(
+                            "private {:.0} MB\n{}",
+                            mb(m.virtual_mem),
+                            self.renderer
+                        ));
                     ui.separator();
                 }
                 ui.weak(self.ws.root.display().to_string());
@@ -529,28 +706,53 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            let label = self.active_env.clone().unwrap_or_else(|| "No environment".into());
+            let label = self
+                .active_env
+                .clone()
+                .unwrap_or_else(|| "No environment".into());
             let mut chosen = None;
-            egui::ComboBox::from_id_salt("env").selected_text(label).width(140.0).show_ui(ui, |ui| {
-                if ui.selectable_label(self.active_env.is_none(), "No environment").clicked() {
-                    chosen = Some(None);
-                }
-                for name in &self.envs {
-                    if ui.selectable_label(self.active_env.as_ref() == Some(name), name).clicked() {
-                        chosen = Some(Some(name.clone()));
+            egui::ComboBox::from_id_salt("env")
+                .selected_text(label)
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.active_env.is_none(), "No environment")
+                        .clicked()
+                    {
+                        chosen = Some(None);
                     }
-                }
-            });
+                    for name in &self.envs {
+                        if ui
+                            .selectable_label(self.active_env.as_ref() == Some(name), name)
+                            .clicked()
+                        {
+                            chosen = Some(Some(name.clone()));
+                        }
+                    }
+                });
             if let Some(env) = chosen {
                 self.set_env(env);
             }
             if let Some(name) = self.active_env.clone()
-                && ui.small_button("Edit").on_hover_text("Edit variables").clicked()
+                && ui
+                    .small_button("Edit")
+                    .on_hover_text("Edit variables")
+                    .clicked()
             {
                 let (shared, secret) = self.ws.load_env(&name);
-                self.env_editor = Some(EnvEditor { name, shared, secret, error: String::new(), confirm_delete: false });
+                self.env_editor = Some(EnvEditor {
+                    name,
+                    shared,
+                    secret,
+                    error: String::new(),
+                    confirm_delete: false,
+                });
             }
-            if ui.small_button("+").on_hover_text("New environment").clicked() {
+            if ui
+                .small_button("+")
+                .on_hover_text("New environment")
+                .clicked()
+            {
                 self.dialog = Some(Dialog::name(NameKind::NewEnv, ""));
             }
         });
@@ -564,23 +766,35 @@ impl App {
             if ui.small_button("+ Folder").clicked() {
                 self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
             }
-            if ui.small_button("▶ Run").on_hover_text("Run the whole collection").clicked() {
+            if ui
+                .small_button("▶ Run")
+                .on_hover_text("Run the whole collection")
+                .clicked()
+            {
                 self.open_runner(root);
             }
         });
         let mut actions = Vec::new();
         let selected = self.open.as_ref().map(|o| o.path.as_path());
-        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            if self.tree.is_empty() {
-                ui.weak("No requests yet. Click \"+ Request\".");
-            }
-            tree_ui(ui, &self.tree, selected, &mut actions);
-        });
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                if self.tree.is_empty() {
+                    ui.weak("No requests yet. Click \"+ Request\".");
+                }
+                tree_ui(ui, &self.tree, selected, &mut actions);
+            });
         for action in actions {
             match action {
                 TreeAction::Open(path) => {
-                    if self.runner.as_ref().and_then(|r| r.run.as_ref()).is_some_and(RunState::running) {
-                        self.status = "The collection runner is still running; cancel it first.".into();
+                    if self
+                        .runner
+                        .as_ref()
+                        .and_then(|r| r.run.as_ref())
+                        .is_some_and(RunState::running)
+                    {
+                        self.status =
+                            "The collection runner is still running; cancel it first.".into();
                         continue;
                     }
                     self.runner = None;
@@ -599,83 +813,145 @@ impl App {
         }
         let all_vars = self.all_vars();
         let Some(open) = &mut self.open else {
-            ui.centered_and_justified(|ui| ui.weak("Select a request on the left, or create one with \"+ Request\"."));
+            ui.centered_and_justified(|ui| {
+                ui.weak("Select a request on the left, or create one with \"+ Request\".")
+            });
             return;
         };
         let (mut send, mut save, mut cancel) = (false, false, false);
         let pending = self.pending.as_ref().filter(|p| p.path == open.path);
+        let streaming = model::is_streaming(&open.draft.method);
+        let session = self.stream.as_mut().filter(|s| s.path == open.path);
+        let live = session.as_ref().is_some_and(|s| s.live);
 
-        egui::Panel::top("request").resizable(true).default_size(320.0).show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading(open.name());
-                if open.dirty() {
-                    ui.colored_label(ORANGE, "●").on_hover_text("Unsaved changes");
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    save = ui
-                        .add_enabled(open.dirty(), egui::Button::new("Save"))
-                        .on_hover_text(ui.ctx().format_shortcut(&SAVE))
-                        .clicked();
+        egui::Panel::top("request")
+            .resizable(true)
+            .default_size(320.0)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.heading(open.name());
+                    if open.dirty() {
+                        ui.colored_label(ORANGE, "●")
+                            .on_hover_text("Unsaved changes");
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        save = ui
+                            .add_enabled(open.dirty(), egui::Button::new("Save"))
+                            .on_hover_text(ui.ctx().format_shortcut(&SAVE))
+                            .clicked();
+                    });
                 });
-            });
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("method")
-                    .selected_text(RichText::new(&open.draft.method).color(method_color(&open.draft.method)).strong())
-                    .width(90.0)
-                    .show_ui(ui, |ui| {
-                        for m in METHODS {
-                            let text = RichText::new(*m).color(method_color(m));
-                            ui.selectable_value(&mut open.draft.method, (*m).to_owned(), text);
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("method")
+                        .selected_text(
+                            RichText::new(&open.draft.method)
+                                .color(method_color(&open.draft.method))
+                                .strong(),
+                        )
+                        .width(90.0)
+                        .show_ui(ui, |ui| {
+                            for m in METHODS {
+                                let text = RichText::new(*m).color(method_color(m));
+                                ui.selectable_value(&mut open.draft.method, (*m).to_owned(), text);
+                            }
+                        });
+                    let button = [80.0, 22.0];
+                    let url = ui.add(
+                        egui::TextEdit::singleline(&mut open.draft.url)
+                            .hint_text("https://{{host}}/path")
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(ui.available_width() - button[0] - 8.0),
+                    );
+                    if url.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        send = true;
+                    }
+                    if pending.is_some() || live {
+                        let label = if live { "Disconnect" } else { "Cancel" };
+                        cancel = ui.add_sized(button, egui::Button::new(label)).clicked();
+                    } else {
+                        let label = RichText::new(if streaming { "Connect" } else { "Send" })
+                            .strong()
+                            .color(Color32::WHITE);
+                        send |= ui
+                            .add_sized(
+                                button,
+                                egui::Button::new(label).fill(Color32::from_rgb(40, 110, 200)),
+                            )
+                            .on_hover_text(ui.ctx().format_shortcut(&SEND))
+                            .clicked();
+                    }
+                });
+                let (_, missing) = open.draft.resolved(&all_vars);
+                // A pre-request script may define them; only warn when nothing could.
+                if !missing.is_empty() && open.draft.pre_request.trim().is_empty() {
+                    let hint = if self.active_env.is_none() {
+                        " (no environment selected)"
+                    } else {
+                        ""
+                    };
+                    ui.colored_label(ORANGE, format!("Undefined: {}{hint}", missing.join(", ")));
+                }
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let count = |kv: &[KeyValue]| {
+                        kv.iter().filter(|p| p.enabled && !p.key.is_empty()).count()
+                    };
+                    let tab = |n: usize, name: &str| {
+                        if n > 0 {
+                            format!("{name} ({n})")
+                        } else {
+                            name.to_owned()
+                        }
+                    };
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Params,
+                        tab(count(&open.draft.params), "Params"),
+                    );
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Headers,
+                        tab(count(&open.draft.headers), "Headers"),
+                    );
+                    let dot = |none: bool, name: &str| {
+                        if none {
+                            name.to_owned()
+                        } else {
+                            format!("{name} ●")
+                        }
+                    };
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Body,
+                        dot(matches!(open.draft.body, Body::None), "Body"),
+                    );
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Auth,
+                        dot(matches!(open.draft.auth, Auth::None), "Auth"),
+                    );
+                    let no_scripts = open.draft.pre_request.trim().is_empty()
+                        && open.draft.tests.trim().is_empty();
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Scripts,
+                        dot(no_scripts, "Scripts"),
+                    );
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| match self.req_tab {
+                        ReqTab::Params => kv_table(ui, "params", &mut open.draft.params),
+                        ReqTab::Headers => kv_table(ui, "headers", &mut open.draft.headers),
+                        ReqTab::Body => body_editor(ui, &mut open.draft.body),
+                        ReqTab::Auth => auth_editor(ui, &mut open.draft.auth),
+                        ReqTab::Scripts => {
+                            scripts_editor(ui, &mut self.script_tab, &mut open.draft)
                         }
                     });
-                let button = [80.0, 22.0];
-                let url = ui.add(
-                    egui::TextEdit::singleline(&mut open.draft.url)
-                        .hint_text("https://{{host}}/path")
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(ui.available_width() - button[0] - 8.0),
-                );
-                if url.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    send = true;
-                }
-                if pending.is_some() {
-                    cancel = ui.add_sized(button, egui::Button::new("Cancel")).clicked();
-                } else {
-                    let label = RichText::new("Send").strong().color(Color32::WHITE);
-                    send |= ui
-                        .add_sized(button, egui::Button::new(label).fill(Color32::from_rgb(40, 110, 200)))
-                        .on_hover_text(ui.ctx().format_shortcut(&SEND))
-                        .clicked();
-                }
             });
-            let (_, missing) = open.draft.resolved(&all_vars);
-            // A pre-request script may define them; only warn when nothing could.
-            if !missing.is_empty() && open.draft.pre_request.trim().is_empty() {
-                let hint = if self.active_env.is_none() { " (no environment selected)" } else { "" };
-                ui.colored_label(ORANGE, format!("Undefined: {}{hint}", missing.join(", ")));
-            }
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                let count = |kv: &[KeyValue]| kv.iter().filter(|p| p.enabled && !p.key.is_empty()).count();
-                let tab = |n: usize, name: &str| if n > 0 { format!("{name} ({n})") } else { name.to_owned() };
-                ui.selectable_value(&mut self.req_tab, ReqTab::Params, tab(count(&open.draft.params), "Params"));
-                ui.selectable_value(&mut self.req_tab, ReqTab::Headers, tab(count(&open.draft.headers), "Headers"));
-                let dot = |none: bool, name: &str| if none { name.to_owned() } else { format!("{name} ●") };
-                ui.selectable_value(&mut self.req_tab, ReqTab::Body, dot(matches!(open.draft.body, Body::None), "Body"));
-                ui.selectable_value(&mut self.req_tab, ReqTab::Auth, dot(matches!(open.draft.auth, Auth::None), "Auth"));
-                let no_scripts = open.draft.pre_request.trim().is_empty() && open.draft.tests.trim().is_empty();
-                ui.selectable_value(&mut self.req_tab, ReqTab::Scripts, dot(no_scripts, "Scripts"));
-            });
-            ui.separator();
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.req_tab {
-                ReqTab::Params => kv_table(ui, "params", &mut open.draft.params),
-                ReqTab::Headers => kv_table(ui, "headers", &mut open.draft.headers),
-                ReqTab::Body => body_editor(ui, &mut open.draft.body),
-                ReqTab::Auth => auth_editor(ui, &mut open.draft.auth),
-                ReqTab::Scripts => scripts_editor(ui, &mut self.script_tab, &mut open.draft),
-            });
-        });
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(p) = pending {
@@ -684,6 +960,15 @@ impl App {
                     ui.label(format!("Sending… {:.1} s", p.started.elapsed().as_secs_f32()));
                 });
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
+                return;
+            }
+            if streaming {
+                match session {
+                    Some(s) => stream_ui(ui, s),
+                    None => {
+                        ui.weak("Press Connect to open the stream. Scripts don't run for WebSocket/SSE.");
+                    }
+                }
                 return;
             }
             match &self.response {
@@ -698,7 +983,11 @@ impl App {
             self.save();
         }
         if cancel {
-            self.cancel();
+            if live {
+                self.disconnect()
+            } else {
+                self.cancel()
+            }
         }
         if send {
             self.send(ui.ctx());
@@ -706,7 +995,9 @@ impl App {
     }
 
     fn dialog_ui(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = &mut self.dialog else { return };
+        let Some(dialog) = &mut self.dialog else {
+            return;
+        };
         let open_name = self.open.as_ref().map(Open::name).unwrap_or_default();
         let mut cancel = false;
         let mut then: Option<Then> = None;
@@ -720,7 +1011,11 @@ impl App {
                         NameKind::Rename(_) => "Rename",
                         NameKind::NewEnv => "New environment",
                     });
-                    let edit = ui.add(egui::TextEdit::singleline(name).hint_text("Name").desired_width(f32::INFINITY));
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("Name")
+                            .desired_width(f32::INFINITY),
+                    );
                     if ui.memory(|m| m.focused().is_none()) {
                         edit.request_focus();
                     }
@@ -737,15 +1032,27 @@ impl App {
                 }
                 Dialog::Delete(path) => {
                     ui.heading("Delete");
-                    let what = if path.is_dir() { "folder and everything in it" } else { "request" };
-                    ui.label(format!("Delete {what} \"{}\"?", path.file_stem().unwrap_or_default().to_string_lossy()));
+                    let what = if path.is_dir() {
+                        "folder and everything in it"
+                    } else {
+                        "request"
+                    };
+                    ui.label(format!(
+                        "Delete {what} \"{}\"?",
+                        path.file_stem().unwrap_or_default().to_string_lossy()
+                    ));
                     ui.horizontal(|ui| {
                         if ui.button(RichText::new("Delete").color(RED)).clicked() {
                             let path = path.clone();
                             then = Some(Box::new(move |app, _| {
                                 app.dialog = None;
                                 match app.ws.delete(&path) {
-                                    Ok(()) if app.open.as_ref().is_some_and(|o| o.path.starts_with(&path)) => {
+                                    Ok(())
+                                        if app
+                                            .open
+                                            .as_ref()
+                                            .is_some_and(|o| o.path.starts_with(&path)) =>
+                                    {
                                         app.open = None;
                                         app.response = None;
                                         app.save_state();
@@ -771,7 +1078,9 @@ impl App {
                                 if save && !app.save() {
                                     return; // keep the dialog; the status bar shows why
                                 }
-                                let Some(Dialog::Unsaved(next)) = app.dialog.take() else { return };
+                                let Some(Dialog::Unsaved(next)) = app.dialog.take() else {
+                                    return;
+                                };
                                 match next {
                                     Next::Open(path) => app.force_open(path),
                                     Next::Quit => {
@@ -794,7 +1103,9 @@ impl App {
     }
 
     fn env_editor_ui(&mut self, ctx: &egui::Context) {
-        let Some(ed) = &mut self.env_editor else { return };
+        let Some(ed) = &mut self.env_editor else {
+            return;
+        };
         let (mut save, mut delete, mut close) = (false, false, false);
         // Only explicit buttons close this one: a stray click outside must not drop edits.
         egui::Modal::new(egui::Id::new("env-editor")).show(ctx, |ui| {
@@ -851,7 +1162,12 @@ impl App {
 
 impl App {
     fn open_runner(&mut self, scope: PathBuf) {
-        if self.runner.as_ref().and_then(|r| r.run.as_ref()).is_some_and(RunState::running) {
+        if self
+            .runner
+            .as_ref()
+            .and_then(|r| r.run.as_ref())
+            .is_some_and(RunState::running)
+        {
             self.status = "The collection runner is already running.".into();
             return;
         }
@@ -866,7 +1182,10 @@ impl App {
             scope,
             title,
             iterations: prev.as_ref().map_or(1, |p| p.iterations),
-            data_path: prev.as_ref().map(|p| p.data_path.clone()).unwrap_or_default(),
+            data_path: prev
+                .as_ref()
+                .map(|p| p.data_path.clone())
+                .unwrap_or_default(),
             delay_ms: prev.as_ref().map_or(0, |p| p.delay_ms),
             only_failures: false,
             error: String::new(),
@@ -895,7 +1214,11 @@ impl App {
         let data = match view.data_path.trim() {
             "" => Ok(Vec::new()),
             p => runner::load_data(Path::new(p)).and_then(|rows| {
-                if rows.is_empty() { Err(format!("{p}: no data rows")) } else { Ok(rows) }
+                if rows.is_empty() {
+                    Err(format!("{p}: no data rows"))
+                } else {
+                    Ok(rows)
+                }
             }),
         };
         let data = match data {
@@ -914,16 +1237,30 @@ impl App {
             return;
         }
         if self.open.as_ref().is_some_and(Open::dirty) {
-            self.status = "Note: the runner uses saved files; unsaved edits are not included.".into();
+            self.status =
+                "Note: the runner uses saved files; unsaved edits are not included.".into();
         }
-        let count = if data.is_empty() { view.iterations.max(1) } else { data.len() };
-        let plan = RunPlan { requests, data, iterations: view.iterations, delay: Duration::from_millis(view.delay_ms) };
+        let count = if data.is_empty() {
+            view.iterations.max(1)
+        } else {
+            data.len()
+        };
+        let plan = RunPlan {
+            requests,
+            data,
+            iterations: view.iterations,
+            delay: Duration::from_millis(view.delay_ms),
+        };
         let total = plan.requests.len() * count;
 
         self.next_run_id += 1;
         let id = self.next_run_id;
         let (cell, net) = (self.client.clone(), self.network.clone());
-        let vars = Vars { env: self.vars.clone(), globals: self.globals.clone(), data: HashMap::new() };
+        let vars = Vars {
+            env: self.vars.clone(),
+            globals: self.globals.clone(),
+            data: HashMap::new(),
+        };
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         let task = self.rt.spawn(async move {
             let client = match cell.get_or_init(|| net::build_client(net)).await {
@@ -944,7 +1281,14 @@ impl App {
             let _ = tx.send(Msg::RunDone(id, env, globals));
             ctx.request_repaint();
         });
-        view.run = Some(RunState { id, started: Instant::now(), finished: None, total, items: Vec::new(), abort: task.abort_handle() });
+        view.run = Some(RunState {
+            id,
+            started: Instant::now(),
+            finished: None,
+            total,
+            items: Vec::new(),
+            abort: task.abort_handle(),
+        });
     }
 
     fn runner_ui(&mut self, ui: &mut egui::Ui) {
@@ -990,7 +1334,9 @@ impl App {
                 }
             } else {
                 let label = RichText::new("▶ Run").strong().color(Color32::WHITE);
-                start = ui.add(egui::Button::new(label).fill(Color32::from_rgb(40, 110, 200))).clicked();
+                start = ui
+                    .add(egui::Button::new(label).fill(Color32::from_rgb(40, 110, 200)))
+                    .clicked();
             }
             ui.checkbox(&mut view.only_failures, "Failures only");
         });
@@ -1000,16 +1346,29 @@ impl App {
             let done = run.items.len();
             let failed = run.items.iter().filter(|i| item_failed(i)).count();
             let (tests_passed, tests_total) = run.items.iter().fold((0, 0), |(p, t), i| {
-                (p + i.tests.iter().filter(|x| x.passed).count(), t + i.tests.len())
+                (
+                    p + i.tests.iter().filter(|x| x.passed).count(),
+                    t + i.tests.len(),
+                )
             });
             let elapsed = run.finished.unwrap_or_else(|| run.started.elapsed());
-            ui.add(egui::ProgressBar::new(done as f32 / run.total.max(1) as f32).text(format!("{done}/{}", run.total)));
+            ui.add(
+                egui::ProgressBar::new(done as f32 / run.total.max(1) as f32)
+                    .text(format!("{done}/{}", run.total)),
+            );
             ui.horizontal(|ui| {
                 ui.label(format!("{:.1} s", elapsed.as_secs_f32()));
                 ui.separator();
-                ui.colored_label(if failed == 0 { GREEN } else { RED }, format!("{failed} failed requests"));
+                ui.colored_label(
+                    if failed == 0 { GREEN } else { RED },
+                    format!("{failed} failed requests"),
+                );
                 ui.separator();
-                let color = if tests_passed == tests_total { GREEN } else { RED };
+                let color = if tests_passed == tests_total {
+                    GREEN
+                } else {
+                    RED
+                };
                 ui.colored_label(color, format!("Tests {tests_passed}/{tests_total}"));
                 if run.finished.is_some() && done < run.total {
                     ui.separator();
@@ -1021,17 +1380,30 @@ impl App {
             }
             ui.separator();
             // ponytail: plain ScrollArea renders every row; switch to show_rows if runs reach tens of thousands.
-            egui::ScrollArea::vertical().id_salt("runner-results").auto_shrink(false).stick_to_bottom(running).show(ui, |ui| {
-                for item in run.items.iter().filter(|i| !view.only_failures || item_failed(i)) {
-                    run_item_ui(ui, item);
-                }
-            });
+            egui::ScrollArea::vertical()
+                .id_salt("runner-results")
+                .auto_shrink(false)
+                .stick_to_bottom(running)
+                .show(ui, |ui| {
+                    for item in run
+                        .items
+                        .iter()
+                        .filter(|i| !view.only_failures || item_failed(i))
+                    {
+                        run_item_ui(ui, item);
+                    }
+                });
         } else {
             ui.weak("Requests run in the order shown on the left, with the selected environment.");
         }
 
         if close {
-            if let Some(run) = self.runner.as_ref().and_then(|r| r.run.as_ref()).filter(|r| r.running()) {
+            if let Some(run) = self
+                .runner
+                .as_ref()
+                .and_then(|r| r.run.as_ref())
+                .filter(|r| r.running())
+            {
                 run.abort.abort();
             }
             self.runner = None;
@@ -1041,7 +1413,9 @@ impl App {
     }
 
     fn network_editor_ui(&mut self, ctx: &egui::Context) {
-        let Some(net) = &mut self.network_editor else { return };
+        let Some(net) = &mut self.network_editor else {
+            return;
+        };
         let (mut apply, mut cancel) = (false, false);
         egui::Modal::new(egui::Id::new("network")).show(ctx, |ui| {
             ui.set_width(560.0);
@@ -1135,11 +1509,20 @@ fn item_failed(item: &RunItem) -> bool {
 fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
     ui.horizontal(|ui| {
         ui.weak(format!("#{:<3}", item.iteration + 1));
-        ui.label(RichText::new(format!("{:<5}", short_method(&item.method))).monospace().small().color(method_color(&item.method)));
+        ui.label(
+            RichText::new(format!("{:<5}", short_method(&item.method)))
+                .monospace()
+                .small()
+                .color(method_color(&item.method)),
+        );
         ui.label(item.name.as_str());
         match &item.status {
             Ok((code, ms)) => {
-                ui.label(RichText::new(code.to_string()).strong().color(status_color(*code)));
+                ui.label(
+                    RichText::new(code.to_string())
+                        .strong()
+                        .color(status_color(*code)),
+                );
                 ui.weak(format!("{ms} ms"));
             }
             Err(_) => {
@@ -1148,7 +1531,11 @@ fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
         }
         if !item.tests.is_empty() {
             let passed = item.tests.iter().filter(|t| t.passed).count();
-            let color = if passed == item.tests.len() { GREEN } else { RED };
+            let color = if passed == item.tests.len() {
+                GREEN
+            } else {
+                RED
+            };
             ui.colored_label(color, format!("{passed}/{} tests", item.tests.len()));
         }
     });
@@ -1168,10 +1555,19 @@ fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
     }
 }
 
-fn tree_ui(ui: &mut egui::Ui, nodes: &[Node], selected: Option<&Path>, actions: &mut Vec<TreeAction>) {
+fn tree_ui(
+    ui: &mut egui::Ui,
+    nodes: &[Node],
+    selected: Option<&Path>,
+    actions: &mut Vec<TreeAction>,
+) {
     for node in nodes {
         match node {
-            Node::Folder { name, path, children } => {
+            Node::Folder {
+                name,
+                path,
+                children,
+            } => {
                 let resp = egui::CollapsingHeader::new(name.as_str())
                     .id_salt(path)
                     // Reveal the open request on startup instead of hiding it in a collapsed folder.
@@ -1184,9 +1580,18 @@ fn tree_ui(ui: &mut egui::Ui, nodes: &[Node], selected: Option<&Path>, actions: 
                             ui.close();
                         }
                     };
-                    item("New request", Dialog::name(NameKind::NewRequest(path.clone()), ""));
-                    item("New folder", Dialog::name(NameKind::NewFolder(path.clone()), ""));
-                    item("Rename", Dialog::name(NameKind::Rename(path.clone()), name.as_str()));
+                    item(
+                        "New request",
+                        Dialog::name(NameKind::NewRequest(path.clone()), ""),
+                    );
+                    item(
+                        "New folder",
+                        Dialog::name(NameKind::NewFolder(path.clone()), ""),
+                    );
+                    item(
+                        "Rename",
+                        Dialog::name(NameKind::Rename(path.clone()), name.as_str()),
+                    );
                     item("Delete", Dialog::Delete(path.clone()));
                     ui.separator();
                     if ui.button("Run folder").clicked() {
@@ -1199,7 +1604,12 @@ fn tree_ui(ui: &mut egui::Ui, nodes: &[Node], selected: Option<&Path>, actions: 
                 let resp = ui
                     .horizontal(|ui| {
                         let badge = format!("{:<5}", short_method(method));
-                        ui.label(RichText::new(badge).monospace().small().color(method_color(method)));
+                        ui.label(
+                            RichText::new(badge)
+                                .monospace()
+                                .small()
+                                .color(method_color(method)),
+                        );
                         ui.selectable_label(selected == Some(path.as_path()), name.as_str())
                     })
                     .inner;
@@ -1208,7 +1618,10 @@ fn tree_ui(ui: &mut egui::Ui, nodes: &[Node], selected: Option<&Path>, actions: 
                 }
                 resp.context_menu(|ui| {
                     if ui.button("Rename").clicked() {
-                        actions.push(TreeAction::Dialog(Dialog::name(NameKind::Rename(path.clone()), name.as_str())));
+                        actions.push(TreeAction::Dialog(Dialog::name(
+                            NameKind::Rename(path.clone()),
+                            name.as_str(),
+                        )));
                         ui.close();
                     }
                     if ui.button("Delete").clicked() {
@@ -1230,7 +1643,11 @@ fn kv_table(ui: &mut egui::Ui, id: &str, rows: &mut Vec<KeyValue>) {
     let existing = rows.len();
     // Plain rows, not egui::Grid: Grid clamps a cell to last frame's column width, so
     // text fields that start narrow stay narrow forever.
-    for (i, row) in rows.iter_mut().chain(std::iter::once(&mut blank)).enumerate() {
+    for (i, row) in rows
+        .iter_mut()
+        .chain(std::iter::once(&mut blank))
+        .enumerate()
+    {
         ui.horizontal(|ui| {
             let real = i < existing;
             if real {
@@ -1272,6 +1689,13 @@ fn body_editor(ui: &mut egui::Ui, body: &mut Body) {
             ("JSON", Body::Json { text: text.clone() }),
             ("Text", Body::Text { text }),
             ("Form", Body::Form { fields: Vec::new() }),
+            (
+                "GraphQL",
+                Body::GraphQL {
+                    query: String::new(),
+                    variables: String::new(),
+                },
+            ),
         ];
         let mut chosen = None;
         for (label, option) in options {
@@ -1307,11 +1731,41 @@ fn body_editor(ui: &mut egui::Ui, body: &mut Body) {
         }
         Body::Text { text } => code_editor(ui, text),
         Body::Form { fields } => kv_table(ui, "form", fields),
+        Body::GraphQL { query, variables } => {
+            ui.label("Query");
+            ui.add(
+                egui::TextEdit::multiline(query)
+                    .code_editor()
+                    .hint_text("query ($id: ID!) {\n  user(id: $id) { name }\n}")
+                    .desired_rows(10)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Variables (JSON)");
+                if !variables.trim().is_empty()
+                    && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(variables)
+                {
+                    ui.colored_label(ORANGE, format!("Not valid JSON: {e}"));
+                }
+            });
+            ui.add(
+                egui::TextEdit::multiline(variables)
+                    .code_editor()
+                    .hint_text("{ \"id\": \"{{userId}}\" }")
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            );
+        }
     }
 }
 
 fn code_editor(ui: &mut egui::Ui, text: &mut String) {
-    ui.add(egui::TextEdit::multiline(text).code_editor().desired_rows(12).desired_width(f32::INFINITY));
+    ui.add(
+        egui::TextEdit::multiline(text)
+            .code_editor()
+            .desired_rows(12)
+            .desired_width(f32::INFINITY),
+    );
 }
 
 fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth) {
@@ -1320,61 +1774,124 @@ fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth) {
         Auth::Bearer { .. } => "Bearer token",
         Auth::Basic { .. } => "Basic auth",
     };
-    egui::ComboBox::from_id_salt("auth").selected_text(label).show_ui(ui, |ui| {
-        if ui.selectable_label(matches!(auth, Auth::None), "No auth").clicked() {
-            *auth = Auth::None;
-        }
-        if ui.selectable_label(matches!(auth, Auth::Bearer { .. }), "Bearer token").clicked() && !matches!(auth, Auth::Bearer { .. }) {
-            *auth = Auth::Bearer { token: String::new() };
-        }
-        if ui.selectable_label(matches!(auth, Auth::Basic { .. }), "Basic auth").clicked() && !matches!(auth, Auth::Basic { .. }) {
-            *auth = Auth::Basic { username: String::new(), password: String::new() };
-        }
-    });
+    egui::ComboBox::from_id_salt("auth")
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(matches!(auth, Auth::None), "No auth")
+                .clicked()
+            {
+                *auth = Auth::None;
+            }
+            if ui
+                .selectable_label(matches!(auth, Auth::Bearer { .. }), "Bearer token")
+                .clicked()
+                && !matches!(auth, Auth::Bearer { .. })
+            {
+                *auth = Auth::Bearer {
+                    token: String::new(),
+                };
+            }
+            if ui
+                .selectable_label(matches!(auth, Auth::Basic { .. }), "Basic auth")
+                .clicked()
+                && !matches!(auth, Auth::Basic { .. })
+            {
+                *auth = Auth::Basic {
+                    username: String::new(),
+                    password: String::new(),
+                };
+            }
+        });
     ui.add_space(4.0);
-    egui::Grid::new("auth-fields").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| match auth {
-        Auth::None => {}
-        Auth::Bearer { token } => {
-            ui.label("Token");
-            ui.add(egui::TextEdit::singleline(token).hint_text("{{token}}").desired_width(420.0));
-            ui.end_row();
-        }
-        Auth::Basic { username, password } => {
-            ui.label("Username");
-            ui.add(egui::TextEdit::singleline(username).desired_width(260.0));
-            ui.end_row();
-            ui.label("Password");
-            ui.add(egui::TextEdit::singleline(password).password(true).desired_width(260.0));
-            ui.end_row();
-        }
-    });
+    egui::Grid::new("auth-fields")
+        .num_columns(2)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| match auth {
+            Auth::None => {}
+            Auth::Bearer { token } => {
+                ui.label("Token");
+                ui.add(
+                    egui::TextEdit::singleline(token)
+                        .hint_text("{{token}}")
+                        .desired_width(420.0),
+                );
+                ui.end_row();
+            }
+            Auth::Basic { username, password } => {
+                ui.label("Username");
+                ui.add(egui::TextEdit::singleline(username).desired_width(260.0));
+                ui.end_row();
+                ui.label("Password");
+                ui.add(
+                    egui::TextEdit::singleline(password)
+                        .password(true)
+                        .desired_width(260.0),
+                );
+                ui.end_row();
+            }
+        });
     if !matches!(auth, Auth::None) {
         ui.weak("Tip: use {{variables}} from a secret environment so credentials never reach git.");
     }
 }
 
 const PRE_SNIPPETS: &[(&str, &str)] = &[
-    ("Set a request header", "pm.request.headers.upsert({ key: \"X-Request-Id\", value: Date.now() });\n"),
-    ("Set an environment variable", "pm.environment.set(\"timestamp\", Date.now());\n"),
-    ("Log a variable", "console.log(pm.environment.get(\"host\"));\n"),
+    (
+        "Set a request header",
+        "pm.request.headers.upsert({ key: \"X-Request-Id\", value: Date.now() });\n",
+    ),
+    (
+        "Set an environment variable",
+        "pm.environment.set(\"timestamp\", Date.now());\n",
+    ),
+    (
+        "Log a variable",
+        "console.log(pm.environment.get(\"host\"));\n",
+    ),
 ];
 
 const POST_SNIPPETS: &[(&str, &str)] = &[
-    ("Status code is 200", "pm.test(\"Status code is 200\", function () {\n    pm.response.to.have.status(200);\n});\n"),
-    ("Response time is below 500 ms", "pm.test(\"Response time is below 500 ms\", function () {\n    pm.expect(pm.response.responseTime).to.be.below(500);\n});\n"),
-    ("JSON body has a property", "pm.test(\"Body has id\", function () {\n    const json = pm.response.json();\n    pm.expect(json).to.have.property(\"id\");\n});\n"),
-    ("Header is present", "pm.test(\"Content-Type is present\", function () {\n    pm.response.to.have.header(\"Content-Type\");\n});\n"),
-    ("Save a JSON value to the environment", "pm.environment.set(\"token\", pm.response.json().token);\n"),
+    (
+        "Status code is 200",
+        "pm.test(\"Status code is 200\", function () {\n    pm.response.to.have.status(200);\n});\n",
+    ),
+    (
+        "Response time is below 500 ms",
+        "pm.test(\"Response time is below 500 ms\", function () {\n    pm.expect(pm.response.responseTime).to.be.below(500);\n});\n",
+    ),
+    (
+        "JSON body has a property",
+        "pm.test(\"Body has id\", function () {\n    const json = pm.response.json();\n    pm.expect(json).to.have.property(\"id\");\n});\n",
+    ),
+    (
+        "Header is present",
+        "pm.test(\"Content-Type is present\", function () {\n    pm.response.to.have.header(\"Content-Type\");\n});\n",
+    ),
+    (
+        "Save a JSON value to the environment",
+        "pm.environment.set(\"token\", pm.response.json().token);\n",
+    ),
 ];
 
 fn scripts_editor(ui: &mut egui::Ui, tab: &mut ScriptTab, req: &mut Request) {
     let mut insert = None;
     ui.horizontal(|ui| {
-        let label = |name: &str, s: &str| if s.trim().is_empty() { name.to_owned() } else { format!("{name} ●") };
+        let label = |name: &str, s: &str| {
+            if s.trim().is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name} ●")
+            }
+        };
         ui.selectable_value(tab, ScriptTab::Pre, label("Pre-request", &req.pre_request));
         ui.selectable_value(tab, ScriptTab::Post, label("Post-response", &req.tests));
         ui.separator();
-        let snippets = if *tab == ScriptTab::Pre { PRE_SNIPPETS } else { POST_SNIPPETS };
+        let snippets = if *tab == ScriptTab::Pre {
+            PRE_SNIPPETS
+        } else {
+            POST_SNIPPETS
+        };
         ui.menu_button("Snippets", |ui| {
             for (name, code) in snippets {
                 if ui.button(*name).clicked() {
@@ -1385,8 +1902,14 @@ fn scripts_editor(ui: &mut egui::Ui, tab: &mut ScriptTab, req: &mut Request) {
         });
     });
     let (text, hint) = match tab {
-        ScriptTab::Pre => (&mut req.pre_request, "// Runs before the request is sent.\n// pm.request, pm.environment, pm.variables, console.log"),
-        ScriptTab::Post => (&mut req.tests, "// Runs after the response arrives.\n// pm.test(name, fn), pm.expect(...), pm.response.json()"),
+        ScriptTab::Pre => (
+            &mut req.pre_request,
+            "// Runs before the request is sent.\n// pm.request, pm.environment, pm.variables, console.log",
+        ),
+        ScriptTab::Post => (
+            &mut req.tests,
+            "// Runs after the response arrives.\n// pm.test(name, fn), pm.expect(...), pm.response.json()",
+        ),
     };
     if let Some(code) = insert {
         if !text.is_empty() {
@@ -1397,10 +1920,94 @@ fn scripts_editor(ui: &mut egui::Ui, tab: &mut ScriptTab, req: &mut Request) {
         }
         text.push_str(code);
     }
-    ui.add(egui::TextEdit::multiline(text).code_editor().hint_text(hint).desired_rows(12).desired_width(f32::INFINITY));
+    ui.add(
+        egui::TextEdit::multiline(text)
+            .code_editor()
+            .hint_text(hint)
+            .desired_rows(12)
+            .desired_width(f32::INFINITY),
+    );
 }
 
 const GREEN: Color32 = Color32::from_rgb(80, 180, 100);
+
+impl StreamSession {
+    fn send_compose(&mut self) {
+        if let Some(tx) = &self.outgoing
+            && !self.compose.is_empty()
+        {
+            let _ = tx.send(self.compose.clone());
+        }
+    }
+}
+
+fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) {
+    ui.horizontal(|ui| {
+        if s.live {
+            ui.spinner();
+            ui.label(format!(
+                "Connected {:.0} s",
+                s.started.elapsed().as_secs_f32()
+            ));
+        } else {
+            ui.weak("Not connected");
+        }
+        ui.weak(format!("· {} events", s.events.len()));
+        if ui.small_button("Clear").clicked() {
+            s.events.clear();
+        }
+    });
+    if s.outgoing.is_some() {
+        ui.horizontal(|ui| {
+            let send_w = 70.0;
+            ui.add(
+                egui::TextEdit::multiline(&mut s.compose)
+                    .desired_rows(2)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("Message")
+                    .desired_width(ui.available_width() - send_w - 8.0),
+            );
+            if ui
+                .add_sized([send_w, 22.0], egui::Button::new("Send"))
+                .on_hover_text(ui.ctx().format_shortcut(&SEND))
+                .clicked()
+            {
+                s.send_compose();
+            }
+        });
+    }
+    ui.separator();
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            for (at, event) in &s.events {
+                let (badge, color, text) = match event {
+                    Event::Open(t) => ("OPEN", GREEN, t),
+                    Event::In(t) => ("IN", Color32::from_rgb(90, 160, 230), t),
+                    Event::Out(t) => ("OUT", ORANGE, t),
+                    Event::Closed(t) => ("CLOSED", Color32::GRAY, t),
+                    Event::Error(t) => ("ERROR", RED, t),
+                };
+                ui.horizontal_top(|ui| {
+                    ui.set_min_height(row_h);
+                    ui.weak(format!("{:>8.3}", at.as_secs_f32()));
+                    ui.add_sized(
+                        [56.0, row_h],
+                        egui::Label::new(RichText::new(badge).color(color).strong().monospace()),
+                    );
+                    // Selectable so payloads can be copied; clipped like the body viewer.
+                    let text: String = text.chars().take(MAX_LINE).collect();
+                    ui.add(
+                        egui::Label::new(RichText::new(text).monospace())
+                            .selectable(true)
+                            .wrap(),
+                    );
+                });
+            }
+        });
+}
 
 fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
     let passed = shown.tests.iter().filter(|t| t.passed).count();
@@ -1408,13 +2015,21 @@ fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
         match &shown.result {
             Ok(view) => {
                 let h = &view.head;
-                ui.label(RichText::new(format!("{} {}", h.status, h.reason)).strong().color(status_color(h.status)));
+                ui.label(
+                    RichText::new(format!("{} {}", h.status, h.reason))
+                        .strong()
+                        .color(status_color(h.status)),
+                );
                 ui.weak(format!("{} ms", h.elapsed.as_millis()));
                 ui.weak(human_size(view.raw_size));
                 ui.weak(&h.version);
                 ui.separator();
                 ui.selectable_value(tab, RespTab::Body, "Body");
-                ui.selectable_value(tab, RespTab::Headers, format!("Headers ({})", h.headers.len()));
+                ui.selectable_value(
+                    tab,
+                    RespTab::Headers,
+                    format!("Headers ({})", h.headers.len()),
+                );
             }
             Err(_) => {
                 ui.colored_label(RED, "Request failed");
@@ -1423,12 +2038,21 @@ fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
             }
         }
         if !shown.tests.is_empty() {
-            let color = if passed == shown.tests.len() { GREEN } else { RED };
-            let label = RichText::new(format!("Tests ({passed}/{})", shown.tests.len())).color(color);
+            let color = if passed == shown.tests.len() {
+                GREEN
+            } else {
+                RED
+            };
+            let label =
+                RichText::new(format!("Tests ({passed}/{})", shown.tests.len())).color(color);
             ui.selectable_value(tab, RespTab::Tests, label);
         }
         if !shown.logs.is_empty() {
-            ui.selectable_value(tab, RespTab::Console, format!("Console ({})", shown.logs.len()));
+            ui.selectable_value(
+                tab,
+                RespTab::Console,
+                format!("Console ({})", shown.logs.len()),
+            );
         }
         if let Ok(view) = &shown.result {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1448,39 +2072,60 @@ fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
     };
     match (current, &shown.result) {
         (RespTab::Tests, _) => {
-            egui::ScrollArea::vertical().id_salt("response-tests").auto_shrink(false).show(ui, |ui| {
-                for t in &shown.tests {
-                    ui.horizontal(|ui| {
-                        let (badge, color) = if t.passed { ("PASS", GREEN) } else { ("FAIL", RED) };
-                        ui.label(RichText::new(badge).monospace().strong().color(color));
-                        ui.add(egui::Label::new(t.name.as_str()).selectable(true));
-                    });
-                    if let Some(e) = &t.error {
-                        ui.add(egui::Label::new(RichText::new(e).monospace().weak()).selectable(true));
+            egui::ScrollArea::vertical()
+                .id_salt("response-tests")
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    for t in &shown.tests {
+                        ui.horizontal(|ui| {
+                            let (badge, color) = if t.passed {
+                                ("PASS", GREEN)
+                            } else {
+                                ("FAIL", RED)
+                            };
+                            ui.label(RichText::new(badge).monospace().strong().color(color));
+                            ui.add(egui::Label::new(t.name.as_str()).selectable(true));
+                        });
+                        if let Some(e) = &t.error {
+                            ui.add(
+                                egui::Label::new(RichText::new(e).monospace().weak())
+                                    .selectable(true),
+                            );
+                        }
                     }
-                }
-            });
+                });
         }
         (RespTab::Console, _) => {
-            egui::ScrollArea::vertical().id_salt("response-console").auto_shrink(false).show(ui, |ui| {
-                for line in &shown.logs {
-                    ui.add(egui::Label::new(RichText::new(line).monospace()).selectable(true));
-                }
-            });
+            egui::ScrollArea::vertical()
+                .id_salt("response-console")
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    for line in &shown.logs {
+                        ui.add(egui::Label::new(RichText::new(line).monospace()).selectable(true));
+                    }
+                });
         }
         (_, Err(e)) => {
             ui.add(egui::Label::new(RichText::new(e).monospace()).selectable(true));
         }
         (RespTab::Headers, Ok(view)) => {
-            egui::ScrollArea::vertical().id_salt("response-headers").auto_shrink(false).show(ui, |ui| {
-                egui::Grid::new("resp-headers").num_columns(2).striped(true).show(ui, |ui| {
-                    for (k, v) in &view.head.headers {
-                        ui.add(egui::Label::new(RichText::new(k).strong()).selectable(true));
-                        ui.add(egui::Label::new(v.as_str()).selectable(true));
-                        ui.end_row();
-                    }
+            egui::ScrollArea::vertical()
+                .id_salt("response-headers")
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("resp-headers")
+                        .num_columns(2)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (k, v) in &view.head.headers {
+                                ui.add(
+                                    egui::Label::new(RichText::new(k).strong()).selectable(true),
+                                );
+                                ui.add(egui::Label::new(v.as_str()).selectable(true));
+                                ui.end_row();
+                            }
+                        });
                 });
-            });
         }
         (_, Ok(view)) => {
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
@@ -1490,7 +2135,11 @@ fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
                 .show_rows(ui, row_height, view.line_starts.len(), |ui, rows| {
                     for row in rows {
                         let start = view.line_starts[row];
-                        let end = view.line_starts.get(row + 1).copied().unwrap_or(view.text.len());
+                        let end = view
+                            .line_starts
+                            .get(row + 1)
+                            .copied()
+                            .unwrap_or(view.text.len());
                         let mut cut = end.min(start + MAX_LINE);
                         while !view.text.is_char_boundary(cut) {
                             cut -= 1;

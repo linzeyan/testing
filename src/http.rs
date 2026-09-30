@@ -16,22 +16,47 @@ pub struct Response {
 
 impl Response {
     pub fn is_json(&self) -> bool {
-        self.headers.iter().any(|(k, v)| k == "content-type" && v.contains("json"))
+        self.headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v.contains("json"))
     }
 }
 
-/// Sends an already-resolved request (see `Request::resolved`).
-pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, String> {
-    let method = reqwest::Method::from_bytes(req.method.trim().to_uppercase().as_bytes())
-        .map_err(|_| format!("invalid method \"{}\"", req.method))?;
+/// HTTP verb for a request; the pseudo-methods map to what goes on the wire.
+pub fn wire_method(method: &str) -> Result<reqwest::Method, String> {
+    match method.trim().to_uppercase().as_str() {
+        "WS" | "SSE" => Ok(reqwest::Method::GET),
+        "GRPC" => Ok(reqwest::Method::POST),
+        m => reqwest::Method::from_bytes(m.as_bytes())
+            .map_err(|_| format!("invalid method \"{method}\"")),
+    }
+}
+
+/// Builds the wire request for an already-resolved `Request` (see `Request::resolved`).
+/// Shared by plain sends, SSE and WebSocket so all get the same auth/headers/proxy.
+pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestBuilder, String> {
+    let method = wire_method(&req.method)?;
     let url = req.url.trim();
     if url.is_empty() {
         return Err("URL is empty".into());
     }
-    // Like Postman: a bare "localhost:8080/x" means http.
-    let url = if url.contains("://") { url.to_owned() } else { format!("http://{url}") };
+    // Like Postman: a bare "localhost:8080/x" means http. WebSocket URLs are upgraded
+    // from plain HTTP(S), which is what ws(s):// means on the wire.
+    let url = if let Some(rest) = url.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else if let Some(rest) = url.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if url.contains("://") {
+        url.to_owned()
+    } else {
+        format!("http://{url}")
+    };
 
-    let pairs = |kv: &[KeyValue]| kv.iter().map(|p| (p.key.clone(), p.value.clone())).collect::<Vec<_>>();
+    let pairs = |kv: &[KeyValue]| {
+        kv.iter()
+            .map(|p| (p.key.clone(), p.value.clone()))
+            .collect::<Vec<_>>()
+    };
     let mut b = client.request(method, url).query(&pairs(&req.params));
     for h in &req.headers {
         b = b.header(h.key.as_str(), h.value.as_str());
@@ -42,24 +67,42 @@ pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, 
         Auth::Basic { username, password } => b.basic_auth(username, Some(password)),
     };
     // An explicit Content-Type header from the user always wins.
-    let has_type = req.headers.iter().any(|h| h.key.eq_ignore_ascii_case("content-type"));
-    let typed = |b: reqwest::RequestBuilder, mime: &str| if has_type { b } else { b.header(CONTENT_TYPE, mime) };
-    b = match req.body {
+    let has_type = req
+        .headers
+        .iter()
+        .any(|h| h.key.eq_ignore_ascii_case("content-type"));
+    let typed = |b: reqwest::RequestBuilder, mime: &str| {
+        if has_type {
+            b
+        } else {
+            b.header(CONTENT_TYPE, mime)
+        }
+    };
+    Ok(match req.body {
         Body::None => b,
         Body::Json { text } => typed(b, "application/json").body(text),
         Body::Text { text } => typed(b, "text/plain; charset=utf-8").body(text),
         Body::Form { fields } => b.form(&pairs(&fields)),
-    };
+        Body::GraphQL { query, variables } => {
+            let variables: serde_json::Value = if variables.trim().is_empty() {
+                serde_json::Value::Object(Default::default())
+            } else {
+                serde_json::from_str(&variables)
+                    .map_err(|e| format!("GraphQL variables are not valid JSON: {e}"))?
+            };
+            let payload = serde_json::json!({ "query": query, "variables": variables });
+            typed(b, "application/json").body(payload.to_string())
+        }
+    })
+}
 
+pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, String> {
+    let b = build(&client, req)?;
     let started = Instant::now();
     let resp = b.send().await.map_err(|e| error_chain(&e))?;
     let status = resp.status();
     let version = format!("{:?}", resp.version());
-    let headers = resp
-        .headers()
-        .iter()
-        .map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
-        .collect();
+    let headers = header_list(resp.headers());
     let body = resp.text().await.map_err(|e| error_chain(&e))?;
     Ok(Response {
         status: status.as_u16(),
@@ -69,6 +112,18 @@ pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, 
         headers,
         body,
     })
+}
+
+pub fn header_list(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
 }
 
 pub fn pretty_json(body: &str) -> Option<String> {
@@ -118,17 +173,27 @@ pub(crate) mod tests {
 
     #[test]
     fn execute_sends_params_headers_auth_and_json_body() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let req = Request {
             method: "post".into(),
             url: echo_server(),
             params: vec![KeyValue::new("q", "a b")],
             headers: vec![KeyValue::new("X-Trace", "1")],
-            body: Body::Json { text: "{\"n\":1}".into() },
-            auth: Auth::Bearer { token: "t0k".into() },
+            body: Body::Json {
+                text: "{\"n\":1}".into(),
+            },
+            auth: Auth::Bearer {
+                token: "t0k".into(),
+            },
             ..Default::default()
         };
-        let net = crate::net::Network { proxy: crate::net::ProxyMode::None, ..Default::default() };
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
         let client = rt.block_on(crate::net::build_client(net)).unwrap();
         let resp = rt.block_on(execute(client, req)).unwrap();
         let wire = resp.body.to_lowercase();

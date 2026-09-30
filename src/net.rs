@@ -81,7 +81,8 @@ pub async fn build_client(net: Network) -> Result<reqwest::Client, String> {
     let ca = net.ca_file.trim();
     if !ca.is_empty() {
         let pem = std::fs::read(ca).map_err(|e| format!("CA file {ca}: {e}"))?;
-        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| format!("CA file {ca}: {e}"))?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| format!("CA file {ca}: {e}"))?;
         if certs.is_empty() {
             return Err(format!("CA file {ca}: no PEM certificates found"));
         }
@@ -105,15 +106,22 @@ fn load_identity(path: &Path, password: &str) -> Result<reqwest::Identity, Strin
         .extension()
         .and_then(|x| x.to_str())
         .is_some_and(|x| x.eq_ignore_ascii_case("pfx") || x.eq_ignore_ascii_case("p12"));
-    let pem = if is_pkcs12 { pkcs12_to_pem(&data, password)? } else { data };
-    reqwest::Identity::from_pem(&pem).map_err(|e| format!("client certificate {shown}: {}", error_chain(&e)))
+    let pem = if is_pkcs12 {
+        pkcs12_to_pem(&data, password)?
+    } else {
+        data
+    };
+    reqwest::Identity::from_pem(&pem)
+        .map_err(|e| format!("client certificate {shown}: {}", error_chain(&e)))
 }
 
 /// reqwest+rustls only takes PEM identities, while corporate client certs usually ship as PFX.
 fn pkcs12_to_pem(der: &[u8], password: &str) -> Result<Vec<u8>, String> {
     let store = p12_keystore::KeyStore::from_pkcs12(der, password, Default::default())
         .map_err(|e| format!("PFX: {e} (wrong password?)"))?;
-    let (_, chain) = store.private_key_chain().ok_or("PFX contains no private key")?;
+    let (_, chain) = store
+        .private_key_chain()
+        .ok_or("PFX contains no private key")?;
     let mut pem = String::new();
     push_pem(&mut pem, "PRIVATE KEY", chain.key().as_der());
     for cert in chain.certs() {
@@ -162,11 +170,18 @@ async fn fetch_pac(location: &str) -> Result<String, String> {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| err(&e))?;
-        let resp = client.get(location).send().await.and_then(|r| r.error_for_status()).map_err(|e| err(&e))?;
+        let resp = client
+            .get(location)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| err(&e))?;
         return resp.text().await.map_err(|e| err(&e));
     }
     let path = match reqwest::Url::parse(location) {
-        Ok(url) if url.scheme() == "file" => url.to_file_path().map_err(|()| format!("PAC {location}: bad file URL"))?,
+        Ok(url) if url.scheme() == "file" => url
+            .to_file_path()
+            .map_err(|()| format!("PAC {location}: bad file URL"))?,
         _ => location.into(),
     };
     std::fs::read_to_string(&path).map_err(|e| err(&e))
@@ -213,22 +228,38 @@ impl Pac {
         ctx.with(|ctx| -> Result<(), String> {
             let g = ctx.globals();
             let caught = |e: rquickjs::Error| exception(&ctx, e);
-            g.set("dnsResolve", rquickjs::Function::new(ctx.clone(), dns_resolve)).map_err(caught)?;
-            g.set("myIpAddress", rquickjs::Function::new(ctx.clone(), my_ip_address)).map_err(caught)?;
+            g.set(
+                "dnsResolve",
+                rquickjs::Function::new(ctx.clone(), dns_resolve),
+            )
+            .map_err(caught)?;
+            g.set(
+                "myIpAddress",
+                rquickjs::Function::new(ctx.clone(), my_ip_address),
+            )
+            .map_err(caught)?;
             ctx.eval::<(), _>(PAC_HELPERS).map_err(caught)?;
             ctx.eval::<(), _>(script).map_err(caught)?;
             g.get::<_, rquickjs::Function>("FindProxyForURL")
                 .map(drop)
                 .map_err(|_| "PAC script: FindProxyForURL is not defined".to_owned())
         })?;
-        Ok(Self { ctx: Mutex::new(ctx), _rt: rt, cache: Mutex::new(HashMap::new()) })
+        Ok(Self {
+            ctx: Mutex::new(ctx),
+            _rt: rt,
+            cache: Mutex::new(HashMap::new()),
+        })
     }
 
     fn find(&self, url: &str, host: &str) -> Result<String, String> {
         let ctx = self.ctx.lock().expect("PAC lock");
         ctx.with(|ctx| {
-            let f: rquickjs::Function = ctx.globals().get("FindProxyForURL").map_err(|e| exception(&ctx, e))?;
-            f.call::<_, String>((url, host)).map_err(|e| exception(&ctx, e))
+            let f: rquickjs::Function = ctx
+                .globals()
+                .get("FindProxyForURL")
+                .map_err(|e| exception(&ctx, e))?;
+            f.call::<_, String>((url, host))
+                .map_err(|e| exception(&ctx, e))
         })
     }
 
@@ -241,8 +272,14 @@ impl Pac {
         if let Some(hit) = self.cache.lock().expect("PAC cache").get(&key) {
             return hit.clone();
         }
-        let proxy = self.find(url.as_str(), host).ok().and_then(|r| first_proxy(&r));
-        self.cache.lock().expect("PAC cache").insert(key, proxy.clone());
+        let proxy = self
+            .find(url.as_str(), host)
+            .ok()
+            .and_then(|r| first_proxy(&r));
+        self.cache
+            .lock()
+            .expect("PAC cache")
+            .insert(key, proxy.clone());
         proxy
     }
 }
@@ -278,7 +315,11 @@ fn first_proxy(result: &str) -> Option<String> {
 
 fn dns_resolve(host: String) -> Option<String> {
     use std::net::ToSocketAddrs;
-    (host.as_str(), 0).to_socket_addrs().ok()?.find(|a| a.is_ipv4()).map(|a| a.ip().to_string())
+    (host.as_str(), 0)
+        .to_socket_addrs()
+        .ok()?
+        .find(|a| a.is_ipv4())
+        .map(|a| a.ip().to_string())
 }
 
 fn my_ip_address() -> String {
@@ -309,7 +350,10 @@ mod tests {
         assert_eq!(at("http://10.1.2.3:8080/"), None);
         // SOCKS is unsupported, so the next entry must be used instead of going direct.
         assert_eq!(at("https://api.github.com/"), Some("http://gh:3128".into()));
-        assert_eq!(at("https://example.com/"), Some("http://proxy.corp.local:8080".into()));
+        assert_eq!(
+            at("https://example.com/"),
+            Some("http://proxy.corp.local:8080".into())
+        );
     }
 
     #[test]
@@ -327,13 +371,20 @@ mod tests {
         let x509 = p12_keystore::Certificate::from_der(cert.cert.der()).unwrap();
         let mut store = p12_keystore::KeyStore::new();
         let chain = p12_keystore::PrivateKeyChain::new(vec![1u8; 20], key, [x509]);
-        store.add_entry("client", p12_keystore::KeyStoreEntry::PrivateKeyChain(chain));
+        store.add_entry(
+            "client",
+            p12_keystore::KeyStoreEntry::PrivateKeyChain(chain),
+        );
         let pfx = store.writer("pw").write().unwrap();
 
         let path = std::env::temp_dir().join(format!("apitool-{}.pfx", std::process::id()));
         std::fs::write(&path, &pfx).unwrap();
         assert!(load_identity(&path, "pw").is_ok());
-        assert!(load_identity(&path, "wrong").unwrap_err().contains("wrong password"));
+        assert!(
+            load_identity(&path, "wrong")
+                .unwrap_err()
+                .contains("wrong password")
+        );
         std::fs::remove_file(&path).unwrap();
     }
 }

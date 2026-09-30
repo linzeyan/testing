@@ -26,7 +26,11 @@ pub struct Info {
 
 impl Info {
     pub fn single(name: String) -> Self {
-        Self { name, iteration: 0, count: 1 }
+        Self {
+            name,
+            iteration: 0,
+            count: 1,
+        }
     }
 }
 
@@ -41,12 +45,23 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn failed(error: String) -> Self {
-        Self { response: Err(error), tests: Vec::new(), logs: Vec::new(), env: Changes::new(), globals: Changes::new() }
+        Self {
+            response: Err(error),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            env: Changes::new(),
+            globals: Changes::new(),
+        }
     }
 }
 
 /// Must run on a multi-threaded tokio runtime: scripts are CPU-bound and use `block_in_place`.
-pub async fn run(client: reqwest::Client, info: &Info, mut req: Request, mut vars: Vars) -> Outcome {
+pub async fn run(
+    client: reqwest::Client,
+    info: &Info,
+    mut req: Request,
+    mut vars: Vars,
+) -> Outcome {
     let mut out = Outcome {
         response: Err(String::new()),
         tests: Vec::new(),
@@ -60,14 +75,24 @@ pub async fn run(client: reqwest::Client, info: &Info, mut req: Request, mut var
         let wire = WireRequest {
             method: req.method.clone(),
             url: req.url.clone(),
-            headers: req.headers.iter().filter(|h| h.enabled && !h.key.is_empty()).map(|h| (h.key.clone(), h.value.clone())).collect(),
+            headers: req
+                .headers
+                .iter()
+                .filter(|h| h.enabled && !h.key.is_empty())
+                .map(|h| (h.key.clone(), h.value.clone()))
+                .collect(),
         };
         let input = script::Input {
             name: &info.name,
             iteration: info.iteration,
             iteration_count: info.count,
             data: &vars.data,
-            env: &vars.env, globals: &vars.globals, locals: &locals, request: &wire, response: None };
+            env: &vars.env,
+            globals: &vars.globals,
+            locals: &locals,
+            request: &wire,
+            response: None,
+        };
         let result = tokio::task::block_in_place(|| script::run(&req.pre_request, &input));
         let error = result.error.clone();
         let edited = absorb(&mut out, &mut vars, &mut locals, result);
@@ -78,7 +103,11 @@ pub async fn run(client: reqwest::Client, info: &Info, mut req: Request, mut var
         if let Some(w) = edited {
             req.method = w.method;
             req.url = w.url;
-            req.headers = w.headers.into_iter().map(|(k, v)| KeyValue::new(k, v)).collect();
+            req.headers = w
+                .headers
+                .into_iter()
+                .map(|(k, v)| KeyValue::new(k, v))
+                .collect();
         }
     }
 
@@ -93,7 +122,11 @@ pub async fn run(client: reqwest::Client, info: &Info, mut req: Request, mut var
     if let Ok(resp) = &response
         && !req.tests.trim().is_empty()
     {
-        let wire = WireRequest { method: req.method.clone(), url: req.url.clone(), headers: Vec::new() };
+        let wire = WireRequest {
+            method: req.method.clone(),
+            url: req.url.clone(),
+            headers: Vec::new(),
+        };
         let sr = ScriptResponse {
             code: resp.status,
             status: &resp.reason,
@@ -106,12 +139,21 @@ pub async fn run(client: reqwest::Client, info: &Info, mut req: Request, mut var
             iteration: info.iteration,
             iteration_count: info.count,
             data: &vars.data,
-            env: &vars.env, globals: &vars.globals, locals: &locals, request: &wire, response: Some(sr) };
+            env: &vars.env,
+            globals: &vars.globals,
+            locals: &locals,
+            request: &wire,
+            response: Some(sr),
+        };
         let result = tokio::task::block_in_place(|| script::run(&req.tests, &input));
         let error = result.error.clone();
         absorb(&mut out, &mut vars, &mut locals, result);
         if let Some(e) = error {
-            out.tests.push(TestResult { name: "Script error".into(), passed: false, error: Some(e) });
+            out.tests.push(TestResult {
+                name: "Script error".into(),
+                passed: false,
+                error: Some(e),
+            });
         }
     }
     out.response = response;
@@ -146,7 +188,11 @@ pub async fn run_collection(
     mut on_item: impl FnMut(RunItem),
 ) -> (Changes, Changes) {
     let (mut env, mut globals) = (Changes::new(), Changes::new());
-    let count = if plan.data.is_empty() { plan.iterations.max(1) } else { plan.data.len() };
+    let count = if plan.data.is_empty() {
+        plan.iterations.max(1)
+    } else {
+        plan.data.len()
+    };
     let mut first = true;
     for iteration in 0..count {
         vars.data = plan.data.get(iteration).cloned().unwrap_or_default();
@@ -155,7 +201,11 @@ pub async fn run_collection(
                 tokio::time::sleep(plan.delay).await;
             }
             first = false;
-            let info = Info { name: name.clone(), iteration, count };
+            let info = Info {
+                name: name.clone(),
+                iteration,
+                count,
+            };
             let out = run(client.clone(), &info, req.clone(), vars.clone()).await;
             for (k, v) in &out.env {
                 apply_one(&mut vars.env, k, v);
@@ -189,32 +239,57 @@ fn apply_one(map: &mut HashMap<String, String>, k: &str, v: &Option<String>) {
 pub fn load_data(path: &Path) -> Result<Vec<HashMap<String, String>>, String> {
     let shown = path.display();
     let text = std::fs::read_to_string(path).map_err(|e| format!("{shown}: {e}"))?;
-    let is_json = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
+    let is_json = path
+        .extension()
+        .is_some_and(|x| x.eq_ignore_ascii_case("json"));
     if is_json {
-        let rows: Vec<serde_json::Map<String, serde_json::Value>> =
-            serde_json::from_str(&text).map_err(|e| format!("{shown}: expected an array of objects: {e}"))?;
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(&text)
+            .map_err(|e| format!("{shown}: expected an array of objects: {e}"))?;
         return Ok(rows
             .into_iter()
             .map(|row| {
                 row.into_iter()
-                    .map(|(k, v)| (k, if let serde_json::Value::String(s) = v { s } else { v.to_string() }))
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            if let serde_json::Value::String(s) = v {
+                                s
+                            } else {
+                                v.to_string()
+                            },
+                        )
+                    })
                     .collect()
             })
             .collect());
     }
-    let mut reader = csv::ReaderBuilder::new().trim(csv::Trim::Headers).from_reader(text.as_bytes());
-    let headers = reader.headers().map_err(|e| format!("{shown}: {e}"))?.clone();
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::Headers)
+        .from_reader(text.as_bytes());
+    let headers = reader
+        .headers()
+        .map_err(|e| format!("{shown}: {e}"))?
+        .clone();
     reader
         .records()
         .map(|rec| {
             let rec = rec.map_err(|e| format!("{shown}: {e}"))?;
-            Ok(headers.iter().zip(rec.iter()).map(|(h, v)| (h.to_owned(), v.to_owned())).collect())
+            Ok(headers
+                .iter()
+                .zip(rec.iter())
+                .map(|(h, v)| (h.to_owned(), v.to_owned()))
+                .collect())
         })
         .collect()
 }
 
 /// Folds one script's output into the running state; returns its edited request.
-fn absorb(out: &mut Outcome, vars: &mut Vars, locals: &mut HashMap<String, String>, r: Output) -> Option<WireRequest> {
+fn absorb(
+    out: &mut Outcome,
+    vars: &mut Vars,
+    locals: &mut HashMap<String, String>,
+    r: Output,
+) -> Option<WireRequest> {
     fn apply(map: &mut HashMap<String, String>, changes: &Changes) {
         for (k, v) in changes {
             match v {
@@ -241,8 +316,17 @@ mod tests {
 
     #[test]
     fn scripts_chain_variables_into_the_request_and_capture_results() {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
-        let client = rt.block_on(build_client(Network { proxy: ProxyMode::None, ..Default::default() })).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt
+            .block_on(build_client(Network {
+                proxy: ProxyMode::None,
+                ..Default::default()
+            }))
+            .unwrap();
         let addr = crate::http::tests::echo_server();
         let req = Request {
             url: "{{base}}/{{id}}".into(),
@@ -272,15 +356,28 @@ mod tests {
         assert!(wire.contains("x-env: qa"), "{wire}");
         assert_eq!(out.env["id"], Some("7".into()));
         assert_eq!(out.globals["seen"], Some("200".into()));
-        let names: Vec<_> = out.tests.iter().map(|t| (t.name.as_str(), t.passed)).collect();
+        let names: Vec<_> = out
+            .tests
+            .iter()
+            .map(|t| (t.name.as_str(), t.passed))
+            .collect();
         // A crashing test script still reports what passed, then the error last.
         assert_eq!(names, [("echoed", true), ("Script error", false)]);
     }
 
     #[test]
     fn collection_run_chains_requests_and_iterates_data_rows() {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
-        let client = rt.block_on(build_client(Network { proxy: ProxyMode::None, ..Default::default() })).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt
+            .block_on(build_client(Network {
+                proxy: ProxyMode::None,
+                ..Default::default()
+            }))
+            .unwrap();
         let base = crate::http::tests::echo_server();
         let login = Request {
             url: format!("{base}/login/{{{{user}}}}"),
@@ -310,13 +407,26 @@ mod tests {
             delay: Duration::ZERO,
         };
         let mut items = Vec::new();
-        let (env, _) = rt.block_on(run_collection(client, plan, Vars::default(), |item| items.push(item)));
+        let (env, _) = rt.block_on(run_collection(client, plan, Vars::default(), |item| {
+            items.push(item)
+        }));
 
-        let order: Vec<_> = items.iter().map(|i| (i.iteration, i.name.as_str())).collect();
-        assert_eq!(order, [(0, "Login"), (0, "Profile"), (1, "Login"), (1, "Profile")]);
+        let order: Vec<_> = items
+            .iter()
+            .map(|i| (i.iteration, i.name.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            [(0, "Login"), (0, "Profile"), (1, "Login"), (1, "Profile")]
+        );
         for item in &items {
             assert!(item.status.is_ok(), "{}: {:?}", item.name, item.status);
-            assert!(item.tests.iter().all(|t| t.passed), "{}: {:?}", item.name, item.tests);
+            assert!(
+                item.tests.iter().all(|t| t.passed),
+                "{}: {:?}",
+                item.name,
+                item.tests
+            );
         }
         // The last write wins and is handed back for persisting.
         assert_eq!(env["session"], Some("bob".into()));
@@ -327,7 +437,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("apitool-data-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let csv = dir.join("users.csv");
-        std::fs::write(&csv, "user, note\nann,\"hello, world\"\nbob,\"multi\nline\"\n").unwrap();
+        std::fs::write(
+            &csv,
+            "user, note\nann,\"hello, world\"\nbob,\"multi\nline\"\n",
+        )
+        .unwrap();
         let rows = load_data(&csv).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["note"], "hello, world");
@@ -347,11 +461,27 @@ mod tests {
 
     #[test]
     fn failing_pre_request_script_blocks_the_send() {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
-        let client = rt.block_on(build_client(Network { proxy: ProxyMode::None, ..Default::default() })).unwrap();
-        let req = Request { url: "http://127.0.0.1:9/".into(), pre_request: "throw new Error('nope')".into(), ..Default::default() };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt
+            .block_on(build_client(Network {
+                proxy: ProxyMode::None,
+                ..Default::default()
+            }))
+            .unwrap();
+        let req = Request {
+            url: "http://127.0.0.1:9/".into(),
+            pre_request: "throw new Error('nope')".into(),
+            ..Default::default()
+        };
         let out = rt.block_on(run(client, &Info::single("t".into()), req, Vars::default()));
         let err = out.response.err().unwrap();
-        assert!(err.contains("Pre-request script failed") && err.contains("nope"), "{err}");
+        assert!(
+            err.contains("Pre-request script failed") && err.contains("nope"),
+            "{err}"
+        );
     }
 }

@@ -7,15 +7,17 @@ edition = "2024"
 base64 = "0.23"
 csv = "1"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "glow", "default_fonts", "accesskit"] }
+futures-util = "0.3"
 memmap2 = "0.9.11"
 memory-stats = "1.2.0"
 p12-keystore = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "charset", "gzip", "query", "form"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "charset", "gzip", "query", "form", "stream"] }
+reqwest-websocket = "0.6"
 rquickjs = { version = "0.14", features = ["parallel"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 toml = "1"
 
 [target."cfg(windows)".dependencies]
@@ -23,3 +25,4 @@ windows-registry = "0.6"
 
 [dev-dependencies]
 rcgen = "0.14"
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }

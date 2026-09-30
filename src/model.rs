@@ -2,7 +2,14 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+pub const METHODS: &[&str] = &[
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "WS", "SSE", "GRPC",
+];
+
+/// Methods whose response is a stream of messages rather than one body.
+pub fn is_streaming(method: &str) -> bool {
+    matches!(method, "WS" | "SSE")
+}
 
 /// One request per file on disk, so field order and `skip_serializing_if` matter:
 /// they keep git diffs minimal.
@@ -60,7 +67,11 @@ fn is_enabled(b: &bool) -> bool {
 
 impl KeyValue {
     pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
-        Self { key: key.into(), value: value.into(), enabled: true }
+        Self {
+            key: key.into(),
+            value: value.into(),
+            enabled: true,
+        }
     }
 }
 
@@ -69,9 +80,20 @@ impl KeyValue {
 pub enum Body {
     #[default]
     None,
-    Json { text: String },
-    Text { text: String },
-    Form { fields: Vec<KeyValue> },
+    Json {
+        text: String,
+    },
+    Text {
+        text: String,
+    },
+    Form {
+        fields: Vec<KeyValue>,
+    },
+    #[serde(rename = "graphql")]
+    GraphQL {
+        query: String,
+        variables: String,
+    },
 }
 
 impl Body {
@@ -85,8 +107,13 @@ impl Body {
 pub enum Auth {
     #[default]
     None,
-    Bearer { token: String },
-    Basic { username: String, password: String },
+    Bearer {
+        token: String,
+    },
+    Basic {
+        username: String,
+        password: String,
+    },
 }
 
 impl Auth {
@@ -143,14 +170,21 @@ impl Request {
                 Body::None => Body::None,
                 Body::Json { text } => Body::Json { text: r(text) },
                 Body::Text { text } => Body::Text { text: r(text) },
-                Body::Form { fields } => Body::Form { fields: kv(fields, &mut r) },
+                Body::Form { fields } => Body::Form {
+                    fields: kv(fields, &mut r),
+                },
+                Body::GraphQL { query, variables } => Body::GraphQL {
+                    query: r(query),
+                    variables: r(variables),
+                },
             },
             auth: match &self.auth {
                 Auth::None => Auth::None,
                 Auth::Bearer { token } => Auth::Bearer { token: r(token) },
-                Auth::Basic { username, password } => {
-                    Auth::Basic { username: r(username), password: r(password) }
-                }
+                Auth::Basic { username, password } => Auth::Basic {
+                    username: r(username),
+                    password: r(password),
+                },
             },
             // Scripts have already run by the time a request is resolved for the wire.
             pre_request: String::new(),
@@ -178,7 +212,10 @@ mod tests {
     fn resolved_drops_disabled_rows() {
         let mut off = KeyValue::new("debug", "1");
         off.enabled = false;
-        let req = Request { params: vec![off, KeyValue::new("q", "{{v}}")], ..Default::default() };
+        let req = Request {
+            params: vec![off, KeyValue::new("q", "{{v}}")],
+            ..Default::default()
+        };
         let vars = HashMap::from([("v".to_owned(), "rust".to_owned())]);
         let (r, _) = req.resolved(&vars);
         assert_eq!(r.params, [KeyValue::new("q", "rust")]);
@@ -194,14 +231,28 @@ mod tests {
             url: "https://{{host}}/users".into(),
             params: vec![KeyValue::new("page", "2")],
             headers: vec![off],
-            body: Body::Json { text: "{\n  \"name\": \"測試\"\n}".into() },
-            auth: Auth::Basic { username: "u".into(), password: "{{pw}}".into() },
+            body: Body::Json {
+                text: "{\n  \"name\": \"測試\"\n}".into(),
+            },
+            auth: Auth::Basic {
+                username: "u".into(),
+                password: "{{pw}}".into(),
+            },
             pre_request: "pm.environment.set(\"ts\", Date.now());".into(),
-            tests: "pm.test(\"ok\", function () {\n    pm.response.to.have.status(200);\n});\n".into(),
+            tests: "pm.test(\"ok\", function () {\n    pm.response.to.have.status(200);\n});\n"
+                .into(),
         };
         let text = toml::to_string_pretty(&req).unwrap();
         assert_eq!(toml::from_str::<Request>(&text).unwrap(), req, "{text}");
-        let form = Request { body: Body::Form { fields: vec![KeyValue::new("a", "b")] }, ..Default::default() };
-        assert_eq!(toml::from_str::<Request>(&toml::to_string_pretty(&form).unwrap()).unwrap(), form);
+        let form = Request {
+            body: Body::Form {
+                fields: vec![KeyValue::new("a", "b")],
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            toml::from_str::<Request>(&toml::to_string_pretty(&form).unwrap()).unwrap(),
+            form
+        );
     }
 }

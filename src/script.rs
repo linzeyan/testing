@@ -186,7 +186,10 @@ pub fn run(script: &str, input: &Input<'_>) -> Output {
 fn run_with_timeout(script: &str, input: &Input<'_>, timeout: Duration) -> Output {
     match run_inner(script, input, timeout) {
         Ok(out) => out,
-        Err(e) => Output { error: Some(e), ..Default::default() },
+        Err(e) => Output {
+            error: Some(e),
+            ..Default::default()
+        },
     }
 }
 
@@ -203,11 +206,15 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
         ctx.globals().set("__input", json).map_err(caught)?;
         // chai's UMD wrapper looks for window/global/self and otherwise uses `this`, which
         // is undefined here; `self` is the one alias that doesn't imply a browser.
-        ctx.eval::<(), _>("globalThis.self = globalThis;").map_err(caught)?;
+        ctx.eval::<(), _>("globalThis.self = globalThis;")
+            .map_err(caught)?;
         ctx.eval::<(), _>(CHAI).map_err(caught)?;
         ctx.eval::<(), _>(PRELUDE).map_err(caught)?;
         // The user's script may throw; keep whatever it recorded before that.
-        let error = ctx.eval::<(), _>(script).err().map(|e| exception(&ctx, e, deadline, timeout));
+        let error = ctx
+            .eval::<(), _>(script)
+            .err()
+            .map(|e| exception(&ctx, e, deadline, timeout));
         let out: String = ctx.eval(EPILOGUE).map_err(caught)?;
         let mut out: Output = serde_json::from_str(&out).map_err(|e| e.to_string())?;
         out.error = error;
@@ -215,7 +222,12 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
     })
 }
 
-fn exception(ctx: &rquickjs::Ctx<'_>, e: rquickjs::Error, deadline: Instant, timeout: Duration) -> String {
+fn exception(
+    ctx: &rquickjs::Ctx<'_>,
+    e: rquickjs::Error,
+    deadline: Instant,
+    timeout: Duration,
+) -> String {
     if Instant::now() > deadline {
         return format!("script timed out after {:.1} s", timeout.as_secs_f32());
     }
@@ -223,7 +235,12 @@ fn exception(ctx: &rquickjs::Ctx<'_>, e: rquickjs::Error, deadline: Instant, tim
         let value = ctx.catch();
         if let Some(x) = value.as_exception() {
             let message = x.message().unwrap_or_default();
-            let line = x.stack().and_then(|s| s.lines().find(|l| l.contains("<eval>")).map(str::trim).map(str::to_owned));
+            let line = x.stack().and_then(|s| {
+                s.lines()
+                    .find(|l| l.contains("<eval>"))
+                    .map(str::trim)
+                    .map(str::to_owned)
+            });
             return match line {
                 Some(at) => format!("{message} ({at})"),
                 None => message,
@@ -241,12 +258,31 @@ mod tests {
     use super::*;
 
     fn request() -> WireRequest {
-        WireRequest { method: "GET".into(), url: "https://{{host}}/users".into(), headers: vec![] }
+        WireRequest {
+            method: "GET".into(),
+            url: "https://{{host}}/users".into(),
+            headers: vec![],
+        }
     }
 
-    fn input<'a>(req: &'a WireRequest, env: &'a HashMap<String, String>, response: Option<ScriptResponse<'a>>) -> Input<'a> {
-        static EMPTY: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(HashMap::new);
-        Input { name: "t", iteration: 0, iteration_count: 1, data: &EMPTY, env, globals: &EMPTY, locals: &EMPTY, request: req, response }
+    fn input<'a>(
+        req: &'a WireRequest,
+        env: &'a HashMap<String, String>,
+        response: Option<ScriptResponse<'a>>,
+    ) -> Input<'a> {
+        static EMPTY: std::sync::LazyLock<HashMap<String, String>> =
+            std::sync::LazyLock::new(HashMap::new);
+        Input {
+            name: "t",
+            iteration: 0,
+            iteration_count: 1,
+            data: &EMPTY,
+            env,
+            globals: &EMPTY,
+            locals: &EMPTY,
+            request: req,
+            response,
+        }
     }
 
     #[test]
@@ -254,7 +290,13 @@ mod tests {
         let (req, env) = (request(), HashMap::new());
         let headers = vec![("content-type".to_owned(), "application/json".to_owned())];
         let body = r#"{"token":"abc","items":[1,2]}"#;
-        let resp = ScriptResponse { code: 201, status: "Created", time: 12, headers: &headers, body };
+        let resp = ScriptResponse {
+            code: 201,
+            status: "Created",
+            time: 12,
+            headers: &headers,
+            body,
+        };
         let out = run(
             r#"
             pm.test("status", function () { pm.response.to.have.status(201); });
@@ -267,9 +309,27 @@ mod tests {
             &input(&req, &env, Some(resp)),
         );
         assert_eq!(out.error, None);
-        let passed: Vec<_> = out.tests.iter().map(|t| (t.name.as_str(), t.passed)).collect();
-        assert_eq!(passed, [("status", true), ("ok", true), ("json", true), ("fails", false)]);
-        assert!(out.tests[3].error.as_deref().unwrap().contains("expected 201 to equal 200"));
+        let passed: Vec<_> = out
+            .tests
+            .iter()
+            .map(|t| (t.name.as_str(), t.passed))
+            .collect();
+        assert_eq!(
+            passed,
+            [
+                ("status", true),
+                ("ok", true),
+                ("json", true),
+                ("fails", false)
+            ]
+        );
+        assert!(
+            out.tests[3]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("expected 201 to equal 200")
+        );
         // Chaining: the token captured here is what the next request's {{token}} resolves to.
         assert_eq!(out.env["token"], Some("abc".into()));
         assert_eq!(out.logs, ["got [1,2]"]);
@@ -277,7 +337,10 @@ mod tests {
 
     #[test]
     fn pre_request_script_can_modify_the_request() {
-        let (req, env) = (request(), HashMap::from([("host".to_owned(), "api.test".to_owned())]));
+        let (req, env) = (
+            request(),
+            HashMap::from([("host".to_owned(), "api.test".to_owned())]),
+        );
         let out = run(
             r#"
             pm.request.headers.add({ key: "X-Ts", value: 42 });
@@ -296,7 +359,10 @@ mod tests {
     #[test]
     fn errors_keep_earlier_results_and_loops_time_out() {
         let (req, env) = (request(), HashMap::new());
-        let out = run("console.log('before'); undefinedFn();", &input(&req, &env, None));
+        let out = run(
+            "console.log('before'); undefinedFn();",
+            &input(&req, &env, None),
+        );
         assert_eq!(out.logs, ["before"]);
         assert!(out.error.unwrap().contains("undefinedFn"));
 
@@ -304,7 +370,11 @@ mod tests {
         assert!(out.error.is_some(), "syntax errors must surface");
 
         let started = Instant::now();
-        let out = run_with_timeout("while (true) {}", &input(&req, &env, None), Duration::from_millis(200));
+        let out = run_with_timeout(
+            "while (true) {}",
+            &input(&req, &env, None),
+            Duration::from_millis(200),
+        );
         assert!(out.error.unwrap().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(5));
     }

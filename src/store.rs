@@ -15,8 +15,16 @@ const GITIGNORE: &str = "*.secret.toml\n.state.toml\n*.tmp\n";
 const SECRET_SUFFIX: &str = ".secret";
 
 pub enum Node {
-    Folder { name: String, path: PathBuf, children: Vec<Node> },
-    Request { name: String, path: PathBuf, method: String },
+    Folder {
+        name: String,
+        path: PathBuf,
+        children: Vec<Node>,
+    },
+    Request {
+        name: String,
+        path: PathBuf,
+        method: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -68,7 +76,10 @@ impl Workspace {
     }
 
     pub fn save_request(&self, path: &Path, req: &Request) -> Result<(), String> {
-        write_atomic(path, &toml::to_string_pretty(req).map_err(|e| e.to_string())?)
+        write_atomic(
+            path,
+            &toml::to_string_pretty(req).map_err(|e| e.to_string())?,
+        )
     }
 
     /// Creates `<dir>/<name>.toml`, refusing to overwrite.
@@ -90,7 +101,11 @@ impl Workspace {
     /// Renames a request file or folder in place; returns the new path.
     pub fn rename(&self, path: &Path, name: &str) -> Result<PathBuf, String> {
         let name = valid_name(name)?;
-        let file_name = if path.is_dir() { name.to_owned() } else { format!("{name}.toml") };
+        let file_name = if path.is_dir() {
+            name.to_owned()
+        } else {
+            format!("{name}.toml")
+        };
         let new = path.with_file_name(file_name);
         if new.exists() {
             return Err(format!("\"{name}\" already exists"));
@@ -100,8 +115,12 @@ impl Workspace {
     }
 
     pub fn delete(&self, path: &Path) -> Result<(), String> {
-        if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) }
-            .map_err(|e| format!("delete: {e}"))
+        if path.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        }
+        .map_err(|e| format!("delete: {e}"))
     }
 
     pub fn env_names(&self) -> Vec<String> {
@@ -128,10 +147,18 @@ impl Workspace {
                 .unwrap_or_default()
                 .vars
         };
-        (read(format!("{name}.toml")), read(format!("{name}{SECRET_SUFFIX}.toml")))
+        (
+            read(format!("{name}.toml")),
+            read(format!("{name}{SECRET_SUFFIX}.toml")),
+        )
     }
 
-    pub fn save_env(&self, name: &str, shared: &[KeyValue], secret: &[KeyValue]) -> Result<(), String> {
+    pub fn save_env(
+        &self,
+        name: &str,
+        shared: &[KeyValue],
+        secret: &[KeyValue],
+    ) -> Result<(), String> {
         let name = valid_name(name)?;
         let write = |file: String, vars: &[KeyValue]| {
             let vars = vars.iter().filter(|v| !v.key.is_empty()).cloned().collect();
@@ -150,7 +177,10 @@ impl Workspace {
     }
 
     pub fn delete_env(&self, name: &str) -> Result<(), String> {
-        for file in [format!("{name}.toml"), format!("{name}{SECRET_SUFFIX}.toml")] {
+        for file in [
+            format!("{name}.toml"),
+            format!("{name}{SECRET_SUFFIX}.toml"),
+        ] {
             let path = self.environments().join(file);
             if path.exists() {
                 fs::remove_file(&path).map_err(|e| format!("delete: {e}"))?;
@@ -179,19 +209,29 @@ fn scan(dir: &Path) -> Vec<Node> {
     let mut requests = Vec::new();
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
         if name.starts_with('.') {
             continue;
         }
         if path.is_dir() {
-            folders.push(Node::Folder { children: scan(&path), name, path });
+            folders.push(Node::Folder {
+                children: scan(&path),
+                name,
+                path,
+            });
         } else if let Some(stem) = name.strip_suffix(".toml") {
             // Peek at the method for the tree badge; a broken file still shows up so it can be fixed.
             let method = fs::read_to_string(&path)
                 .ok()
                 .and_then(|t| toml::from_str::<Request>(&t).ok())
                 .map_or_else(|| "?".into(), |r| r.method);
-            requests.push(Node::Request { name: stem.to_owned(), path, method });
+            requests.push(Node::Request {
+                name: stem.to_owned(),
+                path,
+                method,
+            });
         }
     }
     let key = |n: &Node| match n {
@@ -209,7 +249,10 @@ fn valid_name(name: &str) -> Result<&str, String> {
     if name.is_empty() || name.starts_with('.') || name.ends_with('.') {
         return Err("name can't be empty or start/end with '.'".into());
     }
-    if let Some(c) = name.chars().find(|c| r#"<>:"/\|?*"#.contains(*c) || c.is_control()) {
+    if let Some(c) = name
+        .chars()
+        .find(|c| r#"<>:"/\|?*"#.contains(*c) || c.is_control())
+    {
         return Err(format!("name can't contain '{c}'"));
     }
     Ok(name)
@@ -235,8 +278,14 @@ mod tests {
 
         let folder = ws.create_folder(&ws.collections(), "Users").unwrap();
         let path = ws.create_request(&folder, "Get user").unwrap();
-        assert!(ws.create_request(&folder, "Get user").is_err(), "must not overwrite");
-        assert!(ws.create_request(&folder, "a/b").is_err(), "path separators are not names");
+        assert!(
+            ws.create_request(&folder, "Get user").is_err(),
+            "must not overwrite"
+        );
+        assert!(
+            ws.create_request(&folder, "a/b").is_err(),
+            "path separators are not names"
+        );
 
         let renamed = ws.rename(&path, "Fetch user").unwrap();
         assert!(matches!(&ws.tree()[0], Node::Folder { children, .. }
@@ -244,11 +293,20 @@ mod tests {
         assert_eq!(ws.load_request(&renamed).unwrap(), Request::default());
 
         // Secrets must land in the gitignored file, never in the shared one.
-        ws.save_env("dev", &[KeyValue::new("host", "x")], &[KeyValue::new("token", "s3cret")]).unwrap();
+        ws.save_env(
+            "dev",
+            &[KeyValue::new("host", "x")],
+            &[KeyValue::new("token", "s3cret")],
+        )
+        .unwrap();
         assert_eq!(ws.env_names(), ["dev"]);
         let shared = fs::read_to_string(root.join("environments/dev.toml")).unwrap();
         assert!(!shared.contains("s3cret"));
-        assert!(fs::read_to_string(root.join(".gitignore")).unwrap().contains("*.secret.toml"));
+        assert!(
+            fs::read_to_string(root.join(".gitignore"))
+                .unwrap()
+                .contains("*.secret.toml")
+        );
         assert_eq!(ws.load_env("dev").1, [KeyValue::new("token", "s3cret")]);
 
         fs::remove_dir_all(&root).unwrap();
