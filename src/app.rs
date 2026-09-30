@@ -34,7 +34,7 @@ const MAX_EVENTS: usize = 5000;
 
 /// Built lazily on first use (a PAC file may need downloading) and replaced wholesale when
 /// network settings change, so in-flight requests keep the client they started with.
-type SharedClient = Arc<tokio::sync::OnceCell<Result<reqwest::Client, String>>>;
+type SharedClient = Arc<tokio::sync::OnceCell<Result<net::Clients, String>>>;
 type Then = Box<dyn FnOnce(&mut App, &egui::Context)>;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -207,6 +207,8 @@ pub struct App {
     response: Option<Shown>,
     pending: Option<Pending>,
     stream: Option<StreamSession>,
+    /// Methods of the last `.proto` the gRPC picker looked at; recompiled only on change.
+    grpc_methods: Option<(String, Result<Vec<String>, String>)>,
     status: String,
     dialog: Option<Dialog>,
     env_editor: Option<EnvEditor>,
@@ -240,6 +242,7 @@ impl App {
             response: None,
             pending: None,
             stream: None,
+            grpc_methods: None,
             status: String::new(),
             dialog: None,
             env_editor: None,
@@ -419,8 +422,10 @@ impl App {
                 ctx.request_repaint();
             };
             match cell.get_or_init(|| net::build_client(net)).await {
-                Ok(client) if is_ws => stream::websocket(client.clone(), req, out_rx, emit).await,
-                Ok(client) => stream::sse(client.clone(), req, emit).await,
+                Ok(client) if is_ws => {
+                    stream::websocket(client.http.clone(), req, out_rx, emit).await
+                }
+                Ok(client) => stream::sse(client.http.clone(), req, emit).await,
                 Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
             }
         });
@@ -882,6 +887,11 @@ impl App {
                             .clicked();
                     }
                 });
+                if open.draft.method == "GRPC"
+                    && let Some(e) = grpc_bar(ui, &mut open.draft, &mut self.grpc_methods)
+                {
+                    self.status = e;
+                }
                 let (_, missing) = open.draft.resolved(&all_vars);
                 // A pre-request script may define them; only warn when nothing could.
                 if !missing.is_empty() && open.draft.pre_request.trim().is_empty() {
@@ -1930,6 +1940,63 @@ fn scripts_editor(ui: &mut egui::Ui, tab: &mut ScriptTab, req: &mut Request) {
 }
 
 const GREEN: Color32 = Color32::from_rgb(80, 180, 100);
+
+fn grpc_bar(
+    ui: &mut egui::Ui,
+    req: &mut Request,
+    methods: &mut Option<(String, Result<Vec<String>, String>)>,
+) -> Option<String> {
+    let mut error = None;
+    ui.horizontal(|ui| {
+        ui.label("Proto");
+        ui.add(
+            egui::TextEdit::singleline(&mut req.proto)
+                .hint_text("protos/service.proto (relative to the workspace)")
+                .desired_width(260.0),
+        );
+        let reload = ui
+            .small_button("↻")
+            .on_hover_text("Reload .proto")
+            .clicked();
+        if reload || methods.as_ref().is_none_or(|(p, _)| *p != req.proto) {
+            *methods = Some((req.proto.clone(), crate::grpc::methods(&req.proto)));
+        }
+        let Some((_, list)) = methods else { return };
+        match list {
+            Ok(list) => {
+                let shown = if req.rpc.is_empty() {
+                    "Select method"
+                } else {
+                    &req.rpc
+                };
+                egui::ComboBox::from_id_salt("rpc")
+                    .selected_text(shown)
+                    .width(ui.available_width() - 110.0)
+                    .show_ui(ui, |ui| {
+                        for m in list.iter() {
+                            ui.selectable_value(&mut req.rpc, m.clone(), m);
+                        }
+                    });
+                if ui
+                    .add_enabled(!req.rpc.is_empty(), egui::Button::new("Fill body"))
+                    .on_hover_text("Replace the body with an empty request message")
+                    .clicked()
+                {
+                    match crate::grpc::template(&req.proto, &req.rpc) {
+                        Ok(text) => req.body = Body::Json { text },
+                        Err(e) => error = Some(e),
+                    }
+                }
+            }
+            Err(_) if req.proto.trim().is_empty() => {}
+            Err(e) => {
+                ui.colored_label(RED, e.lines().next().unwrap_or_default())
+                    .on_hover_text(e.as_str());
+            }
+        }
+    });
+    error
+}
 
 impl StreamSession {
     fn send_compose(&mut self) {

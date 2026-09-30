@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod grpc;
 mod http;
 mod model;
 mod net;
@@ -56,6 +57,12 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
     };
+    // Relative paths in requests (.proto files, data files) then resolve inside the
+    // workspace, so they keep working after a git clone on another machine.
+    if let Err(e) = std::env::set_current_dir(&ws.root) {
+        eprintln!("cannot enter workspace {}: {e}", ws.root.display());
+        std::process::exit(1);
+    }
     eframe::run_native(
         "apitool",
         options,
@@ -74,7 +81,8 @@ fn main() -> eframe::Result {
 /// (e.g. an existing git clone).
 fn workspace_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("APITOOL_WORKSPACE") {
-        return dir.into();
+        // Absolute because main changes the working directory to the workspace.
+        return std::path::absolute(dir).unwrap_or_default();
     }
     let exe_dir = std::env::current_exe()
         .ok()

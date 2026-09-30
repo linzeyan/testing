@@ -54,48 +54,79 @@ impl Default for Network {
     }
 }
 
-pub async fn build_client(net: Network) -> Result<reqwest::Client, String> {
+/// gRPC needs HTTP/2 even over plain TCP (h2c), which reqwest only does with prior
+/// knowledge, and that would break HTTP/1-only servers for everything else.
+#[derive(Clone)]
+pub struct Clients {
+    pub http: reqwest::Client,
+    pub grpc: reqwest::Client,
+}
+
+pub async fn build_client(net: Network) -> Result<Clients, String> {
     // reqwest is built with `rustls-no-provider` (ring cross-compiles to Windows with just
     // clang; aws-lc-rs needs cmake/nasm). Installing is idempotent, and doing it here covers
     // every client, including the PAC fetcher below.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut b = reqwest::Client::builder()
-        .timeout(Duration::from_secs(net.timeout_secs.max(1)))
-        .tls_danger_accept_invalid_certs(net.insecure);
 
     // Any explicit `.proxy()` turns off reqwest's own system-proxy lookup.
-    b = match net.proxy {
+    let proxy = match net.proxy {
         ProxyMode::System => match system_pac_url() {
-            Some(url) => b.proxy(pac_proxy(&url).await?),
-            None => b,
+            Some(url) => Some(pac_proxy(&url).await?),
+            None => None,
         },
-        ProxyMode::None => b.no_proxy(),
+        ProxyMode::None => None,
         ProxyMode::Manual => {
             let proxy = reqwest::Proxy::all(net.proxy_url.trim())
                 .map_err(|e| format!("proxy URL: {}", error_chain(&e)))?;
-            b.proxy(proxy.no_proxy(reqwest::NoProxy::from_string(&net.no_proxy)))
+            Some(proxy.no_proxy(reqwest::NoProxy::from_string(&net.no_proxy)))
         }
-        ProxyMode::Pac => b.proxy(pac_proxy(net.pac_url.trim()).await?),
+        ProxyMode::Pac => Some(pac_proxy(net.pac_url.trim()).await?),
     };
 
     let ca = net.ca_file.trim();
+    let mut certs = Vec::new();
     if !ca.is_empty() {
         let pem = std::fs::read(ca).map_err(|e| format!("CA file {ca}: {e}"))?;
-        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+        certs = reqwest::Certificate::from_pem_bundle(&pem)
             .map_err(|e| format!("CA file {ca}: {e}"))?;
         if certs.is_empty() {
             return Err(format!("CA file {ca}: no PEM certificates found"));
         }
-        // Merge keeps the OS trust store; the corporate root is added on top.
-        b = b.tls_certs_merge(certs);
     }
 
     let cert = net.client_cert.trim();
-    if !cert.is_empty() {
-        b = b.identity(load_identity(Path::new(cert), &net.client_cert_password)?);
-    }
+    let identity = if cert.is_empty() {
+        None
+    } else {
+        Some(load_identity(Path::new(cert), &net.client_cert_password)?)
+    };
 
-    b.build().map_err(|e| error_chain(&e))
+    let build = |h2_only: bool| {
+        let mut b = reqwest::Client::builder()
+            .timeout(Duration::from_secs(net.timeout_secs.max(1)))
+            .tls_danger_accept_invalid_certs(net.insecure);
+        if net.proxy == ProxyMode::None {
+            b = b.no_proxy();
+        }
+        if let Some(p) = &proxy {
+            b = b.proxy(p.clone());
+        }
+        if !certs.is_empty() {
+            // Merge keeps the OS trust store; the corporate root is added on top.
+            b = b.tls_certs_merge(certs.clone());
+        }
+        if let Some(id) = &identity {
+            b = b.identity(id.clone());
+        }
+        if h2_only {
+            b = b.http2_prior_knowledge();
+        }
+        b.build().map_err(|e| error_chain(&e))
+    };
+    Ok(Clients {
+        http: build(false)?,
+        grpc: build(true)?,
+    })
 }
 
 /// Accepts a PEM file (key + certificate chain) or a PFX/P12 bundle.

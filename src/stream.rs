@@ -205,7 +205,7 @@ mod tests {
             proxy: crate::net::ProxyMode::None,
             ..Default::default()
         };
-        let client = rt.block_on(crate::net::build_client(net)).unwrap();
+        let client = rt.block_on(crate::net::build_client(net)).unwrap().http;
         let req = Request {
             method: "SSE".into(),
             url: format!("{addr}/events"),
@@ -258,7 +258,7 @@ mod tests {
             proxy: crate::net::ProxyMode::None,
             ..Default::default()
         };
-        let client = rt.block_on(crate::net::build_client(net)).unwrap();
+        let client = rt.block_on(crate::net::build_client(net)).unwrap().http;
         let req = Request {
             method: "WS".into(),
             url: format!("ws://{addr}/socket"),

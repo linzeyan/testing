@@ -18,6 +18,12 @@ pub fn is_streaming(method: &str) -> bool {
 pub struct Request {
     pub method: String,
     pub url: String,
+    /// gRPC only: `.proto` file (relative to the workspace, so it syncs via git) and the
+    /// fully-qualified method, `package.Service/Method`. The JSON body is the message.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub proto: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub rpc: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<KeyValue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -39,6 +45,8 @@ impl Default for Request {
         Self {
             method: "GET".into(),
             url: String::new(),
+            proto: String::new(),
+            rpc: String::new(),
             params: Vec::new(),
             headers: Vec::new(),
             body: Body::None,
@@ -164,6 +172,8 @@ impl Request {
         let req = Request {
             method: self.method.clone(),
             url: r(&self.url),
+            proto: r(&self.proto),
+            rpc: r(&self.rpc),
             params: kv(&self.params, &mut r),
             headers: kv(&self.headers, &mut r),
             body: match &self.body {
@@ -229,6 +239,8 @@ mod tests {
         let req = Request {
             method: "POST".into(),
             url: "https://{{host}}/users".into(),
+            proto: "protos/users.proto".into(),
+            rpc: "users.v1.Users/Get".into(),
             params: vec![KeyValue::new("page", "2")],
             headers: vec![off],
             body: Body::Json {

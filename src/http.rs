@@ -194,7 +194,7 @@ pub(crate) mod tests {
             proxy: crate::net::ProxyMode::None,
             ..Default::default()
         };
-        let client = rt.block_on(crate::net::build_client(net)).unwrap();
+        let client = rt.block_on(crate::net::build_client(net)).unwrap().http;
         let resp = rt.block_on(execute(client, req)).unwrap();
         let wire = resp.body.to_lowercase();
         assert_eq!(resp.status, 200);

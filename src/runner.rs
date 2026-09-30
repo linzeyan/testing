@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::http;
 use crate::model::{KeyValue, Request};
 use crate::script::{self, Changes, Output, ScriptResponse, TestResult, WireRequest};
+use crate::{grpc, http, net};
 
 #[derive(Clone, Default)]
 pub struct Vars {
@@ -56,12 +56,7 @@ impl Outcome {
 }
 
 /// Must run on a multi-threaded tokio runtime: scripts are CPU-bound and use `block_in_place`.
-pub async fn run(
-    client: reqwest::Client,
-    info: &Info,
-    mut req: Request,
-    mut vars: Vars,
-) -> Outcome {
+pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: Vars) -> Outcome {
     let mut out = Outcome {
         response: Err(String::new()),
         tests: Vec::new(),
@@ -117,7 +112,11 @@ pub async fn run(
     merged.extend(vars.data.clone());
     merged.extend(locals.clone());
     let (wire, _) = req.resolved(&merged);
-    let response = http::execute(client, wire).await;
+    let response = if wire.method.eq_ignore_ascii_case("GRPC") {
+        grpc::call(client.grpc, wire).await
+    } else {
+        http::execute(client.http, wire).await
+    };
 
     if let Ok(resp) = &response
         && !req.tests.trim().is_empty()
@@ -182,7 +181,7 @@ pub struct RunPlan {
 /// Runs every request for every iteration, chaining variable writes between requests.
 /// Returns the accumulated env/global changes for the caller to persist.
 pub async fn run_collection(
-    client: reqwest::Client,
+    client: net::Clients,
     plan: RunPlan,
     mut vars: Vars,
     mut on_item: impl FnMut(RunItem),
