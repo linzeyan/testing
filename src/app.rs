@@ -11,7 +11,7 @@ use crate::model::{self, Auth, Body, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
 use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
-use crate::store::{Node, State, Workspace};
+use crate::store::{self, Node, State, Workspace};
 use crate::stream::{self, Event};
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
@@ -319,14 +319,10 @@ impl App {
     }
 
     fn set_env(&mut self, name: Option<String>) {
-        self.vars.clear();
-        if let Some(name) = &name {
-            let (shared, secret) = self.ws.load_env(name);
-            // Secret values override shared ones with the same key.
-            for kv in shared.into_iter().chain(secret).filter(|kv| kv.enabled) {
-                self.vars.insert(kv.key, kv.value);
-            }
-        }
+        self.vars = name
+            .as_deref()
+            .map(|n| self.ws.env_vars(n))
+            .unwrap_or_default();
         self.active_env = name;
         self.save_state();
     }
@@ -1263,7 +1259,7 @@ impl App {
         let title = if scope == self.ws.collections() {
             "Whole collection".to_owned()
         } else {
-            self.display_name(&scope)
+            self.ws.display_name(&scope)
         };
         // Keep the previous settings when re-opening, which is how people iterate on a run.
         let prev = self.runner.take();
@@ -1283,20 +1279,15 @@ impl App {
     }
 
     /// "Folder/Request" relative to the collections root, without the extension.
-    fn display_name(&self, path: &Path) -> String {
-        let rel = path.strip_prefix(self.ws.collections()).unwrap_or(path);
-        rel.with_extension("").to_string_lossy().replace('\\', "/")
-    }
-
     fn start_run(&mut self, ctx: &egui::Context) {
         let Some(view) = &self.runner else { return };
         let mut paths = Vec::new();
-        requests_in(&self.tree, &view.scope, &mut paths);
+        store::requests_in(&self.tree, &view.scope, &mut paths);
         let mut requests = Vec::new();
         let mut error = String::new();
         for path in &paths {
             match self.ws.load_request(path) {
-                Ok(req) => requests.push((self.display_name(path), req)),
+                Ok(req) => requests.push((self.ws.display_name(path), req)),
                 Err(e) => error = e,
             }
         }
@@ -1433,7 +1424,7 @@ impl App {
 
         if let Some(run) = &view.run {
             let done = run.items.len();
-            let failed = run.items.iter().filter(|i| item_failed(i)).count();
+            let failed = run.items.iter().filter(|i| i.failed()).count();
             let (tests_passed, tests_total) = run.items.iter().fold((0, 0), |(p, t), i| {
                 (
                     p + i.tests.iter().filter(|x| x.passed).count(),
@@ -1477,7 +1468,7 @@ impl App {
                     for item in run
                         .items
                         .iter()
-                        .filter(|i| !view.only_failures || item_failed(i))
+                        .filter(|i| !view.only_failures || i.failed())
                     {
                         run_item_ui(ui, item);
                     }
@@ -1579,20 +1570,6 @@ impl App {
             self.network_editor = None;
         }
     }
-}
-
-fn requests_in(nodes: &[Node], scope: &Path, out: &mut Vec<PathBuf>) {
-    for node in nodes {
-        match node {
-            Node::Folder { children, .. } => requests_in(children, scope, out),
-            Node::Request { path, .. } if path.starts_with(scope) => out.push(path.clone()),
-            Node::Request { .. } => {}
-        }
-    }
-}
-
-fn item_failed(item: &RunItem) -> bool {
-    item.status.is_err() || item.tests.iter().any(|t| !t.passed)
 }
 
 fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {

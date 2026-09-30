@@ -175,6 +175,12 @@ pub struct RunItem {
     pub tests: Vec<TestResult>,
 }
 
+impl RunItem {
+    pub fn failed(&self) -> bool {
+        self.status.is_err() || self.tests.iter().any(|t| !t.passed)
+    }
+}
+
 pub struct RunPlan {
     pub requests: Vec<(String, Request)>,
     /// Data rows; when empty, `iterations` plain iterations run instead.

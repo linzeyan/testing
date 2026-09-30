@@ -4,6 +4,7 @@
 //!   environments/<name>.secret.toml  secret variables (gitignored)
 //!   .state.toml                   per-machine UI state (gitignored)
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +46,36 @@ pub struct Workspace {
     pub root: PathBuf,
 }
 
+/// Opens the workspace (`dir`, else `APITOOL_WORKSPACE`, else `workspace/` next to the exe:
+/// portable, so the tool can sit in a user folder on a VDI without installation) and makes
+/// it the working directory, so relative paths in requests (.proto, data files) keep
+/// working after a git clone on another machine.
+pub fn open_workspace(dir: Option<PathBuf>) -> Result<Workspace, String> {
+    let dir = dir
+        .or_else(|| std::env::var_os("APITOOL_WORKSPACE").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            let exe = std::env::current_exe().unwrap_or_default();
+            exe.parent().unwrap_or(Path::new(".")).join("workspace")
+        });
+    // Absolute before changing directory, or a relative root would point elsewhere after.
+    let dir = std::path::absolute(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let ws = Workspace::open(dir)?;
+    std::env::set_current_dir(&ws.root)
+        .map_err(|e| format!("cannot enter workspace {}: {e}", ws.root.display()))?;
+    Ok(ws)
+}
+
+/// Request files under `scope` (a folder or a single request), in tree order.
+pub fn requests_in(nodes: &[Node], scope: &Path, out: &mut Vec<PathBuf>) {
+    for node in nodes {
+        match node {
+            Node::Folder { children, .. } => requests_in(children, scope, out),
+            Node::Request { path, .. } if path.starts_with(scope) => out.push(path.clone()),
+            Node::Request { .. } => {}
+        }
+    }
+}
+
 impl Workspace {
     pub fn open(root: PathBuf) -> Result<Self, String> {
         let ws = Self { root };
@@ -64,6 +95,23 @@ impl Workspace {
 
     fn environments(&self) -> PathBuf {
         self.root.join("environments")
+    }
+
+    /// "folder/request" as shown in runner results.
+    pub fn display_name(&self, path: &Path) -> String {
+        let rel = path.strip_prefix(self.collections()).unwrap_or(path);
+        rel.with_extension("").to_string_lossy().replace('\\', "/")
+    }
+
+    /// Enabled variables of an environment; secret values override shared ones.
+    pub fn env_vars(&self, name: &str) -> HashMap<String, String> {
+        let (shared, secret) = self.load_env(name);
+        shared
+            .into_iter()
+            .chain(secret)
+            .filter(|kv| kv.enabled)
+            .map(|kv| (kv.key, kv.value))
+            .collect()
     }
 
     pub fn tree(&self) -> Vec<Node> {

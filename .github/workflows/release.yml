@@ -48,9 +48,9 @@ jobs:
           dir="target/${{ matrix.target }}/release"
           mkdir dist
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            7z a "dist/$name.zip" "./$dir/apitool.exe"
+            7z a "dist/$name.zip" "./$dir/apitool.exe" "./$dir/apitool-cli.exe"
           else
-            tar -C "$dir" -czf "dist/$name.tar.gz" apitool
+            tar -C "$dir" -czf "dist/$name.tar.gz" apitool apitool-cli
           fi
       - uses: actions/upload-artifact@v7
         with:

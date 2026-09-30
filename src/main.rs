@@ -1,22 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod grpc;
-mod http;
-mod loadtest;
-mod model;
-mod net;
-mod runner;
-mod script;
-mod store;
-mod stream;
-
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui;
 use eframe::egui_wgpu::WgpuSetup;
 use eframe::wgpu;
+
+use apitool::{app, store};
 
 fn main() -> eframe::Result {
     let use_glow = std::env::args().any(|a| a == "--glow");
@@ -51,19 +41,13 @@ fn main() -> eframe::Result {
         });
     }
 
-    let ws = match store::Workspace::open(workspace_dir()) {
+    let ws = match store::open_workspace(None) {
         Ok(ws) => ws,
         Err(e) => {
             eprintln!("cannot open workspace: {e}");
             std::process::exit(1);
         }
     };
-    // Relative paths in requests (.proto files, data files) then resolve inside the
-    // workspace, so they keep working after a git clone on another machine.
-    if let Err(e) = std::env::set_current_dir(&ws.root) {
-        eprintln!("cannot enter workspace {}: {e}", ws.root.display());
-        std::process::exit(1);
-    }
     eframe::run_native(
         "apitool",
         options,
@@ -75,20 +59,6 @@ fn main() -> eframe::Result {
             )))
         }),
     )
-}
-
-/// Portable by default: the workspace lives next to the exe, so the whole tool can sit
-/// in a user folder on a VDI without installation. `APITOOL_WORKSPACE` points elsewhere
-/// (e.g. an existing git clone).
-fn workspace_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("APITOOL_WORKSPACE") {
-        // Absolute because main changes the working directory to the workspace.
-        return std::path::absolute(dir).unwrap_or_default();
-    }
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(PathBuf::from));
-    exe_dir.unwrap_or_default().join("workspace")
 }
 
 fn renderer_info(cc: &eframe::CreationContext<'_>) -> String {
