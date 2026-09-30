@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            check: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            check: true
+          # Cross-built on the arm runner; tests already ran natively above.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            check: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Clippy
+        if: matrix.check
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        if: matrix.check
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="apitool-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          dir="target/${{ matrix.target }}/release"
+          mkdir dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a "dist/$name.zip" "./$dir/apitool.exe"
+          else
+            tar -C "$dir" -czf "dist/$name.tar.gz" apitool
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
