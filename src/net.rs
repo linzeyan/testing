@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -62,7 +62,16 @@ pub struct Clients {
     pub grpc: reqwest::Client,
 }
 
+/// With a fresh cookie jar for this client's lifetime (a CLI run, an MCP session).
 pub async fn build_client(net: Network) -> Result<Clients, String> {
+    build_client_with_jar(net, Default::default()).await
+}
+
+/// With a jar that outlives the client: the GUI keeps cookies across network changes.
+pub async fn build_client_with_jar(
+    net: Network,
+    jar: Arc<crate::cookies::Jar>,
+) -> Result<Clients, String> {
     // reqwest is built with `rustls-no-provider` (ring cross-compiles to Windows with just
     // clang; aws-lc-rs needs cmake/nasm). Installing is idempotent, and doing it here covers
     // every client, including the PAC fetcher below.
@@ -103,6 +112,7 @@ pub async fn build_client(net: Network) -> Result<Clients, String> {
 
     let build = |h2_only: bool| {
         let mut b = reqwest::Client::builder()
+            .cookie_provider(jar.clone())
             .timeout(Duration::from_secs(net.timeout_secs.max(1)))
             .tls_danger_accept_invalid_certs(net.insecure);
         if net.proxy == ProxyMode::None {

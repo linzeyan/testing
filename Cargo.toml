@@ -17,7 +17,7 @@ p12-keystore = "0.3"
 prost = "0.14.4"
 prost-reflect = { version = "0.16.5", features = ["serde"] }
 protox = "0.9.1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "charset", "gzip", "query", "form", "multipart", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "charset", "gzip", "query", "form", "multipart", "stream", "cookies"] }
 reqwest-websocket = "0.6"
 rquickjs = { version = "0.14", features = ["parallel"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -29,6 +29,8 @@ mime_guess = { version = "2", default-features = false }
 # Digest auth. sha2 is already in the tree (p12-keystore); md-5 shares its digest crate.
 md-5 = "0.11"
 sha2 = "0.11"
+# reqwest's own cookie store; used directly to list, delete and persist cookies.
+cookie_store = "0.22"
 toml = "1"
 
 [target."cfg(windows)".dependencies]

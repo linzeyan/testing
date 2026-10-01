@@ -5,6 +5,7 @@
 //!   globals.toml, globals.secret.toml  workspace-wide variables, same split
 //!   .state.toml                   per-machine UI state (gitignored)
 //!   .history.jsonl                requests sent from the app (gitignored)
+//!   .cookies.json                 the app's cookie jar (gitignored)
 
 use std::collections::HashMap;
 use std::fs;
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{KeyValue, Request};
 
-const GITIGNORE: &str = "*.secret.toml\n.state.toml\n.history.jsonl\n*.tmp\n";
+const GITIGNORE: &str = "*.secret.toml\n.state.toml\n.history.jsonl\n.cookies.json\n*.tmp\n";
 const SECRET_SUFFIX: &str = ".secret";
 const HISTORY: &str = ".history.jsonl";
 pub const MAX_HISTORY: usize = 200;
@@ -183,6 +184,10 @@ impl Workspace {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("history: {e}")),
             _ => Ok(()),
         }
+    }
+
+    pub fn cookies_path(&self) -> PathBuf {
+        self.root.join(".cookies.json")
     }
 
     pub fn collections(&self) -> PathBuf {

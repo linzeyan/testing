@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
+use crate::cookies::Jar;
 use crate::graphql::{self, Operation};
 use crate::http;
 use crate::loadtest::{self, Stats};
@@ -260,6 +261,9 @@ pub struct App {
     /// Oldest first.
     history: Vec<HistoryEntry>,
     show_history: bool,
+    /// Outlives client rebuilds; saved to the workspace after responses.
+    cookies: Arc<Jar>,
+    cookie_manager: bool,
     active_env: Option<String>,
     vars: HashMap<String, String>,
     /// Workspace-wide variables (globals.toml + globals.secret.toml), below any environment.
@@ -302,6 +306,8 @@ impl App {
             envs: ws.env_names(),
             history: ws.load_history(),
             show_history: false,
+            cookies: Arc::new(Jar::load(&ws.cookies_path())),
+            cookie_manager: false,
             ws,
             active_env: None,
             vars: HashMap::new(),
@@ -360,12 +366,15 @@ impl App {
         // Build right away so a bad proxy/PAC/cert shows up now, not on the next Send.
         let (cell, net, tx, ctx) = (
             self.client.clone(),
-            self.network.clone(),
+            (self.network.clone(), self.cookies.clone()),
             self.tx.clone(),
             ctx.clone(),
         );
         self.rt.spawn(async move {
-            let msg = match cell.get_or_init(|| net::build_client(net)).await {
+            let msg = match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
                 Ok(_) => "Network settings applied".to_owned(),
                 Err(e) => format!("Network settings: {e}"),
             };
@@ -487,6 +496,12 @@ impl App {
         }
     }
 
+    fn save_cookies(&mut self) {
+        if let Err(e) = self.cookies.save(&self.ws.cookies_path()) {
+            self.status = e;
+        }
+    }
+
     fn record_history(&mut self, sent: Pending, outcome: &Outcome) {
         let (status, elapsed) = match &outcome.response {
             Ok(r) => (r.status, r.elapsed),
@@ -564,7 +579,10 @@ impl App {
         if self.pending.is_some() {
             return;
         }
-        let (cell, net) = (self.client.clone(), self.network.clone());
+        let (cell, net) = (
+            self.client.clone(),
+            (self.network.clone(), self.cookies.clone()),
+        );
         let vars = Vars {
             env: self.vars.clone(),
             globals: self.globals.clone(),
@@ -579,7 +597,10 @@ impl App {
             ctx.clone(),
         );
         let task = self.rt.spawn(async move {
-            let outcome = match cell.get_or_init(|| net::build_client(net)).await {
+            let outcome = match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
                 Ok(client) => {
                     runner::run(client.clone(), &runner::Info::single(name), req, vars).await
                 }
@@ -606,7 +627,7 @@ impl App {
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cell, net, tx, ctx) = (
             self.client.clone(),
-            self.network.clone(),
+            (self.network.clone(), self.cookies.clone()),
             self.tx.clone(),
             ctx.clone(),
         );
@@ -615,7 +636,10 @@ impl App {
                 let _ = tx.send(Msg::Stream(id, e));
                 ctx.request_repaint();
             };
-            match cell.get_or_init(|| net::build_client(net)).await {
+            match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
                 Ok(client) if is_ws => {
                     stream::websocket(client.http.clone(), req, out_rx, emit).await
                 }
@@ -678,6 +702,7 @@ impl App {
                 Msg::RunDone(id, env, globals) => {
                     // Persist chained variables even if the runner pane was closed meanwhile.
                     self.apply_changes(env, globals);
+                    self.save_cookies();
                     if let Some(run) = self
                         .runner
                         .as_mut()
@@ -715,6 +740,7 @@ impl App {
             }
             // Variable writes apply even if the user switched away meanwhile.
             self.apply_changes(outcome.env, outcome.globals);
+            self.save_cookies();
             if !outcome.tests.is_empty() {
                 let passed = outcome.tests.iter().filter(|t| t.passed).count();
                 self.status = format!("Tests: {passed}/{} passed", outcome.tests.len());
@@ -887,6 +913,7 @@ impl eframe::App for App {
         self.dialog_ui(ui.ctx());
         self.env_editor_ui(ui.ctx());
         self.quick_look_ui(ui.ctx());
+        self.cookie_manager_ui(ui.ctx());
         if let Some(id) = self.focus_request.take() {
             ui.memory_mut(|m| m.request_focus(id));
         }
@@ -1168,6 +1195,8 @@ impl App {
                                 .selectable_label(self.load.is_some(), "⚡ Load test")
                                 .clicked();
                         }
+                        ui.toggle_value(&mut self.cookie_manager, "Cookies")
+                            .on_hover_text("Cookies the server set, sent back automatically");
                         // curl can't speak gRPC or WebSocket; a command for those would lie.
                         if !matches!(open.draft.method.as_str(), "GRPC" | "WS")
                             && ui
@@ -1456,13 +1485,16 @@ impl App {
         self.explorer.loading = true;
         let (cell, net, tx, ctx) = (
             self.client.clone(),
-            self.network.clone(),
+            (self.network.clone(), self.cookies.clone()),
             self.tx.clone(),
             ctx.clone(),
         );
         self.rt.spawn(async move {
             let url = req.url.clone();
-            let result = match cell.get_or_init(|| net::build_client(net)).await {
+            let result = match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
                 Ok(client) => match runner::send(client, req).await {
                     Ok(r) if (200..300).contains(&r.status) => graphql::parse(&r.body),
                     Ok(r) => Err(format!(
@@ -1490,13 +1522,16 @@ impl App {
         let (vus, secs) = (view.vus, view.secs);
         let (cell, net, tx, s) = (
             self.client.clone(),
-            self.network.clone(),
+            (self.network.clone(), self.cookies.clone()),
             self.tx.clone(),
             stats.clone(),
         );
         let ctx = ctx.clone();
         let task = self.rt.spawn(async move {
-            match cell.get_or_init(|| net::build_client(net)).await {
+            match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
                 Ok(client) => {
                     loadtest::run(client.clone(), req, vus, Duration::from_secs(secs), s).await
                 }
@@ -1735,6 +1770,54 @@ impl App {
         }
     }
 
+    fn cookie_manager_ui(&mut self, ctx: &egui::Context) {
+        if !self.cookie_manager {
+            return;
+        }
+        let rows = self.cookies.rows();
+        let (mut open, mut remove, mut clear) = (true, None, false);
+        egui::Window::new("Cookies")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                if rows.is_empty() {
+                    ui.weak("No cookies yet. Set-Cookie responses fill the jar.");
+                    return;
+                }
+                ui.weak("Sent back to matching URLs, unless a request sets its own Cookie header.");
+                egui::ScrollArea::vertical()
+                    .max_height(400.0)
+                    .show(ui, |ui| {
+                        let mut domain = "";
+                        for (i, r) in rows.iter().enumerate() {
+                            if r.domain != domain {
+                                ui.strong(&r.domain);
+                                domain = &r.domain;
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button("🗑").on_hover_text("Delete").clicked() {
+                                    remove = Some(i);
+                                }
+                                ui.monospace(format!("{}={}", r.name, clip(&r.value, 60)));
+                                let expires = r.expires.as_deref().unwrap_or("session");
+                                ui.weak(format!("{} · {expires}", r.path));
+                            });
+                        }
+                    });
+                clear = ui.button("Clear all").clicked();
+            });
+        if let Some(i) = remove {
+            self.cookies.remove(&rows[i]);
+        }
+        if clear {
+            self.cookies.clear();
+        }
+        if remove.is_some() || clear {
+            self.save_cookies();
+        }
+        self.cookie_manager = open;
+    }
+
     /// Every variable `{{name}}` can resolve to right now, and where it comes from.
     fn quick_look_ui(&mut self, ctx: &egui::Context) {
         if !self.quick_look {
@@ -1883,7 +1966,10 @@ impl App {
 
         self.next_run_id += 1;
         let id = self.next_run_id;
-        let (cell, net) = (self.client.clone(), self.network.clone());
+        let (cell, net) = (
+            self.client.clone(),
+            (self.network.clone(), self.cookies.clone()),
+        );
         let vars = Vars {
             env: self.vars.clone(),
             globals: self.globals.clone(),
@@ -1891,7 +1977,10 @@ impl App {
         };
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         let task = self.rt.spawn(async move {
-            let client = match cell.get_or_init(|| net::build_client(net)).await {
+            let client = match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
                 Ok(c) => c.clone(),
                 Err(e) => {
                     let _ = tx.send(Msg::Status(format!("Network settings: {e}")));
@@ -3543,6 +3632,51 @@ mod ui_tests {
         h.get_by_label("Discard").click(); // the unsaved "/later" edit
         h.run();
         assert_eq!(draft(&h).url, sent);
+    }
+
+    #[test]
+    fn cookies_from_a_login_are_sent_back_and_can_be_deleted() {
+        let addr = crate::http::tests::serve(|req| match req.starts_with("GET /login ") {
+            true => ("200 OK\r\nset-cookie: sid=abc; Path=/".into(), "ok".into()),
+            false => ("200 OK\r\ncontent-type: text/plain".into(), req.to_owned()),
+        });
+        let mut h = with_request("cookies");
+        let send = |h: &mut Harness<'_, App>, path: &str| {
+            h.state_mut().open.as_mut().unwrap().draft.url = format!("http://{addr}{path}");
+            h.state_mut().response = None;
+            h.get_by_label("Send").click();
+            wait(h, |app| app.response.is_some());
+        };
+        send(&mut h, "/login");
+        send(&mut h, "/me");
+        let shown = h
+            .state()
+            .response
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap();
+        assert!(
+            shown.text.contains("\r\ncookie: sid=abc\r\n"),
+            "{}",
+            shown.text
+        );
+        // Survives a restart.
+        let saved = std::fs::read_to_string(h.state().ws.cookies_path()).unwrap();
+        assert!(saved.contains("sid"), "{saved}");
+
+        h.get_by_label("Cookies").click();
+        h.run();
+        h.get_by_label("sid=abc");
+        h.get_by_label("🗑").click();
+        h.run();
+        assert!(h.state().cookies.rows().is_empty());
+        assert!(
+            !std::fs::read_to_string(h.state().ws.cookies_path())
+                .unwrap()
+                .contains("sid")
+        );
     }
 
     /// As if the open request had just been sent and answered 200 with this body.

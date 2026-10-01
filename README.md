@@ -8,7 +8,8 @@ such as Citrix VDI. No installer: unzip and run.
   CSV/JSON data; load test pane; proxy/PAC, custom CA and client certificates.
   JSON, text, form and multipart bodies (a value `@path` uploads a file); paste a curl
   command into the URL bar to import it, "Copy as curl" to export; find in response
-  (Ctrl+F); saved response examples; request history.
+  (Ctrl+F); saved response examples; request history; Bearer, Basic, Digest and OAuth 2.0
+  (client credentials, password) auth; a cookie jar like a browser's, with a manager.
 - **apitool-cli** — headless runner for CI:
   `apitool-cli <collection|folder|request.toml> [-e env] [-d data.csv] [-n N] [--junit report.xml]`,
   exit code 0 = all passed, 1 = failures, 2 = could not run.
@@ -24,4 +25,5 @@ such as Citrix VDI. No installer: unzip and run.
   The GUI re-reads the workspace when its window regains focus.
 
 The workspace (`workspace/` next to the executable, or `$APITOOL_WORKSPACE`) is plain TOML
-meant to be a git repo; `*.secret.toml`, `.state.toml` and `.history.jsonl` stay local.
+meant to be a git repo; `*.secret.toml`, `.state.toml`, `.history.jsonl` and `.cookies.json`
+stay local.

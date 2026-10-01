@@ -3,6 +3,7 @@
 pub mod app;
 mod auth;
 pub mod cli;
+mod cookies;
 mod curl;
 mod graphql;
 mod grpc;
