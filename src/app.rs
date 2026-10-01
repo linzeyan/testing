@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
+use crate::graphql::{self, Operation};
 use crate::http;
 use crate::loadtest::{self, Stats};
 use crate::model::{self, Auth, Body, KeyValue, METHODS, Request};
@@ -29,6 +30,8 @@ enum Msg {
     RunItem(u64, RunItem),
     RunDone(u64, Changes, Changes),
     Stream(u64, Event),
+    /// GraphQL introspection result for the URL it was fetched from.
+    Schema(String, Result<graphql::Schema, String>),
 }
 
 /// Stream events kept per session; older ones scroll away so a chatty socket can't grow RAM.
@@ -120,6 +123,16 @@ impl Drop for LoadView {
             a.abort();
         }
     }
+}
+
+/// GraphQL schema explorer: one schema at a time, remembered across requests because
+/// requests to the same API share it.
+#[derive(Default)]
+struct Explorer {
+    url: String,
+    schema: Option<Result<graphql::Schema, String>>,
+    loading: bool,
+    filter: String,
 }
 
 struct ResponseView {
@@ -232,6 +245,7 @@ pub struct App {
     stream: Option<StreamSession>,
     /// Methods of the last `.proto` the gRPC picker looked at; recompiled only on change.
     grpc_methods: Option<(String, Result<Vec<String>, String>)>,
+    explorer: Explorer,
     load: Option<LoadView>,
     status: String,
     dialog: Option<Dialog>,
@@ -269,6 +283,7 @@ impl App {
             pending: None,
             stream: None,
             grpc_methods: None,
+            explorer: Explorer::default(),
             load: None,
             status: String::new(),
             dialog: None,
@@ -554,6 +569,13 @@ impl App {
                         .filter(|r| r.id == id)
                     {
                         run.finished = Some(run.started.elapsed());
+                    }
+                    continue;
+                }
+                Msg::Schema(url, result) => {
+                    if self.explorer.url == url {
+                        self.explorer.schema = Some(result);
+                        self.explorer.loading = false;
                     }
                     continue;
                 }
@@ -901,6 +923,7 @@ impl App {
         let (mut send, mut save, mut cancel) = (false, false, false);
         let (mut toggle_load, mut start_load) = (false, false);
         let mut define: Option<Vec<String>> = None;
+        let mut fetch_schema = false;
         let pending = self.pending.as_ref().filter(|p| p.path == open.path);
         let streaming = model::is_streaming(&open.draft.method);
         let session = self.stream.as_mut().filter(|s| s.path == open.path);
@@ -943,6 +966,16 @@ impl App {
                                 ui.selectable_value(&mut open.draft.method, (*m).to_owned(), text);
                             }
                         });
+                    // GRAPHQL is a POST whose body is always a query; open the query editor.
+                    if open.draft.method == "GRAPHQL"
+                        && !matches!(open.draft.body, Body::GraphQL { .. })
+                    {
+                        open.draft.body = Body::GraphQL {
+                            query: String::new(),
+                            variables: String::new(),
+                        };
+                        self.req_tab = ReqTab::Body;
+                    }
                     let button = [80.0, 22.0];
                     let width = ui.available_width() - button[0] - 8.0;
                     let url = var_edit(
@@ -1025,7 +1058,11 @@ impl App {
                     ui.selectable_value(
                         &mut self.req_tab,
                         ReqTab::Body,
-                        dot(matches!(open.draft.body, Body::None), "Body"),
+                        if open.draft.method == "GRAPHQL" {
+                            "Query".to_owned()
+                        } else {
+                            dot(matches!(open.draft.body, Body::None), "Body")
+                        },
                     );
                     ui.selectable_value(
                         &mut self.req_tab,
@@ -1052,7 +1089,27 @@ impl App {
                         ReqTab::Headers => {
                             kv_table(ui, "headers", &mut open.draft.headers, &all_vars);
                         }
-                        ReqTab::Body => body_editor(ui, &mut open.draft.body, &all_vars),
+                        ReqTab::Body => {
+                            // GRAPHQL requests are always a query; no body type to pick.
+                            if open.draft.method == "GRAPHQL"
+                                && let Body::GraphQL { query, variables } = &mut open.draft.body
+                            {
+                                fetch_schema |= graphql_editor(
+                                    ui,
+                                    query,
+                                    variables,
+                                    &all_vars,
+                                    &mut self.explorer,
+                                );
+                                return;
+                            }
+                            fetch_schema |= body_editor(
+                                ui,
+                                &mut open.draft.body,
+                                &all_vars,
+                                &mut self.explorer,
+                            );
+                        }
                         ReqTab::Auth => auth_editor(ui, &mut open.draft.auth, &all_vars),
                         ReqTab::Scripts => {
                             scripts_editor(ui, &mut self.script_tab, &mut open.draft)
@@ -1103,6 +1160,9 @@ impl App {
         if send {
             self.send(ui.ctx());
         }
+        if fetch_schema {
+            self.fetch_schema(ui.ctx());
+        }
         if let Some(names) = define {
             self.open_env_editor(self.active_env.clone(), &names);
         }
@@ -1120,6 +1180,45 @@ impl App {
         if start_load {
             self.start_load(ui.ctx());
         }
+    }
+
+    /// Introspects the open request's endpoint with its own headers and auth.
+    fn fetch_schema(&mut self, ctx: &egui::Context) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let (mut req, _) = open.draft.resolved(&self.all_vars());
+        req.method = "POST".into();
+        req.body = Body::GraphQL {
+            query: graphql::INTROSPECTION.into(),
+            variables: String::new(),
+        };
+        self.explorer.url = req.url.clone();
+        self.explorer.loading = true;
+        let (cell, net, tx, ctx) = (
+            self.client.clone(),
+            self.network.clone(),
+            self.tx.clone(),
+            ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let url = req.url.clone();
+            let result = match cell.get_or_init(|| net::build_client(net)).await {
+                Ok(client) => match runner::send(client, req).await {
+                    Ok(r) if (200..300).contains(&r.status) => graphql::parse(&r.body),
+                    Ok(r) => Err(format!(
+                        "HTTP {} {}\n{}",
+                        r.status,
+                        r.reason,
+                        clip(&r.body, 300)
+                    )),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(format!("Network settings: {e}")),
+            };
+            let _ = tx.send(Msg::Schema(url, result));
+            ctx.request_repaint();
+        });
     }
 
     /// Variables are resolved once up front: every virtual user sends the identical request.
@@ -1926,7 +2025,13 @@ fn kv_table(
     *rows != before
 }
 
-fn body_editor(ui: &mut egui::Ui, body: &mut Body, vars: &HashMap<String, String>) {
+/// Returns true when the GraphQL explorer asked to fetch the schema.
+fn body_editor(
+    ui: &mut egui::Ui,
+    body: &mut Body,
+    vars: &HashMap<String, String>,
+    explorer: &mut Explorer,
+) -> bool {
     ui.horizontal(|ui| {
         // ponytail: switching to None/Form drops the text; keep a per-mode stash if that bites.
         // JSON <-> Text keeps the text, since that switch is usually a content-type correction.
@@ -1985,31 +2090,159 @@ fn body_editor(ui: &mut egui::Ui, body: &mut Body, vars: &HashMap<String, String
             kv_table(ui, "form", fields, vars);
         }
         Body::GraphQL { query, variables } => {
-            ui.label("Query");
-            ui.add(
-                egui::TextEdit::multiline(query)
-                    .code_editor()
-                    .hint_text("query ($id: ID!) {\n  user(id: $id) { name }\n}")
-                    .desired_rows(10)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.horizontal(|ui| {
-                ui.label("Variables (JSON)");
-                if !variables.trim().is_empty()
-                    && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(variables)
-                {
-                    ui.colored_label(ORANGE, format!("Not valid JSON: {e}"));
-                }
-            });
-            ui.add(
-                egui::TextEdit::multiline(variables)
-                    .code_editor()
-                    .hint_text("{ \"id\": \"{{userId}}\" }")
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY),
-            );
+            return graphql_editor(ui, query, variables, vars, explorer);
         }
     }
+    false
+}
+
+/// Query and variables on the left, schema explorer on the right. Returns true when
+/// the user asked to fetch the schema.
+fn graphql_editor(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    variables: &mut String,
+    vars: &HashMap<String, String>,
+    ex: &mut Explorer,
+) -> bool {
+    let mut fetch = false;
+    let mut insert = None;
+    ui.columns(2, |cols| {
+        let ui = &mut cols[0];
+        ui.label("Query");
+        var_edit(
+            ui,
+            egui::Id::new("gql-query"),
+            query,
+            vars,
+            egui::TextStyle::Monospace,
+            true,
+            |e| {
+                e.code_editor()
+                    .hint_text("Fetch the schema and click a field →\nor type a query here.")
+                    .desired_rows(8)
+                    .desired_width(f32::INFINITY)
+            },
+        );
+        ui.horizontal(|ui| {
+            ui.label("Variables (JSON)");
+            if !variables.trim().is_empty()
+                && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(variables)
+            {
+                ui.colored_label(ORANGE, format!("Not valid JSON: {e}"));
+            }
+        });
+        var_edit(
+            ui,
+            egui::Id::new("gql-variables"),
+            variables,
+            vars,
+            egui::TextStyle::Monospace,
+            true,
+            |e| {
+                e.code_editor()
+                    .hint_text("{ \"id\": \"{{userId}}\" }")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+            },
+        );
+
+        let ui = &mut cols[1];
+        ui.horizontal(|ui| {
+            ui.strong("Schema");
+            if ex.loading {
+                ui.spinner();
+            } else {
+                let label = if ex.schema.is_some() {
+                    "Refresh"
+                } else {
+                    "Fetch schema"
+                };
+                fetch = ui
+                    .small_button(label)
+                    .on_hover_text("Introspect using this request's URL, headers and auth")
+                    .clicked();
+            }
+        });
+        match &ex.schema {
+            None => {
+                ui.weak("Fetch the schema to browse its queries and mutations.");
+            }
+            Some(Err(e)) => {
+                ui.colored_label(RED, e.as_str());
+            }
+            Some(Ok(schema)) => {
+                ui.weak(format!("from {}", ex.url));
+                ui.add(
+                    egui::TextEdit::singleline(&mut ex.filter)
+                        .hint_text("Filter fields")
+                        .desired_width(f32::INFINITY),
+                );
+                let filter = ex.filter.to_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt("gql-schema")
+                    .show(ui, |ui| {
+                        for (title, op, fields) in [
+                            ("Query", Operation::Query, &schema.query),
+                            ("Mutation", Operation::Mutation, &schema.mutation),
+                        ] {
+                            if fields.is_empty() {
+                                continue;
+                            }
+                            egui::CollapsingHeader::new(format!("{title} ({})", fields.len()))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for f in fields
+                                        .iter()
+                                        .filter(|f| f.name.to_lowercase().contains(&filter))
+                                    {
+                                        let args: Vec<_> = f
+                                            .args
+                                            .iter()
+                                            .map(|(n, t)| format!("{n}: {t}"))
+                                            .collect();
+                                        let args = if args.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!("({})", args.join(", "))
+                                        };
+                                        let label = format!("{}{args}: {}", f.name, f.ty);
+                                        let mut hover = f.description.clone();
+                                        if !hover.is_empty() {
+                                            hover.push_str("\n\n");
+                                        }
+                                        hover.push_str(
+                                            "Click to replace the query with this field.",
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::Label::new(RichText::new(label).monospace())
+                                                    .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_text(hover)
+                                            .clicked()
+                                        {
+                                            insert = Some((op, f.clone()));
+                                        }
+                                    }
+                                });
+                        }
+                    });
+            }
+        }
+    });
+    if let Some((op, field)) = insert
+        && let Some(Ok(schema)) = &ex.schema
+    {
+        let (text, vars) = schema.operation(op, &field);
+        *query = text;
+        *variables = if vars.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string_pretty(&serde_json::Value::Object(vars)).unwrap_or_default()
+        };
+    }
+    fetch
 }
 
 fn code_editor(ui: &mut egui::Ui, id: &str, text: &mut String, vars: &HashMap<String, String>) {
@@ -2583,6 +2816,7 @@ fn short_method(m: &str) -> &str {
     match m {
         "DELETE" => "DEL",
         "OPTIONS" => "OPT",
+        "GRAPHQL" => "GQL",
         m => m,
     }
 }
@@ -2594,6 +2828,7 @@ fn method_color(m: &str) -> Color32 {
         "PUT" => Color32::from_rgb(70, 140, 230),
         "PATCH" => Color32::from_rgb(170, 110, 220),
         "DELETE" => RED,
+        "GRAPHQL" => Color32::from_rgb(229, 53, 171),
         _ => Color32::GRAY,
     }
 }
@@ -2810,6 +3045,33 @@ mod ui_tests {
             h.query_by_label("127.0.0.1:1").is_some(),
             "env vars listed too"
         );
+    }
+
+    #[test]
+    fn graphql_schema_explorer_writes_the_query() {
+        let mut h = with_request("gql");
+        h.get_by_value("GET").click();
+        h.run();
+        h.get_by_label("GRAPHQL").click();
+        h.run();
+        assert!(matches!(draft(&h).body, Body::GraphQL { .. }));
+        assert!(
+            h.query_by_label("Body").is_none(),
+            "the Body tab reads Query"
+        );
+        let url = crate::http::tests::json_server(crate::graphql::tests::sample());
+        type_into(&mut h, 0, &url);
+        h.get_by_label("Fetch schema").click();
+        wait(&mut h, |app| !app.explorer.loading);
+        shot(&mut h, "30-graphql-schema");
+        h.get_by_label("user(id: ID!): User").click();
+        h.run();
+        shot(&mut h, "31-graphql-inserted");
+        let Body::GraphQL { query, variables } = &draft(&h).body else {
+            panic!("body changed type")
+        };
+        assert!(query.starts_with("query User($id: ID!) {"), "{query}");
+        assert_eq!(variables, "{\n  \"id\": null\n}");
     }
 
     /// The request editor has its own Save; the modal's is drawn last.

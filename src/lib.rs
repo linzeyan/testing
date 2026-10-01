@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod cli;
+mod graphql;
 mod grpc;
 mod http;
 mod loadtest;

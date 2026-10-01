@@ -26,7 +26,7 @@ impl Response {
 pub fn wire_method(method: &str) -> Result<reqwest::Method, String> {
     match method.trim().to_uppercase().as_str() {
         "WS" | "SSE" => Ok(reqwest::Method::GET),
-        "GRPC" => Ok(reqwest::Method::POST),
+        "GRPC" | "GRAPHQL" => Ok(reqwest::Method::POST),
         m => reqwest::Method::from_bytes(m.as_bytes())
             .map_err(|_| format!("invalid method \"{method}\"")),
     }
@@ -171,6 +171,25 @@ pub(crate) mod tests {
             }
         });
         format!("{addr}/users") // no scheme on purpose: must default to http
+    }
+
+    /// Server answering every request with the same JSON body.
+    pub(crate) fn json_server(body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = vec![0; 16 * 1024];
+                let _ = stream.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        format!("http://{addr}/graphql")
     }
 
     #[test]
