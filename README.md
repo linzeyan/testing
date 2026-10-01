@@ -5,7 +5,7 @@ such as Citrix VDI. No installer: unzip and run.
 
 - **apitool** — the GUI. REST, GraphQL, WebSocket, SSE and unary gRPC (runtime `.proto`);
   Postman-style pre-request/test scripts (`pm.*`, chai, `jsonSchema`); collection runner with
-  CSV/JSON data; load test pane; proxy/PAC, custom CA and client certificates.
+  CSV/JSON data; load test pane; proxy/PAC/WPAD, custom CA and client certificates.
   JSON, text, form and multipart bodies (a value `@path` uploads a file); paste a curl
   command into the URL bar to import it, "Copy as curl" to export; find in response
   (Ctrl+F); saved response examples; request history; Bearer, Basic, Digest and OAuth 2.0
