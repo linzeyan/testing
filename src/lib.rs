@@ -11,6 +11,7 @@ mod grpc;
 mod http;
 mod loadtest;
 mod mcp;
+mod mock;
 mod model;
 mod net;
 mod runner;

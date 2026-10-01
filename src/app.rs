@@ -152,6 +152,19 @@ impl Drop for StreamSession {
     }
 }
 
+/// Stops serving when dropped.
+struct MockServer {
+    url: String,
+    folder: String,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
 /// Load-test pane for the open request; replaces the response pane while shown.
 struct LoadView {
     vus: usize,
@@ -280,6 +293,7 @@ enum TreeAction {
     Run(PathBuf),
     FolderSettings(PathBuf),
     CopyDocs(PathBuf),
+    Mock(PathBuf),
 }
 
 /// Collection runner pane. Settings persist while the pane is open; results are summaries only.
@@ -319,6 +333,7 @@ pub struct App {
     /// Outlives client rebuilds; saved to the workspace after responses.
     cookies: Arc<Jar>,
     cookie_manager: bool,
+    mock: Option<MockServer>,
     active_env: Option<String>,
     vars: HashMap<String, String>,
     /// Workspace-wide variables (globals.toml + globals.secret.toml), below any environment.
@@ -366,6 +381,7 @@ impl App {
             show_history: false,
             cookies: Arc::new(Jar::load(&ws.cookies_path())),
             cookie_manager: false,
+            mock: None,
             ws,
             active_env: None,
             vars: HashMap::new(),
@@ -1188,6 +1204,28 @@ impl App {
                     self.network_editor = Some(self.network.clone());
                 }
                 ui.separator();
+                let mut stop_mock = false;
+                if let Some(m) = &self.mock {
+                    ui.colored_label(GREEN, "●");
+                    let hover = format!(
+                        "Answers with the saved examples of {}. Click to copy the URL.",
+                        m.folder
+                    );
+                    if ui
+                        .small_button(format!("Mock {}", m.url))
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(m.url.clone());
+                        self.status = "Copied the mock server URL".into();
+                    }
+                    stop_mock = ui.small_button("Stop").clicked();
+                    ui.separator();
+                }
+                if stop_mock {
+                    self.mock = None;
+                    self.status = "Mock server stopped".into();
+                }
                 if let Some(m) = memory_stats::memory_stats() {
                     ui.weak(format!("RAM {:.0} MB", mb(m.physical_mem)))
                         .on_hover_text(format!(
@@ -1291,13 +1329,18 @@ impl App {
             if ui.small_button("+ Folder").clicked() {
                 self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
             }
-            if ui
-                .small_button("Docs")
-                .on_hover_text("Copy Markdown docs for the whole collection")
-                .clicked()
-            {
-                self.copy_docs(&root, ui.ctx());
-            }
+            ui.menu_button("⋯", |ui| {
+                if ui.button("Copy docs as Markdown").clicked() {
+                    self.copy_docs(&root, ui.ctx());
+                    ui.close();
+                }
+                if ui.button("Start mock server").clicked() {
+                    self.start_mock(root.clone(), ui.ctx());
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("The whole collection");
             if ui
                 .small_button("▶ Run")
                 .on_hover_text("Run the whole collection")
@@ -1329,6 +1372,7 @@ impl App {
                 TreeAction::Run(path) => self.open_runner(path),
                 TreeAction::FolderSettings(dir) => self.open_folder_editor(dir),
                 TreeAction::CopyDocs(dir) => self.copy_docs(&dir, ui.ctx()),
+                TreeAction::Mock(dir) => self.start_mock(dir, ui.ctx()),
             }
         }
     }
@@ -1342,6 +1386,47 @@ impl App {
             }
             Err(e) => self.status = e,
         }
+    }
+
+    /// Port 3000 when free, so a frontend can keep one base URL across restarts.
+    fn start_mock(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        let requests = self.ws.load_requests_in(&dir).unwrap_or_default();
+        if !requests.iter().any(|(_, r)| !r.examples.is_empty()) {
+            self.status = "Nothing to mock yet: send a request, then \"Save as example\"".into();
+            return;
+        }
+        self.mock = None;
+        let bound = self.rt.block_on(async {
+            match tokio::net::TcpListener::bind("127.0.0.1:3000").await {
+                Ok(l) => Ok(l),
+                Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0").await,
+            }
+        });
+        let listener = match bound.and_then(|l| Ok((l.local_addr()?, l))) {
+            Ok(l) => l,
+            Err(e) => return self.status = format!("Mock server: {e}"),
+        };
+        let (addr, listener) = listener;
+        let folder = if dir == self.ws.collections() {
+            "the whole collection".to_owned()
+        } else {
+            store::folder_name(&self.ws.collections(), &dir)
+        };
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        let log = move |line: String| {
+            let _ = tx.send(Msg::Status(format!("Mock: {line}")));
+            ctx.request_repaint();
+        };
+        let task = self
+            .rt
+            .spawn(crate::mock::serve(self.ws.clone(), dir, listener, log));
+        let url = format!("http://{addr}");
+        self.status = format!("Mock server for {folder} at {url}");
+        self.mock = Some(MockServer {
+            url,
+            folder,
+            abort: task.abort_handle(),
+        });
     }
 
     fn history_ui(&mut self, ui: &mut egui::Ui) {
@@ -2786,6 +2871,10 @@ fn tree_ui(
                     }
                     if ui.button("Copy docs as Markdown").clicked() {
                         actions.push(TreeAction::CopyDocs(path.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Start mock server").clicked() {
+                        actions.push(TreeAction::Mock(path.clone()));
                         ui.close();
                     }
                     if ui.button("Run folder").clicked() {

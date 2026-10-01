@@ -23,7 +23,7 @@ rquickjs = { version = "0.14", features = ["parallel"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
-tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 # Already in the tree via reqwest's multipart; declared to type upload parts.
 mime_guess = { version = "2", default-features = false }
 # Digest auth. sha2 is already in the tree (p12-keystore); md-5 shares its digest crate.
@@ -42,5 +42,4 @@ egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
 h2 = "0.4.19"
 http = "1.5.0"
 rcgen = "0.14"
-tokio = { version = "1", features = ["net"] }
 tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }

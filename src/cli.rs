@@ -1,7 +1,7 @@
 //! Headless collection runner for CI and scheduled checks, like Postman's newman.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::runner::{self, RunPlan, Vars};
@@ -10,12 +10,14 @@ use crate::{net, store};
 const USAGE: &str = "usage: apitool-cli <collection|folder|request.toml> [options]
        apitool-cli mcp [--workspace <dir>]
        apitool-cli docs [collection|folder] [--workspace <dir>] [-o <file.md>]
+       apitool-cli mock [collection|folder] [--workspace <dir>] [--port <n>]
 
 Runs every request under the path (relative to the current directory, or to the
 workspace's collections/ folder) and exits with 1 if any request or test fails.
 
 `mcp` serves the workspace to an LLM client (Model Context Protocol over stdio).
 `docs` writes Markdown API docs (default: the whole collection, to stdout).
+`mock` answers HTTP calls with the saved examples (default port 3000, localhost only).
 
 options:
   --workspace <dir>      workspace (default: $APITOOL_WORKSPACE, else workspace/ next to the exe)
@@ -50,8 +52,10 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         crate::mcp::serve(ws, std::io::stdin().lock(), std::io::stdout().lock())?;
         return Ok(true);
     }
-    if args.first().map(String::as_str) == Some("docs") {
-        return docs(&args[1..]);
+    match args.first().map(String::as_str) {
+        Some("docs") => return docs(&args[1..]),
+        Some("mock") => return mock(&args[1..]),
+        _ => {}
     }
     let (mut target, mut workspace, mut env, mut data) = (None, None, None, None);
     let (mut iterations, mut delay, mut junit) = (1usize, 0u64, None);
@@ -83,12 +87,11 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         }
     }
     let target = target.ok_or_else(|| USAGE.to_owned())?;
-    // User paths are relative to where the command ran, so resolve them before
-    // open_workspace changes the working directory.
-    let absolute =
-        |p: &PathBuf| std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()));
-    let (target_abs, data) = (absolute(&target)?, data.as_ref().map(absolute).transpose()?);
-    let junit = junit.as_ref().map(absolute).transpose()?;
+    let (target_abs, data) = (
+        absolute(&target)?,
+        data.as_deref().map(absolute).transpose()?,
+    );
+    let junit = junit.as_deref().map(absolute).transpose()?;
 
     let ws = store::open_workspace(workspace)?;
     let requests = ws.load_requests_in(&scope(&ws, target_abs, &target))?;
@@ -162,7 +165,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
 }
 
 /// A path as given on the command line, or else inside the collections folder.
-fn scope(ws: &store::Workspace, absolute: PathBuf, given: &std::path::Path) -> PathBuf {
+fn scope(ws: &store::Workspace, absolute: PathBuf, given: &Path) -> PathBuf {
     if absolute.exists() {
         absolute
     } else {
@@ -170,32 +173,53 @@ fn scope(ws: &store::Workspace, absolute: PathBuf, given: &std::path::Path) -> P
     }
 }
 
-fn docs(args: &[String]) -> Result<bool, String> {
-    let (mut target, mut workspace, mut output) = (None, None, None);
+/// `[collection|folder]` plus `--option value` pairs, for `docs` and `mock`.
+fn folder_args(
+    args: &[String],
+    options: &[&str],
+) -> Result<(Option<PathBuf>, HashMap<String, String>), String> {
+    let (mut target, mut values) = (None, HashMap::new());
     let mut args = args.iter();
     while let Some(arg) = args.next() {
-        let mut value = || {
-            args.next()
-                .cloned()
-                .ok_or_else(|| format!("{arg} needs a value"))
-        };
-        match arg.as_str() {
-            "--workspace" => workspace = Some(PathBuf::from(value()?)),
-            "-o" | "--output" => output = Some(PathBuf::from(value()?)),
-            s if s.starts_with('-') => return Err(format!("unknown option {s}\n\n{USAGE}")),
-            _ if target.is_none() => target = Some(PathBuf::from(arg)),
-            _ => return Err(format!("unexpected argument {arg}")),
+        if options.contains(&arg.as_str()) {
+            let value = args.next().ok_or_else(|| format!("{arg} needs a value"))?;
+            values.insert(arg.clone(), value.clone());
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown option {arg}\n\n{USAGE}"));
+        } else if target.is_none() {
+            target = Some(PathBuf::from(arg));
+        } else {
+            return Err(format!("unexpected argument {arg}"));
         }
     }
-    let absolute =
-        |p: &PathBuf| std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()));
-    let output = output.as_ref().map(absolute).transpose()?;
-    let target_abs = target.as_ref().map(absolute).transpose()?;
-    let ws = store::open_workspace(workspace)?;
-    let dir = match (target_abs, &target) {
-        (Some(abs), Some(given)) => scope(&ws, abs, given),
+    Ok((target, values))
+}
+
+/// The workspace and the folder named on the command line (default: the whole
+/// collection). Make other relative paths absolute first: this changes directory.
+fn open_folder(
+    target: Option<PathBuf>,
+    values: &HashMap<String, String>,
+) -> Result<(store::Workspace, PathBuf), String> {
+    let target_abs = target.as_deref().map(absolute).transpose()?;
+    let ws = store::open_workspace(values.get("--workspace").map(PathBuf::from))?;
+    let dir = match (target_abs, target) {
+        (Some(abs), Some(given)) => scope(&ws, abs, &given),
         _ => ws.collections(),
     };
+    Ok((ws, dir))
+}
+
+/// User paths are relative to where the command ran; resolve them before
+/// `open_workspace` changes the working directory.
+fn absolute(p: &Path) -> Result<PathBuf, String> {
+    std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()))
+}
+
+fn docs(args: &[String]) -> Result<bool, String> {
+    let (target, values) = folder_args(args, &["--workspace", "-o"])?;
+    let output = values.get("-o").map(|p| absolute(p.as_ref())).transpose()?;
+    let (ws, dir) = open_folder(target, &values)?;
     let md = crate::docs::markdown(&ws, &dir)?;
     match output {
         Some(path) => {
@@ -204,6 +228,33 @@ fn docs(args: &[String]) -> Result<bool, String> {
         None => print!("{md}"),
     }
     Ok(true)
+}
+
+fn mock(args: &[String]) -> Result<bool, String> {
+    let (target, values) = folder_args(args, &["--workspace", "--port"])?;
+    let port: u16 = match values.get("--port") {
+        Some(p) => p.parse().map_err(|_| "--port needs a number".to_owned())?,
+        None => 3000,
+    };
+    let (ws, dir) = open_folder(target, &values)?;
+    let requests = ws.load_requests_in(&dir)?;
+    let mocked = requests
+        .iter()
+        .filter(|(_, r)| !r.examples.is_empty())
+        .count();
+    if mocked == 0 {
+        return Err("no saved examples to serve: send a request, then \"Save as example\"".into());
+    }
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .map_err(|e| format!("port {port}: {e}"))?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        println!("Mocking {mocked} requests at http://{addr} (Ctrl+C stops)");
+        crate::mock::serve(ws, dir, listener, |line| println!("{line}")).await;
+        Ok(true)
+    })
 }
 
 /// One `<testsuite>` per request run, one `<testcase>` per `pm.test`, like newman's

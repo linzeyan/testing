@@ -14,7 +14,9 @@ such as Citrix VDI. No installer: unzip and run.
   request inside, like Postman collection/folder settings; tabs (a click in the tree
   previews, double-click or editing keeps the tab, Ctrl+W closes); Markdown API docs from
   request/folder descriptions and saved examples (right-click a folder > "Copy docs as
-  Markdown", or `apitool-cli docs [folder] [-o api.md]`).
+  Markdown", or `apitool-cli docs [folder] [-o api.md]`); a local mock server answering
+  with saved examples (right-click a folder > "Start mock server", or
+  `apitool-cli mock [folder] [--port 3000]`; `x-mock-response-name`/`-code` pick one).
 - **apitool-cli** — headless runner for CI:
   `apitool-cli <collection|folder|request.toml> [-e env] [-d data.csv] [-n N] [--junit report.xml]`,
   exit code 0 = all passed, 1 = failures, 2 = could not run.

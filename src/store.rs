@@ -93,6 +93,7 @@ pub struct State {
     pub network: crate::net::Network,
 }
 
+#[derive(Clone)]
 pub struct Workspace {
     pub root: PathBuf,
 }
