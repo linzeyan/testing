@@ -6,9 +6,17 @@ use crate::model::{Auth, Body, KeyValue, Request};
 
 /// A curl command for an already-resolved request. Derived from `http::build`, so it
 /// carries exactly the headers, auth and body that Send would. POSIX shell quoting.
-pub fn to_curl(req: Request) -> Result<String, String> {
+pub fn to_curl(mut req: Request) -> Result<String, String> {
     // Client::new panics without a provider, and nothing may have been sent yet.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // A multipart body is a stream with a random boundary; curl builds its own from -F.
+    let parts = match std::mem::take(&mut req.body) {
+        Body::Multipart { parts } => parts,
+        body => {
+            req.body = body;
+            Vec::new()
+        }
+    };
     let wire = build(&reqwest::Client::new(), req)?
         .build()
         .map_err(|e| error_chain(&e))?;
@@ -29,6 +37,16 @@ pub fn to_curl(req: Request) -> Result<String, String> {
     if let Some(body) = wire.body().and_then(|b| b.as_bytes()) {
         let body = String::from_utf8_lossy(body);
         out.push_str(&format!(" \\\n  --data-raw {}", quote(&body)));
+    }
+    for p in parts.iter().filter(|p| p.enabled && !p.key.is_empty()) {
+        // --form-string sends text as is; -F would treat `;` and a leading `<` specially.
+        let flag = if p.value.starts_with('@') {
+            "-F"
+        } else {
+            "--form-string"
+        };
+        let part = quote(&format!("{}={}", p.key, p.value));
+        out.push_str(&format!(" \\\n  {flag} {part}"));
     }
     Ok(out)
 }
@@ -89,6 +107,7 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
     let mut req = Request::default();
     let (mut url, mut method, mut head, mut get) = (None, None, false, false);
     let mut data: Vec<String> = Vec::new();
+    let mut parts: Vec<KeyValue> = Vec::new();
     while let Some(word) = words.next() {
         // `-XPOST` → (`-X`, `POST`)
         let (flag, glued) = match word.strip_prefix('-') {
@@ -136,7 +155,17 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
                 });
             }
             "-F" | "--form" | "--form-string" => {
-                return Err("multipart forms (-F) aren't supported yet".into());
+                let v = value()?;
+                let (k, v) = v.split_once('=').unwrap_or((&v, ""));
+                let v = match (flag.as_str(), v.strip_prefix('@')) {
+                    ("--form-string", Some(_)) => {
+                        return Err("a form text value starting with @ isn't supported".into());
+                    }
+                    // `@file;type=image/png;filename=x`: the type is guessed from the name.
+                    (_, Some(file)) => format!("@{}", file.split(';').next().unwrap_or(file)),
+                    _ => v.to_owned(),
+                };
+                parts.push(KeyValue::new(k, v));
             }
             "-u" | "--user" => {
                 let v = value()?;
@@ -167,6 +196,16 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
         }
     }
     let url = url.ok_or("no URL in the curl command")?;
+    if !parts.is_empty() {
+        if !data.is_empty() {
+            return Err("-d and -F can't be combined".into());
+        }
+        req.url = url;
+        req.body = Body::Multipart { parts };
+        req.method = method.unwrap_or_else(|| "POST".into());
+        req.sync_params();
+        return Ok(req);
+    }
     let data = (!data.is_empty()).then(|| data.join("&"));
     req.url = match (&data, get) {
         (Some(d), true) => format!("{url}{}{d}", if url.contains('?') { '&' } else { '?' }),
@@ -456,5 +495,30 @@ mod tests {
                 .contains("paste")
         );
         assert!(from_curl("wget http://h").is_err());
+        // Multipart: files by path, text kept literally, and it round-trips.
+        let req = from_curl(
+            "curl http://h/up -F 'doc=@files/a b.pdf;type=application/pdf' --form-string 'note=x;y'",
+        )
+        .unwrap();
+        assert_eq!(req.method, "POST");
+        let parts = vec![
+            KeyValue::new("doc", "@files/a b.pdf"),
+            KeyValue::new("note", "x;y"),
+        ];
+        assert_eq!(
+            req.body,
+            Body::Multipart {
+                parts: parts.clone()
+            }
+        );
+        let exported = to_curl(req).unwrap();
+        assert_eq!(
+            exported,
+            "curl -X POST 'http://h/up' \\\n  -F 'doc=@files/a b.pdf' \\\n  --form-string 'note=x;y'"
+        );
+        assert_eq!(
+            from_curl(&exported).unwrap().body,
+            Body::Multipart { parts }
+        );
     }
 }

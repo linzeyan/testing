@@ -2332,6 +2332,7 @@ fn body_editor(
             ("JSON", Body::Json { text: text.clone() }),
             ("Text", Body::Text { text }),
             ("Form", Body::Form { fields: Vec::new() }),
+            ("Multipart", Body::Multipart { parts: Vec::new() }),
             (
                 "GraphQL",
                 Body::GraphQL {
@@ -2375,6 +2376,36 @@ fn body_editor(
         Body::Text { text } => code_editor(ui, "body", text, vars),
         Body::Form { fields } => {
             kv_table(ui, "form", fields, vars);
+        }
+        Body::Multipart { parts } => {
+            ui.weak("A value starting with @ uploads that file, e.g. @files/photo.png (relative to the workspace). Or drop files here.");
+            let dropped: Vec<PathBuf> = ui.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .map(|f| f.path().to_owned())
+                    .collect()
+            });
+            let workspace = std::env::current_dir().unwrap_or_default();
+            for path in dropped {
+                let key = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                // Inside the workspace, keep it relative so it still works after a git clone.
+                let path = path.strip_prefix(&workspace).unwrap_or(&path);
+                parts.push(KeyValue::new(key, format!("@{}", path.display())));
+            }
+            kv_table(ui, "multipart", parts, vars);
+            for p in parts.iter().filter(|p| p.enabled) {
+                if let Some(file) = p.value.strip_prefix('@')
+                    && !file.contains("{{")
+                    && !Path::new(file).is_file()
+                {
+                    ui.colored_label(ORANGE, format!("File not found: {file}"));
+                }
+            }
         }
         Body::GraphQL { query, variables } => {
             return graphql_editor(ui, query, variables, vars, explorer);

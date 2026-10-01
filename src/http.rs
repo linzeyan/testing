@@ -85,6 +85,7 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
         Body::Json { text } => typed(b, "application/json").body(text),
         Body::Text { text } => typed(b, "text/plain; charset=utf-8").body(text),
         Body::Form { fields } => b.form(&pairs(&fields)),
+        Body::Multipart { parts } => b.multipart(multipart(parts)?),
         Body::GraphQL { query, variables } => {
             let variables: serde_json::Value = if variables.trim().is_empty() {
                 serde_json::Value::Object(Default::default())
@@ -96,6 +97,31 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
             typed(b, "application/json").body(payload.to_string())
         }
     })
+}
+
+/// Files are streamed from disk when the request is sent, not read into memory first.
+fn multipart(parts: Vec<KeyValue>) -> Result<reqwest::multipart::Form, String> {
+    use reqwest::multipart::Part;
+    let mut form = reqwest::multipart::Form::new();
+    for p in parts {
+        let Some(path) = p.value.strip_prefix('@') else {
+            form = form.text(p.key, p.value);
+            continue;
+        };
+        let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let len = file.metadata().map_err(|e| format!("{path}: {e}"))?.len();
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        let part = Part::stream_with_length(tokio::fs::File::from_std(file), len)
+            .file_name(name)
+            .mime_str(mime.as_ref())
+            .map_err(|e| error_chain(&e))?;
+        form = form.part(p.key, part);
+    }
+    Ok(form)
 }
 
 pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, String> {
@@ -158,9 +184,25 @@ pub(crate) mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
-                let mut buf = vec![0; 16 * 1024];
-                let n = stream.read(&mut buf).unwrap();
-                let body = &buf[..n];
+                // Read the whole request: a streamed body can arrive after the headers.
+                let (mut body, mut buf) = (Vec::new(), [0; 16 * 1024]);
+                loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    body.extend_from_slice(&buf[..n]);
+                    let Some(end) = body.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        if n == 0 { break } else { continue }
+                    };
+                    let head = String::from_utf8_lossy(&body[..end]).to_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if n == 0 || body.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+                let body = &body[..];
                 // `connection: close` so the client never reuses a socket we're about to drop.
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
@@ -223,5 +265,57 @@ pub(crate) mod tests {
         assert!(wire.contains("authorization: bearer t0k"), "{wire}");
         assert!(wire.contains("content-type: application/json"), "{wire}");
         assert!(wire.ends_with("{\"n\":1}"), "{wire}");
+    }
+
+    #[test]
+    fn multipart_uploads_files_with_name_and_type() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("apitool-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, "file body").unwrap();
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        let client = rt.block_on(crate::net::build_client(net)).unwrap().http;
+        let upload = |value: String| Request {
+            method: "POST".into(),
+            url: echo_server(),
+            body: Body::Multipart {
+                parts: vec![KeyValue::new("doc", value), KeyValue::new("note", "hi")],
+            },
+            ..Default::default()
+        };
+
+        let resp = rt.block_on(execute(
+            client.clone(),
+            upload(format!("@{}", file.display())),
+        ));
+        let wire = resp.unwrap().body;
+        assert!(
+            wire.to_lowercase()
+                .contains("content-type: multipart/form-data; boundary="),
+            "{wire}"
+        );
+        // What servers key on: field name, original file name, guessed type, the bytes.
+        assert!(
+            wire.contains(
+                "name=\"doc\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nfile body\r\n"
+            ),
+            "{wire}"
+        );
+        assert!(wire.contains("name=\"note\"\r\n\r\nhi\r\n"), "{wire}");
+
+        let missing = dir.join("missing.txt");
+        let sent = rt.block_on(execute(client, upload(format!("@{}", missing.display()))));
+        let Err(e) = sent else {
+            panic!("a missing file must fail the send");
+        };
+        assert!(e.contains("missing.txt"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

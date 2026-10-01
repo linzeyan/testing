@@ -17,13 +17,15 @@ p12-keystore = "0.3"
 prost = "0.14.4"
 prost-reflect = { version = "0.16.5", features = ["serde"] }
 protox = "0.9.1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "charset", "gzip", "query", "form", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "charset", "gzip", "query", "form", "multipart", "stream"] }
 reqwest-websocket = "0.6"
 rquickjs = { version = "0.14", features = ["parallel"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+# Already in the tree via reqwest's multipart; declared to type upload parts.
+mime_guess = { version = "2", default-features = false }
 toml = "1"
 
 [target."cfg(windows)".dependencies]

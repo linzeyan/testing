@@ -473,7 +473,7 @@ fn tools() -> Value {
             "headers": kv,
             "body": {
                 "type": "object",
-                "description": "One of {\"type\":\"none\"}, {\"type\":\"json\",\"text\":\"...\"}, {\"type\":\"text\",\"text\":\"...\"}, {\"type\":\"form\",\"fields\":[{\"key\",\"value\"}]}, {\"type\":\"graphql\",\"query\":\"...\",\"variables\":\"<JSON text>\"}",
+                "description": "One of {\"type\":\"none\"}, {\"type\":\"json\",\"text\":\"...\"}, {\"type\":\"text\",\"text\":\"...\"}, {\"type\":\"form\",\"fields\":[{\"key\",\"value\"}]}, {\"type\":\"multipart\",\"parts\":[{\"key\",\"value\"}]} (a value \"@path\" uploads that file), {\"type\":\"graphql\",\"query\":\"...\",\"variables\":\"<JSON text>\"}",
             },
             "auth": {
                 "type": "object",

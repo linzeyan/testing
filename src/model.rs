@@ -113,6 +113,11 @@ pub enum Body {
     Form {
         fields: Vec<KeyValue>,
     },
+    /// multipart/form-data. A value starting with `@` uploads that file, as in `curl -F`.
+    /// ponytail: so a literal text value can't start with `@`; add a per-part flag if needed.
+    Multipart {
+        parts: Vec<KeyValue>,
+    },
     #[serde(rename = "graphql")]
     GraphQL {
         query: String,
@@ -320,6 +325,9 @@ impl Request {
                 Body::Text { text } => Body::Text { text: r(text) },
                 Body::Form { fields } => Body::Form {
                     fields: kv(fields, &mut r),
+                },
+                Body::Multipart { parts } => Body::Multipart {
+                    parts: kv(parts, &mut r),
                 },
                 Body::GraphQL { query, variables } => Body::GraphQL {
                     query: r(query),
