@@ -12,7 +12,7 @@ use crate::model::{self, Auth, Body, Example, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
 use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
-use crate::store::{self, Node, State, Workspace};
+use crate::store::{self, HistoryEntry, Node, State, Workspace};
 use crate::stream::{self, Event};
 use crate::varedit::{clip, var_edit};
 
@@ -88,6 +88,8 @@ impl Open {
 
 struct Pending {
     path: PathBuf,
+    /// As edited when sent, for history.
+    request: Request,
     started: Instant,
     abort: tokio::task::AbortHandle,
 }
@@ -175,7 +177,8 @@ enum NameKind {
 }
 
 enum Next {
-    Open(PathBuf),
+    /// With a draft to put in place of the saved version (restoring from history).
+    Open(PathBuf, Option<Box<Request>>),
     Quit,
 }
 
@@ -254,6 +257,9 @@ pub struct App {
     ws: Workspace,
     tree: Vec<Node>,
     envs: Vec<String>,
+    /// Oldest first.
+    history: Vec<HistoryEntry>,
+    show_history: bool,
     active_env: Option<String>,
     vars: HashMap<String, String>,
     /// Workspace-wide variables (globals.toml + globals.secret.toml), below any environment.
@@ -294,6 +300,8 @@ impl App {
         let mut app = Self {
             tree: ws.tree(),
             envs: ws.env_names(),
+            history: ws.load_history(),
+            show_history: false,
             ws,
             active_env: None,
             vars: HashMap::new(),
@@ -427,6 +435,7 @@ impl App {
     /// user comes back to it. Unsaved work is never replaced, only flagged.
     fn refresh_from_disk(&mut self) {
         self.reload();
+        self.history = self.ws.load_history();
         if self
             .active_env
             .as_ref()
@@ -456,14 +465,41 @@ impl App {
         }
     }
 
-    fn request_open(&mut self, path: PathBuf) {
-        if self.open.as_ref().is_some_and(|o| o.path == path) {
+    fn request_open(&mut self, path: PathBuf, draft: Option<Box<Request>>) {
+        if draft.is_none() && self.open.as_ref().is_some_and(|o| o.path == path) {
             return;
         }
         if self.open.as_ref().is_some_and(Open::dirty) {
-            self.dialog = Some(Dialog::Unsaved(Next::Open(path)));
+            self.dialog = Some(Dialog::Unsaved(Next::Open(path, draft)));
         } else {
-            self.force_open(path);
+            self.force_open_with(path, draft);
+        }
+    }
+
+    fn force_open_with(&mut self, path: PathBuf, draft: Option<Box<Request>>) {
+        self.force_open(path.clone());
+        if let (Some(mut draft), Some(open)) = (draft, &mut self.open)
+            && open.path == path
+        {
+            // Examples belong to the file, not to one send.
+            draft.examples = open.saved.examples.clone();
+            open.draft = *draft;
+        }
+    }
+
+    fn record_history(&mut self, sent: Pending, outcome: &Outcome) {
+        let (status, elapsed) = match &outcome.response {
+            Ok(r) => (r.status, r.elapsed),
+            Err(_) => (0, sent.started.elapsed()),
+        };
+        let path = self.ws.display_name(&sent.path);
+        let entry = HistoryEntry::new(path, status, elapsed.as_millis() as u64, sent.request);
+        if let Err(e) = self.ws.append_history(&entry) {
+            self.status = e;
+        }
+        self.history.push(entry);
+        if self.history.len() > store::MAX_HISTORY {
+            self.history.remove(0);
         }
     }
 
@@ -554,6 +590,7 @@ impl App {
         });
         self.pending = Some(Pending {
             path: open.path.clone(),
+            request: open.draft.clone(),
             started: Instant::now(),
             abort: task.abort_handle(),
         });
@@ -673,8 +710,8 @@ impl App {
                 }
                 Msg::Response(path, outcome) => (path, *outcome),
             };
-            if self.pending.as_ref().is_some_and(|p| p.path == path) {
-                self.pending = None;
+            if let Some(sent) = self.pending.take_if(|p| p.path == path) {
+                self.record_history(sent, &outcome);
             }
             // Variable writes apply even if the user switched away meanwhile.
             self.apply_changes(outcome.env, outcome.globals);
@@ -775,7 +812,7 @@ impl App {
                     self.open_env_editor(Some(name), &[]);
                 }
                 if let Some(path) = created {
-                    self.request_open(path);
+                    self.request_open(path, None);
                 }
             }
         }
@@ -959,7 +996,22 @@ impl App {
         });
         ui.separator();
         ui.horizontal(|ui| {
-            ui.strong("Collections");
+            ui.selectable_value(
+                &mut self.show_history,
+                false,
+                RichText::new("Collections").strong(),
+            );
+            ui.selectable_value(
+                &mut self.show_history,
+                true,
+                RichText::new("History").strong(),
+            );
+        });
+        if self.show_history {
+            self.history_ui(ui);
+            return;
+        }
+        ui.horizontal(|ui| {
             let root = self.ws.collections();
             if ui.small_button("+ Request").clicked() {
                 self.dialog = Some(Dialog::name(NameKind::NewRequest(root.clone()), ""));
@@ -999,10 +1051,76 @@ impl App {
                         continue;
                     }
                     self.runner = None;
-                    self.request_open(path);
+                    self.request_open(path, None);
                 }
                 TreeAction::Dialog(d) => self.dialog = Some(d),
                 TreeAction::Run(path) => self.open_runner(path),
+            }
+        }
+    }
+
+    fn history_ui(&mut self, ui: &mut egui::Ui) {
+        let mut restore = None;
+        ui.horizontal(|ui| {
+            ui.weak("Click to load what was sent.");
+            if !self.history.is_empty() && ui.small_button("Clear").clicked() {
+                match self.ws.clear_history() {
+                    Ok(()) => self.history.clear(),
+                    Err(e) => self.status = e,
+                }
+            }
+        });
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                if self.history.is_empty() {
+                    ui.weak("Requests you send show up here.");
+                }
+                for (i, e) in self.history.iter().enumerate().rev() {
+                    let method = &e.request.method;
+                    let row = ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{:<4}", short_method(method)))
+                                .monospace()
+                                .small()
+                                .color(method_color(method)),
+                        );
+                        let status = match e.status {
+                            0 => "ERR".to_owned(),
+                            s => s.to_string(),
+                        };
+                        ui.label(
+                            RichText::new(status)
+                                .monospace()
+                                .small()
+                                .color(status_color(e.status)),
+                        );
+                        ui.add(
+                            egui::Label::new(e.path.as_str())
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        )
+                    });
+                    let note = if e.body_dropped {
+                        "\nBody was too large to keep"
+                    } else {
+                        ""
+                    };
+                    let hover = format!("{}\n{} · {} ms{note}", e.request.url, ago(e.at), e.ms);
+                    if row.inner.on_hover_text(hover).clicked() {
+                        restore = Some(i);
+                    }
+                }
+            });
+        if let Some(i) = restore {
+            let e = &self.history[i];
+            match self.ws.request_path(&e.path) {
+                Ok(path) if path.is_file() => {
+                    let draft = Box::new(e.request.clone());
+                    self.runner = None;
+                    self.request_open(path, Some(draft));
+                }
+                _ => self.status = format!("\"{}\" no longer exists", e.path),
             }
         }
     }
@@ -1486,7 +1604,7 @@ impl App {
                                     return;
                                 };
                                 match next {
-                                    Next::Open(path) => app.force_open(path),
+                                    Next::Open(path, draft) => app.force_open_with(path, draft),
                                     Next::Quit => {
                                         app.allow_close = true;
                                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3155,6 +3273,19 @@ fn method_color(m: &str) -> Color32 {
     }
 }
 
+/// "5 min ago": local wall-clock time would need time zone data.
+fn ago(unix_secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    match now.saturating_sub(unix_secs) {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86400 => format!("{} h ago", s / 3600),
+        s => format!("{} d ago", s / 86400),
+    }
+}
+
 fn status_color(status: u16) -> Color32 {
     match status {
         200..=299 => GREEN,
@@ -3329,6 +3460,29 @@ mod ui_tests {
 
     fn draft<'h>(h: &'h Harness<'_, App>) -> &'h Request {
         &h.state().open.as_ref().unwrap().draft
+    }
+
+    #[test]
+    fn history_brings_back_what_was_sent() {
+        let mut h = with_request("history");
+        let sent = crate::http::tests::echo_server();
+        type_into(&mut h, 0, &sent);
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| app.response.is_some());
+        let entry = &h.state().history[0];
+        assert_eq!((entry.path.as_str(), entry.status), ("r", 200));
+        assert_eq!(h.state().ws.load_history(), h.state().history, "persisted");
+
+        // Edit after sending, then go back to what was sent.
+        type_into(&mut h, 0, "/later");
+        h.get_by_label("History").click();
+        h.run();
+        // The sidebar row comes before the request heading of the same name.
+        h.get_all_by_label("r").next().unwrap().click();
+        h.run();
+        h.get_by_label("Discard").click(); // the unsaved "/later" edit
+        h.run();
+        assert_eq!(draft(&h).url, sent);
     }
 
     /// As if the open request had just been sent and answered 200 with this body.

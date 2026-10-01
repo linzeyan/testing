@@ -4,6 +4,7 @@
 //!   environments/<name>.secret.toml  secret variables (gitignored)
 //!   globals.toml, globals.secret.toml  workspace-wide variables, same split
 //!   .state.toml                   per-machine UI state (gitignored)
+//!   .history.jsonl                requests sent from the app (gitignored)
 
 use std::collections::HashMap;
 use std::fs;
@@ -13,8 +14,50 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{KeyValue, Request};
 
-const GITIGNORE: &str = "*.secret.toml\n.state.toml\n*.tmp\n";
+const GITIGNORE: &str = "*.secret.toml\n.state.toml\n.history.jsonl\n*.tmp\n";
 const SECRET_SUFFIX: &str = ".secret";
+const HISTORY: &str = ".history.jsonl";
+pub const MAX_HISTORY: usize = 200;
+/// History is for re-sending, and RAM is tight: bigger bodies are left out.
+const MAX_HISTORY_BODY: usize = 32 * 1024;
+
+/// One request sent from the app, as it was edited at the time (variables unresolved).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HistoryEntry {
+    /// Unix seconds.
+    pub at: u64,
+    /// As shown in the tree, e.g. `users/get user`.
+    pub path: String,
+    /// 0 when there was no response.
+    pub status: u16,
+    pub ms: u64,
+    pub request: Request,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub body_dropped: bool,
+}
+
+impl HistoryEntry {
+    pub fn new(path: String, status: u16, ms: u64, mut request: Request) -> Self {
+        // Examples are saved with the file already; repeating them per send is waste.
+        request.examples.clear();
+        let body_size = serde_json::to_string(&request.body).map_or(0, |b| b.len());
+        let body_dropped = body_size > MAX_HISTORY_BODY;
+        if body_dropped {
+            request.body = crate::model::Body::None;
+        }
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Self {
+            at,
+            path,
+            status,
+            ms,
+            request,
+            body_dropped,
+        }
+    }
+}
 
 pub enum Node {
     Folder {
@@ -83,11 +126,63 @@ impl Workspace {
         for dir in [ws.collections(), ws.environments()] {
             fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         }
+        // Checked on every open, so files added to the list later (history holds tokens)
+        // are ignored in existing workspaces too.
         let gitignore = ws.root.join(".gitignore");
-        if !gitignore.exists() {
-            write_atomic(&gitignore, GITIGNORE)?;
+        let current = fs::read_to_string(&gitignore).unwrap_or_default();
+        let missing: String = GITIGNORE
+            .lines()
+            .filter(|line| !current.lines().any(|c| c.trim() == *line))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        if !missing.is_empty() {
+            let sep = if current.is_empty() || current.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            write_atomic(&gitignore, &format!("{current}{sep}{missing}"))?;
         }
         Ok(ws)
+    }
+
+    /// Oldest first, at most `MAX_HISTORY`; the file is trimmed here, so appends stay cheap.
+    pub fn load_history(&self) -> Vec<HistoryEntry> {
+        let path = self.root.join(HISTORY);
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let mut entries: Vec<HistoryEntry> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if entries.len() > MAX_HISTORY {
+            entries.drain(..entries.len() - MAX_HISTORY);
+            let text: String = entries
+                .iter()
+                .filter_map(|e| serde_json::to_string(e).ok())
+                .map(|line| line + "\n")
+                .collect();
+            // Best effort: an untrimmed file is still a valid one.
+            let _ = write_atomic(&path, &text);
+        }
+        entries
+    }
+
+    pub fn append_history(&self, entry: &HistoryEntry) -> Result<(), String> {
+        use std::io::Write;
+        let line = serde_json::to_string(entry).map_err(|e| e.to_string())?;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(HISTORY))
+            .and_then(|mut f| writeln!(f, "{line}"))
+            .map_err(|e| format!("history: {e}"))
+    }
+
+    pub fn clear_history(&self) -> Result<(), String> {
+        match fs::remove_file(self.root.join(HISTORY)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("history: {e}")),
+            _ => Ok(()),
+        }
     }
 
     pub fn collections(&self) -> PathBuf {
@@ -443,6 +538,44 @@ mod tests {
         // A broken file is reported, not treated as "no variables".
         fs::write(root.join("environments/dev.toml"), "vars = [").unwrap();
         assert!(ws.env_vars(Some("dev")).unwrap_err().contains("dev.toml"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn history_is_gitignored_bounded_and_drops_huge_bodies() {
+        let root = std::env::temp_dir().join(format!("apitool-history-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // A workspace from before history existed: its own rules are kept, ours added.
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".gitignore"), "custom").unwrap();
+        let ws = Workspace::open(root.clone()).unwrap();
+        let ignore = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(ignore.starts_with("custom\n") && ignore.contains("\n.history.jsonl\n"));
+        Workspace::open(root.clone()).unwrap();
+        assert_eq!(fs::read_to_string(root.join(".gitignore")).unwrap(), ignore);
+
+        let big = Request {
+            body: crate::model::Body::Text {
+                text: "x".repeat(MAX_HISTORY_BODY + 1),
+            },
+            ..Default::default()
+        };
+        let entry = HistoryEntry::new("big".into(), 200, 5, big);
+        assert!(entry.body_dropped && entry.request.body == crate::model::Body::None);
+        for i in 0..MAX_HISTORY + 5 {
+            let mut e = entry.clone();
+            e.path = i.to_string();
+            ws.append_history(&e).unwrap();
+        }
+        let loaded = ws.load_history();
+        assert_eq!(loaded.len(), MAX_HISTORY);
+        assert_eq!(loaded[0].path, "5", "oldest entries go first");
+        let lines = fs::read_to_string(root.join(HISTORY))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(lines, MAX_HISTORY, "file trimmed too");
 
         fs::remove_dir_all(&root).unwrap();
     }
