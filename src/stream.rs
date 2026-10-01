@@ -1,5 +1,6 @@
-//! Streaming requests: Server-Sent Events and WebSocket. Both go through the shared
-//! reqwest client, so proxy/PAC/CA/client-certificate settings apply as for plain HTTP.
+//! Streaming requests: Server-Sent Events and WebSocket (gRPC streams live in `grpc`).
+//! Both go through the shared reqwest client, so proxy/PAC/CA/client-certificate
+//! settings apply as for plain HTTP.
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::ACCEPT;
@@ -28,7 +29,8 @@ pub async fn sse(client: reqwest::Client, mut req: Request, emit: impl Fn(Event)
         .iter()
         .any(|h| h.key.eq_ignore_ascii_case("accept"));
     let mut b = match http::build(&client, req) {
-        Ok(b) => b,
+        // The client's timeout covers the whole body; a stream lasts until someone ends it.
+        Ok(b) => b.timeout(std::time::Duration::MAX),
         Err(e) => return emit(Event::Error(e)),
     };
     if wants_accept {
@@ -198,6 +200,10 @@ mod tests {
             )
             .unwrap();
             for i in 0..3 {
+                if i == 2 {
+                    // Past the 1 s network timeout: a stream must outlive it.
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                }
                 s.write_all(format!("data: tick {i}\n\n").as_bytes())
                     .unwrap();
                 s.flush().unwrap();
@@ -209,6 +215,7 @@ mod tests {
             .unwrap();
         let net = crate::net::Network {
             proxy: crate::net::ProxyMode::None,
+            timeout_secs: 1,
             ..Default::default()
         };
         let client = rt.block_on(crate::net::build_client(net)).unwrap().http;

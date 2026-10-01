@@ -133,14 +133,17 @@ struct Pending {
     abort: tokio::task::AbortHandle,
 }
 
-/// A live (or just ended) WebSocket/SSE connection for the open request.
+/// A live (or just ended) WebSocket/SSE connection or gRPC stream for the open request.
 struct StreamSession {
     id: u64,
     path: PathBuf,
     started: Instant,
     events: VecDeque<(Duration, Event)>,
-    /// WebSocket only; dropping it makes the task send a Close frame.
+    /// WebSocket and client-streaming gRPC; dropping it makes the task send a Close frame
+    /// (WebSocket) or half-close (gRPC).
     outgoing: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// gRPC: (proto, method), to check messages before they are sent.
+    grpc: Option<(String, String)>,
     live: bool,
     compose: String,
     abort: tokio::task::AbortHandle,
@@ -351,7 +354,7 @@ pub struct App {
     pending: Vec<Pending>,
     stream: Option<StreamSession>,
     /// Methods of the last `.proto` the gRPC picker looked at; recompiled only on change.
-    grpc_methods: Option<(String, Result<Vec<String>, String>)>,
+    grpc_methods: Rpcs,
     explorer: Explorer,
     load: Option<LoadView>,
     status: String,
@@ -803,7 +806,7 @@ impl App {
 
     fn send(&mut self, ctx: &egui::Context) {
         let Some(open) = &self.open else { return };
-        if model::is_streaming(&open.draft.method) {
+        if streams(&open.draft, &self.grpc_methods) {
             return self.connect(ctx);
         }
         if self.pending.iter().any(|p| p.path == open.path) {
@@ -854,6 +857,9 @@ impl App {
         let id = self.next_run_id;
         let (req, _) = open.draft.resolved(&self.all_vars());
         let is_ws = req.method.eq_ignore_ascii_case("WS");
+        let grpc = (req.method == "GRPC").then(|| (req.proto.clone(), req.rpc.clone()));
+        let sends =
+            is_ws || rpc_of(&open.draft, &self.grpc_methods).is_some_and(|r| r.client_streaming);
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cell, net, tx, ctx) = (
             self.client.clone(),
@@ -873,6 +879,9 @@ impl App {
                 Ok(client) if is_ws => {
                     stream::websocket(client.http.clone(), req, out_rx, emit).await
                 }
+                Ok(client) if req.method == "GRPC" => {
+                    crate::grpc::stream(client, req, out_rx, emit).await
+                }
                 Ok(client) => stream::sse(client.http.clone(), req, emit).await,
                 Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
             }
@@ -882,7 +891,8 @@ impl App {
             path: open.path.clone(),
             started: Instant::now(),
             events: VecDeque::new(),
-            outgoing: is_ws.then_some(out_tx),
+            outgoing: sends.then_some(out_tx),
+            grpc,
             live: true,
             compose: self
                 .stream
@@ -895,11 +905,17 @@ impl App {
 
     fn disconnect(&mut self) {
         let Some(s) = &mut self.stream else { return };
-        if s.outgoing.take().is_none() {
-            // SSE has no close handshake; dropping the connection is how clients stop.
-            s.abort.abort();
-            s.events
-                .push_back((s.started.elapsed(), Event::Closed("disconnected".into())));
+        match s.outgoing.take() {
+            // gRPC half-closes and the server may still answer; pressing again cancels.
+            Some(_) if s.grpc.is_some() => return,
+            Some(_) => {}
+            // SSE and server streams have no close handshake; dropping the connection is
+            // how clients stop.
+            None => {
+                s.abort.abort();
+                s.events
+                    .push_back((s.started.elapsed(), Event::Closed("disconnected".into())));
+            }
         }
         s.live = false;
     }
@@ -1139,7 +1155,11 @@ impl eframe::App for App {
         }
         if ui.input_mut(|i| i.consume_shortcut(&SEND)) {
             match self.stream.as_mut().filter(|s| s.live) {
-                Some(s) => s.send_compose(),
+                Some(s) => {
+                    if let Err(e) = s.send_compose() {
+                        self.status = e;
+                    }
+                }
                 None => self.send(ui.ctx()),
             }
         }
@@ -1567,9 +1587,19 @@ impl App {
         let mut fetch_schema = false;
         let mut example = None;
         let pending = self.pending.iter().find(|p| p.path == open.path);
-        let streaming = model::is_streaming(&open.draft.method);
+        // Before `streaming`: whether a gRPC method streams comes from its proto.
+        if open.draft.method == "GRPC"
+            && (self.grpc_methods.as_ref()).is_none_or(|(p, _)| *p != open.draft.proto)
+        {
+            let methods = crate::grpc::methods(&open.draft.proto);
+            self.grpc_methods = Some((open.draft.proto.clone(), methods));
+        }
+        let streaming = streams(&open.draft, &self.grpc_methods);
         let session = self.stream.as_mut().filter(|s| s.path == open.path);
         let live = session.as_ref().is_some_and(|s| s.live);
+        let half_close = session
+            .as_ref()
+            .is_some_and(|s| s.grpc.is_some() && s.outgoing.is_some());
 
         egui::Panel::top("request")
             .resizable(true)
@@ -1664,7 +1694,12 @@ impl App {
                     if url.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         send = true;
                     }
-                    if pending.is_some() || live {
+                    if half_close {
+                        cancel = ui
+                            .add_sized(button, egui::Button::new("End stream"))
+                            .on_hover_text("Stop sending; the server can still reply")
+                            .clicked();
+                    } else if pending.is_some() || live {
                         let label = if live { "Disconnect" } else { "Cancel" };
                         cancel = ui.add_sized(button, egui::Button::new(label)).clicked();
                     } else {
@@ -1834,7 +1869,14 @@ impl App {
             }
             if streaming {
                 match session {
-                    Some(s) => stream_ui(ui, s),
+                    Some(s) => {
+                        if let Err(e) = stream_ui(ui, s) {
+                            self.status = e;
+                        }
+                    }
+                    None if open.draft.method == "GRPC" => {
+                        ui.weak("Press Connect to start the call. The body is the first message (for a client stream, an array is several, empty is none). Scripts don't run for streams.");
+                    }
                     None => {
                         ui.weak("Press Connect to open the stream. Scripts don't run for WebSocket/SSE.");
                     }
@@ -3501,11 +3543,25 @@ fn scripts_editor(
 
 const GREEN: Color32 = Color32::from_rgb(80, 180, 100);
 
-fn grpc_bar(
-    ui: &mut egui::Ui,
-    req: &mut Request,
-    methods: &mut Option<(String, Result<Vec<String>, String>)>,
-) -> Option<String> {
+/// The methods of a `.proto`, re-read when the path changes.
+type Rpcs = Option<(String, Result<Vec<crate::grpc::Rpc>, String>)>;
+
+fn rpc_of<'a>(req: &Request, rpcs: &'a Rpcs) -> Option<&'a crate::grpc::Rpc> {
+    match rpcs {
+        Some((proto, Ok(list))) if req.method == "GRPC" && *proto == req.proto => {
+            list.iter().find(|r| r.name == req.rpc)
+        }
+        _ => None,
+    }
+}
+
+/// WebSocket, SSE and streaming gRPC methods connect instead of sending.
+fn streams(req: &Request, rpcs: &Rpcs) -> bool {
+    model::is_streaming(&req.method)
+        || rpc_of(req, rpcs).is_some_and(|r| r.client_streaming || r.server_streaming)
+}
+
+fn grpc_bar(ui: &mut egui::Ui, req: &mut Request, methods: &mut Rpcs) -> Option<String> {
     let mut error = None;
     ui.horizontal(|ui| {
         ui.label("Proto");
@@ -3534,7 +3590,14 @@ fn grpc_bar(
                     .width(ui.available_width() - 110.0)
                     .show_ui(ui, |ui| {
                         for m in list.iter() {
-                            ui.selectable_value(&mut req.rpc, m.clone(), m);
+                            let kind = match (m.client_streaming, m.server_streaming) {
+                                (false, false) => "",
+                                (false, true) => "  · server stream",
+                                (true, false) => "  · client stream",
+                                (true, true) => "  · bidi stream",
+                            };
+                            let label = format!("{}{kind}", m.name);
+                            ui.selectable_value(&mut req.rpc, m.name.clone(), label);
                         }
                     });
                 if ui
@@ -3653,16 +3716,25 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
 }
 
 impl StreamSession {
-    fn send_compose(&mut self) {
-        if let Some(tx) = &self.outgoing
-            && !self.compose.is_empty()
-        {
-            let _ = tx.send(self.compose.clone());
+    /// Err when a gRPC message doesn't fit the method: refused here, so a typo doesn't
+    /// end the call.
+    fn send_compose(&mut self) -> Result<(), String> {
+        let Some(tx) = &self.outgoing else {
+            return Ok(());
+        };
+        if self.compose.is_empty() {
+            return Ok(());
         }
+        if let Some((proto, rpc)) = &self.grpc {
+            crate::grpc::check(proto, rpc, &self.compose)?;
+        }
+        let _ = tx.send(self.compose.clone());
+        Ok(())
     }
 }
 
-fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) {
+fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) -> Result<(), String> {
+    let mut sent = Ok(());
     ui.horizontal(|ui| {
         if s.live {
             ui.spinner();
@@ -3685,7 +3757,11 @@ fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) {
                 egui::TextEdit::multiline(&mut s.compose)
                     .desired_rows(2)
                     .font(egui::TextStyle::Monospace)
-                    .hint_text("Message")
+                    .hint_text(if s.grpc.is_some() {
+                        "Message (JSON)"
+                    } else {
+                        "Message"
+                    })
                     .desired_width(ui.available_width() - send_w - 8.0),
             );
             if ui
@@ -3693,7 +3769,7 @@ fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) {
                 .on_hover_text(ui.ctx().format_shortcut(&SEND))
                 .clicked()
             {
-                s.send_compose();
+                sent = s.send_compose();
             }
         });
     }
@@ -3728,6 +3804,7 @@ fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) {
                 });
             }
         });
+    sent
 }
 
 /// Returns an example to save when the user asked for one.
@@ -4602,6 +4679,68 @@ mod ui_tests {
     }
 
     #[test]
+    fn grpc_streams_connect_take_messages_and_end() {
+        let mut h = with_request("grpc-stream");
+        let (proto, url) = crate::grpc::tests::greeter();
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        (d.method, d.url, d.proto) = ("GRPC".into(), url, proto);
+        d.rpc = "greet.v1.Greeter/Hello".into();
+        d.body = Body::Json {
+            text: r#"{"name": "ada"}"#.into(),
+        };
+        h.run();
+        assert!(
+            h.query_by_label("Connect").is_none(),
+            "a unary method sends"
+        );
+        h.state_mut().open.as_mut().unwrap().draft.rpc = "greet.v1.Greeter/Chat".into();
+        h.run();
+        h.get_by_label("Connect").click();
+        let replies = |app: &App| {
+            let s = app.stream.as_ref().unwrap();
+            s.events
+                .iter()
+                .filter(|(_, e)| matches!(e, Event::In(_)))
+                .count()
+        };
+        wait_live(&mut h, |app| replies(app) == 1);
+
+        // A typo is refused before it reaches the wire; the call goes on.
+        h.state_mut().stream.as_mut().unwrap().compose = r#"{"nmae": "bob"}"#.into();
+        h.get_by_label("Send").click();
+        h.run_steps(2);
+        assert!(h.state().status.contains("nmae"), "{}", h.state().status);
+        h.state_mut().stream.as_mut().unwrap().compose = r#"{"name": "bob"}"#.into();
+        h.get_by_label("Send").click();
+        wait_live(&mut h, |app| replies(app) == 2);
+        shot(&mut h, "32-grpc-stream");
+
+        // Half-close: the server finishes its side and the call ends cleanly.
+        h.get_by_label("End stream").click();
+        wait(&mut h, |app| !app.stream.as_ref().unwrap().live);
+        let events: Vec<_> = h
+            .state()
+            .stream
+            .as_ref()
+            .unwrap()
+            .events
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect();
+        assert_eq!(
+            events,
+            [
+                Event::Open("calling greet.v1.Greeter/Chat".into()),
+                Event::Out(r#"{"name":"ada"}"#.into()),
+                Event::In(r#"{"message":"hi ada x0"}"#.into()),
+                Event::Out(r#"{"name": "bob"}"#.into()),
+                Event::In(r#"{"message":"hi bob x0"}"#.into()),
+                Event::Closed("OK".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn graphql_schema_explorer_writes_the_query() {
         let mut h = with_request("gql");
         // The method picker, not the method badge on the tab.
@@ -4673,10 +4812,15 @@ mod ui_tests {
     }
 
     fn wait(h: &mut Harness<'_, App>, done: impl Fn(&App) -> bool) {
+        wait_live(h, done);
+        h.run();
+    }
+
+    /// Without settling: a live stream's spinner keeps repainting, which `run` rejects.
+    fn wait_live(h: &mut Harness<'_, App>, done: impl Fn(&App) -> bool) {
         for _ in 0..200 {
             h.step();
             if done(h.state()) {
-                h.run();
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));

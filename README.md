@@ -3,7 +3,8 @@
 A small, portable Postman-style API client (Rust + egui) built for low-memory machines
 such as Citrix VDI. No installer: unzip and run.
 
-- **apitool** — the GUI. REST, GraphQL, WebSocket, SSE and unary gRPC (runtime `.proto`);
+- **apitool** — the GUI. REST, GraphQL, WebSocket, SSE and gRPC (runtime `.proto`; streaming
+  methods connect like a WebSocket, and a JSON array body sends several messages);
   Postman-style pre-request/test scripts (`pm.*`, chai, `jsonSchema`); collection runner with
   CSV/JSON data; load test pane; proxy/PAC/WPAD, custom CA and client certificates.
   JSON, text, form and multipart bodies (a value `@path` uploads a file); paste a curl
