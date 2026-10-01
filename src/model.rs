@@ -38,6 +38,21 @@ pub struct Request {
     /// JavaScript run on the response (`pm.test`, variable capture).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub tests: String,
+    /// Saved responses, for reference and documentation.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<Example>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Example {
+    pub name: String,
+    pub status: u16,
+    /// ponytail: only the content type is kept from the headers; keep more when a
+    /// consumer (mock server) needs them.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub content_type: String,
+    pub body: String,
 }
 
 impl Default for Request {
@@ -53,6 +68,7 @@ impl Default for Request {
             auth: Auth::None,
             pre_request: String::new(),
             tests: String::new(),
+            examples: Vec::new(),
         }
     }
 }
@@ -321,6 +337,7 @@ impl Request {
             // Scripts have already run by the time a request is resolved for the wire.
             pre_request: String::new(),
             tests: String::new(),
+            examples: Vec::new(),
         };
         (req, missing)
     }
@@ -438,6 +455,12 @@ mod tests {
             pre_request: "pm.environment.set(\"ts\", Date.now());".into(),
             tests: "pm.test(\"ok\", function () {\n    pm.response.to.have.status(200);\n});\n"
                 .into(),
+            examples: vec![Example {
+                name: "found".into(),
+                status: 200,
+                content_type: "application/json".into(),
+                body: "{\n  \"id\": 1\n}".into(),
+            }],
         };
         let text = toml::to_string_pretty(&req).unwrap();
         assert_eq!(toml::from_str::<Request>(&text).unwrap(), req, "{text}");

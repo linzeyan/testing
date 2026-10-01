@@ -8,7 +8,7 @@ use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use crate::graphql::{self, Operation};
 use crate::http;
 use crate::loadtest::{self, Stats};
-use crate::model::{self, Auth, Body, KeyValue, METHODS, Request};
+use crate::model::{self, Auth, Body, Example, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
 use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
@@ -50,6 +50,7 @@ enum ReqTab {
     Body,
     Auth,
     Scripts,
+    Examples,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -478,6 +479,23 @@ impl App {
                 self.stream = None;
                 self.load = None;
                 self.save_state();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Written to disk at once on top of the last saved version, so unsaved edits in the
+    /// draft are neither saved along with it nor lost.
+    fn save_example(&mut self, example: Example) {
+        let Some(open) = &mut self.open else { return };
+        let mut on_disk = open.saved.clone();
+        on_disk.examples.push(example.clone());
+        match self.ws.save_request(&open.path, &on_disk) {
+            Ok(()) => {
+                self.status = format!("Saved example \"{}\"", example.name);
+                open.saved = on_disk;
+                open.draft.examples.push(example);
+                self.req_tab = ReqTab::Examples;
             }
             Err(e) => self.status = e,
         }
@@ -1005,6 +1023,7 @@ impl App {
         let (mut toggle_load, mut start_load) = (false, false);
         let mut define: Option<Vec<String>> = None;
         let mut fetch_schema = false;
+        let mut example = None;
         let pending = self.pending.as_ref().filter(|p| p.path == open.path);
         let streaming = model::is_streaming(&open.draft.method);
         let session = self.stream.as_mut().filter(|s| s.path == open.path);
@@ -1184,6 +1203,16 @@ impl App {
                         ReqTab::Scripts,
                         dot(no_scripts, "Scripts"),
                     );
+                    let examples = open.draft.examples.len();
+                    if examples > 0 {
+                        ui.selectable_value(
+                            &mut self.req_tab,
+                            ReqTab::Examples,
+                            tab(examples, "Examples"),
+                        );
+                    } else if self.req_tab == ReqTab::Examples {
+                        self.req_tab = ReqTab::Params;
+                    }
                 });
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -1222,6 +1251,7 @@ impl App {
                         ReqTab::Scripts => {
                             scripts_editor(ui, &mut self.script_tab, &mut open.draft)
                         }
+                        ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
                     });
             });
 
@@ -1251,9 +1281,12 @@ impl App {
                 None => {
                     ui.weak(format!("Press Send or {} to see the response.", ui.ctx().format_shortcut(&SEND)));
                 }
-                Some(shown) => response_ui(ui, shown, &mut self.resp_tab),
+                Some(shown) => example = response_ui(ui, shown, &mut self.resp_tab),
             }
         });
+        if let Some(example) = example {
+            self.save_example(example);
+        }
 
         if save {
             self.save();
@@ -2805,7 +2838,9 @@ fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) {
         });
 }
 
-fn response_ui(ui: &mut egui::Ui, shown: &mut Shown, tab: &mut RespTab) {
+/// Returns an example to save when the user asked for one.
+fn response_ui(ui: &mut egui::Ui, shown: &mut Shown, tab: &mut RespTab) -> Option<Example> {
+    let mut example = None;
     let passed = shown.tests.iter().filter(|t| t.passed).count();
     ui.horizontal(|ui| {
         match &shown.result {
@@ -2854,6 +2889,25 @@ fn response_ui(ui: &mut egui::Ui, shown: &mut Shown, tab: &mut RespTab) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Copy").on_hover_text("Copy body").clicked() {
                     ui.ctx().copy_text(view.text.clone());
+                }
+                if ui
+                    .small_button("Save as example")
+                    .on_hover_text("Keep this response with the request")
+                    .clicked()
+                {
+                    let h = &view.head;
+                    let content_type = h
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    example = Some(Example {
+                        name: format!("{} {}", h.status, h.reason).trim().to_owned(),
+                        status: h.status,
+                        content_type,
+                        body: view.text.clone(),
+                    });
                 }
                 if *tab == RespTab::Body {
                     find_bar(ui, view);
@@ -2957,6 +3011,41 @@ fn response_ui(ui: &mut egui::Ui, shown: &mut Shown, tab: &mut RespTab) {
                 }
             });
         }
+    }
+    example
+}
+
+fn examples_editor(ui: &mut egui::Ui, examples: &mut Vec<Example>) {
+    let mut remove = None;
+    for (i, ex) in examples.iter_mut().enumerate() {
+        let title =
+            RichText::new(format!("{} · {}", ex.status, ex.name)).color(status_color(ex.status));
+        egui::CollapsingHeader::new(title)
+            .id_salt(("example", i))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut ex.name);
+                    ui.label("Status");
+                    ui.add(egui::DragValue::new(&mut ex.status).range(100..=599));
+                    if ui
+                        .small_button("🗑")
+                        .on_hover_text("Delete example")
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut ex.body)
+                        .code_editor()
+                        .desired_rows(8)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+    }
+    if let Some(i) = remove {
+        examples.remove(i);
     }
 }
 
@@ -3242,6 +3331,47 @@ mod ui_tests {
         &h.state().open.as_ref().unwrap().draft
     }
 
+    /// As if the open request had just been sent and answered 200 with this body.
+    fn show_response(h: &mut Harness<'_, App>, content_type: &str, body: String) {
+        h.state_mut().response = Some(Shown {
+            result: Ok(into_view(http::Response {
+                status: 200,
+                reason: "OK".into(),
+                version: "HTTP/1.1".into(),
+                elapsed: Duration::ZERO,
+                headers: vec![("content-type".into(), content_type.into())],
+                body,
+            })),
+            tests: Vec::new(),
+            logs: Vec::new(),
+        });
+        h.run();
+    }
+
+    #[test]
+    fn saving_an_example_keeps_unsaved_edits_out_of_the_file() {
+        let mut h = with_request("example");
+        type_into(&mut h, 0, "http://x/unsaved");
+        show_response(&mut h, "application/json", r#"{"id":1}"#.into());
+        h.get_by_label("Save as example").click();
+        h.run();
+        let path = h.state().open.as_ref().unwrap().path.clone();
+        let on_disk = h.state().ws.load_request(&path).unwrap();
+        assert_eq!(on_disk.url, "", "the unsaved URL edit stays a draft");
+        assert_eq!(
+            on_disk.examples,
+            [Example {
+                name: "200 OK".into(),
+                status: 200,
+                content_type: "application/json".into(),
+                body: "{\n  \"id\": 1\n}".into(),
+            }]
+        );
+        let open = h.state().open.as_ref().unwrap();
+        assert!(open.dirty() && open.draft.examples.len() == 1);
+        h.get_by_label("Examples (1)");
+    }
+
     #[test]
     fn find_in_response_counts_hits_and_scrolls_to_each() {
         let mut h = with_request("find");
@@ -3251,19 +3381,7 @@ mod ui_tests {
                 _ => "hay\n".into(),
             })
             .collect();
-        h.state_mut().response = Some(Shown {
-            result: Ok(into_view(http::Response {
-                status: 200,
-                reason: "OK".into(),
-                version: "HTTP/1.1".into(),
-                elapsed: Duration::ZERO,
-                headers: Vec::new(),
-                body,
-            })),
-            tests: Vec::new(),
-            logs: Vec::new(),
-        });
-        h.run();
+        show_response(&mut h, "text/plain", body);
         h.key_press_modifiers(Modifiers::COMMAND, Key::F);
         h.run();
         h.event(egui::Event::Text("needle".into())); // case-insensitive
