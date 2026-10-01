@@ -6,8 +6,11 @@ such as Citrix VDI. No installer: unzip and run.
 - **apitool** — the GUI. REST, GraphQL, WebSocket, SSE and unary gRPC (runtime `.proto`);
   Postman-style pre-request/test scripts (`pm.*`, chai, `jsonSchema`); collection runner with
   CSV/JSON data; load test pane; proxy/PAC, custom CA and client certificates.
+  JSON, text, form and multipart bodies (a value `@path` uploads a file); paste a curl
+  command into the URL bar to import it, "Copy as curl" to export; find in response
+  (Ctrl+F); saved response examples; request history.
 - **apitool-cli** — headless runner for CI:
-  `apitool-cli <collection|folder|request.toml> [-e env] [-d data.csv] [-n N]`,
+  `apitool-cli <collection|folder|request.toml> [-e env] [-d data.csv] [-n N] [--junit report.xml]`,
   exit code 0 = all passed, 1 = failures, 2 = could not run.
 - **apitool-cli mcp** — MCP server (stdio) so an LLM client can list, read, write, send and
   run requests and edit variables in the workspace. Secret values are masked unless asked for.
@@ -21,4 +24,4 @@ such as Citrix VDI. No installer: unzip and run.
   The GUI re-reads the workspace when its window regains focus.
 
 The workspace (`workspace/` next to the executable, or `$APITOOL_WORKSPACE`) is plain TOML
-meant to be a git repo; `*.secret.toml` and `.state.toml` stay local.
+meant to be a git repo; `*.secret.toml`, `.state.toml` and `.history.jsonl` stay local.
