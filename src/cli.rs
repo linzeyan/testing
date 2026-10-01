@@ -21,6 +21,7 @@ options:
   -d, --data <file>      CSV or JSON data file; one iteration per row
   -n, --iterations <n>   iterations without a data file (default 1)
   --delay <ms>           pause between requests
+  --junit <file>         also write a JUnit XML report (for CI test dashboards)
 ";
 
 /// Exit code: 0 all passed, 1 something failed, 2 could not run.
@@ -48,7 +49,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         return Ok(true);
     }
     let (mut target, mut workspace, mut env, mut data) = (None, None, None, None);
-    let (mut iterations, mut delay) = (1usize, 0u64);
+    let (mut iterations, mut delay, mut junit) = (1usize, 0u64, None);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -60,6 +61,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
             "--workspace" => workspace = Some(PathBuf::from(value()?)),
             "-e" | "--env" => env = Some(value()?),
             "-d" | "--data" => data = Some(PathBuf::from(value()?)),
+            "--junit" => junit = Some(PathBuf::from(value()?)),
             "-n" | "--iterations" => {
                 iterations = value()?
                     .parse()
@@ -81,6 +83,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
     let absolute =
         |p: &PathBuf| std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()));
     let (target_abs, data) = (absolute(&target)?, data.as_ref().map(absolute).transpose()?);
+    let junit = junit.as_ref().map(absolute).transpose()?;
 
     let ws = store::open_workspace(workspace)?;
     let scope = if target_abs.exists() {
@@ -121,7 +124,9 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         data: HashMap::new(),
     };
     let (mut total, mut failed, mut tests, mut tests_failed) = (0, 0, 0, 0);
+    let mut suites = String::new();
     rt.block_on(runner::run_collection(client, plan, vars, |item| {
+        suites.push_str(&junit_suite(&item));
         total += 1;
         failed += item.failed() as usize;
         let mark = if item.failed() { "FAIL" } else { "ok  " };
@@ -147,7 +152,60 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         }
     }));
     println!("\n{total} requests, {failed} failed; {tests} tests, {tests_failed} failed");
+    if let Some(path) = junit {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites name=\"apitool\">\n{suites}</testsuites>\n"
+        );
+        std::fs::write(&path, xml).map_err(|e| format!("write {}: {e}", path.display()))?;
+    }
     Ok(failed == 0)
+}
+
+/// One `<testsuite>` per request run, one `<testcase>` per `pm.test`, like newman's
+/// JUnit reporter. A request that got no response is a single erroring testcase.
+fn junit_suite(item: &runner::RunItem) -> String {
+    let name = esc(&format!("{} #{}", item.name, item.iteration + 1));
+    let (time, cases) = match &item.status {
+        Err(e) => (
+            0.0,
+            format!(
+                "    <testcase name=\"{name}\" classname=\"{name}\"><error message=\"{}\"/></testcase>\n",
+                esc(e)
+            ),
+        ),
+        Ok((_, ms)) => {
+            let cases: String = item
+                .tests
+                .iter()
+                .map(|t| {
+                    let failure = if t.passed {
+                        String::new()
+                    } else {
+                        let why = t.error.as_deref().unwrap_or("failed");
+                        format!("<failure message=\"{}\"/>", esc(why))
+                    };
+                    format!(
+                        "    <testcase name=\"{}\" classname=\"{name}\">{failure}</testcase>\n",
+                        esc(&t.name)
+                    )
+                })
+                .collect();
+            (*ms as f64 / 1000.0, cases)
+        }
+    };
+    let count = item.tests.len().max(item.status.is_err() as usize);
+    let failures = item.tests.iter().filter(|t| !t.passed).count();
+    let errors = item.status.is_err() as usize;
+    format!(
+        "  <testsuite name=\"{name}\" tests=\"{count}\" failures=\"{failures}\" errors=\"{errors}\" time=\"{time:.3}\">\n{cases}  </testsuite>\n"
+    )
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[cfg(test)]
@@ -181,7 +239,15 @@ mod tests {
         // A CI job relies on this: green only when every test passed.
         assert_eq!(run(args("smoke")), Ok(true));
         write("b.toml", 404);
-        assert_eq!(run(args("smoke")), Ok(false));
+        let report = ws.join("report.xml");
+        let mut with_junit = args("smoke");
+        with_junit.extend(["--junit".into(), report.display().to_string()]);
+        assert_eq!(run(with_junit), Ok(false));
+        // CI dashboards count these attributes and show the failure message.
+        let xml = std::fs::read_to_string(&report).unwrap();
+        assert_eq!(xml.matches("<testcase ").count(), 2, "{xml}");
+        assert_eq!(xml.matches("<failure message=").count(), 1, "{xml}");
+        assert!(xml.contains("name=\"smoke/b #1\""), "{xml}");
         assert!(run(args("missing")).unwrap_err().contains("no requests"));
     }
 }
