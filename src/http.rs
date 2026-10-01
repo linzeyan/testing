@@ -57,7 +57,9 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
             .map(|p| (p.key.clone(), p.value.clone()))
             .collect::<Vec<_>>()
     };
-    let mut b = client.request(method, url).query(&pairs(&req.params));
+    // The query lives in the URL itself (see `Request::url_from_params`); the params table is
+    // only its editor, so it is not appended again here.
+    let mut b = client.request(method, url);
     for h in &req.headers {
         b = b.header(h.key.as_str(), h.value.as_str());
     }
@@ -179,8 +181,7 @@ pub(crate) mod tests {
             .unwrap();
         let req = Request {
             method: "post".into(),
-            url: echo_server(),
-            params: vec![KeyValue::new("q", "a b")],
+            url: format!("{}?q=a b", echo_server()),
             headers: vec![KeyValue::new("X-Trace", "1")],
             body: Body::Json {
                 text: "{\"n\":1}".into(),
@@ -198,7 +199,7 @@ pub(crate) mod tests {
         let resp = rt.block_on(execute(client, req)).unwrap();
         let wire = resp.body.to_lowercase();
         assert_eq!(resp.status, 200);
-        assert!(wire.starts_with("post /users?q=a+b http/1.1"), "{wire}");
+        assert!(wire.starts_with("post /users?q=a%20b http/1.1"), "{wire}");
         assert!(wire.contains("x-trace: 1"), "{wire}");
         assert!(wire.contains("authorization: bearer t0k"), "{wire}");
         assert!(wire.contains("content-type: application/json"), "{wire}");

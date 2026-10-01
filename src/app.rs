@@ -13,6 +13,7 @@ use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
 use crate::store::{self, Node, State, Workspace};
 use crate::stream::{self, Event};
+use crate::varedit::var_edit;
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
@@ -884,12 +885,19 @@ impl App {
                             }
                         });
                     let button = [80.0, 22.0];
-                    let url = ui.add(
-                        egui::TextEdit::singleline(&mut open.draft.url)
-                            .hint_text("https://{{host}}/path")
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(ui.available_width() - button[0] - 8.0),
+                    let width = ui.available_width() - button[0] - 8.0;
+                    let url = var_edit(
+                        ui,
+                        egui::Id::new("url"),
+                        &mut open.draft.url,
+                        &all_vars,
+                        egui::TextStyle::Monospace,
+                        false,
+                        |e| e.hint_text("https://{{host}}/path").desired_width(width),
                     );
+                    if url.changed() {
+                        open.draft.params_from_url();
+                    }
                     if url.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         send = true;
                     }
@@ -975,10 +983,16 @@ impl App {
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .show(ui, |ui| match self.req_tab {
-                        ReqTab::Params => kv_table(ui, "params", &mut open.draft.params),
-                        ReqTab::Headers => kv_table(ui, "headers", &mut open.draft.headers),
-                        ReqTab::Body => body_editor(ui, &mut open.draft.body),
-                        ReqTab::Auth => auth_editor(ui, &mut open.draft.auth),
+                        ReqTab::Params => {
+                            if kv_table(ui, "params", &mut open.draft.params, &all_vars) {
+                                open.draft.url_from_params();
+                            }
+                        }
+                        ReqTab::Headers => {
+                            kv_table(ui, "headers", &mut open.draft.headers, &all_vars);
+                        }
+                        ReqTab::Body => body_editor(ui, &mut open.draft.body, &all_vars),
+                        ReqTab::Auth => auth_editor(ui, &mut open.draft.auth, &all_vars),
                         ReqTab::Scripts => {
                             scripts_editor(ui, &mut self.script_tab, &mut open.draft)
                         }
@@ -1199,11 +1213,11 @@ impl App {
             egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                 ui.label(RichText::new("Shared").strong());
                 ui.weak("Saved to environments/<name>.toml and committed to git.");
-                kv_table(ui, "env-shared", &mut ed.shared);
+                kv_table(ui, "env-shared", &mut ed.shared, &HashMap::new());
                 ui.add_space(10.0);
                 ui.label(RichText::new("Secret").strong());
                 ui.weak("Saved to <name>.secret.toml, which is gitignored. Overrides shared values.");
-                kv_table(ui, "env-secret", &mut ed.secret);
+                kv_table(ui, "env-secret", &mut ed.secret, &HashMap::new());
             });
             if !ed.error.is_empty() {
                 ui.colored_label(RED, ed.error.as_str());
@@ -1701,7 +1715,14 @@ fn tree_ui(
 }
 
 /// Key/value grid with a trailing blank row: typing into it creates a new row, like Postman.
-fn kv_table(ui: &mut egui::Ui, id: &str, rows: &mut Vec<KeyValue>) {
+/// Returns whether any row changed.
+fn kv_table(
+    ui: &mut egui::Ui,
+    id: &str,
+    rows: &mut Vec<KeyValue>,
+    vars: &HashMap<String, String>,
+) -> bool {
+    let before = rows.clone();
     let key_width = 200.0;
     let value_width = (ui.available_width() - key_width - 90.0).max(120.0);
     let mut remove = None;
@@ -1724,10 +1745,25 @@ fn kv_table(ui: &mut egui::Ui, id: &str, rows: &mut Vec<KeyValue>) {
             }
             // Ids are by row index, so the blank row's editor becomes row `existing` after it's
             // promoted and keeps keyboard focus mid-typing.
-            let key = egui::TextEdit::singleline(&mut row.key).id(egui::Id::new((id, i, 0)));
-            ui.add(key.hint_text("Key").desired_width(key_width));
-            let value = egui::TextEdit::singleline(&mut row.value).id(egui::Id::new((id, i, 1)));
-            ui.add(value.hint_text("Value").desired_width(value_width));
+            let style = egui::TextStyle::Body;
+            var_edit(
+                ui,
+                egui::Id::new((id, i, 0)),
+                &mut row.key,
+                vars,
+                style.clone(),
+                false,
+                |e| e.hint_text("Key").desired_width(key_width),
+            );
+            var_edit(
+                ui,
+                egui::Id::new((id, i, 1)),
+                &mut row.value,
+                vars,
+                style,
+                false,
+                |e| e.hint_text("Value").desired_width(value_width),
+            );
             if real && ui.small_button("🗑").on_hover_text("Remove").clicked() {
                 remove = Some(i);
             }
@@ -1739,9 +1775,10 @@ fn kv_table(ui: &mut egui::Ui, id: &str, rows: &mut Vec<KeyValue>) {
     if !blank.key.is_empty() || !blank.value.is_empty() {
         rows.push(blank);
     }
+    *rows != before
 }
 
-fn body_editor(ui: &mut egui::Ui, body: &mut Body) {
+fn body_editor(ui: &mut egui::Ui, body: &mut Body, vars: &HashMap<String, String>) {
     ui.horizontal(|ui| {
         // ponytail: switching to None/Form drops the text; keep a per-mode stash if that bites.
         // JSON <-> Text keeps the text, since that switch is usually a content-type correction.
@@ -1793,10 +1830,12 @@ fn body_editor(ui: &mut egui::Ui, body: &mut Body) {
                     ui.colored_label(ORANGE, format!("Not valid JSON: {e}"));
                 }
             });
-            code_editor(ui, text);
+            code_editor(ui, "body", text, vars);
         }
-        Body::Text { text } => code_editor(ui, text),
-        Body::Form { fields } => kv_table(ui, "form", fields),
+        Body::Text { text } => code_editor(ui, "body", text, vars),
+        Body::Form { fields } => {
+            kv_table(ui, "form", fields, vars);
+        }
         Body::GraphQL { query, variables } => {
             ui.label("Query");
             ui.add(
@@ -1825,16 +1864,23 @@ fn body_editor(ui: &mut egui::Ui, body: &mut Body) {
     }
 }
 
-fn code_editor(ui: &mut egui::Ui, text: &mut String) {
-    ui.add(
-        egui::TextEdit::multiline(text)
-            .code_editor()
-            .desired_rows(12)
-            .desired_width(f32::INFINITY),
+fn code_editor(ui: &mut egui::Ui, id: &str, text: &mut String, vars: &HashMap<String, String>) {
+    var_edit(
+        ui,
+        egui::Id::new(id),
+        text,
+        vars,
+        egui::TextStyle::Monospace,
+        true,
+        |e| {
+            e.code_editor()
+                .desired_rows(12)
+                .desired_width(f32::INFINITY)
+        },
     );
 }
 
-fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth) {
+fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth, vars: &HashMap<String, String>) {
     let label = match auth {
         Auth::None => "No auth",
         Auth::Bearer { .. } => "Bearer token",
@@ -1877,16 +1923,28 @@ fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth) {
             Auth::None => {}
             Auth::Bearer { token } => {
                 ui.label("Token");
-                ui.add(
-                    egui::TextEdit::singleline(token)
-                        .hint_text("{{token}}")
-                        .desired_width(420.0),
+                var_edit(
+                    ui,
+                    egui::Id::new("auth-token"),
+                    token,
+                    vars,
+                    egui::TextStyle::Body,
+                    false,
+                    |e| e.hint_text("{{token}}").desired_width(420.0),
                 );
                 ui.end_row();
             }
             Auth::Basic { username, password } => {
                 ui.label("Username");
-                ui.add(egui::TextEdit::singleline(username).desired_width(260.0));
+                var_edit(
+                    ui,
+                    egui::Id::new("auth-user"),
+                    username,
+                    vars,
+                    egui::TextStyle::Body,
+                    false,
+                    |e| e.desired_width(260.0),
+                );
                 ui.end_row();
                 ui.label("Password");
                 ui.add(
@@ -2411,4 +2469,157 @@ fn human_size(bytes: usize) -> String {
 
 fn mb(bytes: usize) -> f64 {
     bytes as f64 / 1_048_576.0
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use egui::accesskit::Role;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+
+    use super::*;
+
+    fn workspace(name: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("apitool-ui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::open(dir).unwrap()
+    }
+
+    fn harness(ws: Workspace) -> Harness<'static, App> {
+        Harness::builder()
+            .with_size([1200.0, 800.0])
+            .build_eframe(|_| App::new(ws, "test".into()))
+    }
+
+    /// Set APITOOL_SHOTS=1 to dump what the test sees to /tmp/apitool-shots (needs a GPU).
+    fn shot(h: &mut Harness<'_, App>, name: &str) {
+        if std::env::var_os("APITOOL_SHOTS").is_none() {
+            return;
+        }
+        std::fs::create_dir_all("/tmp/apitool-shots").unwrap();
+        let img = h.render().unwrap();
+        img.save(format!("/tmp/apitool-shots/{name}.png")).unwrap();
+    }
+
+    fn type_into(h: &mut Harness<'_, App>, nth: usize, text: &str) {
+        h.get_all_by_role(Role::TextInput).nth(nth).unwrap().click();
+        h.run();
+        h.get_all_by_role(Role::TextInput)
+            .nth(nth)
+            .unwrap()
+            .type_text(text);
+        h.run();
+    }
+
+    #[test]
+    fn new_environment_variable_resolves_in_the_url() {
+        let mut h = harness(workspace("env"));
+        h.run();
+        shot(&mut h, "01-empty");
+        h.get_by_label("+").click();
+        h.run();
+        type_into(&mut h, 0, "dev");
+        h.get_by_label("OK").click();
+        h.run();
+        h.get_by_label("Edit").click();
+        h.run();
+        shot(&mut h, "02-env-editor");
+        type_into(&mut h, 0, "host");
+        let addr = crate::http::tests::echo_server();
+        let host = addr.trim_end_matches("/users").to_owned();
+        type_into(&mut h, 1, &host);
+        shot(&mut h, "03-env-typed");
+        h.get_by_label("Save").click();
+        h.run();
+        assert_eq!(h.state().vars.get("host"), Some(&host));
+
+        h.get_by_label("+ Request").click();
+        h.run();
+        type_into(&mut h, 0, "r1");
+        h.get_by_label("OK").click();
+        h.run();
+        // The URL bar is the first text field of the request editor.
+        type_into(&mut h, 0, "{{host}}/x");
+        assert_eq!(h.state().open.as_ref().unwrap().draft.url, "{{host}}/x");
+        assert!(h.query_by_label_contains("Undefined").is_none());
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| {
+            app.pending.is_none() && app.response.is_some()
+        });
+        shot(&mut h, "04-sent");
+        let shown = h.state().response.as_ref().unwrap();
+        let view = shown.result.as_ref().expect("request should succeed");
+        assert!(
+            view.text.to_lowercase().starts_with("get /x http/1.1"),
+            "{}",
+            view.text
+        );
+    }
+
+    /// A workspace with one request `r` (and env `dev` with `host`), opened in the app.
+    fn with_request(name: &str) -> Harness<'static, App> {
+        let ws = workspace(name);
+        ws.create_request(&ws.collections(), "r").unwrap();
+        ws.save_env("dev", &[KeyValue::new("host", "127.0.0.1:1")], &[])
+            .unwrap();
+        ws.save_state(&State {
+            active_env: Some("dev".into()),
+            ..Default::default()
+        });
+        let mut h = harness(ws);
+        h.run();
+        h.get_by_label("r").click();
+        h.run();
+        h
+    }
+
+    fn draft<'h>(h: &'h Harness<'_, App>) -> &'h Request {
+        &h.state().open.as_ref().unwrap().draft
+    }
+
+    #[test]
+    fn url_query_and_params_table_stay_in_sync() {
+        let mut h = with_request("params");
+        type_into(&mut h, 0, "http://x/a?page=2&q=b");
+        assert_eq!(
+            draft(&h).params,
+            [KeyValue::new("page", "2"), KeyValue::new("q", "b")]
+        );
+        // Inputs: URL, then key/value per row, then the blank row.
+        type_into(&mut h, 5, "debug");
+        assert_eq!(draft(&h).url, "http://x/a?page=2&q=b&debug");
+        // Unticking a row drops it from the URL but keeps it in the table.
+        h.get_all_by_role(Role::CheckBox).next().unwrap().click();
+        h.run();
+        shot(&mut h, "10-params-sync");
+        assert_eq!(draft(&h).url, "http://x/a?q=b&debug");
+        assert_eq!(draft(&h).params.len(), 3);
+    }
+
+    #[test]
+    fn typing_double_braces_autocompletes_a_variable() {
+        let mut h = with_request("complete");
+        type_into(&mut h, 0, "{{ho");
+        shot(&mut h, "11-autocomplete");
+        h.key_press(Key::Enter);
+        h.run();
+        assert_eq!(draft(&h).url, "{{host}}");
+        // Enter picked the suggestion; it must not also have sent the request.
+        assert!(h.state().pending.is_none());
+        type_into(&mut h, 0, "/x");
+        assert_eq!(draft(&h).url, "{{host}}/x", "cursor lands after the braces");
+        shot(&mut h, "12-highlight");
+    }
+
+    fn wait(h: &mut Harness<'_, App>, done: impl Fn(&App) -> bool) {
+        for _ in 0..200 {
+            h.step();
+            if done(h.state()) {
+                h.run();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for the app");
+    }
 }

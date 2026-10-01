@@ -8,6 +8,7 @@ base64 = "0.23"
 csv = "1"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "glow", "default_fonts", "accesskit"] }
 futures-util = "0.3"
+getrandom = "0.3"
 http-body-util = "0.1.5"
 jsonschema = { version = "0.58.3", default-features = false }
 memmap2 = "0.9.11"
@@ -29,6 +30,7 @@ toml = "1"
 windows-registry = "0.6"
 
 [dev-dependencies]
+egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
 h2 = "0.4.19"
 http = "1.5.0"
 rcgen = "0.14"

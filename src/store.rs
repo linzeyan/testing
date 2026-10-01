@@ -120,7 +120,10 @@ impl Workspace {
 
     pub fn load_request(&self, path: &Path) -> Result<Request, String> {
         let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+        let mut req: Request =
+            toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+        req.sync_params();
+        Ok(req)
     }
 
     pub fn save_request(&self, path: &Path, req: &Request) -> Result<(), String> {

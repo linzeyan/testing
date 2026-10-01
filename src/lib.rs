@@ -11,3 +11,4 @@ mod runner;
 mod script;
 pub mod store;
 mod stream;
+mod varedit;

@@ -130,6 +130,68 @@ impl Auth {
     }
 }
 
+/// Postman's dynamic variables: a fresh value on every use, no definition needed.
+pub const DYNAMIC: &[(&str, &str)] = &[
+    ("$guid", "random UUID v4"),
+    ("$randomUUID", "random UUID v4"),
+    ("$timestamp", "Unix time, seconds"),
+    ("$isoTimestamp", "current UTC time, ISO 8601"),
+    ("$randomInt", "random integer 0-1000"),
+];
+
+fn dynamic(name: &str) -> Option<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let random = || {
+        let mut b = [0u8; 16];
+        getrandom::fill(&mut b).expect("OS random source");
+        b
+    };
+    Some(match name {
+        "$guid" | "$randomUUID" => {
+            let mut b = random();
+            b[6] = (b[6] & 0x0f) | 0x40; // version 4
+            b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+            let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+            format!(
+                "{}-{}-{}-{}-{}",
+                &h[..8],
+                &h[8..12],
+                &h[12..16],
+                &h[16..20],
+                &h[20..]
+            )
+        }
+        "$timestamp" => now.as_secs().to_string(),
+        "$isoTimestamp" => iso8601(now),
+        "$randomInt" => (u32::from_le_bytes(random()[..4].try_into().unwrap()) % 1001).to_string(),
+        _ => return None,
+    })
+}
+
+/// UTC "YYYY-MM-DDTHH:MM:SS.mmmZ" without a date library (days-to-civil, H. Hinnant).
+fn iso8601(since_epoch: std::time::Duration) -> String {
+    let secs = since_epoch.as_secs() as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60,
+        since_epoch.subsec_millis()
+    )
+}
+
 /// Replaces `{{name}}` with its value. Unknown names are left verbatim (so the server
 /// error shows what was wrong) and reported in `missing`.
 pub fn resolve(s: &str, vars: &HashMap<String, String>, missing: &mut Vec<String>) -> String {
@@ -143,8 +205,8 @@ pub fn resolve(s: &str, vars: &HashMap<String, String>, missing: &mut Vec<String
             return out;
         };
         let name = after[..end].trim();
-        match vars.get(name) {
-            Some(v) => out.push_str(v),
+        match vars.get(name).cloned().or_else(|| dynamic(name)) {
+            Some(v) => out.push_str(&v),
             None => {
                 out.push_str(&rest[start..start + 2 + end + 2]);
                 if !missing.iter().any(|m| m == name) {
@@ -158,7 +220,67 @@ pub fn resolve(s: &str, vars: &HashMap<String, String>, missing: &mut Vec<String
     out
 }
 
+/// Splits a URL into (before `?`, query, `#fragment`); query excludes the `?`.
+fn split_url(url: &str) -> (&str, &str, &str) {
+    let (rest, fragment) = match url.find('#') {
+        Some(i) => url.split_at(i),
+        None => (url, ""),
+    };
+    match rest.split_once('?') {
+        Some((base, query)) => (base, query, fragment),
+        None => (rest, "", fragment),
+    }
+}
+
 impl Request {
+    /// Rebuilds the params table from the URL's query string. The URL is what gets sent;
+    /// disabled rows exist only in the table, as in Postman, so they are kept at the end.
+    pub fn params_from_url(&mut self) {
+        let (_, query, _) = split_url(&self.url);
+        let mut params: Vec<KeyValue> = query
+            .split('&')
+            .filter(|s| !s.is_empty())
+            .map(|pair| {
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                KeyValue::new(k, v)
+            })
+            .collect();
+        params.extend(self.params.iter().filter(|p| !p.enabled).cloned());
+        self.params = params;
+    }
+
+    /// Rewrites the URL's query string from the enabled params rows (text kept as typed;
+    /// encoding happens when the URL is parsed for sending).
+    pub fn url_from_params(&mut self) {
+        let (base, _, fragment) = split_url(&self.url);
+        let query: Vec<String> = self
+            .params
+            .iter()
+            .filter(|p| p.enabled && !(p.key.is_empty() && p.value.is_empty()))
+            .map(|p| match p.value.as_str() {
+                "" => p.key.clone(),
+                v => format!("{}={v}", p.key),
+            })
+            .collect();
+        let query = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query.join("&"))
+        };
+        self.url = format!("{base}{query}{fragment}");
+    }
+
+    /// Makes the URL and the params table agree. Files and MCP clients may set either one,
+    /// so a URL without a query string takes its query from the enabled params.
+    pub fn sync_params(&mut self) {
+        let has_query = !split_url(&self.url).1.is_empty();
+        if !has_query && self.params.iter().any(|p| p.enabled && !p.key.is_empty()) {
+            self.url_from_params();
+        } else {
+            self.params_from_url();
+        }
+    }
+
     /// A copy with variables substituted and disabled rows dropped: exactly what goes on the wire.
     pub fn resolved(&self, vars: &HashMap<String, String>) -> (Request, Vec<String>) {
         fn kv(list: &[KeyValue], r: &mut dyn FnMut(&str) -> String) -> Vec<KeyValue> {
@@ -216,6 +338,69 @@ mod tests {
         // Unknown vars stay visible in the URL so the failure is self-explanatory.
         assert_eq!(out, "https://api.test/{{id}}/{{id}}?x={{");
         assert_eq!(missing, ["id"]);
+    }
+
+    #[test]
+    fn dynamic_variables_need_no_definition() {
+        let mut missing = Vec::new();
+        let vars = HashMap::new();
+        let id = resolve("{{$guid}}", &vars, &mut missing);
+        // Shape of a v4 UUID: version nibble 4, variant nibble 8-b.
+        assert_eq!((id.len(), &id[14..15]), (36, "4"), "{id}");
+        assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"), "{id}");
+        assert_ne!(
+            id,
+            resolve("{{$guid}}", &vars, &mut missing),
+            "fresh per use"
+        );
+        assert_eq!(
+            iso8601(std::time::Duration::from_millis(951_782_400_123)),
+            "2000-02-29T00:00:00.123Z"
+        );
+        let ts: u64 = resolve("{{$timestamp}}", &vars, &mut missing)
+            .parse()
+            .unwrap();
+        assert!(ts > 1_700_000_000);
+        assert!(missing.is_empty());
+        // A user-defined variable with the same name wins.
+        let own = HashMap::from([("$timestamp".to_owned(), "fixed".to_owned())]);
+        assert_eq!(resolve("{{$timestamp}}", &own, &mut missing), "fixed");
+    }
+
+    #[test]
+    fn url_and_params_stay_in_sync_both_ways() {
+        let mut off = KeyValue::new("debug", "1");
+        off.enabled = false;
+        let mut req = Request {
+            url: "{{host}}/users?page=2&q={{term}}&flag#top".into(),
+            params: vec![off.clone()],
+            ..Default::default()
+        };
+        // Typing in the URL updates the table, keeping the disabled row.
+        req.params_from_url();
+        assert_eq!(
+            req.params,
+            [
+                KeyValue::new("page", "2"),
+                KeyValue::new("q", "{{term}}"),
+                KeyValue::new("flag", ""),
+                off.clone()
+            ]
+        );
+        // Editing the table rewrites the query; disabled rows never reach the URL.
+        req.params[0].value = "3".into();
+        req.params.remove(1);
+        req.url_from_params();
+        assert_eq!(req.url, "{{host}}/users?page=3&flag#top");
+        // A file (or an MCP client) that only sets params gets them into the URL.
+        let mut from_file = Request {
+            url: "http://x/a".into(),
+            params: vec![KeyValue::new("k", "v"), off],
+            ..Default::default()
+        };
+        from_file.sync_params();
+        assert_eq!(from_file.url, "http://x/a?k=v");
+        assert_eq!(from_file.params.len(), 2);
     }
 
     #[test]
