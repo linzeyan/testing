@@ -18,6 +18,7 @@ use crate::varedit::{clip, var_edit};
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
+const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 /// Lines longer than this are clipped in the viewer; JSON is pretty-printed first so
 /// only non-JSON minified bodies hit it.
 const MAX_LINE: usize = 4096;
@@ -141,6 +142,20 @@ struct ResponseView {
     text: String,
     raw_size: usize,
     line_starts: Vec<usize>,
+    find: Find,
+}
+
+/// Find-in-body state. Lives in the view, so a new response starts a fresh search.
+#[derive(Default)]
+struct Find {
+    query: String,
+    /// The query `hits` were computed for; recomputed only when the query changes.
+    searched: String,
+    /// Byte offsets of matches in `ResponseView::text`.
+    hits: Vec<usize>,
+    current: usize,
+    /// Scroll the body to `current` on the next frame.
+    scroll: bool,
 }
 
 /// What the response pane shows for the last run of the open request.
@@ -766,6 +781,7 @@ fn into_view(mut head: http::Response) -> ResponseView {
         text,
         raw_size,
         line_starts,
+        find: Find::default(),
     }
 }
 
@@ -788,6 +804,10 @@ impl eframe::App for App {
             } else {
                 self.save();
             }
+        }
+        if ui.input_mut(|i| i.consume_shortcut(&FIND)) {
+            self.resp_tab = RespTab::Body;
+            self.focus_request = Some(egui::Id::new("find"));
         }
         if ui.input_mut(|i| i.consume_shortcut(&SEND)) {
             match self.stream.as_mut().filter(|s| s.live) {
@@ -1227,7 +1247,7 @@ impl App {
                 }
                 return;
             }
-            match &self.response {
+            match &mut self.response {
                 None => {
                     ui.weak(format!("Press Send or {} to see the response.", ui.ctx().format_shortcut(&SEND)));
                 }
@@ -2785,7 +2805,7 @@ fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) {
         });
 }
 
-fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
+fn response_ui(ui: &mut egui::Ui, shown: &mut Shown, tab: &mut RespTab) {
     let passed = shown.tests.iter().filter(|t| t.passed).count();
     ui.horizontal(|ui| {
         match &shown.result {
@@ -2830,10 +2850,13 @@ fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
                 format!("Console ({})", shown.logs.len()),
             );
         }
-        if let Ok(view) = &shown.result {
+        if let Ok(view) = &mut shown.result {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Copy").on_hover_text("Copy body").clicked() {
                     ui.ctx().copy_text(view.text.clone());
+                }
+                if *tab == RespTab::Body {
+                    find_bar(ui, view);
                 }
             });
         }
@@ -2846,7 +2869,7 @@ fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
         RespTab::Headers if shown.result.is_err() => RespTab::Body,
         t => t,
     };
-    match (current, &shown.result) {
+    match (current, &mut shown.result) {
         (RespTab::Tests, _) => {
             egui::ScrollArea::vertical()
                 .id_salt("response-tests")
@@ -2882,7 +2905,7 @@ fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
                 });
         }
         (_, Err(e)) => {
-            ui.add(egui::Label::new(RichText::new(e).monospace()).selectable(true));
+            ui.add(egui::Label::new(RichText::new(e.as_str()).monospace()).selectable(true));
         }
         (RespTab::Headers, Ok(view)) => {
             egui::ScrollArea::vertical()
@@ -2905,27 +2928,121 @@ fn response_ui(ui: &mut egui::Ui, shown: &Shown, tab: &mut RespTab) {
         }
         (_, Ok(view)) => {
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-            egui::ScrollArea::both()
+            let mut area = egui::ScrollArea::both()
                 .id_salt("response-body")
-                .auto_shrink(false)
-                .show_rows(ui, row_height, view.line_starts.len(), |ui, rows| {
-                    for row in rows {
-                        let start = view.line_starts[row];
-                        let end = view
-                            .line_starts
-                            .get(row + 1)
-                            .copied()
-                            .unwrap_or(view.text.len());
-                        let mut cut = end.min(start + MAX_LINE);
-                        while !view.text.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        let line = RichText::new(view.text[start..cut].trim_end()).monospace();
-                        ui.add(egui::Label::new(line).extend());
+                .auto_shrink(false);
+            if std::mem::take(&mut view.find.scroll)
+                && let Some(&at) = view.find.hits.get(view.find.current)
+            {
+                let row = view.line_starts.partition_point(|&s| s <= at) - 1;
+                // A few lines of context above the hit.
+                let pitch = row_height + ui.spacing().item_spacing.y;
+                area = area.vertical_scroll_offset(row.saturating_sub(3) as f32 * pitch);
+            }
+            let view = &*view;
+            area.show_rows(ui, row_height, view.line_starts.len(), |ui, rows| {
+                for row in rows {
+                    let start = view.line_starts[row];
+                    let end = view
+                        .line_starts
+                        .get(row + 1)
+                        .copied()
+                        .unwrap_or(view.text.len());
+                    let mut cut = end.min(start + MAX_LINE);
+                    while !view.text.is_char_boundary(cut) {
+                        cut -= 1;
                     }
-                });
+                    let end = start + view.text[start..cut].trim_end().len();
+                    ui.add(egui::Label::new(highlighted(ui, view, start..end)).extend());
+                }
+            });
         }
     }
+}
+
+/// The find bar, laid out right to left next to Copy.
+fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
+    let ResponseView { text, find, .. } = view;
+    let next = ui.small_button("Next").on_hover_text("Enter").clicked();
+    let prev = ui
+        .small_button("Prev")
+        .on_hover_text("Shift+Enter")
+        .clicked();
+    if !find.searched.is_empty() {
+        let n = find.hits.len();
+        ui.weak(format!("{}/{n}", if n == 0 { 0 } else { find.current + 1 }));
+    }
+    let edit = ui.add(
+        egui::TextEdit::singleline(&mut find.query)
+            .id(egui::Id::new("find"))
+            .hint_text("Find")
+            .desired_width(160.0),
+    );
+    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+    if enter {
+        edit.request_focus(); // keep typing / pressing Enter for the next hit
+    }
+    if find.query != find.searched {
+        // ASCII-only case folding keeps byte offsets identical to `text`.
+        let needle = find.query.to_ascii_lowercase();
+        find.hits = if needle.is_empty() {
+            Vec::new()
+        } else {
+            let hay = text.to_ascii_lowercase();
+            hay.match_indices(&needle).map(|(i, _)| i).collect()
+        };
+        find.searched = find.query.clone();
+        find.current = 0;
+        find.scroll = !find.hits.is_empty();
+    }
+    let n = find.hits.len();
+    if n > 0 {
+        let shift = ui.input(|i| i.modifiers.shift);
+        if next || (enter && !shift) {
+            find.current = (find.current + 1) % n;
+            find.scroll = true;
+        } else if prev || (enter && shift) {
+            find.current = (find.current + n - 1) % n;
+            find.scroll = true;
+        }
+    }
+}
+
+/// One body line, with find hits painted over it.
+fn highlighted(
+    ui: &egui::Ui,
+    view: &ResponseView,
+    line: std::ops::Range<usize>,
+) -> egui::WidgetText {
+    let (text, find) = (&view.text, &view.find);
+    let len = find.searched.len();
+    let first = find.hits.partition_point(|&h| h + len <= line.start);
+    if len == 0 || find.hits.get(first).is_none_or(|&h| h >= line.end) {
+        return RichText::new(&text[line]).monospace().into();
+    }
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let plain = egui::TextFormat::simple(font.clone(), ui.visuals().text_color());
+    let mark = |current| egui::TextFormat {
+        background: if current {
+            ORANGE
+        } else {
+            Color32::from_rgb(240, 220, 90)
+        },
+        ..egui::TextFormat::simple(font.clone(), Color32::BLACK)
+    };
+    let mut job = egui::text::LayoutJob::default();
+    let mut pos = line.start;
+    for (k, &h) in find.hits.iter().enumerate().skip(first) {
+        if h >= line.end {
+            break;
+        }
+        let (from, to) = (h.max(pos), (h + len).min(line.end));
+        job.append(&text[pos..from], 0.0, plain.clone());
+        job.append(&text[from..to], 0.0, mark(k == find.current));
+        pos = to;
+    }
+    job.append(&text[pos..line.end], 0.0, plain);
+    job.into()
 }
 
 fn short_method(m: &str) -> &str {
@@ -3123,6 +3240,45 @@ mod ui_tests {
 
     fn draft<'h>(h: &'h Harness<'_, App>) -> &'h Request {
         &h.state().open.as_ref().unwrap().draft
+    }
+
+    #[test]
+    fn find_in_response_counts_hits_and_scrolls_to_each() {
+        let mut h = with_request("find");
+        let body: String = (0..500)
+            .map(|i| match i % 200 {
+                7 => format!("NEEDLE {i}\n"),
+                _ => "hay\n".into(),
+            })
+            .collect();
+        h.state_mut().response = Some(Shown {
+            result: Ok(into_view(http::Response {
+                status: 200,
+                reason: "OK".into(),
+                version: "HTTP/1.1".into(),
+                elapsed: Duration::ZERO,
+                headers: Vec::new(),
+                body,
+            })),
+            tests: Vec::new(),
+            logs: Vec::new(),
+        });
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run();
+        h.event(egui::Event::Text("needle".into())); // case-insensitive
+        h.run();
+        h.get_by_label("1/3");
+        h.key_press(Key::Enter);
+        h.run();
+        h.get_by_label("2/3");
+        // Only rows on screen exist, so the second hit being there means we scrolled to it.
+        assert!(h.query_by_label("NEEDLE 207").is_some());
+        assert!(h.query_by_label("NEEDLE 7").is_none());
+        h.key_press_modifiers(Modifiers::SHIFT, Key::Enter);
+        h.run();
+        h.get_by_label("1/3");
+        assert!(h.query_by_label("NEEDLE 7").is_some());
     }
 
     #[test]
