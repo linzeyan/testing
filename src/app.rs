@@ -394,6 +394,39 @@ impl App {
         self.envs = self.ws.env_names();
     }
 
+    /// Picks up edits made outside the window (git pull, an MCP client, an editor) when the
+    /// user comes back to it. Unsaved work is never replaced, only flagged.
+    fn refresh_from_disk(&mut self) {
+        self.reload();
+        if self
+            .active_env
+            .as_ref()
+            .is_some_and(|e| !self.envs.contains(e))
+        {
+            self.active_env = None;
+        }
+        self.reload_vars();
+        let Some(open) = &mut self.open else { return };
+        match self.ws.load_request(&open.path) {
+            Ok(disk) if disk == open.saved => {}
+            Ok(disk) if !open.dirty() => {
+                open.saved = disk.clone();
+                open.draft = disk;
+                self.status = format!("Reloaded {}: changed on disk", open.name());
+            }
+            Ok(_) => {
+                self.status = format!(
+                    "{} changed on disk; saving will overwrite that change",
+                    open.name()
+                )
+            }
+            Err(_) if !open.path.exists() => {
+                self.status = format!("{} was deleted on disk; Save recreates it", open.name())
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
     fn request_open(&mut self, path: PathBuf) {
         if self.open.as_ref().is_some_and(|o| o.path == path) {
             return;
@@ -724,6 +757,14 @@ fn into_view(mut head: http::Response) -> ResponseView {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive();
+        let regained = ui.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::WindowFocused(true)))
+        });
+        if regained {
+            self.refresh_from_disk();
+        }
         // Consume shortcuts before widgets see them, so Ctrl+Enter doesn't also insert a newline.
         if ui.input_mut(|i| i.consume_shortcut(&SAVE)) {
             self.save();
@@ -3075,6 +3116,40 @@ mod ui_tests {
     }
 
     /// The request editor has its own Save; the modal's is drawn last.
+    #[test]
+    fn edits_made_while_away_show_up_when_the_window_regains_focus() {
+        let mut h = with_request("refocus");
+        let path = h.state().open.as_ref().unwrap().path.clone();
+        // What an MCP client or a git pull does while the user is in another window.
+        let external = |h: &Harness<'_, App>, url: &str| {
+            let ws = &h.state().ws;
+            let req = Request {
+                url: url.into(),
+                ..Default::default()
+            };
+            ws.save_request(&path, &req).unwrap();
+            ws.save_env(Some("dev"), &[KeyValue::new("host", url)], &[])
+                .unwrap();
+            ws.create_request(&ws.collections(), url.trim_start_matches("http://"))
+                .unwrap();
+        };
+        external(&h, "http://first");
+        h.event(egui::Event::WindowFocused(true));
+        h.run();
+        assert_eq!(draft(&h).url, "http://first");
+        assert_eq!(h.state().vars["host"], "http://first");
+        h.get_by_label("first");
+
+        // Unsaved typing must survive; the user is told instead.
+        type_into(&mut h, 0, "/mine");
+        external(&h, "http://second");
+        h.event(egui::Event::WindowFocused(true));
+        h.run();
+        assert_eq!(draft(&h).url, "http://first/mine");
+        assert!(h.state().status.contains("changed on disk"));
+        h.get_by_label("second");
+    }
+
     fn modal_save(h: &mut Harness<'_, App>) {
         h.get_all_by_label("Save").last().unwrap().click();
         h.run();

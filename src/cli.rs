@@ -8,9 +8,12 @@ use crate::runner::{self, RunPlan, Vars};
 use crate::{net, store};
 
 const USAGE: &str = "usage: apitool-cli <collection|folder|request.toml> [options]
+       apitool-cli mcp [--workspace <dir>]
 
 Runs every request under the path (relative to the current directory, or to the
 workspace's collections/ folder) and exits with 1 if any request or test fails.
+
+`mcp` serves the workspace to an LLM client (Model Context Protocol over stdio).
 
 options:
   --workspace <dir>      workspace (default: $APITOOL_WORKSPACE, else workspace/ next to the exe)
@@ -33,6 +36,17 @@ pub fn main() -> i32 {
 }
 
 fn run(args: Vec<String>) -> Result<bool, String> {
+    if args.first().map(String::as_str) == Some("mcp") {
+        let workspace = match &args[1..] {
+            [] => None,
+            [flag, dir] if flag == "--workspace" => Some(PathBuf::from(dir)),
+            _ => return Err("usage: apitool-cli mcp [--workspace <dir>]".into()),
+        };
+        // stdout carries only JSON-RPC; diagnostics go to stderr via `main`.
+        let ws = store::open_workspace(workspace)?;
+        crate::mcp::serve(ws, std::io::stdin().lock(), std::io::stdout().lock())?;
+        return Ok(true);
+    }
     let (mut target, mut workspace, mut env, mut data) = (None, None, None, None);
     let (mut iterations, mut delay) = (1usize, 0u64);
     let mut args = args.into_iter();
@@ -74,15 +88,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
     } else {
         ws.collections().join(&target)
     };
-    let mut paths = Vec::new();
-    store::requests_in(&ws.tree(), &scope, &mut paths);
-    if paths.is_empty() {
-        return Err(format!("no requests under {}", scope.display()));
-    }
-    let requests = paths
-        .iter()
-        .map(|p| Ok((ws.display_name(p), ws.load_request(p)?)))
-        .collect::<Result<Vec<_>, String>>()?;
+    let requests = ws.load_requests_in(&scope)?;
     let env = match env {
         Some(name) if !ws.env_names().contains(&name) => {
             return Err(format!("unknown environment \"{name}\""));

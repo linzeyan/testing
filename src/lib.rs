@@ -6,6 +6,7 @@ mod graphql;
 mod grpc;
 mod http;
 mod loadtest;
+mod mcp;
 mod model;
 mod net;
 mod runner;

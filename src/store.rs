@@ -163,6 +163,33 @@ impl Workspace {
         )
     }
 
+    /// `folder/name` (as shown by `display_name`) → its file. Every segment must be a valid
+    /// name, which also keeps `..` from escaping the workspace.
+    pub fn request_path(&self, name: &str) -> Result<PathBuf, String> {
+        let name = name.trim().trim_matches('/');
+        let name = name.strip_suffix(".toml").unwrap_or(name);
+        let (dirs, file) = name.rsplit_once('/').unwrap_or(("", name));
+        let mut path = self.collections();
+        for dir in dirs.split('/').filter(|d| !d.is_empty()) {
+            path.push(valid_name(dir)?);
+        }
+        Ok(path.join(format!("{}.toml", valid_name(file)?)))
+    }
+
+    /// Every request under `scope` (a folder or a single request file), in tree order,
+    /// with display names.
+    pub fn load_requests_in(&self, scope: &Path) -> Result<Vec<(String, Request)>, String> {
+        let mut paths = Vec::new();
+        requests_in(&self.tree(), scope, &mut paths);
+        if paths.is_empty() {
+            return Err(format!("no requests under {}", scope.display()));
+        }
+        paths
+            .iter()
+            .map(|p| Ok((self.display_name(p), self.load_request(p)?)))
+            .collect()
+    }
+
     /// Creates `<dir>/<name>.toml`, refusing to overwrite.
     pub fn create_request(&self, dir: &Path, name: &str) -> Result<PathBuf, String> {
         let path = dir.join(format!("{}.toml", valid_name(name)?));

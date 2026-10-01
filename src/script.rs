@@ -41,7 +41,7 @@ pub struct Input<'a> {
     pub response: Option<ScriptResponse<'a>>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TestResult {
     pub name: String,
     pub passed: bool,
