@@ -9,11 +9,13 @@ use crate::{net, store};
 
 const USAGE: &str = "usage: apitool-cli <collection|folder|request.toml> [options]
        apitool-cli mcp [--workspace <dir>]
+       apitool-cli docs [collection|folder] [--workspace <dir>] [-o <file.md>]
 
 Runs every request under the path (relative to the current directory, or to the
 workspace's collections/ folder) and exits with 1 if any request or test fails.
 
 `mcp` serves the workspace to an LLM client (Model Context Protocol over stdio).
+`docs` writes Markdown API docs (default: the whole collection, to stdout).
 
 options:
   --workspace <dir>      workspace (default: $APITOOL_WORKSPACE, else workspace/ next to the exe)
@@ -47,6 +49,9 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         let ws = store::open_workspace(workspace)?;
         crate::mcp::serve(ws, std::io::stdin().lock(), std::io::stdout().lock())?;
         return Ok(true);
+    }
+    if args.first().map(String::as_str) == Some("docs") {
+        return docs(&args[1..]);
     }
     let (mut target, mut workspace, mut env, mut data) = (None, None, None, None);
     let (mut iterations, mut delay, mut junit) = (1usize, 0u64, None);
@@ -86,12 +91,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
     let junit = junit.as_ref().map(absolute).transpose()?;
 
     let ws = store::open_workspace(workspace)?;
-    let scope = if target_abs.exists() {
-        target_abs
-    } else {
-        ws.collections().join(&target)
-    };
-    let requests = ws.load_requests_in(&scope)?;
+    let requests = ws.load_requests_in(&scope(&ws, target_abs, &target))?;
     let env = match env {
         Some(name) if !ws.env_names().contains(&name) => {
             return Err(format!("unknown environment \"{name}\""));
@@ -159,6 +159,51 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         std::fs::write(&path, xml).map_err(|e| format!("write {}: {e}", path.display()))?;
     }
     Ok(failed == 0)
+}
+
+/// A path as given on the command line, or else inside the collections folder.
+fn scope(ws: &store::Workspace, absolute: PathBuf, given: &std::path::Path) -> PathBuf {
+    if absolute.exists() {
+        absolute
+    } else {
+        ws.collections().join(given)
+    }
+}
+
+fn docs(args: &[String]) -> Result<bool, String> {
+    let (mut target, mut workspace, mut output) = (None, None, None);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next()
+                .cloned()
+                .ok_or_else(|| format!("{arg} needs a value"))
+        };
+        match arg.as_str() {
+            "--workspace" => workspace = Some(PathBuf::from(value()?)),
+            "-o" | "--output" => output = Some(PathBuf::from(value()?)),
+            s if s.starts_with('-') => return Err(format!("unknown option {s}\n\n{USAGE}")),
+            _ if target.is_none() => target = Some(PathBuf::from(arg)),
+            _ => return Err(format!("unexpected argument {arg}")),
+        }
+    }
+    let absolute =
+        |p: &PathBuf| std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()));
+    let output = output.as_ref().map(absolute).transpose()?;
+    let target_abs = target.as_ref().map(absolute).transpose()?;
+    let ws = store::open_workspace(workspace)?;
+    let dir = match (target_abs, &target) {
+        (Some(abs), Some(given)) => scope(&ws, abs, given),
+        _ => ws.collections(),
+    };
+    let md = crate::docs::markdown(&ws, &dir)?;
+    match output {
+        Some(path) => {
+            std::fs::write(&path, md).map_err(|e| format!("write {}: {e}", path.display()))?
+        }
+        None => print!("{md}"),
+    }
+    Ok(true)
 }
 
 /// One `<testsuite>` per request run, one `<testcase>` per `pm.test`, like newman's

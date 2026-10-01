@@ -5,6 +5,7 @@ mod auth;
 pub mod cli;
 mod cookies;
 mod curl;
+mod docs;
 mod graphql;
 mod grpc;
 mod http;

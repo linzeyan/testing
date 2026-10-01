@@ -24,6 +24,9 @@ pub struct Request {
     pub proto: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub rpc: String,
+    /// Markdown, for the generated API docs.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<KeyValue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -51,6 +54,9 @@ pub struct Request {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[serde(default)]
 pub struct Folder {
+    /// Markdown, for the generated API docs.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vars: Vec<KeyValue>,
     /// Used by requests (and subfolders) whose auth is `inherit`.
@@ -95,6 +101,7 @@ impl Default for Request {
             url: String::new(),
             proto: String::new(),
             rpc: String::new(),
+            description: String::new(),
             params: Vec::new(),
             headers: Vec::new(),
             body: Body::None,
@@ -386,6 +393,7 @@ impl Request {
             url: r(&self.url),
             proto: r(&self.proto),
             rpc: r(&self.rpc),
+            description: String::new(),
             params: kv(&self.params, &mut r),
             headers: kv(&self.headers, &mut r),
             body: match &self.body {
@@ -542,6 +550,7 @@ mod tests {
             url: "https://{{host}}/users".into(),
             proto: "protos/users.proto".into(),
             rpc: "users.v1.Users/Get".into(),
+            description: "Fetches **one** user.\n".into(),
             params: vec![KeyValue::new("page", "2")],
             headers: vec![off],
             body: Body::Json {

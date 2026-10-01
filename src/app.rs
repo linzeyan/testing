@@ -53,6 +53,7 @@ enum ReqTab {
     Auth,
     Scripts,
     Examples,
+    Docs,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -60,6 +61,7 @@ enum FolderTab {
     Vars,
     Auth,
     Scripts,
+    Docs,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -277,6 +279,7 @@ enum TreeAction {
     Dialog(Dialog),
     Run(PathBuf),
     FolderSettings(PathBuf),
+    CopyDocs(PathBuf),
 }
 
 /// Collection runner pane. Settings persist while the pane is open; results are summaries only.
@@ -1289,6 +1292,13 @@ impl App {
                 self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
             }
             if ui
+                .small_button("Docs")
+                .on_hover_text("Copy Markdown docs for the whole collection")
+                .clicked()
+            {
+                self.copy_docs(&root, ui.ctx());
+            }
+            if ui
                 .small_button("▶ Run")
                 .on_hover_text("Run the whole collection")
                 .clicked()
@@ -1318,7 +1328,19 @@ impl App {
                 TreeAction::Dialog(d) => self.dialog = Some(d),
                 TreeAction::Run(path) => self.open_runner(path),
                 TreeAction::FolderSettings(dir) => self.open_folder_editor(dir),
+                TreeAction::CopyDocs(dir) => self.copy_docs(&dir, ui.ctx()),
             }
+        }
+    }
+
+    /// From the saved files, so unsaved edits aren't documented.
+    fn copy_docs(&mut self, dir: &Path, ctx: &egui::Context) {
+        match crate::docs::markdown(&self.ws, dir) {
+            Ok(md) => {
+                ctx.copy_text(md);
+                self.status = "Copied the docs as Markdown".into();
+            }
+            Err(e) => self.status = e,
         }
     }
 
@@ -1645,6 +1667,11 @@ impl App {
                         ReqTab::Scripts,
                         dot(no_scripts, "Scripts"),
                     );
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Docs,
+                        dot(open.draft.description.trim().is_empty(), "Docs"),
+                    );
                     let examples = open.draft.examples.len();
                     if examples > 0 {
                         ui.selectable_value(
@@ -1703,6 +1730,7 @@ impl App {
                             &open.draft.inherited,
                         ),
                         ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
+                        ReqTab::Docs => docs_editor(ui, &mut open.draft.description),
                     });
             });
 
@@ -2146,6 +2174,8 @@ impl App {
                 ui.selectable_value(&mut ed.tab, FolderTab::Vars, vars_label);
                 ui.selectable_value(&mut ed.tab, FolderTab::Auth, auth);
                 ui.selectable_value(&mut ed.tab, FolderTab::Scripts, dot(scripts, "Scripts"));
+                let docs = dot(!f.description.trim().is_empty(), "Docs");
+                ui.selectable_value(&mut ed.tab, FolderTab::Docs, docs);
             });
             ui.separator();
             egui::ScrollArea::vertical()
@@ -2170,6 +2200,7 @@ impl App {
                         &mut ed.folder.tests,
                         &ed.parent,
                     ),
+                    FolderTab::Docs => docs_editor(ui, &mut ed.folder.description),
                 });
             if !ed.error.is_empty() {
                 ui.colored_label(RED, ed.error.as_str());
@@ -2753,6 +2784,10 @@ fn tree_ui(
                         actions.push(TreeAction::FolderSettings(path.clone()));
                         ui.close();
                     }
+                    if ui.button("Copy docs as Markdown").clicked() {
+                        actions.push(TreeAction::CopyDocs(path.clone()));
+                        ui.close();
+                    }
                     if ui.button("Run folder").clicked() {
                         actions.push(TreeAction::Run(path.clone()));
                         ui.close();
@@ -3249,6 +3284,18 @@ fn auth_editor(
             );
         }
     }
+}
+
+fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
+    ui.weak(
+        "Markdown, for the docs a folder's right-click menu copies (\"Copy docs as Markdown\").",
+    );
+    ui.add(
+        egui::TextEdit::multiline(description)
+            .hint_text("What this is for, when to use it, what comes back…")
+            .desired_rows(12)
+            .desired_width(f32::INFINITY),
+    );
 }
 
 const PRE_SNIPPETS: &[(&str, &str)] = &[
