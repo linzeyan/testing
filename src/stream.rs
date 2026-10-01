@@ -19,7 +19,10 @@ pub enum Event {
 }
 
 /// Reads an event stream until the server ends it; `emit` receives every event.
-pub async fn sse(client: reqwest::Client, req: Request, emit: impl Fn(Event)) {
+pub async fn sse(client: reqwest::Client, mut req: Request, emit: impl Fn(Event)) {
+    if let Err(e) = http::with_token(&client, &mut req, false).await {
+        return emit(Event::Error(e));
+    }
     let wants_accept = !req
         .headers
         .iter()
@@ -65,10 +68,13 @@ pub async fn sse(client: reqwest::Client, req: Request, emit: impl Fn(Event)) {
 /// sender of `outgoing` closes the socket gracefully.
 pub async fn websocket(
     client: reqwest::Client,
-    req: Request,
+    mut req: Request,
     mut outgoing: mpsc::UnboundedReceiver<String>,
     emit: impl Fn(Event),
 ) {
+    if let Err(e) = http::with_token(&client, &mut req, false).await {
+        return emit(Event::Error(e));
+    }
     let b = match http::build(&client, req) {
         Ok(b) => b,
         Err(e) => return emit(Event::Error(e)),

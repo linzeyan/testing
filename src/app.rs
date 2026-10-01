@@ -2580,82 +2580,111 @@ fn code_editor(ui: &mut egui::Ui, id: &str, text: &mut String, vars: &HashMap<St
 }
 
 fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth, vars: &HashMap<String, String>) {
-    let label = match auth {
-        Auth::None => "No auth",
-        Auth::Bearer { .. } => "Bearer token",
-        Auth::Basic { .. } => "Basic auth",
-    };
+    let (user, pass) = (String::new, String::new);
+    let kinds = [
+        ("No auth", Auth::None),
+        ("Bearer token", Auth::Bearer { token: user() }),
+        (
+            "Basic auth",
+            Auth::Basic {
+                username: user(),
+                password: pass(),
+            },
+        ),
+        (
+            "Digest auth",
+            Auth::Digest {
+                username: user(),
+                password: pass(),
+            },
+        ),
+        ("OAuth 2.0", Auth::OAuth2(model::OAuth2::default())),
+    ];
+    let current = std::mem::discriminant(&*auth);
+    let label = kinds
+        .iter()
+        .find(|(_, k)| std::mem::discriminant(k) == current)
+        .map_or("", |(l, _)| *l);
     egui::ComboBox::from_id_salt("auth")
         .selected_text(label)
         .show_ui(ui, |ui| {
-            if ui
-                .selectable_label(matches!(auth, Auth::None), "No auth")
-                .clicked()
-            {
-                *auth = Auth::None;
-            }
-            if ui
-                .selectable_label(matches!(auth, Auth::Bearer { .. }), "Bearer token")
-                .clicked()
-                && !matches!(auth, Auth::Bearer { .. })
-            {
-                *auth = Auth::Bearer {
-                    token: String::new(),
-                };
-            }
-            if ui
-                .selectable_label(matches!(auth, Auth::Basic { .. }), "Basic auth")
-                .clicked()
-                && !matches!(auth, Auth::Basic { .. })
-            {
-                *auth = Auth::Basic {
-                    username: String::new(),
-                    password: String::new(),
-                };
+            for (label, kind) in kinds {
+                let same = std::mem::discriminant(&kind) == current;
+                if ui.selectable_label(same, label).clicked() && !same {
+                    *auth = kind;
+                }
             }
         });
     ui.add_space(4.0);
+    let text = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
+        ui.label(label);
+        var_edit(
+            ui,
+            egui::Id::new(("auth", label)),
+            value,
+            vars,
+            egui::TextStyle::Body,
+            false,
+            |e| e.hint_text(hint).desired_width(420.0),
+        );
+        ui.end_row();
+    };
+    let secret = |ui: &mut egui::Ui, label: &str, value: &mut String| {
+        ui.label(label);
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .password(true)
+                .desired_width(260.0),
+        );
+        ui.end_row();
+    };
     egui::Grid::new("auth-fields")
         .num_columns(2)
         .spacing([8.0, 6.0])
         .show(ui, |ui| match auth {
             Auth::None => {}
-            Auth::Bearer { token } => {
-                ui.label("Token");
-                var_edit(
-                    ui,
-                    egui::Id::new("auth-token"),
-                    token,
-                    vars,
-                    egui::TextStyle::Body,
-                    false,
-                    |e| e.hint_text("{{token}}").desired_width(420.0),
-                );
-                ui.end_row();
+            Auth::Bearer { token } => text(ui, "Token", token, "{{token}}"),
+            Auth::Basic { username, password } | Auth::Digest { username, password } => {
+                text(ui, "Username", username, "");
+                secret(ui, "Password", password);
             }
-            Auth::Basic { username, password } => {
-                ui.label("Username");
-                var_edit(
+            Auth::OAuth2(o) => {
+                ui.label("Grant");
+                ui.horizontal(|ui| {
+                    use model::Grant;
+                    ui.selectable_value(
+                        &mut o.grant,
+                        Grant::ClientCredentials,
+                        "Client credentials",
+                    );
+                    ui.selectable_value(&mut o.grant, Grant::Password, "Password");
+                });
+                ui.end_row();
+                text(
                     ui,
-                    egui::Id::new("auth-user"),
-                    username,
-                    vars,
-                    egui::TextStyle::Body,
-                    false,
-                    |e| e.desired_width(260.0),
+                    "Token URL",
+                    &mut o.token_url,
+                    "https://login.example.com/oauth2/token",
                 );
-                ui.end_row();
-                ui.label("Password");
-                ui.add(
-                    egui::TextEdit::singleline(password)
-                        .password(true)
-                        .desired_width(260.0),
-                );
-                ui.end_row();
+                text(ui, "Client ID", &mut o.client_id, "");
+                secret(ui, "Client secret", &mut o.client_secret);
+                text(ui, "Scope", &mut o.scope, "optional, space separated");
+                if o.grant == model::Grant::Password {
+                    text(ui, "Username", &mut o.username, "");
+                    secret(ui, "Password", &mut o.password);
+                }
             }
         });
-    if !matches!(auth, Auth::None) {
-        ui.weak("Tip: use {{variables}} from a secret environment so credentials never reach git.");
+    match auth {
+        Auth::None => {}
+        Auth::OAuth2(_) => {
+            ui.weak("The token is fetched on Send and reused until it expires or is rejected.");
+        }
+        _ => {
+            ui.weak(
+                "Tip: use {{variables}} from a secret environment so credentials never reach git.",
+            );
+        }
     }
 }
 

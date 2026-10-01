@@ -477,7 +477,7 @@ fn tools() -> Value {
             },
             "auth": {
                 "type": "object",
-                "description": "One of {\"type\":\"none\"}, {\"type\":\"bearer\",\"token\":\"...\"}, {\"type\":\"basic\",\"username\":\"...\",\"password\":\"...\"}",
+                "description": "One of {\"type\":\"none\"}, {\"type\":\"bearer\",\"token\":\"...\"}, {\"type\":\"basic\",\"username\":\"...\",\"password\":\"...\"}, {\"type\":\"digest\",\"username\":\"...\",\"password\":\"...\"}, {\"type\":\"oauth2\",\"grant\":\"client_credentials\"|\"password\",\"token_url\":\"...\",\"client_id\":\"...\",\"client_secret\":\"...\",\"scope\":\"...\",\"username\":\"...\",\"password\":\"...\"} (the token is fetched and cached automatically)",
             },
             "pre_request": { "type": "string", "description": "JavaScript run before sending (Postman pm API)" },
             "tests": { "type": "string", "description": "JavaScript run on the response, e.g. pm.test(\"ok\", () => pm.response.to.have.status(200));" },

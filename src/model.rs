@@ -143,6 +143,39 @@ pub enum Auth {
         username: String,
         password: String,
     },
+    /// Answers the server's 401 challenge, so it costs one extra round trip.
+    Digest {
+        username: String,
+        password: String,
+    },
+    #[serde(rename = "oauth2")]
+    OAuth2(OAuth2),
+}
+
+/// OAuth 2.0 grants that need no browser. ponytail: authorization code (browser + local
+/// redirect) is left out until someone needs it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct OAuth2 {
+    pub grant: Grant,
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    /// Password grant only.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub username: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub password: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Grant {
+    #[default]
+    ClientCredentials,
+    Password,
 }
 
 impl Auth {
@@ -341,6 +374,19 @@ impl Request {
                     username: r(username),
                     password: r(password),
                 },
+                Auth::Digest { username, password } => Auth::Digest {
+                    username: r(username),
+                    password: r(password),
+                },
+                Auth::OAuth2(o) => Auth::OAuth2(OAuth2 {
+                    grant: o.grant,
+                    token_url: r(&o.token_url),
+                    client_id: r(&o.client_id),
+                    client_secret: r(&o.client_secret),
+                    scope: r(&o.scope),
+                    username: r(&o.username),
+                    password: r(&o.password),
+                }),
             },
             // Scripts have already run by the time a request is resolved for the wire.
             pre_request: String::new(),

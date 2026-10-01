@@ -239,6 +239,7 @@ dependencies = [
  "http",
  "http-body-util",
  "jsonschema",
+ "md-5",
  "memmap2",
  "memory-stats",
  "mime_guess",
@@ -253,6 +254,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "tungstenite",
@@ -2599,6 +2601,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d3a9855747c17eaf4383823f135220716ab49bea5fbea7dd42cc9a92f8aa31"
 dependencies = [
  "logos-codegen 0.16.1",
+]
+
+[[package]]
+name = "md-5"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
+dependencies = [
+ "cfg-if",
+ "digest 0.11.3",
 ]
 
 [[package]]

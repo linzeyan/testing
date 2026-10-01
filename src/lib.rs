@@ -1,6 +1,7 @@
 //! Shared by the GUI (`apitool`) and the headless runner (`apitool-cli`).
 
 pub mod app;
+mod auth;
 pub mod cli;
 mod curl;
 mod graphql;

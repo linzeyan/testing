@@ -67,6 +67,15 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
         Auth::None => b,
         Auth::Bearer { token } => b.bearer_auth(token),
         Auth::Basic { username, password } => b.basic_auth(username, Some(password)),
+        // Both need a round trip first; `execute` and `with_token` take care of it.
+        Auth::Digest { .. } => {
+            return Err(
+                "Digest auth works for plain HTTP requests only, not WebSocket, SSE or gRPC".into(),
+            );
+        }
+        Auth::OAuth2(_) => {
+            return Err("internal: OAuth 2.0 token not fetched before building".into());
+        }
     };
     // An explicit Content-Type header from the user always wins.
     let has_type = req
@@ -124,8 +133,69 @@ fn multipart(parts: Vec<KeyValue>) -> Result<reqwest::multipart::Form, String> {
     Ok(form)
 }
 
+/// Swaps OAuth 2.0 auth for the bearer token it yields (cached, or fetched now).
+pub async fn with_token(
+    client: &reqwest::Client,
+    req: &mut Request,
+    fresh: bool,
+) -> Result<(), String> {
+    if let Auth::OAuth2(o) = &req.auth {
+        let token = crate::auth::oauth2_token(client, o, fresh).await?;
+        req.auth = Auth::Bearer { token };
+    }
+    Ok(())
+}
+
+/// Sends a resolved request, doing the extra round trip Digest and OAuth 2.0 need.
 pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, String> {
-    let b = build(&client, req)?;
+    match req.auth.clone() {
+        Auth::OAuth2(_) => {
+            let mut first = req.clone();
+            with_token(&client, &mut first, false).await?;
+            let resp = send_once(&client, first).await?;
+            if resp.status != 401 {
+                return Ok(resp);
+            }
+            // The cached token was revoked or expired early: one retry with a new one.
+            let mut retry = req;
+            with_token(&client, &mut retry, true).await?;
+            send_once(&client, retry).await
+        }
+        Auth::Digest { username, password } => {
+            let mut req = Request {
+                auth: Auth::None,
+                ..req
+            };
+            let first = send_once(&client, req.clone()).await?;
+            let challenge = first.headers.iter().find(|(k, v)| {
+                k.eq_ignore_ascii_case("www-authenticate")
+                    && v.trim_start()
+                        .get(..6)
+                        .is_some_and(|s| s.eq_ignore_ascii_case("digest"))
+            });
+            let (401, Some((_, challenge))) = (first.status, challenge) else {
+                return Ok(first);
+            };
+            let wire = build(&client, req.clone())?
+                .build()
+                .map_err(|e| error_chain(&e))?;
+            let uri = match wire.url().query() {
+                Some(q) => format!("{}?{q}", wire.url().path()),
+                None => wire.url().path().to_owned(),
+            };
+            let method = wire.method().as_str();
+            let cnonce = crate::auth::cnonce();
+            let value =
+                crate::auth::digest(challenge, method, &uri, &username, &password, &cnonce)?;
+            req.headers.push(KeyValue::new("Authorization", value));
+            send_once(&client, req).await
+        }
+        _ => send_once(&client, req).await,
+    }
+}
+
+async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, String> {
+    let b = build(client, req)?;
     let started = Instant::now();
     let resp = b.send().await.map_err(|e| error_chain(&e))?;
     let status = resp.status();
@@ -177,61 +247,152 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// Server that answers each request with the raw request it received, so tests
-    /// can assert on exactly what went over the wire.
-    pub(crate) fn echo_server() -> String {
+    /// Test server: `handle` turns the raw request into (status line plus any extra header
+    /// lines, body).
+    pub(crate) fn serve(
+        handle: impl Fn(&str) -> (String, String) + Send + 'static,
+    ) -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
-                // Read the whole request: a streamed body can arrive after the headers.
-                let (mut body, mut buf) = (Vec::new(), [0; 16 * 1024]);
-                loop {
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    body.extend_from_slice(&buf[..n]);
-                    let Some(end) = body.windows(4).position(|w| w == b"\r\n\r\n") else {
-                        if n == 0 { break } else { continue }
-                    };
-                    let head = String::from_utf8_lossy(&body[..end]).to_lowercase();
-                    let len: usize = head
-                        .lines()
-                        .find_map(|l| l.strip_prefix("content-length:"))
-                        .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(0);
-                    if n == 0 || body.len() >= end + 4 + len {
-                        break;
-                    }
-                }
-                let body = &body[..];
+                let (head, body) = handle(&read_request(&mut stream));
                 // `connection: close` so the client never reuses a socket we're about to drop.
                 let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
-                    body.len()
-                );
-                stream.write_all(head.as_bytes()).unwrap();
-                stream.write_all(body).unwrap();
-            }
-        });
-        format!("{addr}/users") // no scheme on purpose: must default to http
-    }
-
-    /// Server answering every request with the same JSON body.
-    pub(crate) fn json_server(body: String) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
-                let mut buf = vec![0; 16 * 1024];
-                let _ = stream.read(&mut buf);
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                    "HTTP/1.1 {head}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(head.as_bytes());
                 let _ = stream.write_all(body.as_bytes());
             }
         });
+        addr
+    }
+
+    /// The whole request: a streamed body can arrive after the headers.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let (mut req, mut buf) = (Vec::new(), [0; 16 * 1024]);
+        loop {
+            let n = stream.read(&mut buf).unwrap_or(0);
+            req.extend_from_slice(&buf[..n]);
+            let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") else {
+                if n == 0 {
+                    break;
+                }
+                continue;
+            };
+            let head = String::from_utf8_lossy(&req[..end]).to_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if n == 0 || req.len() >= end + 4 + len {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&req).into_owned()
+    }
+
+    /// Answers each request with the raw request it received, so tests can assert on
+    /// exactly what went over the wire.
+    pub(crate) fn echo_server() -> String {
+        let addr = serve(|req| ("200 OK\r\ncontent-type: text/plain".into(), req.to_owned()));
+        format!("{addr}/users") // no scheme on purpose: must default to http
+    }
+
+    /// Answers every request with the same JSON body.
+    pub(crate) fn json_server(body: String) -> String {
+        let addr = serve(move |_| {
+            (
+                "200 OK\r\ncontent-type: application/json".into(),
+                body.clone(),
+            )
+        });
         format!("http://{addr}/graphql")
+    }
+
+    fn client(rt: &tokio::runtime::Runtime) -> reqwest::Client {
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        rt.block_on(crate::net::build_client(net)).unwrap().http
+    }
+
+    #[test]
+    fn digest_auth_answers_the_servers_challenge() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let addr = serve(|req| {
+            if req.contains("\r\nauthorization: Digest ") {
+                return ("200 OK\r\ncontent-type: text/plain".into(), req.to_owned());
+            }
+            // Servers often offer Basic too; the Digest challenge must be the one picked.
+            let challenge = "401 Unauthorized\r\nwww-authenticate: Basic realm=\"x\"\r\nwww-authenticate: Digest realm=\"r\", qop=\"auth,auth-int\", nonce=\"n1\", opaque=\"o\"";
+            (challenge.into(), String::new())
+        });
+        let req = Request {
+            url: format!("http://{addr}/a?b=1"),
+            auth: Auth::Digest {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            ..Default::default()
+        };
+        let resp = rt.block_on(execute(client(&rt), req)).unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(
+            resp.body.contains(r#"authorization: Digest username="u", realm="r", nonce="n1", uri="/a?b=1", algorithm=MD5, response=""#),
+            "{}",
+            resp.body
+        );
+        assert!(resp.body.contains(r#"opaque="o""#), "{}", resp.body);
+    }
+
+    #[test]
+    fn oauth2_token_is_reused_and_renewed_after_a_401() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fetched = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = fetched.clone();
+        let addr = serve(move |req| {
+            if req.starts_with("POST /token ") {
+                if !req.contains("grant_type=client_credentials&client_id=app&client_secret=s3") {
+                    return ("400 Bad Request".into(), req.to_owned());
+                }
+                let n = count.fetch_add(1, SeqCst) + 1;
+                let token = format!(r#"{{"access_token":"t{n}","expires_in":3600}}"#);
+                return ("200 OK\r\ncontent-type: application/json".into(), token);
+            }
+            // The first token gets revoked on the server before it expires.
+            if req.contains("\r\nauthorization: Bearer t1\r\n") {
+                return ("401 Unauthorized".into(), String::new());
+            }
+            ("200 OK\r\ncontent-type: text/plain".into(), req.to_owned())
+        });
+        let req = Request {
+            url: format!("http://{addr}/api"),
+            auth: Auth::OAuth2(crate::model::OAuth2 {
+                token_url: format!("http://{addr}/token"),
+                client_id: "app".into(),
+                client_secret: "s3".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let resp = rt.block_on(execute(client(&rt), req.clone())).unwrap();
+            assert!(
+                resp.body.contains("\r\nauthorization: Bearer t2\r\n"),
+                "{}",
+                resp.body
+            );
+        }
+        assert_eq!(
+            fetched.load(SeqCst),
+            2,
+            "t1 rejected, t2 fetched once and reused"
+        );
     }
 
     #[test]

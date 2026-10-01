@@ -26,6 +26,9 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 # Already in the tree via reqwest's multipart; declared to type upload parts.
 mime_guess = { version = "2", default-features = false }
+# Digest auth. sha2 is already in the tree (p12-keystore); md-5 shares its digest crate.
+md-5 = "0.11"
+sha2 = "0.11"
 toml = "1"
 
 [target."cfg(windows)".dependencies]

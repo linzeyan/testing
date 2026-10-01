@@ -17,6 +17,17 @@ pub fn to_curl(mut req: Request) -> Result<String, String> {
             Vec::new()
         }
     };
+    // curl answers the Digest challenge itself; OAuth 2.0 needs a token fetched by Send.
+    let mut digest = None;
+    match std::mem::take(&mut req.auth) {
+        Auth::Digest { username, password } => digest = Some(format!("{username}:{password}")),
+        Auth::OAuth2(o) => {
+            let token = crate::auth::cached_token(&o)
+                .unwrap_or_else(|| "<press Send once to fetch a token>".into());
+            req.auth = Auth::Bearer { token };
+        }
+        auth => req.auth = auth,
+    }
     let wire = build(&reqwest::Client::new(), req)?
         .build()
         .map_err(|e| error_chain(&e))?;
@@ -27,6 +38,9 @@ pub fn to_curl(mut req: Request) -> Result<String, String> {
         // `-X HEAD` makes curl wait for a body that never comes.
         "HEAD" => out.push_str(" --head"),
         m => out.push_str(&format!(" -X {m}")),
+    }
+    if let Some(user) = digest {
+        out.push_str(&format!(" --digest -u {}", quote(&user)));
     }
     out.push(' ');
     out.push_str(&quote(wire.url().as_str()));
@@ -106,6 +120,7 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
     }
     let mut req = Request::default();
     let (mut url, mut method, mut head, mut get) = (None, None, false, false);
+    let mut digest = false;
     let mut data: Vec<String> = Vec::new();
     let mut parts: Vec<KeyValue> = Vec::new();
     while let Some(word) = words.next() {
@@ -186,6 +201,7 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
             }
             "--url" => url = Some(value()?),
             "-I" | "--head" => head = true,
+            "--digest" => digest = true,
             "-G" | "--get" => get = true,
             f if IGNORED_WITH_VALUE.contains(&f) => {
                 value()?;
@@ -196,6 +212,9 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
         }
     }
     let url = url.ok_or("no URL in the curl command")?;
+    if digest && let Auth::Basic { username, password } = std::mem::take(&mut req.auth) {
+        req.auth = Auth::Digest { username, password };
+    }
     if !parts.is_empty() {
         if !data.is_empty() {
             return Err("-d and -F can't be combined".into());
@@ -495,6 +514,17 @@ mod tests {
                 .contains("paste")
         );
         assert!(from_curl("wget http://h").is_err());
+        // curl does the Digest handshake itself, so the flag maps both ways.
+        let req = from_curl("curl --digest -u 'u:p w' http://h/x").unwrap();
+        let digest = Auth::Digest {
+            username: "u".into(),
+            password: "p w".into(),
+        };
+        assert_eq!(req.auth, digest);
+        assert_eq!(
+            to_curl(req).unwrap(),
+            "curl --digest -u 'u:p w' 'http://h/x'"
+        );
         // Multipart: files by path, text kept literally, and it round-trips.
         let req = from_curl(
             "curl http://h/up -F 'doc=@files/a b.pdf;type=application/pdf' --form-string 'note=x;y'",

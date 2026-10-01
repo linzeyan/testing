@@ -156,8 +156,10 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
 }
 
 /// Sends an already-resolved request with the client its protocol needs.
-pub async fn send(client: &net::Clients, req: Request) -> Result<http::Response, String> {
+pub async fn send(client: &net::Clients, mut req: Request) -> Result<http::Response, String> {
     if req.method.eq_ignore_ascii_case("GRPC") {
+        // The gRPC client speaks only HTTP/2; the token endpoint gets the regular one.
+        http::with_token(&client.http, &mut req, false).await?;
         grpc::call(client.grpc.clone(), req).await
     } else {
         http::execute(client.http.clone(), req).await
