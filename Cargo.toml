@@ -34,7 +34,8 @@ cookie_store = "0.22"
 toml = "1"
 
 [target."cfg(windows)".dependencies]
-windows-registry = "0.6"
+# WinHTTP reads IE/Edge proxy settings and does WPAD discovery the way the OS does.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinHttp"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }

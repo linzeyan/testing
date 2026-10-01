@@ -259,7 +259,7 @@ dependencies = [
  "tokio",
  "toml",
  "tungstenite",
- "windows-registry",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

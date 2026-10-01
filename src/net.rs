@@ -15,7 +15,8 @@ use crate::http::error_chain;
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyMode {
-    /// OS settings; on Windows this includes the PAC script from `AutoConfigURL`.
+    /// OS settings; on Windows this includes the PAC script ("Use setup script", or found
+    /// by WPAD when "Automatically detect settings" is on).
     #[default]
     System,
     None,
@@ -79,7 +80,7 @@ pub async fn build_client_with_jar(
 
     // Any explicit `.proxy()` turns off reqwest's own system-proxy lookup.
     let proxy = match net.proxy {
-        ProxyMode::System => match system_pac_url() {
+        ProxyMode::System => match system_pac_url().await? {
             Some(url) => Some(pac_proxy(&url).await?),
             None => None,
         },
@@ -181,19 +182,73 @@ fn push_pem(out: &mut String, label: &str, der: &[u8]) {
     out.push_str(&format!("-----END {label}-----\n"));
 }
 
+/// Windows' "Automatic configuration" settings: the PAC script address, and whether
+/// "Automatically detect settings" (WPAD) is on. Cheap: no network traffic.
 #[cfg(windows)]
-pub fn system_pac_url() -> Option<String> {
-    let settings = windows_registry::CURRENT_USER
-        .open(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
-        .ok()?;
-    let url = settings.get_string("AutoConfigURL").ok()?;
-    (!url.trim().is_empty()).then_some(url)
+pub fn system_auto_config() -> (Option<String>, bool) {
+    use windows_sys::Win32::Networking::WinHttp::*;
+    let mut c = WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default();
+    // SAFETY: on success the strings are WinHTTP allocations we own (taken by `take_wide`).
+    if unsafe { WinHttpGetIEProxyConfigForCurrentUser(&mut c) } == 0 {
+        // No settings stored yet: Windows' default is auto-detect on (Chromium does the same).
+        return (None, true);
+    }
+    let pac = unsafe {
+        take_wide(c.lpszProxy);
+        take_wide(c.lpszProxyBypass);
+        take_wide(c.lpszAutoConfigUrl)
+    };
+    (pac.filter(|u| !u.trim().is_empty()), c.fAutoDetect != 0)
+}
+
+/// WPAD: the PAC address from DHCP, else DNS (`http://wpad.<domain>/wpad.dat`). Blocks
+/// for seconds when nothing answers, which is why browsers only try it when asked to.
+#[cfg(windows)]
+fn detect_wpad() -> Option<String> {
+    use windows_sys::Win32::Networking::WinHttp::*;
+    let mut url = std::ptr::null_mut();
+    let flags = WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A;
+    if unsafe { WinHttpDetectAutoProxyConfigUrl(flags, &mut url) } == 0 {
+        return None;
+    }
+    // SAFETY: on success `url` is a WinHTTP allocation we own.
+    unsafe { take_wide(url) }
+}
+
+/// Copies a NUL-terminated WinHTTP string and frees it. Null is None.
+#[cfg(windows)]
+unsafe fn take_wide(p: windows_sys::core::PWSTR) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    unsafe {
+        let len = (0..).take_while(|&i| *p.add(i) != 0).count();
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+        windows_sys::Win32::Foundation::GlobalFree(p.cast());
+        Some(s)
+    }
 }
 
 // ponytail: macOS system PAC isn't read (dev machine only); use PAC mode explicitly there.
 #[cfg(not(windows))]
-pub fn system_pac_url() -> Option<String> {
+pub fn system_auto_config() -> (Option<String>, bool) {
+    (None, false)
+}
+
+#[cfg(not(windows))]
+fn detect_wpad() -> Option<String> {
     None
+}
+
+/// The PAC script System mode uses: the configured one, else WPAD discovery if it's on.
+async fn system_pac_url() -> Result<Option<String>, String> {
+    match system_auto_config() {
+        (Some(url), _) => Ok(Some(url)),
+        (None, true) => tokio::task::spawn_blocking(detect_wpad)
+            .await
+            .map_err(|e| format!("WPAD: {e}")),
+        (None, false) => Ok(None),
+    }
 }
 
 async fn pac_proxy(location: &str) -> Result<reqwest::Proxy, String> {

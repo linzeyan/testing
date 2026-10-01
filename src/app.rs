@@ -2151,11 +2151,17 @@ impl App {
                 ui.radio_value(&mut net.proxy, ProxyMode::Pac, "PAC script");
             });
             match net.proxy {
-                ProxyMode::System => match net::system_pac_url() {
-                    Some(url) => {
+                ProxyMode::System => match net::system_auto_config() {
+                    (Some(url), _) => {
                         ui.weak(format!("Windows is configured with a PAC script, which will be used:\n{url}"));
                     }
-                    None => {
+                    (None, true) => {
+                        ui.weak(
+                            "Windows has \"Automatically detect settings\" on: the PAC script is \
+                             looked up via WPAD (DHCP, then DNS) before the first request.",
+                        );
+                    }
+                    (None, false) => {
                         ui.weak("Uses the OS proxy settings and HTTP(S)_PROXY / NO_PROXY variables.");
                     }
                 },
