@@ -35,6 +35,8 @@ pub struct Input<'a> {
     /// Current row of the runner's data file (`pm.iterationData`).
     pub data: &'a HashMap<String, String>,
     pub env: &'a HashMap<String, String>,
+    /// Folder variables (`pm.collectionVariables`).
+    pub collection: &'a HashMap<String, String>,
     pub globals: &'a HashMap<String, String>,
     pub locals: &'a HashMap<String, String>,
     pub request: &'a WireRequest,
@@ -103,6 +105,13 @@ var pm = {
   },
   environment: __scope(__in.env, __out.env),
   globals: __scope(__in.globals, __out.globals),
+  // Read-only: they live in a committed .folder.toml, which a script shouldn't rewrite.
+  collectionVariables: (function (s) {
+    s.set = s.unset = function () {
+      throw new Error('pm.collectionVariables is read-only here (edit them in Folder settings); use pm.environment.set');
+    };
+    return s;
+  })(__scope(__in.collection, {})),
   expect: chai.expect,
   test: function (name, fn) {
     try { fn(); __out.tests.push({ name: String(name), passed: true }); }
@@ -129,6 +138,7 @@ pm.variables = {
     if (__has(__locals, k)) return __locals[k];
     if (__has(__in.data, k)) return __in.data[k];
     if (__has(__in.env, k)) return __in.env[k];
+    if (__has(__in.collection, k)) return __in.collection[k];
     return __in.globals[k];
   },
   set: function (k, v) { v = __str(v); __locals[k] = v; __out.locals[k] = v; },
@@ -307,6 +317,7 @@ mod tests {
             iteration_count: 1,
             data: &EMPTY,
             env,
+            collection: &EMPTY,
             globals: &EMPTY,
             locals: &EMPTY,
             request: req,

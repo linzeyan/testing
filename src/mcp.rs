@@ -303,6 +303,7 @@ impl Server {
         let env = self.environment(args)?;
         let vars = self.vars(env.as_deref())?;
         let mut all = vars.globals.clone();
+        all.extend(req.inherited.vars.clone());
         all.extend(vars.env.clone());
         let (_, missing) = req.resolved(&all);
         let client = self.client()?;
@@ -477,7 +478,7 @@ fn tools() -> Value {
             },
             "auth": {
                 "type": "object",
-                "description": "One of {\"type\":\"none\"}, {\"type\":\"bearer\",\"token\":\"...\"}, {\"type\":\"basic\",\"username\":\"...\",\"password\":\"...\"}, {\"type\":\"digest\",\"username\":\"...\",\"password\":\"...\"}, {\"type\":\"oauth2\",\"grant\":\"client_credentials\"|\"password\",\"token_url\":\"...\",\"client_id\":\"...\",\"client_secret\":\"...\",\"scope\":\"...\",\"username\":\"...\",\"password\":\"...\"} (the token is fetched and cached automatically)",
+                "description": "One of {\"type\":\"inherit\"} (the default: the auth set in the nearest folder's settings, else none), {\"type\":\"none\"}, {\"type\":\"bearer\",\"token\":\"...\"}, {\"type\":\"basic\",\"username\":\"...\",\"password\":\"...\"}, {\"type\":\"digest\",\"username\":\"...\",\"password\":\"...\"}, {\"type\":\"oauth2\",\"grant\":\"client_credentials\"|\"password\",\"token_url\":\"...\",\"client_id\":\"...\",\"client_secret\":\"...\",\"scope\":\"...\",\"username\":\"...\",\"password\":\"...\"} (the token is fetched and cached automatically)",
             },
             "pre_request": { "type": "string", "description": "JavaScript run before sending (Postman pm API)" },
             "tests": { "type": "string", "description": "JavaScript run on the response, e.g. pm.test(\"ok\", () => pm.response.to.have.status(200));" },

@@ -1,5 +1,6 @@
 //! The workspace is a plain directory meant to be a git repo:
 //!   collections/**/<name>.toml   one request per file, folders are directories
+//!   collections/**/.folder.toml  variables, auth and scripts shared by a folder (committed)
 //!   environments/<name>.toml      shared variables (committed)
 //!   environments/<name>.secret.toml  secret variables (gitignored)
 //!   globals.toml, globals.secret.toml  workspace-wide variables, same split
@@ -13,11 +14,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{KeyValue, Request};
+use crate::model::{Auth, Folder, Inherited, KeyValue, Request};
 
 const GITIGNORE: &str = "*.secret.toml\n.state.toml\n.history.jsonl\n.cookies.json\n*.tmp\n";
 const SECRET_SUFFIX: &str = ".secret";
 const HISTORY: &str = ".history.jsonl";
+/// Starts with a dot, so the tree (and `valid_name`) never mistakes it for a request.
+const FOLDER: &str = ".folder.toml";
 pub const MAX_HISTORY: usize = 200;
 /// History is for re-sending, and RAM is tight: bigger bodies are left out.
 const MAX_HISTORY_BODY: usize = 32 * 1024;
@@ -253,7 +256,65 @@ impl Workspace {
         let mut req: Request =
             toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
         req.sync_params();
+        req.inherited = self.inherited(path)?;
         Ok(req)
+    }
+
+    /// A missing file is empty settings; a broken one is an error, like environments.
+    pub fn load_folder(&self, dir: &Path) -> Result<Folder, String> {
+        let path = dir.join(FOLDER);
+        match fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Folder::default()),
+            Err(e) => Err(format!("read {}: {e}", path.display())),
+            Ok(text) => toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display())),
+        }
+    }
+
+    pub fn save_folder(&self, dir: &Path, folder: &Folder) -> Result<(), String> {
+        let path = dir.join(FOLDER);
+        if *folder == Folder::default() {
+            return match fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("delete: {e}")),
+                _ => Ok(()),
+            };
+        }
+        let mut folder = folder.clone();
+        folder.vars.retain(|v| !v.key.is_empty());
+        write_atomic(
+            &path,
+            &toml::to_string_pretty(&folder).map_err(|e| e.to_string())?,
+        )
+    }
+
+    /// The settings of every folder between `collections/` and the request at `path`.
+    pub fn inherited(&self, path: &Path) -> Result<Inherited, String> {
+        let root = self.collections();
+        let mut dirs: Vec<&Path> = path
+            .ancestors()
+            .skip(1)
+            .take_while(|d| *d != root && d.starts_with(&root))
+            .collect();
+        dirs.reverse();
+        let mut out = Inherited::default();
+        for dir in dirs {
+            let f = self.load_folder(dir)?;
+            let name = folder_name(&root, dir);
+            let vars = f
+                .vars
+                .into_iter()
+                .filter(|v| v.enabled && !v.key.is_empty());
+            out.vars.extend(vars.map(|v| (v.key, v.value)));
+            if f.auth != Auth::Inherit {
+                out.auth = Some((name.clone(), f.auth));
+            }
+            if !f.pre_request.trim().is_empty() {
+                out.pre_request.push((name.clone(), f.pre_request));
+            }
+            if !f.tests.trim().is_empty() {
+                out.tests.push((name, f.tests));
+            }
+        }
+        Ok(out)
     }
 
     pub fn save_request(&self, path: &Path, req: &Request) -> Result<(), String> {
@@ -415,6 +476,12 @@ impl Workspace {
     }
 }
 
+/// "users/admin"; unlike `display_name`, a dot in a folder name isn't an extension.
+pub fn folder_name(root: &Path, dir: &Path) -> String {
+    let rel = dir.strip_prefix(root).unwrap_or(dir);
+    rel.to_string_lossy().replace('\\', "/")
+}
+
 fn scan(dir: &Path) -> Vec<Node> {
     let mut folders = Vec::new();
     let mut requests = Vec::new();
@@ -544,6 +611,57 @@ mod tests {
         fs::write(root.join("environments/dev.toml"), "vars = [").unwrap();
         assert!(ws.env_vars(Some("dev")).unwrap_err().contains("dev.toml"));
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn folder_settings_cascade_to_the_requests_below() {
+        let root = std::env::temp_dir().join(format!("apitool-folders-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let ws = Workspace::open(root.clone()).unwrap();
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let admin = ws.create_folder(&api, "admin.v2").unwrap();
+        let req = ws.create_request(&admin, "r").unwrap();
+        let bearer = Auth::Bearer {
+            token: "{{token}}".into(),
+        };
+        let outer = Folder {
+            vars: vec![KeyValue::new("base", "outer"), KeyValue::new("page", "1")],
+            auth: bearer.clone(),
+            pre_request: "outer()".into(),
+            ..Default::default()
+        };
+        ws.save_folder(&api, &outer).unwrap();
+        let inner = Folder {
+            vars: vec![KeyValue::new("base", "inner")],
+            pre_request: "inner()".into(),
+            ..Default::default()
+        };
+        ws.save_folder(&admin, &inner).unwrap();
+
+        let got = ws.load_request(&req).unwrap().inherited;
+        // The inner folder wins; one that sets no auth passes its parent's down.
+        assert_eq!(got.vars["base"], "inner");
+        assert_eq!(got.vars["page"], "1");
+        assert_eq!(got.auth, Some(("api".into(), bearer)));
+        // Outermost first, as Postman runs collection then folder scripts. A dot in a
+        // folder name is not an extension.
+        let pre: Vec<_> = got
+            .pre_request
+            .iter()
+            .map(|(f, s)| (f.as_str(), s.as_str()))
+            .collect();
+        assert_eq!(pre, [("api", "outer()"), ("api/admin.v2", "inner()")]);
+        assert!(
+            matches!(&ws.tree()[0], Node::Folder { children, .. } if children.len() == 1),
+            "settings files are not requests"
+        );
+
+        ws.save_folder(&admin, &Folder::default()).unwrap();
+        assert!(!admin.join(FOLDER).exists(), "no empty settings files");
+        // A broken file must not quietly drop the auth every request relies on.
+        fs::write(api.join(FOLDER), "auth = [").unwrap();
+        assert!(ws.load_request(&req).unwrap_err().contains(".folder.toml"));
         fs::remove_dir_all(&root).unwrap();
     }
 

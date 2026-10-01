@@ -9,7 +9,7 @@ use crate::cookies::Jar;
 use crate::graphql::{self, Operation};
 use crate::http;
 use crate::loadtest::{self, Stats};
-use crate::model::{self, Auth, Body, Example, KeyValue, METHODS, Request};
+use crate::model::{self, Auth, Body, Example, Folder, Inherited, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
 use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
@@ -52,6 +52,13 @@ enum ReqTab {
     Auth,
     Scripts,
     Examples,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum FolderTab {
+    Vars,
+    Auth,
+    Scripts,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -221,10 +228,24 @@ impl EnvEditor {
     }
 }
 
+/// Edits a folder's `.folder.toml`.
+struct FolderEditor {
+    dir: PathBuf,
+    name: String,
+    folder: Folder,
+    saved: Folder,
+    /// What the folders above this one pass down.
+    parent: Inherited,
+    tab: FolderTab,
+    error: String,
+    confirm_discard: bool,
+}
+
 enum TreeAction {
     Open(PathBuf),
     Dialog(Dialog),
     Run(PathBuf),
+    FolderSettings(PathBuf),
 }
 
 /// Collection runner pane. Settings persist while the pane is open; results are summaries only.
@@ -285,6 +306,7 @@ pub struct App {
     status: String,
     dialog: Option<Dialog>,
     env_editor: Option<EnvEditor>,
+    folder_editor: Option<FolderEditor>,
     runner: Option<RunnerView>,
     next_run_id: u64,
     network: Network,
@@ -327,6 +349,7 @@ impl App {
             status: String::new(),
             dialog: None,
             env_editor: None,
+            folder_editor: None,
             runner: None,
             next_run_id: 0,
             network: state.network,
@@ -453,6 +476,7 @@ impl App {
             self.active_env = None;
         }
         self.reload_vars();
+        self.refresh_inherited();
         let Some(open) = &mut self.open else { return };
         match self.ws.load_request(&open.path) {
             Ok(disk) if disk == open.saved => {}
@@ -474,6 +498,19 @@ impl App {
         }
     }
 
+    /// Folder settings apply to the open request at once, unsaved edits or not: they
+    /// aren't part of its file.
+    fn refresh_inherited(&mut self) {
+        let Some(open) = &mut self.open else { return };
+        match self.ws.inherited(&open.path) {
+            Ok(inherited) => {
+                open.saved.inherited = inherited.clone();
+                open.draft.inherited = inherited;
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
     fn request_open(&mut self, path: PathBuf, draft: Option<Box<Request>>) {
         if draft.is_none() && self.open.as_ref().is_some_and(|o| o.path == path) {
             return;
@@ -490,8 +527,9 @@ impl App {
         if let (Some(mut draft), Some(open)) = (draft, &mut self.open)
             && open.path == path
         {
-            // Examples belong to the file, not to one send.
+            // Examples belong to the file, not to one send; folder settings to the folder.
             draft.examples = open.saved.examples.clone();
+            draft.inherited = open.saved.inherited.clone();
             open.draft = *draft;
         }
     }
@@ -791,6 +829,9 @@ impl App {
     /// Everything `{{name}}` can resolve to, with the same precedence as the runner.
     fn all_vars(&self) -> HashMap<String, String> {
         let mut all = self.globals.clone();
+        if let Some(open) = &self.open {
+            all.extend(open.draft.inherited.vars.clone());
+        }
         all.extend(self.vars.clone());
         all
     }
@@ -882,6 +923,8 @@ impl eframe::App for App {
             // Save what the user is looking at, not the request hidden behind the editor.
             if self.env_editor.is_some() {
                 self.save_env_editor();
+            } else if self.folder_editor.is_some() {
+                self.save_folder_editor();
             } else {
                 self.save();
             }
@@ -912,6 +955,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| self.main_area(ui));
         self.dialog_ui(ui.ctx());
         self.env_editor_ui(ui.ctx());
+        self.folder_editor_ui(ui.ctx());
         self.quick_look_ui(ui.ctx());
         self.cookie_manager_ui(ui.ctx());
         if let Some(id) = self.focus_request.take() {
@@ -1082,6 +1126,7 @@ impl App {
                 }
                 TreeAction::Dialog(d) => self.dialog = Some(d),
                 TreeAction::Run(path) => self.open_runner(path),
+                TreeAction::FolderSettings(dir) => self.open_folder_editor(dir),
             }
         }
     }
@@ -1290,7 +1335,9 @@ impl App {
                 }
                 let (_, missing) = open.draft.resolved(&all_vars);
                 // A pre-request script may define them; only warn when nothing could.
-                if !missing.is_empty() && open.draft.pre_request.trim().is_empty() {
+                let scripted = !open.draft.pre_request.trim().is_empty()
+                    || !open.draft.inherited.pre_request.is_empty();
+                if !missing.is_empty() && !scripted {
                     ui.horizontal(|ui| {
                         ui.colored_label(ORANGE, format!("Undefined: {}", missing.join(", ")));
                         // Without an environment, Globals is where a value works right away.
@@ -1341,7 +1388,10 @@ impl App {
                     ui.selectable_value(
                         &mut self.req_tab,
                         ReqTab::Auth,
-                        dot(matches!(open.draft.auth, Auth::None), "Auth"),
+                        dot(
+                            matches!(open.draft.effective_auth(), Auth::None | Auth::Inherit),
+                            "Auth",
+                        ),
                     );
                     let no_scripts = open.draft.pre_request.trim().is_empty()
                         && open.draft.tests.trim().is_empty();
@@ -1394,10 +1444,19 @@ impl App {
                                 &mut self.explorer,
                             );
                         }
-                        ReqTab::Auth => auth_editor(ui, &mut open.draft.auth, &all_vars),
-                        ReqTab::Scripts => {
-                            scripts_editor(ui, &mut self.script_tab, &mut open.draft)
-                        }
+                        ReqTab::Auth => auth_editor(
+                            ui,
+                            &mut open.draft.auth,
+                            &all_vars,
+                            open.draft.inherited.auth.as_ref(),
+                        ),
+                        ReqTab::Scripts => scripts_editor(
+                            ui,
+                            &mut self.script_tab,
+                            &mut open.draft.pre_request,
+                            &mut open.draft.tests,
+                            &open.draft.inherited,
+                        ),
                         ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
                     });
             });
@@ -1770,6 +1829,133 @@ impl App {
         }
     }
 
+    fn open_folder_editor(&mut self, dir: PathBuf) {
+        // A folder inherits from its parents exactly like a request in it would.
+        let loaded = self.ws.load_folder(&dir);
+        match loaded.and_then(|f| Ok((f, self.ws.inherited(&dir)?))) {
+            Ok((folder, parent)) => {
+                // Ready to type into the blank row, like the environment editor.
+                self.focus_request = Some(egui::Id::new(("folder-vars", folder.vars.len(), 0)));
+                self.folder_editor = Some(FolderEditor {
+                    name: store::folder_name(&self.ws.collections(), &dir),
+                    dir,
+                    saved: folder.clone(),
+                    folder,
+                    parent,
+                    tab: FolderTab::Vars,
+                    error: String::new(),
+                    confirm_discard: false,
+                })
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn folder_editor_ui(&mut self, ctx: &egui::Context) {
+        let Some(ed) = &mut self.folder_editor else {
+            return;
+        };
+        let (mut save, mut close) = (false, false);
+        let mut vars = self.globals.clone();
+        vars.extend(ed.parent.vars.clone());
+        let own = ed.folder.vars.iter().filter(|v| v.enabled);
+        vars.extend(own.map(|v| (v.key.clone(), v.value.clone())));
+        vars.extend(self.vars.clone());
+        // Like the environment editor: only explicit buttons close it.
+        egui::Modal::new(egui::Id::new("folder-editor")).show(ctx, |ui| {
+            ui.set_width(620.0);
+            ui.heading(format!("Folder: {}", ed.name));
+            ui.weak(
+                "Shared by every request in this folder and its subfolders. \
+                 Saved to .folder.toml and committed to git.",
+            );
+            ui.horizontal(|ui| {
+                let f = &ed.folder;
+                let n = f
+                    .vars
+                    .iter()
+                    .filter(|v| v.enabled && !v.key.is_empty())
+                    .count();
+                let vars_label = match n {
+                    0 => "Variables".to_owned(),
+                    n => format!("Variables ({n})"),
+                };
+                let dot = |set: bool, name: &str| match set {
+                    true => format!("{name} ●"),
+                    false => name.to_owned(),
+                };
+                let scripts = !f.pre_request.trim().is_empty() || !f.tests.trim().is_empty();
+                let auth = dot(f.auth != Auth::Inherit, "Auth");
+                ui.selectable_value(&mut ed.tab, FolderTab::Vars, vars_label);
+                ui.selectable_value(&mut ed.tab, FolderTab::Auth, auth);
+                ui.selectable_value(&mut ed.tab, FolderTab::Scripts, dot(scripts, "Scripts"));
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| match ed.tab {
+                    FolderTab::Vars => {
+                        ui.weak(
+                            "Below environments: an environment variable with the same name \
+                             wins. Keep secrets in a secret environment.",
+                        );
+                        kv_table(ui, "folder-vars", &mut ed.folder.vars, &HashMap::new());
+                    }
+                    FolderTab::Auth => {
+                        let parent = ed.parent.auth.as_ref();
+                        auth_editor(ui, &mut ed.folder.auth, &vars, parent);
+                        ui.weak("Requests set to \"Inherit from parent\" use this.");
+                    }
+                    FolderTab::Scripts => scripts_editor(
+                        ui,
+                        &mut self.script_tab,
+                        &mut ed.folder.pre_request,
+                        &mut ed.folder.tests,
+                        &ed.parent,
+                    ),
+                });
+            if !ed.error.is_empty() {
+                ui.colored_label(RED, ed.error.as_str());
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                save = ui
+                    .button("Save")
+                    .on_hover_text(ui.ctx().format_shortcut(&SAVE))
+                    .clicked();
+                let close_label = if ed.confirm_discard {
+                    RichText::new("Discard changes").color(RED)
+                } else {
+                    RichText::new("Close")
+                };
+                close = ui.button(close_label).clicked();
+            });
+        });
+        if save {
+            self.save_folder_editor();
+        } else if close {
+            if ed.folder != ed.saved && !ed.confirm_discard {
+                ed.confirm_discard = true;
+            } else {
+                self.folder_editor = None;
+            }
+        }
+    }
+
+    fn save_folder_editor(&mut self) {
+        let Some(ed) = &mut self.folder_editor else {
+            return;
+        };
+        match self.ws.save_folder(&ed.dir, &ed.folder) {
+            Ok(()) => {
+                self.status = format!("Saved folder {}", ed.name);
+                self.folder_editor = None;
+                self.refresh_inherited();
+            }
+            Err(e) => ed.error = e,
+        }
+    }
+
     fn cookie_manager_ui(&mut self, ctx: &egui::Context) {
         if !self.cookie_manager {
             return;
@@ -1843,10 +2029,13 @@ impl App {
                     .show(ui, |ui| {
                         egui::Grid::new("quick-look").striped(true).show(ui, |ui| {
                             for name in &names {
-                                let (value, source) = match self.vars.get(name) {
-                                    Some(v) => (v, env.clone().unwrap_or_default()),
-                                    None => (&self.globals[name], "Globals".to_owned()),
-                                };
+                                let folder = self.open.as_ref().map(|o| &o.draft.inherited.vars);
+                                let (value, source) =
+                                    match (self.vars.get(name), folder.and_then(|f| f.get(name))) {
+                                        (Some(v), _) => (v, env.clone().unwrap_or_default()),
+                                        (None, Some(v)) => (v, "Folder".to_owned()),
+                                        _ => (&self.globals[name], "Globals".to_owned()),
+                                    };
                                 ui.monospace(name);
                                 ui.label(RichText::new(clip(value, 60)).monospace())
                                     .on_hover_text(value.as_str());
@@ -2303,6 +2492,10 @@ fn tree_ui(
                     );
                     item("Delete", Dialog::Delete(path.clone()));
                     ui.separator();
+                    if ui.button("Folder settings…").clicked() {
+                        actions.push(TreeAction::FolderSettings(path.clone()));
+                        ui.close();
+                    }
                     if ui.button("Run folder").clicked() {
                         actions.push(TreeAction::Run(path.clone()));
                         ui.close();
@@ -2674,9 +2867,16 @@ fn code_editor(ui: &mut egui::Ui, id: &str, text: &mut String, vars: &HashMap<St
     );
 }
 
-fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth, vars: &HashMap<String, String>) {
+/// `inherited`: what "Inherit from parent" currently resolves to, and from which folder.
+fn auth_editor(
+    ui: &mut egui::Ui,
+    auth: &mut Auth,
+    vars: &HashMap<String, String>,
+    inherited: Option<&(String, Auth)>,
+) {
     let (user, pass) = (String::new, String::new);
     let kinds = [
+        ("Inherit from parent", Auth::Inherit),
         ("No auth", Auth::None),
         ("Bearer token", Auth::Bearer { token: user() }),
         (
@@ -2695,18 +2895,21 @@ fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth, vars: &HashMap<String, String
         ),
         ("OAuth 2.0", Auth::OAuth2(model::OAuth2::default())),
     ];
+    let label_of = |a: &Auth| {
+        let d = std::mem::discriminant(a);
+        kinds
+            .iter()
+            .find(|(_, k)| std::mem::discriminant(k) == d)
+            .map_or("", |(l, _)| *l)
+    };
     let current = std::mem::discriminant(&*auth);
-    let label = kinds
-        .iter()
-        .find(|(_, k)| std::mem::discriminant(k) == current)
-        .map_or("", |(l, _)| *l);
     egui::ComboBox::from_id_salt("auth")
-        .selected_text(label)
+        .selected_text(label_of(auth))
         .show_ui(ui, |ui| {
-            for (label, kind) in kinds {
-                let same = std::mem::discriminant(&kind) == current;
-                if ui.selectable_label(same, label).clicked() && !same {
-                    *auth = kind;
+            for (label, kind) in &kinds {
+                let same = std::mem::discriminant(kind) == current;
+                if ui.selectable_label(same, *label).clicked() && !same {
+                    *auth = kind.clone();
                 }
             }
         });
@@ -2737,7 +2940,7 @@ fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth, vars: &HashMap<String, String
         .num_columns(2)
         .spacing([8.0, 6.0])
         .show(ui, |ui| match auth {
-            Auth::None => {}
+            Auth::Inherit | Auth::None => {}
             Auth::Bearer { token } => text(ui, "Token", token, "{{token}}"),
             Auth::Basic { username, password } | Auth::Digest { username, password } => {
                 text(ui, "Username", username, "");
@@ -2771,6 +2974,12 @@ fn auth_editor(ui: &mut egui::Ui, auth: &mut Auth, vars: &HashMap<String, String
             }
         });
     match auth {
+        Auth::Inherit => {
+            ui.weak(match inherited {
+                Some((folder, a)) => format!("Uses {} from folder \"{folder}\".", label_of(a)),
+                None => "No folder above sets auth, so none is sent.".to_owned(),
+            });
+        }
         Auth::None => {}
         Auth::OAuth2(_) => {
             ui.weak("The token is fetched on Send and reused until it expires or is rejected.");
@@ -2825,7 +3034,14 @@ const POST_SNIPPETS: &[(&str, &str)] = &[
     ),
 ];
 
-fn scripts_editor(ui: &mut egui::Ui, tab: &mut ScriptTab, req: &mut Request) {
+/// For a request or a folder; `inherited` lists the folder scripts that run first.
+fn scripts_editor(
+    ui: &mut egui::Ui,
+    tab: &mut ScriptTab,
+    pre_request: &mut String,
+    tests: &mut String,
+    inherited: &Inherited,
+) {
     let mut insert = None;
     ui.horizontal(|ui| {
         let label = |name: &str, s: &str| {
@@ -2835,8 +3051,8 @@ fn scripts_editor(ui: &mut egui::Ui, tab: &mut ScriptTab, req: &mut Request) {
                 format!("{name} ●")
             }
         };
-        ui.selectable_value(tab, ScriptTab::Pre, label("Pre-request", &req.pre_request));
-        ui.selectable_value(tab, ScriptTab::Post, label("Post-response", &req.tests));
+        ui.selectable_value(tab, ScriptTab::Pre, label("Pre-request", pre_request));
+        ui.selectable_value(tab, ScriptTab::Post, label("Post-response", tests));
         ui.separator();
         let snippets = if *tab == ScriptTab::Pre {
             PRE_SNIPPETS
@@ -2852,13 +3068,21 @@ fn scripts_editor(ui: &mut egui::Ui, tab: &mut ScriptTab, req: &mut Request) {
             }
         });
     });
+    let above = match tab {
+        ScriptTab::Pre => &inherited.pre_request,
+        ScriptTab::Post => &inherited.tests,
+    };
+    if !above.is_empty() {
+        let folders: Vec<&str> = above.iter().map(|(f, _)| f.as_str()).collect();
+        ui.weak(format!("Folder scripts run first: {}", folders.join(", ")));
+    }
     let (text, hint) = match tab {
         ScriptTab::Pre => (
-            &mut req.pre_request,
+            pre_request,
             "// Runs before the request is sent.\n// pm.request, pm.environment, pm.variables, console.log",
         ),
         ScriptTab::Post => (
-            &mut req.tests,
+            tests,
             "// Runs after the response arrives.\n// pm.test(name, fn), pm.expect(...), pm.response.json()",
         ),
     };
@@ -3594,6 +3818,72 @@ mod ui_tests {
         h.run();
         assert!(h.state().env_editor.is_none());
         assert!(!h.state().vars.contains_key("tmp"));
+    }
+
+    #[test]
+    fn folder_variables_reach_the_requests_inside_without_touching_their_edits() {
+        let ws = workspace("folder");
+        let dir = ws.create_folder(&ws.collections(), "api").unwrap();
+        let path = ws.create_request(&dir, "r").unwrap();
+        let req = Request {
+            url: "{{base}}/x".into(),
+            ..Default::default()
+        };
+        ws.save_request(&path, &req).unwrap();
+        let mut h = harness(ws);
+        h.run();
+        h.get_by_label("api").click();
+        h.run();
+        h.get_by_label("r").click();
+        h.run();
+        h.get_by_label_contains("Undefined: base");
+        let draft = KeyValue::new("X-Draft", "1");
+        h.state_mut()
+            .open
+            .as_mut()
+            .unwrap()
+            .draft
+            .headers
+            .push(draft.clone());
+
+        h.get_by_label("api").click_secondary();
+        h.run();
+        h.get_by_label("Folder settings…").click();
+        h.run();
+        // Opens ready to type, like the environment editor.
+        for c in "base".chars() {
+            h.event(egui::Event::Text(c.to_string()));
+            h.step();
+        }
+        h.key_press(Key::Tab);
+        h.run();
+        let host = crate::http::tests::echo_server();
+        h.event(egui::Event::Text(
+            host.trim_end_matches("/users").to_owned(),
+        ));
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        h.run();
+
+        assert!(h.state().folder_editor.is_none());
+        assert!(h.query_by_label_contains("Undefined").is_none());
+        let open = h.state().open.as_ref().unwrap();
+        assert!(open.draft.headers.contains(&draft), "unsaved edits kept");
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| app.response.is_some());
+        let shown = h
+            .state()
+            .response
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap();
+        assert!(
+            shown.text.to_lowercase().starts_with("get /x "),
+            "{}",
+            shown.text
+        );
     }
 
     /// A workspace with one request `r` (and env `dev` with `host`), opened in the app.

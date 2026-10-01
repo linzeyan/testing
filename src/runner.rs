@@ -65,8 +65,19 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
         globals: Changes::new(),
     };
     let mut locals = HashMap::new();
+    let collection = req.inherited.vars.clone();
+    // Postman's order: outermost folder first, the request's own script last.
+    let scripts = |inherited: &[(String, String)], own: &str| -> Vec<(String, String)> {
+        let own = (String::new(), own.to_owned());
+        let all = inherited.iter().cloned().chain(std::iter::once(own));
+        all.filter(|(_, s)| !s.trim().is_empty()).collect()
+    };
+    let whose = |folder: &str| match folder {
+        "" => String::new(),
+        f => format!(" of folder \"{f}\""),
+    };
 
-    if !req.pre_request.trim().is_empty() {
+    for (folder, code) in scripts(&req.inherited.pre_request, &req.pre_request) {
         let wire = WireRequest {
             method: req.method.clone(),
             url: req.url.clone(),
@@ -83,16 +94,20 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
             iteration_count: info.count,
             data: &vars.data,
             env: &vars.env,
+            collection: &collection,
             globals: &vars.globals,
             locals: &locals,
             request: &wire,
             response: None,
         };
-        let result = tokio::task::block_in_place(|| script::run(&req.pre_request, &input));
+        let result = tokio::task::block_in_place(|| script::run(&code, &input));
         let error = result.error.clone();
         let edited = absorb(&mut out, &mut vars, &mut locals, result);
         if let Some(e) = error {
-            out.response = Err(format!("Pre-request script failed, request not sent:\n{e}"));
+            let whose = whose(&folder);
+            out.response = Err(format!(
+                "Pre-request script{whose} failed, request not sent:\n{e}"
+            ));
             return out;
         }
         if let Some(w) = edited {
@@ -106,49 +121,51 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
         }
     }
 
-    // Precedence like Postman: request-local > data row > environment > globals.
+    // Precedence like Postman: request-local > data row > environment > folder > globals.
     let mut merged = vars.globals.clone();
+    merged.extend(collection.clone());
     merged.extend(vars.env.clone());
     merged.extend(vars.data.clone());
     merged.extend(locals.clone());
     let (wire, _) = req.resolved(&merged);
     let response = send(&client, wire).await;
 
-    if let Ok(resp) = &response
-        && !req.tests.trim().is_empty()
-    {
-        let wire = WireRequest {
-            method: req.method.clone(),
-            url: req.url.clone(),
-            headers: Vec::new(),
-        };
-        let sr = ScriptResponse {
-            code: resp.status,
-            status: &resp.reason,
-            time: resp.elapsed.as_millis(),
-            headers: &resp.headers,
-            body: &resp.body,
-        };
-        let input = script::Input {
-            name: &info.name,
-            iteration: info.iteration,
-            iteration_count: info.count,
-            data: &vars.data,
-            env: &vars.env,
-            globals: &vars.globals,
-            locals: &locals,
-            request: &wire,
-            response: Some(sr),
-        };
-        let result = tokio::task::block_in_place(|| script::run(&req.tests, &input));
-        let error = result.error.clone();
-        absorb(&mut out, &mut vars, &mut locals, result);
-        if let Some(e) = error {
-            out.tests.push(TestResult {
-                name: "Script error".into(),
-                passed: false,
-                error: Some(e),
-            });
+    if let Ok(resp) = &response {
+        for (folder, code) in scripts(&req.inherited.tests, &req.tests) {
+            let wire = WireRequest {
+                method: req.method.clone(),
+                url: req.url.clone(),
+                headers: Vec::new(),
+            };
+            let sr = ScriptResponse {
+                code: resp.status,
+                status: &resp.reason,
+                time: resp.elapsed.as_millis(),
+                headers: &resp.headers,
+                body: &resp.body,
+            };
+            let input = script::Input {
+                name: &info.name,
+                iteration: info.iteration,
+                iteration_count: info.count,
+                data: &vars.data,
+                env: &vars.env,
+                collection: &collection,
+                globals: &vars.globals,
+                locals: &locals,
+                request: &wire,
+                response: Some(sr),
+            };
+            let result = tokio::task::block_in_place(|| script::run(&code, &input));
+            let error = result.error.clone();
+            absorb(&mut out, &mut vars, &mut locals, result);
+            if let Some(e) = error {
+                out.tests.push(TestResult {
+                    name: format!("Script error{}", whose(&folder)),
+                    passed: false,
+                    error: Some(e),
+                });
+            }
         }
     }
     out.response = response;
@@ -442,6 +459,77 @@ mod tests {
         }
         // The last write wins and is handed back for persisting.
         assert_eq!(env["session"], Some("bob".into()));
+    }
+
+    #[test]
+    fn folder_scripts_wrap_the_request_and_folder_settings_apply() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt
+            .block_on(build_client(Network {
+                proxy: ProxyMode::None,
+                ..Default::default()
+            }))
+            .unwrap();
+        let s = |v: &str| v.to_owned();
+        let mut req = Request {
+            url: "{{base}}/x".into(),
+            pre_request: "console.log('own');".into(),
+            tests: r#"pm.test("own", function () {
+                pm.expect(pm.collectionVariables.get("stage")).to.equal("folder");
+            });"#
+                .into(),
+            ..Default::default()
+        };
+        req.inherited = crate::model::Inherited {
+            vars: HashMap::from([
+                (s("base"), crate::http::tests::echo_server()),
+                (s("stage"), s("folder")),
+            ]),
+            auth: Some((
+                s("api"),
+                crate::model::Auth::Bearer {
+                    token: s("{{token}}"),
+                },
+            )),
+            pre_request: vec![
+                (s("api"), s("console.log('outer');")),
+                (
+                    s("api/admin"),
+                    s("console.log('inner'); \
+                       pm.request.headers.upsert({ key: 'X-Stage', value: pm.variables.get('stage') });"),
+                ),
+            ],
+            tests: vec![(s("api"), s("pm.collectionVariables.set('x', 1);"))],
+        };
+        let vars = Vars {
+            env: HashMap::from([(s("token"), s("s3cret")), (s("stage"), s("env"))]),
+            ..Default::default()
+        };
+        let out = rt.block_on(run(client, &Info::single("t".into()), req, vars));
+
+        assert_eq!(out.logs, ["outer", "inner", "own"]);
+        let wire = out.response.unwrap().body.to_lowercase();
+        assert!(wire.starts_with("get /users/x "), "{wire}");
+        assert!(wire.contains("authorization: bearer s3cret"), "{wire}");
+        assert!(
+            wire.contains("x-stage: env"),
+            "environment beats folder: {wire}"
+        );
+        let tests: Vec<_> = out
+            .tests
+            .iter()
+            .map(|t| (t.name.as_str(), t.passed))
+            .collect();
+        // Folder tests run first, and an error says whose script it was.
+        assert_eq!(
+            tests,
+            [("Script error of folder \"api\"", false), ("own", true)]
+        );
+        assert!(out.tests[0].error.as_deref().unwrap().contains("read-only"));
     }
 
     #[test]

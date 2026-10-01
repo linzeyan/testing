@@ -9,7 +9,9 @@ such as Citrix VDI. No installer: unzip and run.
   JSON, text, form and multipart bodies (a value `@path` uploads a file); paste a curl
   command into the URL bar to import it, "Copy as curl" to export; find in response
   (Ctrl+F); saved response examples; request history; Bearer, Basic, Digest and OAuth 2.0
-  (client credentials, password) auth; a cookie jar like a browser's, with a manager.
+  (client credentials, password) auth; a cookie jar like a browser's, with a manager;
+  folder settings (right-click a folder) with variables, auth and scripts shared by every
+  request inside, like Postman collection/folder settings.
 - **apitool-cli** — headless runner for CI:
   `apitool-cli <collection|folder|request.toml> [-e env] [-d data.csv] [-n N] [--junit report.xml]`,
   exit code 0 = all passed, 1 = failures, 2 = could not run.

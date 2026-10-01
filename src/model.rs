@@ -30,7 +30,7 @@ pub struct Request {
     pub headers: Vec<KeyValue>,
     #[serde(skip_serializing_if = "Body::is_none")]
     pub body: Body,
-    #[serde(skip_serializing_if = "Auth::is_none")]
+    #[serde(skip_serializing_if = "Auth::is_inherit")]
     pub auth: Auth,
     /// JavaScript run before sending (may edit the request and variables).
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -41,6 +41,39 @@ pub struct Request {
     /// Saved responses, for reference and documentation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<Example>,
+    /// From the folders above; filled in when loaded from the workspace, never saved.
+    #[serde(skip)]
+    pub inherited: Inherited,
+}
+
+/// A folder's `.folder.toml`: what every request below it shares, like a Postman
+/// collection or folder.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Folder {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub vars: Vec<KeyValue>,
+    /// Used by requests (and subfolders) whose auth is `inherit`.
+    #[serde(skip_serializing_if = "Auth::is_inherit")]
+    pub auth: Auth,
+    /// Runs before the request's own pre-request script.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub pre_request: String,
+    /// Runs before the request's own tests.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tests: String,
+}
+
+/// A request's folders folded together, outermost first. Scripts carry their folder's
+/// name so an error says where it came from.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Inherited {
+    /// Inner folders override outer ones.
+    pub vars: HashMap<String, String>,
+    /// From the nearest folder that sets one, with that folder's name.
+    pub auth: Option<(String, Auth)>,
+    pub pre_request: Vec<(String, String)>,
+    pub tests: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -65,10 +98,11 @@ impl Default for Request {
             params: Vec::new(),
             headers: Vec::new(),
             body: Body::None,
-            auth: Auth::None,
+            auth: Auth::Inherit,
             pre_request: String::new(),
             tests: String::new(),
             examples: Vec::new(),
+            inherited: Inherited::default(),
         }
     }
 }
@@ -134,7 +168,9 @@ impl Body {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Auth {
+    /// From the enclosing folder, else none; what new requests start with, as in Postman.
     #[default]
+    Inherit,
     None,
     Bearer {
         token: String,
@@ -179,8 +215,8 @@ pub enum Grant {
 }
 
 impl Auth {
-    fn is_none(&self) -> bool {
-        matches!(self, Self::None)
+    fn is_inherit(&self) -> bool {
+        matches!(self, Self::Inherit)
     }
 }
 
@@ -367,8 +403,8 @@ impl Request {
                     variables: r(variables),
                 },
             },
-            auth: match &self.auth {
-                Auth::None => Auth::None,
+            auth: match self.effective_auth() {
+                Auth::None | Auth::Inherit => Auth::None,
                 Auth::Bearer { token } => Auth::Bearer { token: r(token) },
                 Auth::Basic { username, password } => Auth::Basic {
                     username: r(username),
@@ -392,8 +428,17 @@ impl Request {
             pre_request: String::new(),
             tests: String::new(),
             examples: Vec::new(),
+            inherited: Inherited::default(),
         };
         (req, missing)
+    }
+
+    /// The auth that applies: its own, or the inherited one.
+    pub fn effective_auth(&self) -> &Auth {
+        match (&self.auth, &self.inherited.auth) {
+            (Auth::Inherit, Some((_, auth))) => auth,
+            (auth, _) => auth,
+        }
     }
 }
 
@@ -515,6 +560,8 @@ mod tests {
                 content_type: "application/json".into(),
                 body: "{\n  \"id\": 1\n}".into(),
             }],
+            // Derived from the folders on load, never written.
+            inherited: Inherited::default(),
         };
         let text = toml::to_string_pretty(&req).unwrap();
         assert_eq!(toml::from_str::<Request>(&text).unwrap(), req, "{text}");
@@ -522,6 +569,8 @@ mod tests {
             body: Body::Form {
                 fields: vec![KeyValue::new("a", "b")],
             },
+            // An explicit "No auth" must not come back as "inherit" from the folder.
+            auth: Auth::None,
             ..Default::default()
         };
         assert_eq!(
