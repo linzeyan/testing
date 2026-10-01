@@ -86,7 +86,10 @@ struct EnvFile {
 #[serde(default)]
 pub struct State {
     pub active_env: Option<String>,
+    /// The active tab.
     pub open: Option<PathBuf>,
+    /// Every open tab, in order.
+    pub tabs: Vec<PathBuf>,
     pub network: crate::net::Network,
 }
 

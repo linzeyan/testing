@@ -11,7 +11,8 @@ such as Citrix VDI. No installer: unzip and run.
   (Ctrl+F); saved response examples; request history; Bearer, Basic, Digest and OAuth 2.0
   (client credentials, password) auth; a cookie jar like a browser's, with a manager;
   folder settings (right-click a folder) with variables, auth and scripts shared by every
-  request inside, like Postman collection/folder settings.
+  request inside, like Postman collection/folder settings; tabs (a click in the tree
+  previews, double-click or editing keeps the tab, Ctrl+W closes).
 - **apitool-cli** — headless runner for CI:
   `apitool-cli <collection|folder|request.toml> [-e env] [-d data.csv] [-n N] [--junit report.xml]`,
   exit code 0 = all passed, 1 = failures, 2 = could not run.

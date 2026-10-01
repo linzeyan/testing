@@ -20,6 +20,7 @@ use crate::varedit::{clip, var_edit};
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
 /// Lines longer than this are clipped in the viewer; JSON is pretty-printed first so
 /// only non-JSON minified bodies hit it.
 const MAX_LINE: usize = 4096;
@@ -92,6 +93,34 @@ impl Open {
     fn dirty(&self) -> bool {
         self.saved != self.draft
     }
+}
+
+/// One request in the tab bar. The active tab's request, response and load test live
+/// in `App::open`/`response`/`load`, so the editor code stays single-request.
+struct Tab {
+    path: PathBuf,
+    /// Opened by a plain click in the tree: the next click there reuses this tab instead
+    /// of adding one. Editing or double-clicking keeps it.
+    preview: bool,
+    /// Background tabs only; also `None` for tabs restored at startup and not shown yet.
+    // ponytail: background tabs keep their response; drop it on parking if RAM bites.
+    parked: Option<Parked>,
+}
+
+impl Tab {
+    fn new(path: PathBuf, preview: bool) -> Self {
+        Self {
+            path,
+            preview,
+            parked: None,
+        }
+    }
+}
+
+struct Parked {
+    open: Open,
+    response: Option<Shown>,
+    load: Option<LoadView>,
 }
 
 struct Pending {
@@ -186,7 +215,8 @@ enum NameKind {
 
 enum Next {
     /// With a draft to put in place of the saved version (restoring from history).
-    Open(PathBuf, Option<Box<Request>>),
+    Open(PathBuf, Box<Request>),
+    Close(PathBuf),
     Quit,
 }
 
@@ -242,7 +272,8 @@ struct FolderEditor {
 }
 
 enum TreeAction {
-    Open(PathBuf),
+    /// `true` (a double-click) opens a normal tab instead of a preview.
+    Open(PathBuf, bool),
     Dialog(Dialog),
     Run(PathBuf),
     FolderSettings(PathBuf),
@@ -293,11 +324,13 @@ pub struct App {
     /// Focus to move to on the next frame, once the target widget exists.
     focus_request: Option<egui::Id>,
     open: Option<Open>,
+    tabs: Vec<Tab>,
     req_tab: ReqTab,
     script_tab: ScriptTab,
     resp_tab: RespTab,
     response: Option<Shown>,
-    pending: Option<Pending>,
+    /// At most one per request; tabs send independently.
+    pending: Vec<Pending>,
     stream: Option<StreamSession>,
     /// Methods of the last `.proto` the gRPC picker looked at; recompiled only on change.
     grpc_methods: Option<(String, Result<Vec<String>, String>)>,
@@ -337,11 +370,12 @@ impl App {
             quick_look: false,
             focus_request: None,
             open: None,
+            tabs: Vec::new(),
             req_tab: ReqTab::Params,
             script_tab: ScriptTab::Post,
             resp_tab: RespTab::Body,
             response: None,
-            pending: None,
+            pending: Vec::new(),
             stream: None,
             grpc_methods: None,
             explorer: Explorer::default(),
@@ -368,8 +402,10 @@ impl App {
         };
         let env = state.active_env.filter(|e| app.envs.contains(e));
         app.set_env(env);
+        let tabs = state.tabs.into_iter().filter(|p| p.exists());
+        app.tabs = tabs.map(|p| Tab::new(p, false)).collect();
         if let Some(path) = state.open.filter(|p| p.exists()) {
-            app.force_open(path);
+            app.activate(path, true);
         }
         app
     }
@@ -378,6 +414,7 @@ impl App {
         self.ws.save_state(&State {
             active_env: self.active_env.clone(),
             open: self.open.as_ref().map(|o| o.path.clone()),
+            tabs: self.tabs.iter().map(|t| t.path.clone()).collect(),
             network: self.network.clone(),
         });
     }
@@ -476,6 +513,11 @@ impl App {
             self.active_env = None;
         }
         self.reload_vars();
+        self.refresh_open();
+    }
+
+    /// The open request against its file: reloaded if it has no unsaved edits, else flagged.
+    fn refresh_open(&mut self) {
         self.refresh_inherited();
         let Some(open) = &mut self.open else { return };
         match self.ws.load_request(&open.path) {
@@ -511,10 +553,142 @@ impl App {
         }
     }
 
-    fn request_open(&mut self, path: PathBuf, draft: Option<Box<Request>>) {
-        if draft.is_none() && self.open.as_ref().is_some_and(|o| o.path == path) {
-            return;
+    fn tab_index(&self, path: &Path) -> Option<usize> {
+        self.tabs.iter().position(|t| t.path == path)
+    }
+
+    /// Shows `path` in its tab, opening one if needed. A clean preview tab is reused, so
+    /// clicking through the tree doesn't pile up tabs; `pin` makes the tab a normal one.
+    fn activate(&mut self, path: PathBuf, pin: bool) {
+        let current = self.open.as_ref().map(|o| o.path.clone());
+        if current.as_ref() != Some(&path) {
+            let from = current.as_ref().and_then(|p| self.tab_index(p));
+            let parked = self.open.take().map(|open| Parked {
+                open,
+                response: self.response.take(),
+                load: self.load.take(),
+            });
+            let clean = !parked.as_ref().is_some_and(|p| p.open.dirty());
+            let reuse = from.filter(|&i| self.tabs[i].preview && clean);
+            let to = match (self.tab_index(&path), reuse) {
+                (Some(i), _) => i,
+                (None, Some(i)) => {
+                    self.tabs[i] = Tab::new(path.clone(), true);
+                    i
+                }
+                (None, None) => {
+                    let at = from.map_or(self.tabs.len(), |i| i + 1);
+                    self.tabs.insert(at, Tab::new(path.clone(), true));
+                    at
+                }
+            };
+            // The tab left behind keeps its draft, response and load test (unless reused).
+            if let (Some(f), Some(p)) = (from, parked)
+                && self.tabs[f].path == p.open.path
+            {
+                self.tabs[f].parked = Some(p);
+            }
+            match self.tabs[to].parked.take() {
+                Some(p) => {
+                    (self.open, self.response, self.load) = (Some(p.open), p.response, p.load);
+                    self.refresh_open();
+                    self.save_state();
+                }
+                None => {
+                    self.force_open(path.clone());
+                    if self.open.is_none() {
+                        // Unreadable file: the status bar says why; go back to where we were.
+                        self.tabs.remove(to);
+                        if let Some(back) = current.filter(|p| self.tab_index(p).is_some()) {
+                            self.activate(back, false);
+                        }
+                        return;
+                    }
+                }
+            }
         }
+        if pin && let Some(i) = self.tab_index(&path) {
+            self.tabs[i].preview = false;
+        }
+    }
+
+    /// Asks first if the tab has unsaved edits, with it brought to the front.
+    fn close_tab(&mut self, path: &Path) {
+        let Some(i) = self.tab_index(path) else {
+            return;
+        };
+        let dirty = match &self.tabs[i].parked {
+            Some(p) => p.open.dirty(),
+            None => self
+                .open
+                .as_ref()
+                .is_some_and(|o| o.path == path && o.dirty()),
+        };
+        if dirty {
+            self.activate(path.to_owned(), false);
+            self.dialog = Some(Dialog::Unsaved(Next::Close(path.to_owned())));
+        } else {
+            self.drop_tab(i);
+        }
+    }
+
+    /// Without asking. The tab to its right (else left) takes over if it was active.
+    fn drop_tab(&mut self, i: usize) {
+        let tab = self.tabs.remove(i);
+        if self.stream.as_ref().is_some_and(|s| s.path == tab.path) {
+            self.stream = None;
+        }
+        if self.open.as_ref().is_some_and(|o| o.path == tab.path) {
+            (self.open, self.response, self.load) = (None, None, None);
+            let next = self
+                .tabs
+                .get(i)
+                .or(i.checked_sub(1).and_then(|j| self.tabs.get(j)));
+            if let Some(next) = next.map(|t| t.path.clone()) {
+                self.activate(next, false);
+                return;
+            }
+        }
+        self.save_state();
+    }
+
+    /// Requests with unsaved edits, in any tab.
+    fn unsaved(&self) -> Vec<String> {
+        let parked = self.tabs.iter().filter_map(|t| t.parked.as_ref());
+        let opens = self.open.iter().chain(parked.map(|p| &p.open));
+        opens.filter(|o| o.dirty()).map(Open::name).collect()
+    }
+
+    /// Returns false (the status bar says why) if any write failed.
+    fn save_all(&mut self) -> bool {
+        if self.open.as_ref().is_some_and(Open::dirty) && !self.save() {
+            return false;
+        }
+        for p in self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()) {
+            if p.open.dirty() {
+                if let Err(e) = self.ws.save_request(&p.open.path, &p.open.draft) {
+                    self.status = e;
+                    return false;
+                }
+                p.open.saved = p.open.draft.clone();
+            }
+        }
+        true
+    }
+
+    /// The runner pane can't be left mid-run; says so in the status bar.
+    fn runner_busy(&mut self) -> bool {
+        let runner = self.runner.as_ref().and_then(|r| r.run.as_ref());
+        let busy = runner.is_some_and(RunState::running);
+        if busy {
+            self.status = "The collection runner is still running; cancel it first.".into();
+        }
+        busy
+    }
+
+    /// Puts a request from history in its tab, asking first if that has unsaved edits.
+    fn restore(&mut self, path: PathBuf, draft: Box<Request>) {
+        self.activate(path.clone(), true);
         if self.open.as_ref().is_some_and(Open::dirty) {
             self.dialog = Some(Dialog::Unsaved(Next::Open(path, draft)));
         } else {
@@ -522,9 +696,9 @@ impl App {
         }
     }
 
-    fn force_open_with(&mut self, path: PathBuf, draft: Option<Box<Request>>) {
+    fn force_open_with(&mut self, path: PathBuf, mut draft: Box<Request>) {
         self.force_open(path.clone());
-        if let (Some(mut draft), Some(open)) = (draft, &mut self.open)
+        if let Some(open) = &mut self.open
             && open.path == path
         {
             // Examples belong to the file, not to one send; folder settings to the folder.
@@ -565,7 +739,6 @@ impl App {
                     draft: req,
                 });
                 self.response = None;
-                self.stream = None;
                 self.load = None;
                 self.save_state();
             }
@@ -614,7 +787,7 @@ impl App {
         if model::is_streaming(&open.draft.method) {
             return self.connect(ctx);
         }
-        if self.pending.is_some() {
+        if self.pending.iter().any(|p| p.path == open.path) {
             return;
         }
         let (cell, net) = (
@@ -647,7 +820,7 @@ impl App {
             let _ = tx.send(Msg::Response(path, Box::new(outcome)));
             ctx.request_repaint();
         });
-        self.pending = Some(Pending {
+        self.pending.push(Pending {
             path: open.path.clone(),
             request: open.draft.clone(),
             started: Instant::now(),
@@ -713,8 +886,9 @@ impl App {
     }
 
     fn cancel(&mut self) {
-        if let Some(p) = self.pending.take() {
-            p.abort.abort();
+        let path = self.open.as_ref().map(|o| &o.path);
+        if let Some(i) = self.pending.iter().position(|p| Some(&p.path) == path) {
+            self.pending.remove(i).abort.abort();
             self.status = "Request cancelled".into();
         }
     }
@@ -773,7 +947,8 @@ impl App {
                 }
                 Msg::Response(path, outcome) => (path, *outcome),
             };
-            if let Some(sent) = self.pending.take_if(|p| p.path == path) {
+            if let Some(i) = self.pending.iter().position(|p| p.path == path) {
+                let sent = self.pending.remove(i);
                 self.record_history(sent, &outcome);
             }
             // Variable writes apply even if the user switched away meanwhile.
@@ -783,19 +958,25 @@ impl App {
                 let passed = outcome.tests.iter().filter(|t| t.passed).count();
                 self.status = format!("Tests: {passed}/{} passed", outcome.tests.len());
             }
-            // Only the open request's response is kept: bodies can be MBs and RAM is the constraint.
+            let failed = outcome.response.is_err() || outcome.tests.iter().any(|t| !t.passed);
+            let to_tests = failed && !outcome.tests.is_empty();
+            let shown = || Shown {
+                result: outcome.response.map(into_view),
+                tests: outcome.tests,
+                logs: outcome.logs,
+            };
+            // Kept only while the request has a tab: bodies can be MBs and RAM is the constraint.
             if self.open.as_ref().is_some_and(|o| o.path == path) {
-                let failed = outcome.response.is_err() || outcome.tests.iter().any(|t| !t.passed);
-                self.resp_tab = if failed && !outcome.tests.is_empty() {
+                self.resp_tab = if to_tests {
                     RespTab::Tests
                 } else {
                     RespTab::Body
                 };
-                self.response = Some(Shown {
-                    result: outcome.response.map(into_view),
-                    tests: outcome.tests,
-                    logs: outcome.logs,
-                });
+                self.response = Some(shown());
+            } else if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path)
+                && let Some(p) = &mut t.parked
+            {
+                p.response = Some(shown());
             }
         }
     }
@@ -855,14 +1036,18 @@ impl App {
                 .and_then(|(shared, secret)| self.ws.save_env(Some(&name), &shared, &secret))
                 .map(|()| None),
             NameKind::Rename(old) => self.ws.rename(old, &name).map(|new| {
-                // Keep the open request (and its unsaved draft) pointing at the moved file.
-                if let Some(open) = &mut self.open {
-                    if open.path == *old {
-                        open.path = new.clone();
-                    } else if let Ok(rest) = open.path.strip_prefix(&*old) {
-                        open.path = new.join(rest);
+                // Keep tabs (and their unsaved drafts) pointing at the moved files.
+                let moved = |p: &mut PathBuf| {
+                    if *p == *old {
+                        *p = new.clone();
+                    } else if let Ok(rest) = p.strip_prefix(&*old) {
+                        *p = new.join(rest);
                     }
-                }
+                };
+                let parked = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut());
+                let opens = self.open.iter_mut().chain(parked.map(|p| &mut p.open));
+                opens.for_each(|o| moved(&mut o.path));
+                self.tabs.iter_mut().for_each(|t| moved(&mut t.path));
                 None
             }),
         };
@@ -879,7 +1064,7 @@ impl App {
                     self.open_env_editor(Some(name), &[]);
                 }
                 if let Some(path) = created {
-                    self.request_open(path, None);
+                    self.activate(path, true);
                 }
             }
         }
@@ -939,9 +1124,17 @@ impl eframe::App for App {
                 None => self.send(ui.ctx()),
             }
         }
+        if ui.input_mut(|i| i.consume_shortcut(&CLOSE_TAB))
+            && self.dialog.is_none()
+            && self.env_editor.is_none()
+            && self.folder_editor.is_none()
+            && let Some(path) = self.open.as_ref().map(|o| o.path.clone())
+        {
+            self.close_tab(&path);
+        }
         if ui.input(|i| i.viewport().close_requested())
             && !self.allow_close
-            && self.open.as_ref().is_some_and(Open::dirty)
+            && !self.unsaved().is_empty()
         {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -953,6 +1146,11 @@ impl eframe::App for App {
             .default_size(260.0)
             .show(ui, |ui| self.sidebar(ui));
         egui::CentralPanel::default().show(ui, |ui| self.main_area(ui));
+        // Editing turns a preview tab into a normal one, as in VS Code.
+        let dirty = self.open.as_ref().filter(|o| o.dirty());
+        if let Some(i) = dirty.and_then(|o| self.tab_index(&o.path)) {
+            self.tabs[i].preview = false;
+        }
         self.dialog_ui(ui.ctx());
         self.env_editor_ui(ui.ctx());
         self.folder_editor_ui(ui.ctx());
@@ -1110,19 +1308,12 @@ impl App {
             });
         for action in actions {
             match action {
-                TreeAction::Open(path) => {
-                    if self
-                        .runner
-                        .as_ref()
-                        .and_then(|r| r.run.as_ref())
-                        .is_some_and(RunState::running)
-                    {
-                        self.status =
-                            "The collection runner is still running; cancel it first.".into();
+                TreeAction::Open(path, pin) => {
+                    if self.runner_busy() {
                         continue;
                     }
                     self.runner = None;
-                    self.request_open(path, None);
+                    self.activate(path, pin);
                 }
                 TreeAction::Dialog(d) => self.dialog = Some(d),
                 TreeAction::Run(path) => self.open_runner(path),
@@ -1190,14 +1381,68 @@ impl App {
                 Ok(path) if path.is_file() => {
                     let draft = Box::new(e.request.clone());
                     self.runner = None;
-                    self.request_open(path, Some(draft));
+                    self.restore(path, draft);
                 }
                 _ => self.status = format!("\"{}\" no longer exists", e.path),
             }
         }
     }
 
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let active = self.open.as_ref().map(|o| o.path.clone());
+        let (mut show, mut close) = (None, None);
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for tab in &self.tabs {
+                    let is_active = active.as_ref() == Some(&tab.path);
+                    let open = match &tab.parked {
+                        _ if is_active => self.open.as_ref(),
+                        Some(p) => Some(&p.open),
+                        None => None,
+                    };
+                    if let Some(o) = open {
+                        let m = &o.draft.method;
+                        let badge = RichText::new(short_method(m)).monospace().small();
+                        ui.label(badge.color(method_color(m)));
+                    }
+                    let name = tab.path.file_stem().unwrap_or_default().to_string_lossy();
+                    let mut text = RichText::new(match open.is_some_and(Open::dirty) {
+                        true => format!("{name} ●"),
+                        false => name.into_owned(),
+                    });
+                    if tab.preview {
+                        text = text.italics();
+                    }
+                    let label = ui
+                        .selectable_label(is_active, text)
+                        .on_hover_text(self.ws.display_name(&tab.path));
+                    if label.clicked() {
+                        show = Some(tab.path.clone());
+                    }
+                    let x = ui
+                        .small_button("×")
+                        .on_hover_text(format!("Close ({})", ui.ctx().format_shortcut(&CLOSE_TAB)));
+                    if x.clicked() || label.middle_clicked() {
+                        close = Some(tab.path.clone());
+                    }
+                    ui.separator();
+                }
+            });
+        });
+        if let Some(path) = close {
+            self.close_tab(&path);
+        } else if let Some(path) = show
+            && !self.runner_busy()
+        {
+            self.runner = None;
+            self.activate(path, false);
+        }
+    }
+
     fn main_area(&mut self, ui: &mut egui::Ui) {
+        if !self.tabs.is_empty() {
+            egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
+        }
         if self.runner.is_some() {
             self.runner_ui(ui);
             return;
@@ -1214,7 +1459,7 @@ impl App {
         let mut define: Option<Vec<String>> = None;
         let mut fetch_schema = false;
         let mut example = None;
-        let pending = self.pending.as_ref().filter(|p| p.path == open.path);
+        let pending = self.pending.iter().find(|p| p.path == open.path);
         let streaming = model::is_streaming(&open.draft.method);
         let session = self.stream.as_mut().filter(|s| s.path == open.path);
         let live = session.as_ref().is_some_and(|s| s.live);
@@ -1610,6 +1855,7 @@ impl App {
     }
 
     fn dialog_ui(&mut self, ctx: &egui::Context) {
+        let unsaved = self.unsaved().join("\", \"");
         let Some(dialog) = &mut self.dialog else {
             return;
         };
@@ -1663,17 +1909,21 @@ impl App {
                             then = Some(Box::new(move |app, _| {
                                 app.dialog = None;
                                 match app.ws.delete(&path) {
-                                    Ok(())
-                                        if app
-                                            .open
-                                            .as_ref()
-                                            .is_some_and(|o| o.path.starts_with(&path)) =>
-                                    {
-                                        app.open = None;
-                                        app.response = None;
+                                    // The delete was confirmed; its tabs close without asking.
+                                    Ok(()) => {
+                                        let active = app.open.as_ref().map(|o| o.path.clone());
+                                        let gone = |p: &Path| p.starts_with(&path);
+                                        app.tabs.retain(|t| {
+                                            !gone(&t.path) || Some(&t.path) == active.as_ref()
+                                        });
+                                        if let Some(i) = active
+                                            .filter(|p| gone(p))
+                                            .and_then(|p| app.tab_index(&p))
+                                        {
+                                            app.drop_tab(i);
+                                        }
                                         app.save_state();
                                     }
-                                    Ok(()) => {}
                                     Err(e) => app.status = e,
                                 }
                                 app.reload();
@@ -1682,16 +1932,18 @@ impl App {
                         cancel = ui.button("Cancel").clicked();
                     });
                 }
-                Dialog::Unsaved(_) => {
+                Dialog::Unsaved(next) => {
+                    let quit = matches!(next, Next::Quit);
                     ui.heading("Unsaved changes");
-                    ui.label(format!("Save changes to \"{open_name}\"?"));
+                    let names = if quit { &unsaved } else { &open_name };
+                    ui.label(format!("Save changes to \"{names}\"?"));
                     ui.horizontal(|ui| {
                         let save = ui.button("Save").clicked();
                         let discard = ui.button("Discard").clicked();
                         cancel = ui.button("Cancel").clicked();
                         if save || discard {
                             then = Some(Box::new(move |app, ctx| {
-                                if save && !app.save() {
+                                if save && !(if quit { app.save_all() } else { app.save() }) {
                                     return; // keep the dialog; the status bar shows why
                                 }
                                 let Some(Dialog::Unsaved(next)) = app.dialog.take() else {
@@ -1699,6 +1951,11 @@ impl App {
                                 };
                                 match next {
                                     Next::Open(path, draft) => app.force_open_with(path, draft),
+                                    Next::Close(path) => {
+                                        if let Some(i) = app.tab_index(&path) {
+                                            app.drop_tab(i);
+                                        }
+                                    }
                                     Next::Quit => {
                                         app.allow_close = true;
                                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2515,8 +2772,10 @@ fn tree_ui(
                         ui.selectable_label(selected == Some(path.as_path()), name.as_str())
                     })
                     .inner;
-                if resp.clicked() {
-                    actions.push(TreeAction::Open(path.clone()));
+                if resp.double_clicked() {
+                    actions.push(TreeAction::Open(path.clone(), true));
+                } else if resp.clicked() {
+                    actions.push(TreeAction::Open(path.clone(), false));
                 }
                 resp.context_menu(|ui| {
                     if ui.button("Rename").clicked() {
@@ -3757,7 +4016,7 @@ mod ui_tests {
         assert!(h.query_by_label_contains("Undefined").is_none());
         h.get_by_label("Send").click();
         wait(&mut h, |app| {
-            app.pending.is_none() && app.response.is_some()
+            app.pending.is_empty() && app.response.is_some()
         });
         shot(&mut h, "04-sent");
         let shown = h.state().response.as_ref().unwrap();
@@ -3884,6 +4143,58 @@ mod ui_tests {
             "{}",
             shown.text
         );
+    }
+
+    #[test]
+    fn tabs_keep_unsaved_edits_and_ask_only_when_closing() {
+        let ws = workspace("tabs");
+        for name in ["a", "b", "c"] {
+            ws.create_request(&ws.collections(), name).unwrap();
+        }
+        let b = ws.collections().join("b.toml");
+        let mut h = harness(ws);
+        h.run();
+        let tabs = |h: &Harness<'_, App>| -> Vec<String> {
+            let stem = |t: &Tab| t.path.file_stem().unwrap().to_string_lossy().into_owned();
+            h.state().tabs.iter().map(stem).collect()
+        };
+        h.get_by_label("a").click();
+        h.run();
+        // A plain click previews: the next one reuses the tab instead of piling them up.
+        h.get_all_by_label("b").next().unwrap().click();
+        h.run();
+        assert_eq!(tabs(&h), ["b"]);
+        // Editing keeps the tab, and switching away never interrupts with a dialog.
+        type_into(&mut h, 0, "http://edited");
+        h.get_all_by_label("c").next().unwrap().click();
+        h.run();
+        assert_eq!(tabs(&h), ["b", "c"]);
+        assert!(h.state().dialog.is_none());
+        h.get_by_label("b ●").click();
+        h.run();
+        shot(&mut h, "13-tabs");
+        assert_eq!(draft(&h).url, "http://edited");
+
+        // Quitting must count edits in background tabs too.
+        h.get_all_by_label("c").last().unwrap().click();
+        h.run();
+        assert_eq!(h.state().unsaved(), ["b"]);
+        // Closing the edited tab asks, with it in front so Save saves what's shown.
+        h.get_all_by_label("×").next().unwrap().click();
+        h.run();
+        assert_eq!(draft(&h).url, "http://edited");
+        h.get_by_label("Discard").click();
+        h.run();
+        assert_eq!(tabs(&h), ["c"]);
+        assert_eq!(
+            h.state().ws.load_request(&b).unwrap().url,
+            "",
+            "file untouched"
+        );
+        // A clean tab closes without asking.
+        h.key_press_modifiers(Modifiers::COMMAND, Key::W);
+        h.run();
+        assert!(h.state().tabs.is_empty() && h.state().open.is_none());
     }
 
     /// A workspace with one request `r` (and env `dev` with `host`), opened in the app.
@@ -4095,7 +4406,7 @@ mod ui_tests {
         h.run();
         assert_eq!(draft(&h).url, "{{host}}");
         // Enter picked the suggestion; it must not also have sent the request.
-        assert!(h.state().pending.is_none());
+        assert!(h.state().pending.is_empty());
         type_into(&mut h, 0, "/x");
         assert_eq!(draft(&h).url, "{{host}}/x", "cursor lands after the braces");
         shot(&mut h, "12-highlight");
@@ -4157,7 +4468,11 @@ mod ui_tests {
     #[test]
     fn graphql_schema_explorer_writes_the_query() {
         let mut h = with_request("gql");
-        h.get_by_value("GET").click();
+        // The method picker, not the method badge on the tab.
+        let picker = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("GET");
+        h.get(picker).click();
         h.run();
         h.get_by_label("GRAPHQL").click();
         h.run();
