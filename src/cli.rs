@@ -87,9 +87,10 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         Some(name) if !ws.env_names().contains(&name) => {
             return Err(format!("unknown environment \"{name}\""));
         }
-        Some(name) => ws.env_vars(&name),
+        Some(name) => ws.env_vars(Some(&name))?,
         None => HashMap::new(),
     };
+    let globals = ws.env_vars(None)?;
     let data = match data {
         Some(p) => runner::load_data(&p)?,
         None => Vec::new(),
@@ -110,7 +111,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
     };
     let vars = Vars {
         env,
-        globals: HashMap::new(),
+        globals,
         data: HashMap::new(),
     };
     let (mut total, mut failed, mut tests, mut tests_failed) = (0, 0, 0, 0);

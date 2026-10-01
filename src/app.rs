@@ -13,7 +13,7 @@ use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
 use crate::store::{self, Node, State, Workspace};
 use crate::stream::{self, Event};
-use crate::varedit::var_edit;
+use crate::varedit::{clip, var_edit};
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
@@ -142,6 +142,7 @@ enum NameKind {
     NewFolder(PathBuf),
     Rename(PathBuf),
     NewEnv,
+    DuplicateEnv(String),
 }
 
 enum Next {
@@ -170,7 +171,8 @@ impl Dialog {
 }
 
 struct EnvEditor {
-    name: String,
+    /// `None` edits the workspace-wide globals.
+    env: Option<String>,
     shared: Vec<KeyValue>,
     secret: Vec<KeyValue>,
     error: String,
@@ -216,8 +218,11 @@ pub struct App {
     envs: Vec<String>,
     active_env: Option<String>,
     vars: HashMap<String, String>,
-    /// `pm.globals`: session-only, like Postman's globals without a workspace sync.
+    /// Workspace-wide variables (globals.toml + globals.secret.toml), below any environment.
     globals: HashMap<String, String>,
+    quick_look: bool,
+    /// Focus to move to on the next frame, once the target widget exists.
+    focus_request: Option<egui::Id>,
     open: Option<Open>,
     req_tab: ReqTab,
     script_tab: ScriptTab,
@@ -254,6 +259,8 @@ impl App {
             active_env: None,
             vars: HashMap::new(),
             globals: HashMap::new(),
+            quick_look: false,
+            focus_request: None,
             open: None,
             req_tab: ReqTab::Params,
             script_tab: ScriptTab::Post,
@@ -320,12 +327,51 @@ impl App {
     }
 
     fn set_env(&mut self, name: Option<String>) {
-        self.vars = name
-            .as_deref()
-            .map(|n| self.ws.env_vars(n))
-            .unwrap_or_default();
         self.active_env = name;
+        self.reload_vars();
         self.save_state();
+    }
+
+    /// Re-reads globals and the active environment from disk. A broken file is shown in
+    /// the status bar instead of quietly leaving every variable undefined.
+    fn reload_vars(&mut self) {
+        let mut load = |env: Option<&str>| {
+            self.ws.env_vars(env).unwrap_or_else(|e| {
+                self.status = format!("Variables not loaded: {e}");
+                HashMap::new()
+            })
+        };
+        let globals = load(None);
+        let vars = self
+            .active_env
+            .clone()
+            .map(|n| load(Some(&n)))
+            .unwrap_or_default();
+        (self.globals, self.vars) = (globals, vars);
+    }
+
+    /// `add` appends empty rows for these keys, e.g. the undefined names in the URL.
+    fn open_env_editor(&mut self, env: Option<String>, add: &[String]) {
+        match self.ws.load_env(env.as_deref()) {
+            Ok((mut shared, secret)) => {
+                for key in add {
+                    shared.push(KeyValue::new(key.clone(), ""));
+                }
+                if !add.is_empty() {
+                    // Jump straight to the value of the first new row.
+                    let row = shared.len() - add.len();
+                    self.focus_request = Some(egui::Id::new(("env-shared", row, 1)));
+                }
+                self.env_editor = Some(EnvEditor {
+                    env,
+                    shared,
+                    secret,
+                    error: String::new(),
+                    confirm_delete: false,
+                });
+            }
+            Err(e) => self.status = e,
+        }
     }
 
     fn reload(&mut self) {
@@ -559,16 +605,8 @@ impl App {
         if !env.is_empty() {
             match self.active_env.clone() {
                 Some(name) => {
-                    let (shared, mut secret) = self.ws.load_env(&name);
-                    for (key, value) in &env {
-                        secret.retain(|kv| &kv.key != key);
-                        if let Some(v) = value {
-                            secret.push(KeyValue::new(key.clone(), v.clone()));
-                        }
-                    }
-                    match self.ws.save_env(&name, &shared, &secret) {
-                        Ok(()) => self.set_env(Some(name)),
-                        Err(e) => self.status = format!("Saving environment: {e}"),
+                    if let Err(e) = self.ws.apply_changes(Some(&name), &env) {
+                        self.status = format!("Saving environment: {e}");
                     }
                 }
                 None => {
@@ -578,11 +616,11 @@ impl App {
                 }
             }
         }
-        for (key, value) in globals {
-            match value {
-                Some(v) => self.globals.insert(key, v),
-                None => self.globals.remove(&key),
-            };
+        if let Err(e) = self.ws.apply_changes(None, &globals) {
+            self.status = format!("Saving globals: {e}");
+        }
+        if !self.status.starts_with("Saving") {
+            self.reload_vars();
         }
     }
 
@@ -601,7 +639,16 @@ impl App {
         let result = match kind {
             NameKind::NewRequest(dir) => self.ws.create_request(dir, &name).map(Some),
             NameKind::NewFolder(dir) => self.ws.create_folder(dir, &name).map(|_| None),
-            NameKind::NewEnv => self.ws.save_env(&name, &[], &[]).map(|()| None),
+            // Never overwrite: an existing name would silently wipe that environment.
+            NameKind::NewEnv | NameKind::DuplicateEnv(_) if self.envs.contains(&name) => {
+                Err(format!("Environment \"{name}\" already exists"))
+            }
+            NameKind::NewEnv => self.ws.save_env(Some(&name), &[], &[]).map(|()| None),
+            NameKind::DuplicateEnv(from) => self
+                .ws
+                .load_env(Some(from))
+                .and_then(|(shared, secret)| self.ws.save_env(Some(&name), &shared, &secret))
+                .map(|()| None),
             NameKind::Rename(old) => self.ws.rename(old, &name).map(|new| {
                 // Keep the open request (and its unsaved draft) pointing at the moved file.
                 if let Some(open) = &mut self.open {
@@ -617,7 +664,7 @@ impl App {
         match result {
             Err(e) => *error = e,
             Ok(created) => {
-                let new_env = matches!(kind, NameKind::NewEnv);
+                let new_env = matches!(kind, NameKind::NewEnv | NameKind::DuplicateEnv(_));
                 self.dialog = None;
                 self.reload();
                 self.save_state();
@@ -681,6 +728,10 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| self.main_area(ui));
         self.dialog_ui(ui.ctx());
         self.env_editor_ui(ui.ctx());
+        self.quick_look_ui(ui.ctx());
+        if let Some(id) = self.focus_request.take() {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
         self.network_editor_ui(ui.ctx());
     }
 }
@@ -728,6 +779,25 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
+            ui.strong("Environment");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("+ New")
+                    .on_hover_text("New environment")
+                    .clicked()
+                {
+                    self.dialog = Some(Dialog::name(NameKind::NewEnv, ""));
+                }
+                if ui
+                    .small_button("Globals")
+                    .on_hover_text("Variables available in every environment")
+                    .clicked()
+                {
+                    self.open_env_editor(None, &[]);
+                }
+            });
+        });
+        ui.horizontal(|ui| {
             let label = self
                 .active_env
                 .clone()
@@ -735,7 +805,7 @@ impl App {
             let mut chosen = None;
             egui::ComboBox::from_id_salt("env")
                 .selected_text(label)
-                .width(140.0)
+                .width(150.0)
                 .show_ui(ui, |ui| {
                     if ui
                         .selectable_label(self.active_env.is_none(), "No environment")
@@ -758,25 +828,13 @@ impl App {
             if let Some(name) = self.active_env.clone()
                 && ui
                     .small_button("Edit")
-                    .on_hover_text("Edit variables")
+                    .on_hover_text("Edit this environment's variables")
                     .clicked()
             {
-                let (shared, secret) = self.ws.load_env(&name);
-                self.env_editor = Some(EnvEditor {
-                    name,
-                    shared,
-                    secret,
-                    error: String::new(),
-                    confirm_delete: false,
-                });
+                self.open_env_editor(Some(name), &[]);
             }
-            if ui
-                .small_button("+")
-                .on_hover_text("New environment")
-                .clicked()
-            {
-                self.dialog = Some(Dialog::name(NameKind::NewEnv, ""));
-            }
+            ui.toggle_value(&mut self.quick_look, "👁")
+                .on_hover_text("Quick look: every variable in scope");
         });
         ui.separator();
         ui.horizontal(|ui| {
@@ -842,6 +900,7 @@ impl App {
         };
         let (mut send, mut save, mut cancel) = (false, false, false);
         let (mut toggle_load, mut start_load) = (false, false);
+        let mut define: Option<Vec<String>> = None;
         let pending = self.pending.as_ref().filter(|p| p.path == open.path);
         let streaming = model::is_streaming(&open.draft.method);
         let session = self.stream.as_mut().filter(|s| s.path == open.path);
@@ -925,12 +984,14 @@ impl App {
                 let (_, missing) = open.draft.resolved(&all_vars);
                 // A pre-request script may define them; only warn when nothing could.
                 if !missing.is_empty() && open.draft.pre_request.trim().is_empty() {
-                    let hint = if self.active_env.is_none() {
-                        " (no environment selected)"
-                    } else {
-                        ""
-                    };
-                    ui.colored_label(ORANGE, format!("Undefined: {}{hint}", missing.join(", ")));
+                    ui.horizontal(|ui| {
+                        ui.colored_label(ORANGE, format!("Undefined: {}", missing.join(", ")));
+                        // Without an environment, Globals is where a value works right away.
+                        let target = self.active_env.as_deref().unwrap_or("Globals");
+                        if ui.small_button(format!("Define in {target}…")).clicked() {
+                            define = Some(missing.clone());
+                        }
+                    });
                 }
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
@@ -1042,6 +1103,9 @@ impl App {
         if send {
             self.send(ui.ctx());
         }
+        if let Some(names) = define {
+            self.open_env_editor(self.active_env.clone(), &names);
+        }
         if toggle_load {
             self.load = match self.load.take() {
                 Some(_) => None,
@@ -1109,6 +1173,7 @@ impl App {
                         NameKind::NewFolder(_) => "New folder",
                         NameKind::Rename(_) => "Rename",
                         NameKind::NewEnv => "New environment",
+                        NameKind::DuplicateEnv(_) => "Duplicate environment",
                     });
                     let edit = ui.add(
                         egui::TextEdit::singleline(name)
@@ -1205,18 +1270,28 @@ impl App {
         let Some(ed) = &mut self.env_editor else {
             return;
         };
-        let (mut save, mut delete, mut close) = (false, false, false);
+        let (mut save, mut delete, mut close, mut duplicate) = (false, false, false, false);
+        let file = ed.env.clone().unwrap_or_else(|| "globals".into());
         // Only explicit buttons close this one: a stray click outside must not drop edits.
         egui::Modal::new(egui::Id::new("env-editor")).show(ctx, |ui| {
             ui.set_width(620.0);
-            ui.heading(format!("Environment: {}", ed.name));
+            match &ed.env {
+                Some(name) => ui.heading(format!("Environment: {name}")),
+                None => ui.heading("Globals"),
+            };
+            if ed.env.is_none() {
+                ui.weak("Available in every environment; an environment variable with the same name wins.");
+            }
             egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                 ui.label(RichText::new("Shared").strong());
-                ui.weak("Saved to environments/<name>.toml and committed to git.");
+                ui.weak(format!("Saved to {file}.toml and committed to git."));
                 kv_table(ui, "env-shared", &mut ed.shared, &HashMap::new());
                 ui.add_space(10.0);
                 ui.label(RichText::new("Secret").strong());
-                ui.weak("Saved to <name>.secret.toml, which is gitignored. Overrides shared values.");
+                ui.weak(format!(
+                    "Saved to {file}.secret.toml, which is gitignored. Overrides shared values; \
+                     values set by scripts land here."
+                ));
                 kv_table(ui, "env-secret", &mut ed.secret, &HashMap::new());
             });
             if !ed.error.is_empty() {
@@ -1226,35 +1301,108 @@ impl App {
             ui.horizontal(|ui| {
                 save = ui.button("Save").clicked();
                 close = ui.button("Close").clicked();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let label = if ed.confirm_delete { "Click again to delete" } else { "Delete environment" };
-                    if ui.button(RichText::new(label).color(RED)).clicked() {
-                        delete = ed.confirm_delete;
-                        ed.confirm_delete = true;
-                    }
-                });
+                if ed.env.is_some() {
+                    duplicate = ui
+                        .button("Duplicate…")
+                        .on_hover_text("Save, then copy into a new environment (e.g. dev → prod)")
+                        .clicked();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if ed.confirm_delete {
+                            "Click again to delete"
+                        } else {
+                            "Delete environment"
+                        };
+                        if ui.button(RichText::new(label).color(RED)).clicked() {
+                            delete = ed.confirm_delete;
+                            ed.confirm_delete = true;
+                        }
+                    });
+                }
             });
         });
-        if save {
-            match self.ws.save_env(&ed.name, &ed.shared, &ed.secret) {
+        if save || duplicate {
+            match self.ws.save_env(ed.env.as_deref(), &ed.shared, &ed.secret) {
                 Ok(()) => {
-                    let name = ed.name.clone();
+                    let from = ed.env.clone();
                     self.env_editor = None;
-                    self.set_env(Some(name));
+                    self.reload_vars();
+                    if duplicate && let Some(from) = from {
+                        let name = format!("{from} copy");
+                        self.dialog = Some(Dialog::name(NameKind::DuplicateEnv(from), name));
+                    }
                 }
                 Err(e) => ed.error = e,
             }
-        } else if delete {
-            match self.ws.delete_env(&ed.name) {
+        } else if delete && let Some(name) = ed.env.clone() {
+            match self.ws.delete_env(&name) {
                 Ok(()) => {
                     self.env_editor = None;
-                    self.set_env(None);
+                    if self.active_env.as_ref() == Some(&name) {
+                        self.set_env(None);
+                    }
                     self.reload();
                 }
                 Err(e) => ed.error = e,
             }
         } else if close {
             self.env_editor = None;
+        }
+    }
+
+    /// Every variable `{{name}}` can resolve to right now, and where it comes from.
+    fn quick_look_ui(&mut self, ctx: &egui::Context) {
+        if !self.quick_look {
+            return;
+        }
+        let mut edit = None;
+        let mut open = true;
+        egui::Window::new("Variables in scope")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .default_pos([280.0, 60.0])
+            .show(ctx, |ui| {
+                let env = self.active_env.clone();
+                let mut names: Vec<_> = self.all_vars().into_keys().collect();
+                names.sort_by_key(|n| n.to_lowercase());
+                if names.is_empty() {
+                    ui.weak("No variables yet. Add some to an environment or to Globals.");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("quick-look").striped(true).show(ui, |ui| {
+                            for name in &names {
+                                let (value, source) = match self.vars.get(name) {
+                                    Some(v) => (v, env.clone().unwrap_or_default()),
+                                    None => (&self.globals[name], "Globals".to_owned()),
+                                };
+                                ui.monospace(name);
+                                ui.label(RichText::new(clip(value, 60)).monospace())
+                                    .on_hover_text(value.as_str());
+                                ui.weak(source);
+                                ui.end_row();
+                            }
+                        });
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if let Some(name) = &env
+                        && ui.button(format!("Edit {name}")).clicked()
+                    {
+                        edit = Some(Some(name.clone()));
+                    }
+                    if ui.button("Edit Globals").clicked() {
+                        edit = Some(None);
+                    }
+                });
+                let dynamic: Vec<_> = model::DYNAMIC.iter().map(|(n, _)| *n).collect();
+                ui.weak(format!("Always available: {}", dynamic.join(", ")));
+            });
+        self.quick_look = open;
+        if let Some(env) = edit {
+            self.open_env_editor(env, &[]);
         }
     }
 }
@@ -2516,7 +2664,7 @@ mod ui_tests {
         let mut h = harness(workspace("env"));
         h.run();
         shot(&mut h, "01-empty");
-        h.get_by_label("+").click();
+        h.get_by_label("+ New").click();
         h.run();
         type_into(&mut h, 0, "dev");
         h.get_by_label("OK").click();
@@ -2529,7 +2677,7 @@ mod ui_tests {
         let host = addr.trim_end_matches("/users").to_owned();
         type_into(&mut h, 1, &host);
         shot(&mut h, "03-env-typed");
-        h.get_by_label("Save").click();
+        modal_save(&mut h);
         h.run();
         assert_eq!(h.state().vars.get("host"), Some(&host));
 
@@ -2560,7 +2708,7 @@ mod ui_tests {
     fn with_request(name: &str) -> Harness<'static, App> {
         let ws = workspace(name);
         ws.create_request(&ws.collections(), "r").unwrap();
-        ws.save_env("dev", &[KeyValue::new("host", "127.0.0.1:1")], &[])
+        ws.save_env(Some("dev"), &[KeyValue::new("host", "127.0.0.1:1")], &[])
             .unwrap();
         ws.save_state(&State {
             active_env: Some("dev".into()),
@@ -2609,6 +2757,65 @@ mod ui_tests {
         type_into(&mut h, 0, "/x");
         assert_eq!(draft(&h).url, "{{host}}/x", "cursor lands after the braces");
         shot(&mut h, "12-highlight");
+    }
+
+    #[test]
+    fn undefined_variable_is_defined_from_the_request_in_one_step() {
+        let mut h = with_request("define");
+        type_into(&mut h, 0, "{{base}}/x");
+        h.get_by_label("Define in dev…").click();
+        h.run();
+        shot(&mut h, "20-define");
+        // The editor opens with the missing name added and its value focused.
+        let value = h
+            .get_all_by_role(Role::TextInput)
+            .find(|n| n.is_focused())
+            .expect("value field focused");
+        value.type_text("http://example.test");
+        h.run();
+        modal_save(&mut h);
+        h.run();
+        assert_eq!(h.state().vars["base"], "http://example.test");
+        assert_eq!(
+            h.state().active_env.as_deref(),
+            Some("dev"),
+            "editing keeps the env"
+        );
+        assert!(h.query_by_label_contains("Undefined").is_none());
+    }
+
+    #[test]
+    fn globals_persist_and_appear_in_quick_look() {
+        let mut h = with_request("globals");
+        h.get_by_label("Globals").click();
+        h.run();
+        // The modal's fields come after the request editor's: shared key/value, then secret.
+        let key = h.get_all_by_role(Role::TextInput).count() - 4;
+        type_into(&mut h, key, "apiKey");
+        type_into(&mut h, key + 1, "k-123");
+        modal_save(&mut h);
+        h.run();
+        let root = h.state().ws.root.clone();
+        assert_eq!(h.state().globals["apiKey"], "k-123");
+        assert!(
+            std::fs::read_to_string(root.join("globals.toml"))
+                .unwrap()
+                .contains("k-123")
+        );
+        h.get_by_label("👁").click();
+        h.run();
+        shot(&mut h, "21-quick-look");
+        assert!(h.query_by_label("k-123").is_some());
+        assert!(
+            h.query_by_label("127.0.0.1:1").is_some(),
+            "env vars listed too"
+        );
+    }
+
+    /// The request editor has its own Save; the modal's is drawn last.
+    fn modal_save(h: &mut Harness<'_, App>) {
+        h.get_all_by_label("Save").last().unwrap().click();
+        h.run();
     }
 
     fn wait(h: &mut Harness<'_, App>, done: impl Fn(&App) -> bool) {

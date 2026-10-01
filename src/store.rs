@@ -2,6 +2,7 @@
 //!   collections/**/<name>.toml   one request per file, folders are directories
 //!   environments/<name>.toml      shared variables (committed)
 //!   environments/<name>.secret.toml  secret variables (gitignored)
+//!   globals.toml, globals.secret.toml  workspace-wide variables, same split
 //!   .state.toml                   per-machine UI state (gitignored)
 
 use std::collections::HashMap;
@@ -103,15 +104,44 @@ impl Workspace {
         rel.with_extension("").to_string_lossy().replace('\\', "/")
     }
 
-    /// Enabled variables of an environment; secret values override shared ones.
-    pub fn env_vars(&self, name: &str) -> HashMap<String, String> {
-        let (shared, secret) = self.load_env(name);
-        shared
+    /// Variables belong to an environment, or (`None`) to the workspace-wide globals.
+    fn vars_path(&self, env: Option<&str>, secret: bool) -> PathBuf {
+        let suffix = if secret { SECRET_SUFFIX } else { "" };
+        match env {
+            Some(name) => self.environments().join(format!("{name}{suffix}.toml")),
+            None => self.root.join(format!("globals{suffix}.toml")),
+        }
+    }
+
+    /// Enabled variables of an environment (or the globals); secret values override shared ones.
+    pub fn env_vars(&self, env: Option<&str>) -> Result<HashMap<String, String>, String> {
+        let (shared, secret) = self.load_env(env)?;
+        Ok(shared
             .into_iter()
             .chain(secret)
             .filter(|kv| kv.enabled)
             .map(|kv| (kv.key, kv.value))
-            .collect()
+            .collect())
+    }
+
+    /// Script writes (`pm.environment.set` …) go to the gitignored secret file: like
+    /// Postman's "current value" they stay on this machine. `None` values remove the key.
+    pub fn apply_changes(
+        &self,
+        env: Option<&str>,
+        changes: &HashMap<String, Option<String>>,
+    ) -> Result<(), String> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let (shared, mut secret) = self.load_env(env)?;
+        for (key, value) in changes {
+            secret.retain(|kv| &kv.key != key);
+            if let Some(v) = value {
+                secret.push(KeyValue::new(key.clone(), v.clone()));
+            }
+        }
+        self.save_env(env, &shared, &secret)
     }
 
     pub fn tree(&self) -> Vec<Node> {
@@ -189,40 +219,43 @@ impl Workspace {
         names
     }
 
-    /// Returns (shared, secret) variables.
-    pub fn load_env(&self, name: &str) -> (Vec<KeyValue>, Vec<KeyValue>) {
-        let read = |file: String| -> Vec<KeyValue> {
-            fs::read_to_string(self.environments().join(file))
-                .ok()
-                .and_then(|t| toml::from_str::<EnvFile>(&t).ok())
-                .unwrap_or_default()
-                .vars
+    /// Returns (shared, secret) variables. A missing file is empty; a broken one is an
+    /// error, because silently dropping it makes every `{{name}}` look undefined.
+    pub fn load_env(&self, env: Option<&str>) -> Result<(Vec<KeyValue>, Vec<KeyValue>), String> {
+        let read = |path: PathBuf| match fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("read {}: {e}", path.display())),
+            Ok(text) => toml::from_str::<EnvFile>(&text)
+                .map(|f| f.vars)
+                .map_err(|e| format!("parse {}: {e}", path.display())),
         };
-        (
-            read(format!("{name}.toml")),
-            read(format!("{name}{SECRET_SUFFIX}.toml")),
-        )
+        Ok((
+            read(self.vars_path(env, false))?,
+            read(self.vars_path(env, true))?,
+        ))
     }
 
     pub fn save_env(
         &self,
-        name: &str,
+        env: Option<&str>,
         shared: &[KeyValue],
         secret: &[KeyValue],
     ) -> Result<(), String> {
-        let name = valid_name(name)?;
-        let write = |file: String, vars: &[KeyValue]| {
+        if let Some(name) = env {
+            valid_name(name)?;
+        }
+        let write = |path: PathBuf, vars: &[KeyValue]| {
             let vars = vars.iter().filter(|v| !v.key.is_empty()).cloned().collect();
             let text = toml::to_string_pretty(&EnvFile { vars }).map_err(|e| e.to_string())?;
-            write_atomic(&self.environments().join(file), &text)
+            write_atomic(&path, &text)
         };
-        write(format!("{name}.toml"), shared)?;
-        let secret_path = format!("{name}{SECRET_SUFFIX}.toml");
+        write(self.vars_path(env, false), shared)?;
+        let secret_path = self.vars_path(env, true);
         if secret.iter().any(|v| !v.key.is_empty()) {
             write(secret_path, secret)
         } else {
             // Don't leave empty secret files lying around.
-            let _ = fs::remove_file(self.environments().join(secret_path));
+            let _ = fs::remove_file(secret_path);
             Ok(())
         }
     }
@@ -345,7 +378,7 @@ mod tests {
 
         // Secrets must land in the gitignored file, never in the shared one.
         ws.save_env(
-            "dev",
+            Some("dev"),
             &[KeyValue::new("host", "x")],
             &[KeyValue::new("token", "s3cret")],
         )
@@ -358,7 +391,31 @@ mod tests {
                 .unwrap()
                 .contains("*.secret.toml")
         );
-        assert_eq!(ws.load_env("dev").1, [KeyValue::new("token", "s3cret")]);
+        assert_eq!(
+            ws.load_env(Some("dev")).unwrap().1,
+            [KeyValue::new("token", "s3cret")]
+        );
+
+        // Script writes chain into the local (secret) file, for envs and globals alike.
+        let changes = HashMap::from([
+            ("token".to_owned(), Some("new".to_owned())),
+            ("host".to_owned(), None),
+        ]);
+        ws.apply_changes(Some("dev"), &changes).unwrap();
+        ws.apply_changes(None, &changes).unwrap();
+        for env in [Some("dev"), None] {
+            assert_eq!(
+                ws.env_vars(env).unwrap().get("token").map(String::as_str),
+                Some("new")
+            );
+        }
+        // Removing from the secret file never touches the committed shared value.
+        assert_eq!(ws.env_vars(Some("dev")).unwrap()["host"], "x");
+        assert!(!ws.env_names().contains(&"globals".to_owned()));
+
+        // A broken file is reported, not treated as "no variables".
+        fs::write(root.join("environments/dev.toml"), "vars = [").unwrap();
+        assert!(ws.env_vars(Some("dev")).unwrap_err().contains("dev.toml"));
 
         fs::remove_dir_all(&root).unwrap();
     }

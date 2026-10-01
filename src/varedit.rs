@@ -227,7 +227,7 @@ fn insert(text: &mut String, open: usize, cursor: usize, name: &str) -> usize {
     text[..open + 2 + name.len() + 2].chars().count()
 }
 
-fn clip(s: &str, max: usize) -> String {
+pub fn clip(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}…", &s[..i]),
         None => s.to_owned(),
