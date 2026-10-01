@@ -188,8 +188,17 @@ struct EnvEditor {
     env: Option<String>,
     shared: Vec<KeyValue>,
     secret: Vec<KeyValue>,
+    /// What's on disk, so Close can tell whether it would throw edits away.
+    saved: (Vec<KeyValue>, Vec<KeyValue>),
     error: String,
     confirm_delete: bool,
+    confirm_discard: bool,
+}
+
+impl EnvEditor {
+    fn dirty(&self) -> bool {
+        (&self.shared, &self.secret) != (&self.saved.0, &self.saved.1)
+    }
 }
 
 enum TreeAction {
@@ -369,20 +378,24 @@ impl App {
     fn open_env_editor(&mut self, env: Option<String>, add: &[String]) {
         match self.ws.load_env(env.as_deref()) {
             Ok((mut shared, secret)) => {
+                let saved = (shared.clone(), secret.clone());
                 for key in add {
                     shared.push(KeyValue::new(key.clone(), ""));
                 }
-                if !add.is_empty() {
-                    // Jump straight to the value of the first new row.
-                    let row = shared.len() - add.len();
-                    self.focus_request = Some(egui::Id::new(("env-shared", row, 1)));
-                }
+                // Ready to type: the value of the first added row, else the blank row's key.
+                let (row, col) = match add.len() {
+                    0 => (shared.len(), 0),
+                    n => (shared.len() - n, 1),
+                };
+                self.focus_request = Some(egui::Id::new(("env-shared", row, col)));
                 self.env_editor = Some(EnvEditor {
                     env,
                     shared,
                     secret,
+                    saved,
                     error: String::new(),
                     confirm_delete: false,
+                    confirm_discard: false,
                 });
             }
             Err(e) => self.status = e,
@@ -724,7 +737,9 @@ impl App {
                 self.reload();
                 self.save_state();
                 if new_env {
-                    self.set_env(Some(name));
+                    self.set_env(Some(name.clone()));
+                    // A new environment is only useful once it has variables.
+                    self.open_env_editor(Some(name), &[]);
                 }
                 if let Some(path) = created {
                     self.request_open(path);
@@ -767,7 +782,12 @@ impl eframe::App for App {
         }
         // Consume shortcuts before widgets see them, so Ctrl+Enter doesn't also insert a newline.
         if ui.input_mut(|i| i.consume_shortcut(&SAVE)) {
-            self.save();
+            // Save what the user is looking at, not the request hidden behind the editor.
+            if self.env_editor.is_some() {
+                self.save_env_editor();
+            } else {
+                self.save();
+            }
         }
         if ui.input_mut(|i| i.consume_shortcut(&SEND)) {
             match self.stream.as_mut().filter(|s| s.live) {
@@ -1439,8 +1459,16 @@ impl App {
             }
             ui.separator();
             ui.horizontal(|ui| {
-                save = ui.button("Save").clicked();
-                close = ui.button("Close").clicked();
+                save = ui
+                    .button("Save")
+                    .on_hover_text(ui.ctx().format_shortcut(&SAVE))
+                    .clicked();
+                let close_label = if ed.confirm_discard {
+                    RichText::new("Discard changes").color(RED)
+                } else {
+                    RichText::new("Close")
+                };
+                close = ui.button(close_label).clicked();
                 if ed.env.is_some() {
                     duplicate = ui
                         .button("Duplicate…")
@@ -1461,17 +1489,13 @@ impl App {
             });
         });
         if save || duplicate {
-            match self.ws.save_env(ed.env.as_deref(), &ed.shared, &ed.secret) {
-                Ok(()) => {
-                    let from = ed.env.clone();
-                    self.env_editor = None;
-                    self.reload_vars();
-                    if duplicate && let Some(from) = from {
-                        let name = format!("{from} copy");
-                        self.dialog = Some(Dialog::name(NameKind::DuplicateEnv(from), name));
-                    }
-                }
-                Err(e) => ed.error = e,
+            let from = ed.env.clone();
+            if self.save_env_editor()
+                && duplicate
+                && let Some(from) = from
+            {
+                let name = format!("{from} copy");
+                self.dialog = Some(Dialog::name(NameKind::DuplicateEnv(from), name));
             }
         } else if delete && let Some(name) = ed.env.clone() {
             match self.ws.delete_env(&name) {
@@ -1485,7 +1509,31 @@ impl App {
                 Err(e) => ed.error = e,
             }
         } else if close {
-            self.env_editor = None;
+            if ed.dirty() && !ed.confirm_discard {
+                ed.confirm_discard = true;
+            } else {
+                self.env_editor = None;
+            }
+        }
+    }
+
+    /// Returns false (and shows why in the editor) if writing failed.
+    fn save_env_editor(&mut self) -> bool {
+        let Some(ed) = &mut self.env_editor else {
+            return false;
+        };
+        match self.ws.save_env(ed.env.as_deref(), &ed.shared, &ed.secret) {
+            Ok(()) => {
+                let name = ed.env.clone().unwrap_or_else(|| "Globals".into());
+                self.status = format!("Saved {name}");
+                self.env_editor = None;
+                self.reload_vars();
+                true
+            }
+            Err(e) => {
+                ed.error = e;
+                false
+            }
         }
     }
 
@@ -2945,8 +2993,6 @@ mod ui_tests {
         type_into(&mut h, 0, "dev");
         h.get_by_label("OK").click();
         h.run();
-        h.get_by_label("Edit").click();
-        h.run();
         shot(&mut h, "02-env-editor");
         type_into(&mut h, 0, "host");
         let addr = crate::http::tests::echo_server();
@@ -2978,6 +3024,57 @@ mod ui_tests {
             "{}",
             view.text
         );
+    }
+
+    #[test]
+    fn new_environment_opens_ready_to_type_and_never_drops_variables() {
+        let mut h = harness(workspace("env-keys"));
+        h.run();
+        h.get_by_label("+ New").click();
+        h.run();
+        type_into(&mut h, 0, "dev");
+        h.get_by_label("OK").click();
+        h.run();
+        // No click needed: the editor opens with the key field focused. One char per
+        // frame, as a physical keyboard delivers them.
+        let typed = |h: &mut Harness<'_, App>, text: &str| {
+            for c in text.chars() {
+                h.event(egui::Event::Text(c.to_string()));
+                h.step();
+            }
+            h.run();
+        };
+        typed(&mut h, "host");
+        h.key_press(Key::Tab);
+        h.run();
+        // The value through an IME, the way Windows TSF delivers committed text.
+        for c in "abc".chars() {
+            let c = c.to_string();
+            h.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: c.clone(),
+                active_range_chars: None,
+            }));
+            h.step();
+            h.event(egui::Event::Ime(egui::ImeEvent::Commit(c)));
+            h.step();
+        }
+        // Ctrl+S saves the environment, not the request behind the editor.
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        h.run();
+        assert!(h.state().env_editor.is_none());
+        assert_eq!(h.state().vars.get("host").map(String::as_str), Some("abc"));
+
+        // Close never silently throws typed variables away.
+        h.get_by_label("Edit").click();
+        h.run();
+        typed(&mut h, "tmp");
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(h.state().env_editor.is_some(), "first Close only warns");
+        h.get_by_label("Discard changes").click();
+        h.run();
+        assert!(h.state().env_editor.is_none());
+        assert!(!h.state().vars.contains_key("tmp"));
     }
 
     /// A workspace with one request `r` (and env `dev` with `host`), opened in the app.
