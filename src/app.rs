@@ -1011,6 +1011,22 @@ impl App {
                                 .selectable_label(self.load.is_some(), "⚡ Load test")
                                 .clicked();
                         }
+                        // curl can't speak gRPC or WebSocket; a command for those would lie.
+                        if !matches!(open.draft.method.as_str(), "GRPC" | "WS")
+                            && ui
+                                .button("Copy as curl")
+                                .on_hover_text("With variables filled in; scripts don't run")
+                                .clicked()
+                        {
+                            let (wire, _) = open.draft.resolved(&all_vars);
+                            match crate::curl::to_curl(wire) {
+                                Ok(cmd) => {
+                                    ui.ctx().copy_text(cmd);
+                                    self.status = "Copied curl command".into();
+                                }
+                                Err(e) => self.status = e,
+                            }
+                        }
                     });
                 });
                 ui.horizontal(|ui| {
@@ -1048,7 +1064,18 @@ impl App {
                         false,
                         |e| e.hint_text("https://{{host}}/path").desired_width(width),
                     );
-                    if url.changed() {
+                    // Pasting a curl command (e.g. devtools "Copy as cURL") imports it, like Postman.
+                    if url.changed() && open.draft.url.trim_start().starts_with("curl ") {
+                        match crate::curl::from_curl(&open.draft.url) {
+                            Ok(r) => {
+                                let d = &mut open.draft;
+                                (d.method, d.url, d.params) = (r.method, r.url, r.params);
+                                (d.headers, d.body, d.auth) = (r.headers, r.body, r.auth);
+                                self.status = "Imported curl command".into();
+                            }
+                            Err(e) => self.status = format!("curl import: {e}"),
+                        }
+                    } else if url.changed() {
                         open.draft.params_from_url();
                     }
                     if url.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
@@ -3096,6 +3123,30 @@ mod ui_tests {
 
     fn draft<'h>(h: &'h Harness<'_, App>) -> &'h Request {
         &h.state().open.as_ref().unwrap().draft
+    }
+
+    #[test]
+    fn pasting_a_curl_command_into_the_url_imports_it() {
+        let mut h = with_request("curl");
+        h.get_all_by_role(Role::TextInput).next().unwrap().click();
+        h.run();
+        h.event(egui::Event::Paste(
+            "curl 'https://api.test/x?a=1' \\\n  -H 'accept: text/plain' \\\n  --data-raw 'k=v'"
+                .into(),
+        ));
+        h.run();
+        let d = draft(&h);
+        assert_eq!(
+            (d.method.as_str(), d.url.as_str()),
+            ("POST", "https://api.test/x?a=1")
+        );
+        assert_eq!(d.headers, [KeyValue::new("accept", "text/plain")]);
+        assert_eq!(
+            d.body,
+            Body::Form {
+                fields: vec![KeyValue::new("k", "v")]
+            }
+        );
     }
 
     #[test]

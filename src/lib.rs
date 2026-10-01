@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod cli;
+mod curl;
 mod graphql;
 mod grpc;
 mod http;
