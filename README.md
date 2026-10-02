@@ -28,7 +28,8 @@ such as Citrix VDI. No installer: unzip and run.
   like Postman collection/folder settings; tabs (a click in the tree previews,
   double-click or editing keeps the tab, Ctrl+W closes; right-click a tab to duplicate it or
   close others, those to the right or all, which leaves tabs with unsaved edits open);
-  hover the status code for what it means and the size for headers vs body; Markdown API docs from
+  hover the status code for what it means and the size for headers vs body; "Side by side"
+  in the status bar puts the response beside the request (kept across restarts); Markdown API docs from
   request/folder descriptions and saved examples (right-click a folder > "Copy docs as
   Markdown", or `apitool-cli docs [folder] [-o api.md]`); a local mock server answering
   with saved examples (right-click a folder > "Start mock server", or

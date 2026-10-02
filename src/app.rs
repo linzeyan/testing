@@ -473,6 +473,8 @@ pub struct App {
     code_lang: String,
     /// Word wrap in the response body, kept across restarts.
     wrap_response: bool,
+    /// The response beside the request instead of under it (Postman's two-pane view).
+    side_by_side: bool,
     mock: Option<MockServer>,
     active_env: Option<String>,
     vars: HashMap<String, String>,
@@ -527,6 +529,7 @@ impl App {
                 .filter(|l| crate::codegen::TARGETS.iter().any(|(n, _)| l == n))
                 .unwrap_or_else(|| "cURL".into()),
             wrap_response: state.wrap_response,
+            side_by_side: state.side_by_side,
             mock: None,
             ws,
             active_env: None,
@@ -638,6 +641,7 @@ impl App {
             network: self.network.clone(),
             code_lang: self.code_lang.clone(),
             wrap_response: self.wrap_response,
+            side_by_side: self.side_by_side,
         });
     }
 
@@ -1649,6 +1653,14 @@ impl App {
                     self.network_editor = Some(self.network.clone());
                 }
                 ui.separator();
+                if ui
+                    .toggle_value(&mut self.side_by_side, "Side by side")
+                    .on_hover_text("The response beside the request instead of under it")
+                    .changed()
+                {
+                    self.save_state();
+                }
+                ui.separator();
                 let mut stop_mock = false;
                 if let Some(m) = &self.mock {
                     ui.colored_label(GREEN, "●");
@@ -2287,303 +2299,295 @@ impl App {
                 });
         }
 
-        egui::Panel::top("request")
-            .resizable(true)
-            .default_size(320.0)
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.heading(open.name());
-                    if open.dirty() {
-                        ui.colored_label(ORANGE, "●")
-                            .on_hover_text("Unsaved changes");
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        save = ui
-                            .add_enabled(open.dirty(), egui::Button::new("Save"))
-                            .on_hover_text(ui.ctx().format_shortcut(&SAVE))
-                            .clicked();
-                        if !streaming {
-                            toggle_load = ui
-                                .selectable_label(self.load.is_some(), "⚡ Load test")
-                                .clicked();
-                        }
-                        ui.toggle_value(&mut self.cookie_manager, "Cookies")
-                            .on_hover_text("Cookies the server set, sent back automatically");
-                        ui.toggle_value(&mut self.code, "</> Code")
-                            .on_hover_text("This request as curl, Python, Go, … to copy");
-                    });
-                });
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("method")
-                        .selected_text(
-                            RichText::new(&open.draft.method)
-                                .color(method_color(&open.draft.method))
-                                .strong(),
-                        )
-                        .width(90.0)
-                        .show_ui(ui, |ui| {
-                            for m in METHODS {
-                                let text = RichText::new(*m).color(method_color(m));
-                                ui.selectable_value(&mut open.draft.method, (*m).to_owned(), text);
-                            }
-                        });
-                    // GRAPHQL is a POST whose body is always a query; open the query editor.
-                    if open.draft.method == "GRAPHQL"
-                        && !matches!(open.draft.body, Body::GraphQL { .. })
-                    {
-                        open.draft.body = Body::GraphQL {
-                            query: String::new(),
-                            variables: String::new(),
-                        };
-                        self.req_tab = ReqTab::Body;
-                    }
-                    let button = [80.0, 22.0];
-                    let width = ui.available_width() - button[0] - 8.0;
-                    let hint = match open.draft.method.as_str() {
-                        "MQTT" => "mqtt://{{broker}}:1883",
-                        _ => "https://{{host}}/path",
-                    };
-                    let url = var_edit(
-                        ui,
-                        egui::Id::new("url"),
-                        &mut open.draft.url,
-                        &all_vars,
-                        egui::TextStyle::Monospace,
-                        false,
-                        |e| e.hint_text(hint).desired_width(width),
-                    );
-                    // Pasting a curl command (e.g. devtools "Copy as cURL") imports it, like Postman.
-                    if url.changed() && open.draft.url.trim_start().starts_with("curl ") {
-                        match crate::curl::from_curl(&open.draft.url) {
-                            Ok(r) => {
-                                let d = &mut open.draft;
-                                (d.method, d.url, d.params) = (r.method, r.url, r.params);
-                                (d.headers, d.body, d.auth) = (r.headers, r.body, r.auth);
-                                d.settings = r.settings;
-                                self.status = "Imported curl command".into();
-                            }
-                            Err(e) => self.status = format!("curl import: {e}"),
-                        }
-                    } else if url.changed() {
-                        open.draft.params_from_url();
-                    }
-                    if url.changed() {
-                        open.draft.path_vars_from_url();
-                    }
-                    if url.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        send = true;
-                    }
-                    if half_close {
-                        cancel = ui
-                            .add_sized(button, egui::Button::new("End stream"))
-                            .on_hover_text("Stop sending; the server can still reply")
-                            .clicked();
-                    } else if pending.is_some() || live {
-                        let label = if live { "Disconnect" } else { "Cancel" };
-                        cancel = ui.add_sized(button, egui::Button::new(label)).clicked();
-                    } else {
-                        let label = RichText::new(if streaming { "Connect" } else { "Send" })
-                            .strong()
-                            .color(Color32::WHITE);
-                        send |= ui
-                            .add_sized(
-                                button,
-                                egui::Button::new(label).fill(Color32::from_rgb(40, 110, 200)),
-                            )
-                            .on_hover_text(ui.ctx().format_shortcut(&SEND))
-                            .clicked();
-                    }
-                });
-                if open.draft.method == "GRPC"
-                    && let Some(e) = grpc_bar(ui, &mut open.draft, &mut self.grpc_methods)
-                {
-                    self.status = e;
+        // Separate ids, so each layout keeps its own dragged size.
+        let panel = match self.side_by_side {
+            true => egui::Panel::left("request-side").default_size(ui.available_width() / 2.0),
+            false => egui::Panel::top("request").default_size(320.0),
+        };
+        panel.resizable(true).show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading(open.name());
+                if open.dirty() {
+                    ui.colored_label(ORANGE, "●")
+                        .on_hover_text("Unsaved changes");
                 }
-                let (_, missing) = open.draft.resolved(&all_vars);
-                // A pre-request script may define them; only warn when nothing could.
-                let scripted = !open.draft.pre_request.trim().is_empty()
-                    || !open.draft.inherited.pre_request.is_empty();
-                if !missing.is_empty() && !scripted {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(ORANGE, format!("Undefined: {}", missing.join(", ")));
-                        // Without an environment, Globals is where a value works right away.
-                        let target = self.active_env.as_deref().unwrap_or("Globals");
-                        if ui.small_button(format!("Define in {target}…")).clicked() {
-                            define = Some(missing.clone());
-                        }
-                    });
-                }
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    let count = |kv: &[KeyValue]| {
-                        kv.iter().filter(|p| p.enabled && !p.key.is_empty()).count()
-                    };
-                    let tab = |n: usize, name: &str| {
-                        if n > 0 {
-                            format!("{name} ({n})")
-                        } else {
-                            name.to_owned()
-                        }
-                    };
-                    let dot = |none: bool, name: &str| {
-                        if none {
-                            name.to_owned()
-                        } else {
-                            format!("{name} ●")
-                        }
-                    };
-                    // MQTT has no query, headers or body: topics take their place.
-                    let mqtt = open.draft.method == "MQTT";
-                    let http_only = [ReqTab::Params, ReqTab::Headers, ReqTab::Body];
-                    if mqtt && http_only.contains(&self.req_tab) {
-                        self.req_tab = ReqTab::Topics;
-                    } else if !mqtt && self.req_tab == ReqTab::Topics {
-                        self.req_tab = ReqTab::Params;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    save = ui
+                        .add_enabled(open.dirty(), egui::Button::new("Save"))
+                        .on_hover_text(ui.ctx().format_shortcut(&SAVE))
+                        .clicked();
+                    if !streaming {
+                        toggle_load = ui
+                            .selectable_label(self.load.is_some(), "⚡ Load test")
+                            .clicked();
                     }
-                    if mqtt {
-                        let topics = open.draft.mqtt.topics.iter();
-                        let on = topics.filter(|t| t.enabled && !t.filter.is_empty()).count();
-                        ui.selectable_value(&mut self.req_tab, ReqTab::Topics, tab(on, "Topics"));
-                    } else {
-                        ui.selectable_value(
-                            &mut self.req_tab,
-                            ReqTab::Params,
-                            tab(
-                                count(&open.draft.params) + count(&open.draft.path_vars),
-                                "Params",
-                            ),
-                        );
-                        ui.selectable_value(
-                            &mut self.req_tab,
-                            ReqTab::Headers,
-                            tab(count(&open.draft.headers), "Headers"),
-                        );
-                        ui.selectable_value(
-                            &mut self.req_tab,
-                            ReqTab::Body,
-                            if open.draft.method == "GRAPHQL" {
-                                "Query".to_owned()
-                            } else {
-                                dot(matches!(open.draft.body, Body::None), "Body")
-                            },
-                        );
-                    }
-                    ui.selectable_value(
-                        &mut self.req_tab,
-                        ReqTab::Auth,
-                        dot(
-                            matches!(open.draft.effective_auth(), Auth::None | Auth::Inherit),
-                            "Auth",
-                        ),
-                    );
-                    let no_scripts = open.draft.pre_request.trim().is_empty()
-                        && open.draft.tests.trim().is_empty();
-                    ui.selectable_value(
-                        &mut self.req_tab,
-                        ReqTab::Scripts,
-                        dot(no_scripts, "Scripts"),
-                    );
-                    // How a single HTTP exchange goes out, or MQTT's connection; other
-                    // streams and gRPC have none.
-                    if !matches!(open.draft.method.as_str(), "WS" | "SSE" | "GRPC") {
-                        let default = match mqtt {
-                            true => {
-                                open.draft.mqtt.client_id.is_empty()
-                                    && !open.draft.mqtt.v5
-                                    && open.draft.mqtt.keep_alive_secs == 60
-                                    && open.draft.mqtt.clean_session
-                            }
-                            false => open.draft.settings.is_default(),
-                        };
-                        ui.selectable_value(
-                            &mut self.req_tab,
-                            ReqTab::Settings,
-                            dot(default, "Settings"),
-                        );
-                    } else if self.req_tab == ReqTab::Settings {
-                        self.req_tab = ReqTab::Params;
-                    }
-                    ui.selectable_value(
-                        &mut self.req_tab,
-                        ReqTab::Docs,
-                        dot(open.draft.description.trim().is_empty(), "Docs"),
-                    );
-                    let examples = open.draft.examples.len();
-                    if examples > 0 {
-                        ui.selectable_value(
-                            &mut self.req_tab,
-                            ReqTab::Examples,
-                            tab(examples, "Examples"),
-                        );
-                    } else if self.req_tab == ReqTab::Examples {
-                        self.req_tab = ReqTab::Params;
-                    }
+                    ui.toggle_value(&mut self.cookie_manager, "Cookies")
+                        .on_hover_text("Cookies the server set, sent back automatically");
+                    ui.toggle_value(&mut self.code, "</> Code")
+                        .on_hover_text("This request as curl, Python, Go, … to copy");
                 });
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .auto_shrink(false)
-                    .show(ui, |ui| match self.req_tab {
-                        ReqTab::Params => {
-                            if kv_table(ui, "params", &mut open.draft.params, &all_vars, true) {
-                                open.draft.url_from_params();
-                            }
-                            path_vars_table(ui, &mut open.draft.path_vars, &all_vars);
-                        }
-                        ReqTab::Headers => {
-                            kv_table(ui, "headers", &mut open.draft.headers, &all_vars, true);
-                        }
-                        ReqTab::Body => {
-                            // GRAPHQL requests are always a query; no body type to pick.
-                            if open.draft.method == "GRAPHQL"
-                                && let Body::GraphQL { query, variables } = &mut open.draft.body
-                            {
-                                fetch_schema |= graphql_editor(
-                                    ui,
-                                    query,
-                                    variables,
-                                    &all_vars,
-                                    &mut self.explorer,
-                                );
-                                return;
-                            }
-                            fetch_schema |= body_editor(
-                                ui,
-                                &mut open.draft.body,
-                                &all_vars,
-                                &mut self.explorer,
-                            );
-                        }
-                        ReqTab::Auth => auth_editor(
-                            ui,
-                            &mut open.draft.auth,
-                            &all_vars,
-                            open.draft.inherited.auth.as_ref(),
-                        ),
-                        ReqTab::Scripts => scripts_editor(
-                            ui,
-                            &mut self.script_tab,
-                            &mut open.draft.pre_request,
-                            &mut open.draft.tests,
-                            &open.draft.inherited,
-                        ),
-                        ReqTab::Settings if open.draft.method == "MQTT" => {
-                            mqtt_settings(ui, &mut open.draft.mqtt)
-                        }
-                        ReqTab::Settings => {
-                            settings_editor(ui, &mut open.draft.settings, self.network.timeout_secs)
-                        }
-                        ReqTab::Topics => {
-                            if topics_editor(ui, &mut open.draft.mqtt.topics, live)
-                                && let Some(s) = session.as_deref()
-                            {
-                                s.resubscribe(&open.draft, &all_vars);
-                            }
-                        }
-                        ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
-                        ReqTab::Docs => docs_editor(ui, &mut open.draft.description),
-                    });
             });
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("method")
+                    .selected_text(
+                        RichText::new(&open.draft.method)
+                            .color(method_color(&open.draft.method))
+                            .strong(),
+                    )
+                    .width(90.0)
+                    .show_ui(ui, |ui| {
+                        for m in METHODS {
+                            let text = RichText::new(*m).color(method_color(m));
+                            ui.selectable_value(&mut open.draft.method, (*m).to_owned(), text);
+                        }
+                    });
+                // GRAPHQL is a POST whose body is always a query; open the query editor.
+                if open.draft.method == "GRAPHQL"
+                    && !matches!(open.draft.body, Body::GraphQL { .. })
+                {
+                    open.draft.body = Body::GraphQL {
+                        query: String::new(),
+                        variables: String::new(),
+                    };
+                    self.req_tab = ReqTab::Body;
+                }
+                let button = [80.0, 22.0];
+                let width = ui.available_width() - button[0] - 8.0;
+                let hint = match open.draft.method.as_str() {
+                    "MQTT" => "mqtt://{{broker}}:1883",
+                    _ => "https://{{host}}/path",
+                };
+                let url = var_edit(
+                    ui,
+                    egui::Id::new("url"),
+                    &mut open.draft.url,
+                    &all_vars,
+                    egui::TextStyle::Monospace,
+                    false,
+                    |e| e.hint_text(hint).desired_width(width),
+                );
+                // Pasting a curl command (e.g. devtools "Copy as cURL") imports it, like Postman.
+                if url.changed() && open.draft.url.trim_start().starts_with("curl ") {
+                    match crate::curl::from_curl(&open.draft.url) {
+                        Ok(r) => {
+                            let d = &mut open.draft;
+                            (d.method, d.url, d.params) = (r.method, r.url, r.params);
+                            (d.headers, d.body, d.auth) = (r.headers, r.body, r.auth);
+                            d.settings = r.settings;
+                            self.status = "Imported curl command".into();
+                        }
+                        Err(e) => self.status = format!("curl import: {e}"),
+                    }
+                } else if url.changed() {
+                    open.draft.params_from_url();
+                }
+                if url.changed() {
+                    open.draft.path_vars_from_url();
+                }
+                if url.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    send = true;
+                }
+                if half_close {
+                    cancel = ui
+                        .add_sized(button, egui::Button::new("End stream"))
+                        .on_hover_text("Stop sending; the server can still reply")
+                        .clicked();
+                } else if pending.is_some() || live {
+                    let label = if live { "Disconnect" } else { "Cancel" };
+                    cancel = ui.add_sized(button, egui::Button::new(label)).clicked();
+                } else {
+                    let label = RichText::new(if streaming { "Connect" } else { "Send" })
+                        .strong()
+                        .color(Color32::WHITE);
+                    send |= ui
+                        .add_sized(
+                            button,
+                            egui::Button::new(label).fill(Color32::from_rgb(40, 110, 200)),
+                        )
+                        .on_hover_text(ui.ctx().format_shortcut(&SEND))
+                        .clicked();
+                }
+            });
+            if open.draft.method == "GRPC"
+                && let Some(e) = grpc_bar(ui, &mut open.draft, &mut self.grpc_methods)
+            {
+                self.status = e;
+            }
+            let (_, missing) = open.draft.resolved(&all_vars);
+            // A pre-request script may define them; only warn when nothing could.
+            let scripted = !open.draft.pre_request.trim().is_empty()
+                || !open.draft.inherited.pre_request.is_empty();
+            if !missing.is_empty() && !scripted {
+                ui.horizontal(|ui| {
+                    ui.colored_label(ORANGE, format!("Undefined: {}", missing.join(", ")));
+                    // Without an environment, Globals is where a value works right away.
+                    let target = self.active_env.as_deref().unwrap_or("Globals");
+                    if ui.small_button(format!("Define in {target}…")).clicked() {
+                        define = Some(missing.clone());
+                    }
+                });
+            }
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let count =
+                    |kv: &[KeyValue]| kv.iter().filter(|p| p.enabled && !p.key.is_empty()).count();
+                let tab = |n: usize, name: &str| {
+                    if n > 0 {
+                        format!("{name} ({n})")
+                    } else {
+                        name.to_owned()
+                    }
+                };
+                let dot = |none: bool, name: &str| {
+                    if none {
+                        name.to_owned()
+                    } else {
+                        format!("{name} ●")
+                    }
+                };
+                // MQTT has no query, headers or body: topics take their place.
+                let mqtt = open.draft.method == "MQTT";
+                let http_only = [ReqTab::Params, ReqTab::Headers, ReqTab::Body];
+                if mqtt && http_only.contains(&self.req_tab) {
+                    self.req_tab = ReqTab::Topics;
+                } else if !mqtt && self.req_tab == ReqTab::Topics {
+                    self.req_tab = ReqTab::Params;
+                }
+                if mqtt {
+                    let topics = open.draft.mqtt.topics.iter();
+                    let on = topics.filter(|t| t.enabled && !t.filter.is_empty()).count();
+                    ui.selectable_value(&mut self.req_tab, ReqTab::Topics, tab(on, "Topics"));
+                } else {
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Params,
+                        tab(
+                            count(&open.draft.params) + count(&open.draft.path_vars),
+                            "Params",
+                        ),
+                    );
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Headers,
+                        tab(count(&open.draft.headers), "Headers"),
+                    );
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Body,
+                        if open.draft.method == "GRAPHQL" {
+                            "Query".to_owned()
+                        } else {
+                            dot(matches!(open.draft.body, Body::None), "Body")
+                        },
+                    );
+                }
+                ui.selectable_value(
+                    &mut self.req_tab,
+                    ReqTab::Auth,
+                    dot(
+                        matches!(open.draft.effective_auth(), Auth::None | Auth::Inherit),
+                        "Auth",
+                    ),
+                );
+                let no_scripts =
+                    open.draft.pre_request.trim().is_empty() && open.draft.tests.trim().is_empty();
+                ui.selectable_value(
+                    &mut self.req_tab,
+                    ReqTab::Scripts,
+                    dot(no_scripts, "Scripts"),
+                );
+                // How a single HTTP exchange goes out, or MQTT's connection; other
+                // streams and gRPC have none.
+                if !matches!(open.draft.method.as_str(), "WS" | "SSE" | "GRPC") {
+                    let default = match mqtt {
+                        true => {
+                            open.draft.mqtt.client_id.is_empty()
+                                && !open.draft.mqtt.v5
+                                && open.draft.mqtt.keep_alive_secs == 60
+                                && open.draft.mqtt.clean_session
+                        }
+                        false => open.draft.settings.is_default(),
+                    };
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Settings,
+                        dot(default, "Settings"),
+                    );
+                } else if self.req_tab == ReqTab::Settings {
+                    self.req_tab = ReqTab::Params;
+                }
+                ui.selectable_value(
+                    &mut self.req_tab,
+                    ReqTab::Docs,
+                    dot(open.draft.description.trim().is_empty(), "Docs"),
+                );
+                let examples = open.draft.examples.len();
+                if examples > 0 {
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Examples,
+                        tab(examples, "Examples"),
+                    );
+                } else if self.req_tab == ReqTab::Examples {
+                    self.req_tab = ReqTab::Params;
+                }
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| match self.req_tab {
+                    ReqTab::Params => {
+                        if kv_table(ui, "params", &mut open.draft.params, &all_vars, true) {
+                            open.draft.url_from_params();
+                        }
+                        path_vars_table(ui, &mut open.draft.path_vars, &all_vars);
+                    }
+                    ReqTab::Headers => {
+                        kv_table(ui, "headers", &mut open.draft.headers, &all_vars, true);
+                    }
+                    ReqTab::Body => {
+                        // GRAPHQL requests are always a query; no body type to pick.
+                        if open.draft.method == "GRAPHQL"
+                            && let Body::GraphQL { query, variables } = &mut open.draft.body
+                        {
+                            fetch_schema |=
+                                graphql_editor(ui, query, variables, &all_vars, &mut self.explorer);
+                            return;
+                        }
+                        fetch_schema |=
+                            body_editor(ui, &mut open.draft.body, &all_vars, &mut self.explorer);
+                    }
+                    ReqTab::Auth => auth_editor(
+                        ui,
+                        &mut open.draft.auth,
+                        &all_vars,
+                        open.draft.inherited.auth.as_ref(),
+                    ),
+                    ReqTab::Scripts => scripts_editor(
+                        ui,
+                        &mut self.script_tab,
+                        &mut open.draft.pre_request,
+                        &mut open.draft.tests,
+                        &open.draft.inherited,
+                    ),
+                    ReqTab::Settings if open.draft.method == "MQTT" => {
+                        mqtt_settings(ui, &mut open.draft.mqtt)
+                    }
+                    ReqTab::Settings => {
+                        settings_editor(ui, &mut open.draft.settings, self.network.timeout_secs)
+                    }
+                    ReqTab::Topics => {
+                        if topics_editor(ui, &mut open.draft.mqtt.topics, live)
+                            && let Some(s) = session.as_deref()
+                        {
+                            s.resubscribe(&open.draft, &all_vars);
+                        }
+                    }
+                    ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
+                    ReqTab::Docs => docs_editor(ui, &mut open.draft.description),
+                });
+        });
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(p) = pending {
@@ -3889,7 +3893,8 @@ fn kv_table(
             return *rows != before;
         }
     }
-    let key_width = 200.0;
+    // Narrower in a side-by-side pane, so the value keeps most of the room.
+    let key_width = (ui.available_width() * 0.25).clamp(100.0, 200.0);
     let rest = (ui.available_width() - key_width - 90.0).max(120.0);
     let (value_width, desc_width) = match describe {
         true => (rest * 0.6, rest * 0.4 - ui.spacing().item_spacing.x),
@@ -3964,7 +3969,8 @@ fn path_vars_table(ui: &mut egui::Ui, rows: &mut [KeyValue], vars: &HashMap<Stri
     }
     ui.add_space(6.0);
     ui.strong("Path Variables");
-    let key_width = 200.0;
+    // Narrower in a side-by-side pane, so the value keeps most of the room.
+    let key_width = (ui.available_width() * 0.25).clamp(100.0, 200.0);
     let rest = (ui.available_width() - key_width - 90.0).max(120.0);
     for (i, row) in rows.iter_mut().enumerate() {
         ui.horizontal(|ui| {
@@ -5956,6 +5962,28 @@ mod ui_tests {
         );
         // Its value is resolved like the rest of the request.
         assert!(h.query_by_label("Undefined: uid").is_some());
+    }
+
+    #[test]
+    fn side_by_side_puts_the_response_beside_the_request_and_is_kept() {
+        let mut h = with_request("sidebyside");
+        let hint = "Press Send or Ctrl+Enter to see the response.";
+        let rects =
+            |h: &Harness<'_, App>| (h.get_by_label("Params").rect(), h.get_by_label(hint).rect());
+        let (p, r) = rects(&h);
+        assert!(
+            r.top() > p.bottom(),
+            "stacked: the response is under the request"
+        );
+        h.get_by_label("Side by side").click();
+        h.run();
+        shot(&mut h, "44-side-by-side");
+        let (p, r) = rects(&h);
+        assert!(r.top() < p.top() && r.left() > p.right(), "{p:?} {r:?}");
+        assert!(
+            h.state().ws.load_state().side_by_side,
+            "kept for the next start"
+        );
     }
 
     /// A workspace with one request `r` (and env `dev` with `host`), opened in the app.

@@ -116,6 +116,7 @@ pub struct State {
     /// The language the code panel shows.
     pub code_lang: String,
     pub wrap_response: bool,
+    pub side_by_side: bool,
 }
 
 /// Clones share one connection: the GUI's mock server reads from its own thread.
