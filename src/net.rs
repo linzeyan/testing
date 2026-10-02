@@ -11,6 +11,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::http::error_chain;
+use crate::model::{HttpVersion, Settings};
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
@@ -63,6 +64,52 @@ pub struct Clients {
     pub grpc: reqwest::Client,
     /// Why the system's PAC script was skipped, to show next to the proxy mode.
     pub note: Option<String>,
+    variants: Arc<Variants>,
+}
+
+/// What request settings change about the connection itself (the timeout is set per
+/// request instead). reqwest fixes these per client, so each combination in use gets
+/// its own, built once.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Variant {
+    version: HttpVersion,
+    /// None doesn't follow.
+    redirects: Option<u32>,
+    insecure: bool,
+    cookies: bool,
+}
+
+impl From<&Settings> for Variant {
+    fn from(s: &Settings) -> Self {
+        Self {
+            version: s.http_version,
+            redirects: s.follow_redirects.then_some(s.max_redirects),
+            insecure: !s.verify_tls,
+            cookies: s.cookies,
+        }
+    }
+}
+
+struct Variants {
+    build: Box<dyn Fn(Variant) -> Result<reqwest::Client, String> + Send + Sync>,
+    built: Mutex<HashMap<Variant, reqwest::Client>>,
+}
+
+impl Clients {
+    /// The client for a request's settings; the shared one unless they differ from the
+    /// defaults.
+    pub fn for_settings(&self, s: &Settings) -> Result<reqwest::Client, String> {
+        let v = Variant::from(s);
+        if v == Variant::from(&Settings::default()) {
+            return Ok(self.http.clone());
+        }
+        if let Some(c) = self.variants.built.lock().unwrap().get(&v) {
+            return Ok(c.clone());
+        }
+        let c = (self.variants.build)(v)?;
+        self.variants.built.lock().unwrap().insert(v, c.clone());
+        Ok(c)
+    }
 }
 
 /// With a fresh cookie jar for this client's lifetime (a CLI run, an MCP session).
@@ -115,11 +162,17 @@ pub async fn build_client_with_jar(
         Some(load_identity(Path::new(cert), &net.client_cert_password)?)
     };
 
-    let build = |h2_only: bool| {
+    let build = move |v: Variant| {
         let mut b = reqwest::Client::builder()
-            .cookie_provider(jar.clone())
             .timeout(Duration::from_secs(net.timeout_secs.max(1)))
-            .tls_danger_accept_invalid_certs(net.insecure);
+            .tls_danger_accept_invalid_certs(net.insecure || v.insecure)
+            .redirect(match v.redirects {
+                Some(n) => reqwest::redirect::Policy::limited(n as usize),
+                None => reqwest::redirect::Policy::none(),
+            });
+        if v.cookies {
+            b = b.cookie_provider(jar.clone());
+        }
         if net.proxy == ProxyMode::None {
             b = b.no_proxy();
         }
@@ -133,15 +186,27 @@ pub async fn build_client_with_jar(
         if let Some(id) = &identity {
             b = b.identity(id.clone());
         }
-        if h2_only {
-            b = b.http2_prior_knowledge();
-        }
+        b = match v.version {
+            HttpVersion::Auto => b,
+            HttpVersion::Http1 => b.http1_only(),
+            // Over TLS this offers only h2; over plain TCP it is h2c.
+            HttpVersion::Http2 => b.http2_prior_knowledge(),
+        };
         b.build().map_err(|e| error_chain(&e))
     };
+    let default = Variant::from(&Settings::default());
+    let grpc = Variant {
+        version: HttpVersion::Http2,
+        ..default
+    };
     Ok(Clients {
-        http: build(false)?,
-        grpc: build(true)?,
+        http: build(default)?,
+        grpc: build(grpc)?,
         note,
+        variants: Arc::new(Variants {
+            build: Box::new(build),
+            built: Default::default(),
+        }),
     })
 }
 

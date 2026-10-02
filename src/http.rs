@@ -60,6 +60,9 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
     // The query lives in the URL itself (see `Request::url_from_params`); the params table is
     // only its editor, so it is not appended again here.
     let mut b = client.request(method, url);
+    if req.settings.timeout_ms > 0 {
+        b = b.timeout(Duration::from_millis(req.settings.timeout_ms));
+    }
     for h in &req.headers {
         b = b.header(h.key.as_str(), h.value.as_str());
     }

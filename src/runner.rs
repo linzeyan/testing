@@ -179,7 +179,7 @@ pub async fn send(client: &net::Clients, mut req: Request) -> Result<http::Respo
         http::with_token(&client.http, &mut req, false).await?;
         grpc::call(client.grpc.clone(), req).await
     } else {
-        http::execute(client.http.clone(), req).await
+        http::execute(client.for_settings(&req.settings)?, req).await
     }
 }
 
@@ -342,6 +342,118 @@ fn absorb(
 mod tests {
     use super::*;
     use crate::net::{Network, ProxyMode, build_client};
+
+    #[test]
+    fn request_settings_change_how_it_goes_out() {
+        use crate::model::{HttpVersion, Settings};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt
+            .block_on(build_client(Network {
+                proxy: ProxyMode::None,
+                ..Default::default()
+            }))
+            .unwrap();
+        let addr = crate::http::tests::serve(|raw| {
+            let none = String::new();
+            match raw.split(' ').nth(1).unwrap_or("") {
+                "/start" => ("302 Found\r\nlocation: /end".into(), none),
+                "/loop" => ("302 Found\r\nlocation: /loop".into(), none),
+                "/login" => ("200 OK\r\nset-cookie: sid=1; Path=/".into(), none),
+                "/slow" => {
+                    std::thread::sleep(Duration::from_millis(500));
+                    ("200 OK".into(), none)
+                }
+                _ => ("200 OK".into(), raw.to_lowercase()),
+            }
+        });
+        let h2c = h2c_server();
+        let send = |url: String, settings: Settings| {
+            let req = Request {
+                url,
+                settings,
+                ..Default::default()
+            };
+            rt.block_on(super::send(&client, req))
+        };
+        let at = |path: &str| format!("http://{addr}{path}");
+        let d = Settings::default();
+
+        assert_eq!(send(at("/start"), d.clone()).unwrap().status, 200);
+        let stay = Settings {
+            follow_redirects: false,
+            ..d.clone()
+        };
+        assert_eq!(
+            send(at("/start"), stay).unwrap().status,
+            302,
+            "the 3xx itself"
+        );
+        let few = Settings {
+            max_redirects: 3,
+            ..d.clone()
+        };
+        let err = send(at("/loop"), few).err().expect("a redirect loop fails");
+        assert!(err.contains("too many redirects"), "{err}");
+
+        send(at("/login"), d.clone()).unwrap();
+        assert!(
+            send(at("/echo"), d.clone())
+                .unwrap()
+                .body
+                .contains("cookie: sid=1")
+        );
+        let jarless = Settings {
+            cookies: false,
+            ..d.clone()
+        };
+        assert!(!send(at("/echo"), jarless).unwrap().body.contains("cookie:"));
+
+        let h1 = Settings {
+            http_version: HttpVersion::Http1,
+            ..d.clone()
+        };
+        assert_eq!(send(at("/echo"), h1).unwrap().version, "HTTP/1.1");
+        let h2 = Settings {
+            http_version: HttpVersion::Http2,
+            ..d.clone()
+        };
+        assert_eq!(send(h2c, h2).unwrap().version, "HTTP/2.0");
+
+        // Last: the server sleeps through it before taking another request.
+        let quick = Settings {
+            timeout_ms: 100,
+            ..d.clone()
+        };
+        let err = send(at("/slow"), quick).err().expect("too slow");
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    /// Answers every request with an empty 200 over cleartext HTTP/2.
+    fn h2c_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (sock, _) = listener.accept().await.unwrap();
+                let mut conn = h2::server::handshake(sock).await.unwrap();
+                while let Some(Ok((_, mut respond))) = conn.accept().await {
+                    let ok = ::http::Response::builder().body(()).unwrap();
+                    respond.send_response(ok, true).unwrap();
+                }
+            });
+        });
+        format!("http://{addr}/")
+    }
 
     #[test]
     fn scripts_chain_variables_into_the_request_and_capture_results() {

@@ -53,6 +53,7 @@ enum ReqTab {
     Body,
     Auth,
     Scripts,
+    Settings,
     Examples,
     Docs,
 }
@@ -1821,6 +1822,16 @@ impl App {
                         ReqTab::Scripts,
                         dot(no_scripts, "Scripts"),
                     );
+                    // How a single HTTP exchange goes out; streams and gRPC don't use them.
+                    if !matches!(open.draft.method.as_str(), "WS" | "SSE" | "GRPC") {
+                        ui.selectable_value(
+                            &mut self.req_tab,
+                            ReqTab::Settings,
+                            dot(open.draft.settings.is_default(), "Settings"),
+                        );
+                    } else if self.req_tab == ReqTab::Settings {
+                        self.req_tab = ReqTab::Params;
+                    }
                     ui.selectable_value(
                         &mut self.req_tab,
                         ReqTab::Docs,
@@ -1883,6 +1894,9 @@ impl App {
                             &mut open.draft.tests,
                             &open.draft.inherited,
                         ),
+                        ReqTab::Settings => {
+                            settings_editor(ui, &mut open.draft.settings, self.network.timeout_secs)
+                        }
                         ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
                         ReqTab::Docs => docs_editor(ui, &mut open.draft.description),
                     });
@@ -3494,6 +3508,78 @@ fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
             .desired_rows(12)
             .desired_width(f32::INFINITY),
     );
+}
+
+fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_secs: u64) {
+    use model::HttpVersion;
+    egui::Grid::new("settings")
+        .num_columns(3)
+        .spacing([16.0, 10.0])
+        .show(ui, |ui| {
+            ui.label("HTTP version");
+            let name = |v: HttpVersion| match v {
+                HttpVersion::Auto => "Auto",
+                HttpVersion::Http1 => "HTTP/1.1",
+                HttpVersion::Http2 => "HTTP/2",
+            };
+            egui::ComboBox::from_id_salt("http-version")
+                .selected_text(name(s.http_version))
+                .show_ui(ui, |ui| {
+                    for v in [HttpVersion::Auto, HttpVersion::Http1, HttpVersion::Http2] {
+                        ui.selectable_value(&mut s.http_version, v, name(v));
+                    }
+                });
+            ui.weak("Auto uses HTTP/2 when an https server offers it");
+            ui.end_row();
+
+            ui.label("Follow redirects");
+            ui.checkbox(&mut s.follow_redirects, "");
+            ui.weak("Off shows the 3xx response itself");
+            ui.end_row();
+
+            ui.label("Maximum redirects");
+            ui.add_enabled(
+                s.follow_redirects,
+                egui::DragValue::new(&mut s.max_redirects).range(1..=50),
+            );
+            ui.end_row();
+
+            ui.label("Verify TLS certificate");
+            ui.checkbox(&mut s.verify_tls, "");
+            if s.verify_tls {
+                ui.weak("Off accepts any certificate, for this request only");
+            } else {
+                ui.colored_label(RED, "Any server certificate is accepted");
+            }
+            ui.end_row();
+
+            ui.label("Cookie jar");
+            ui.checkbox(&mut s.cookies, "");
+            ui.weak("Send stored cookies and keep the ones the server sets");
+            ui.end_row();
+
+            ui.label("Timeout");
+            let default = format!("Default ({default_timeout_secs} s)");
+            ui.add(
+                egui::DragValue::new(&mut s.timeout_ms)
+                    .range(0..=3_600_000)
+                    .speed(100)
+                    .custom_formatter(move |v, _| match v {
+                        0.0 => default.clone(),
+                        v => format!("{v} ms"),
+                    })
+                    .custom_parser(|t| t.trim().trim_end_matches("ms").trim().parse().ok()),
+            );
+            ui.weak("0 uses the network settings' timeout");
+            ui.end_row();
+        });
+    ui.add_space(8.0);
+    if ui
+        .add_enabled(!s.is_default(), egui::Button::new("Reset to defaults"))
+        .clicked()
+    {
+        *s = model::Settings::default();
+    }
 }
 
 const PRE_SNIPPETS: &[(&str, &str)] = &[

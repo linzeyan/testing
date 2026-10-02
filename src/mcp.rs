@@ -485,6 +485,18 @@ fn tools() -> Value {
             "tests": { "type": "string", "description": "JavaScript run on the response, e.g. pm.test(\"ok\", () => pm.response.to.have.status(200));" },
             "proto": { "type": "string", "description": "gRPC: .proto file path relative to the workspace" },
             "rpc": { "type": "string", "description": "gRPC: package.Service/Method" },
+            "settings": {
+                "type": "object",
+                "description": "HTTP only; omit for the defaults",
+                "properties": {
+                    "http_version": { "type": "string", "enum": ["auto", "http1", "http2"], "default": "auto" },
+                    "follow_redirects": { "type": "boolean", "default": true },
+                    "max_redirects": { "type": "integer", "default": 10 },
+                    "verify_tls": { "type": "boolean", "default": true },
+                    "cookies": { "type": "boolean", "default": true, "description": "Send and store cookies" },
+                    "timeout_ms": { "type": "integer", "default": 0, "description": "0 = the network settings' timeout" },
+                },
+            },
         },
         "required": ["method", "url"],
     });

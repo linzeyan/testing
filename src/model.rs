@@ -41,12 +41,60 @@ pub struct Request {
     /// JavaScript run on the response (`pm.test`, variable capture).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub tests: String,
+    #[serde(skip_serializing_if = "Settings::is_default")]
+    pub settings: Settings,
     /// Saved responses, for reference and documentation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<Example>,
     /// From the folders above; filled in when loaded from the workspace, never saved.
     #[serde(skip)]
     pub inherited: Inherited,
+}
+
+/// How one HTTP request goes out, like Postman's per-request Settings tab. The defaults
+/// are what every other request does.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct Settings {
+    pub http_version: HttpVersion,
+    pub follow_redirects: bool,
+    pub max_redirects: u32,
+    /// Off skips certificate checks for this request only (the network setting does it
+    /// for all).
+    pub verify_tls: bool,
+    /// Send and store cookies with the cookie jar.
+    pub cookies: bool,
+    /// 0 is the network settings' timeout.
+    pub timeout_ms: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            http_version: HttpVersion::Auto,
+            follow_redirects: true,
+            max_redirects: 10,
+            verify_tls: true,
+            cookies: true,
+            timeout_ms: 0,
+        }
+    }
+}
+
+impl Settings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpVersion {
+    /// HTTP/2 when the server offers it over TLS, else HTTP/1.1.
+    #[default]
+    Auto,
+    Http1,
+    Http2,
 }
 
 /// A folder's `.folder.toml`: what every request below it shares, like a Postman
@@ -108,6 +156,7 @@ impl Default for Request {
             auth: Auth::Inherit,
             pre_request: String::new(),
             tests: String::new(),
+            settings: Settings::default(),
             examples: Vec::new(),
             inherited: Inherited::default(),
         }
@@ -450,6 +499,7 @@ impl Request {
             // Scripts have already run by the time a request is resolved for the wire.
             pre_request: String::new(),
             tests: String::new(),
+            settings: self.settings.clone(),
             examples: Vec::new(),
             inherited: Inherited::default(),
         };
@@ -616,6 +666,12 @@ mod tests {
             pre_request: "pm.environment.set(\"ts\", Date.now());".into(),
             tests: "pm.test(\"ok\", function () {\n    pm.response.to.have.status(200);\n});\n"
                 .into(),
+            settings: Settings {
+                http_version: HttpVersion::Http1,
+                follow_redirects: false,
+                timeout_ms: 1500,
+                ..Default::default()
+            },
             examples: vec![Example {
                 name: "found".into(),
                 status: 200,
