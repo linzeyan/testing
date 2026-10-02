@@ -18,7 +18,9 @@ such as Citrix VDI. No installer: unzip and run.
   Postman v2.1 collection or environment (⋯ > "Import from Postman…": paste it, give its
   path or drop the file) and copy a folder or the whole collection as a Postman
   collection; duplicate requests and folders (Ctrl+D); new request (Ctrl+N); Ctrl+L
-  selects the URL; filter the tree by name; find in response (Ctrl+F); saved response
+  selects the URL; filter the tree by name; a response body with JSON colours and line numbers,
+  Pretty/Raw, word wrap and Save… to a file (bodies past 16 MiB keep their start, to
+  spare RAM); find in response (Ctrl+F); saved response
   examples; request history; Bearer, Basic, Digest and OAuth 2.0 (client credentials,
   password) auth; a cookie jar like a browser's, with a manager; folder settings
   (right-click a folder) with variables, auth and scripts shared by every request inside,
