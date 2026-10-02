@@ -1121,6 +1121,9 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // ponytail: teardown is best-effort (`let _ = remove_dir_all`): Windows won't delete
+    // apitool.db while the test's Workspace still holds it, so a Windows run leaves its
+    // dir in %TEMP%. Drop every handle before the delete if that ever matters.
     fn fresh(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("apitool-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -1188,7 +1191,7 @@ mod tests {
         // A second handle (the MCP server next to the app) sees the same data.
         let other = Workspace::open(root.clone()).unwrap();
         assert_eq!(other.env_vars(Some("dev")).unwrap()["token"], "new");
-        fs::remove_dir_all(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1236,7 +1239,7 @@ mod tests {
         // Deleting the copy leaves the original whole.
         ws.delete(&folder).unwrap();
         assert_eq!(ws.load_requests_in(&api).unwrap().len(), 3);
-        fs::remove_dir_all(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1253,7 +1256,7 @@ mod tests {
         let left = ws.load_requests_in(&ws.collections()).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].0, "users/inside", "the folder keeps what's inside");
-        fs::remove_dir_all(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1297,7 +1300,7 @@ mod tests {
             matches!(&ws.tree()[0], Node::Folder { children, .. } if children.len() == 1),
             "settings are not requests"
         );
-        fs::remove_dir_all(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1322,7 +1325,7 @@ mod tests {
         assert_eq!(loaded[0].path, "5", "oldest entries go first");
         ws.clear_history().unwrap();
         assert!(ws.load_history().is_empty());
-        fs::remove_dir_all(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1400,7 +1403,7 @@ mod tests {
             ("h2", "s3cret")
         );
         assert_eq!(ws.env_vars(None).unwrap()["g"], "1");
-        fs::remove_dir_all(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

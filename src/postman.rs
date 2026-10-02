@@ -1041,6 +1041,6 @@ mod tests {
             saved.inherited = Default::default();
             assert_eq!(back[name.strip_prefix("api/").unwrap()], saved, "{name}");
         }
-        std::fs::remove_dir_all(&root).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

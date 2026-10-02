@@ -256,6 +256,6 @@ mod tests {
         assert!(md.contains("**Example: found — 200 · `application/json`**\n\n````json\n"));
         assert_eq!(markdown(&ws, &ws.collections()).unwrap()[..6], *"# API\n");
         assert!(markdown(&ws, &root.join("nope")).is_err());
-        std::fs::remove_dir_all(&root).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
