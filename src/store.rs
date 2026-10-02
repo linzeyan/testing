@@ -410,6 +410,21 @@ impl Workspace {
         rows.unwrap_or_default()
     }
 
+    /// Each request's latest kept status, for the tree.
+    pub fn last_statuses(&self) -> HashMap<PathBuf, u16> {
+        let db = self.db();
+        let sql = "SELECT path, status FROM responses \
+                   WHERE id IN (SELECT MAX(id) FROM responses GROUP BY path)";
+        let rows = db.prepare(sql).and_then(|mut q| {
+            let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u16>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        });
+        let root = self.collections();
+        (rows.unwrap_or_default().into_iter())
+            .map(|(key, status)| (root.join(format!("{key}.toml")), status))
+            .collect()
+    }
+
     pub fn load_response(&self, id: i64) -> Result<crate::http::Response, String> {
         let db = self.db();
         let json: String = sql(db.query_row(
@@ -1470,6 +1485,11 @@ mod tests {
         let list = ws.responses(&path);
         assert_eq!(list.len(), MAX_RESPONSES, "the oldest goes");
         assert_eq!((list[0].status, list[0].ms), (209, 7), "newest first");
+        assert_eq!(
+            ws.last_statuses().get(&path),
+            Some(&209),
+            "the latest, for the tree"
+        );
         assert!(ws.load_response(big).is_err());
         // Renaming keeps them with the request; deleting takes them along.
         let renamed = ws.rename(&path, "s").unwrap();

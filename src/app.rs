@@ -504,6 +504,8 @@ impl RunState {
 pub struct App {
     ws: Workspace,
     tree: Vec<Node>,
+    /// Each request's latest kept status, shown on its tree row.
+    statuses: HashMap<PathBuf, u16>,
     envs: Vec<String>,
     /// Oldest first.
     history: Vec<HistoryEntry>,
@@ -565,6 +567,7 @@ impl App {
         let state = ws.load_state();
         let mut app = Self {
             tree: ws.tree(),
+            statuses: ws.last_statuses(),
             envs: ws.env_names(),
             history: ws.load_history(),
             show_history: false,
@@ -771,6 +774,7 @@ impl App {
 
     fn reload(&mut self) {
         self.tree = self.ws.tree();
+        self.statuses = self.ws.last_statuses();
         self.envs = self.ws.env_names();
     }
 
@@ -1303,9 +1307,12 @@ impl App {
             let failed = outcome.response.is_err() || outcome.tests.iter().any(|t| !t.passed);
             let to_tests = failed && !outcome.tests.is_empty();
             let past = match &outcome.response {
-                Ok(r) => (self.ws.add_response(&path, r))
-                    .inspect_err(|e| self.status = format!("Keeping the response: {e}"))
-                    .ok(),
+                Ok(r) => {
+                    self.statuses.insert(path.clone(), r.status);
+                    (self.ws.add_response(&path, r))
+                        .inspect_err(|e| self.status = format!("Keeping the response: {e}"))
+                        .ok()
+                }
                 Err(_) => None,
             };
             let shown = || Shown {
@@ -2010,7 +2017,7 @@ impl App {
                 } else if nodes.is_empty() {
                     ui.weak("Nothing matches.");
                 }
-                tree_ui(ui, nodes, selected, &expand, &mut actions);
+                tree_ui(ui, nodes, selected, &self.statuses, &expand, &mut actions);
                 // The empty space under the tree takes a drop to the top level.
                 let size = egui::vec2(ui.available_width(), ui.available_height().max(24.0));
                 let rest = ui.allocate_response(size, egui::Sense::hover());
@@ -2387,6 +2394,24 @@ impl App {
         let mut fetch_schema = false;
         let mut example = None;
         let pending = self.pending.iter().find(|p| p.path == open.path);
+        // The folders above the request, outermost first, for the breadcrumb.
+        let root = self.ws.collections();
+        let crumbs: Vec<(String, PathBuf)> = (open.path.ancestors().skip(1))
+            .take_while(|d| d.starts_with(&root) && *d != root)
+            .map(|d| {
+                (
+                    d.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    d.to_path_buf(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let mut folder_clicked: Option<PathBuf> = None;
         // Before `streaming`: whether a gRPC method streams comes from its proto.
         if open.draft.method == "GRPC"
             && (self.grpc_methods.as_ref()).is_none_or(|(p, _)| *p != open.draft.proto)
@@ -2462,6 +2487,13 @@ impl App {
         panel.resizable(true).show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
+                for (name, dir) in &crumbs {
+                    let link = ui.link(RichText::new(name).weak());
+                    if link.on_hover_text("Folder settings").clicked() {
+                        folder_clicked = Some(dir.clone());
+                    }
+                    ui.weak("›");
+                }
                 ui.heading(open.name());
                 if open.dirty() {
                     ui.colored_label(ORANGE, "●")
@@ -2805,7 +2837,10 @@ impl App {
             && let Some(path) = &path
         {
             match self.ws.clear_responses(path) {
-                Ok(()) => self.status = "Cleared this request's response history".into(),
+                Ok(()) => {
+                    self.statuses.remove(path);
+                    self.status = "Cleared this request's response history".into();
+                }
                 Err(e) => self.status = e,
             }
         }
@@ -2865,6 +2900,10 @@ impl App {
         }
         if start_load {
             self.start_load(ui.ctx());
+        }
+        if let Some(dir) = folder_clicked {
+            self.reveal = Some(dir.clone());
+            self.open_folder_editor(dir);
         }
     }
 
@@ -4049,6 +4088,7 @@ fn tree_ui(
     ui: &mut egui::Ui,
     nodes: &[Node],
     selected: Option<&Path>,
+    statuses: &HashMap<PathBuf, u16>,
     expand: &dyn Fn(&Path) -> bool,
     actions: &mut Vec<TreeAction>,
 ) {
@@ -4064,7 +4104,9 @@ fn tree_ui(
                     // Reveal the open request on startup instead of hiding it in a collapsed folder.
                     .default_open(selected.is_some_and(|s| s.starts_with(path)))
                     .open(expand(path).then_some(true))
-                    .show(ui, |ui| tree_ui(ui, children, selected, expand, actions));
+                    .show(ui, |ui| {
+                        tree_ui(ui, children, selected, statuses, expand, actions)
+                    });
                 let header = &resp.header_response;
                 header
                     .interact(egui::Sense::drag())
@@ -4083,7 +4125,15 @@ fn tree_ui(
                                 .small()
                                 .color(method_color(method)),
                         );
-                        ui.selectable_label(selected == Some(path.as_path()), name.as_str())
+                        let row =
+                            ui.selectable_label(selected == Some(path.as_path()), name.as_str());
+                        if let Some(&status) = statuses.get(path) {
+                            let text = RichText::new(status.to_string())
+                                .small()
+                                .color(status_color(status));
+                            ui.label(text).on_hover_text("Last response");
+                        }
+                        row
                     })
                     .inner;
                 if resp.double_clicked() {
@@ -5855,11 +5905,22 @@ fn response_ui(
     };
     match (current, &mut shown.result) {
         (RespTab::Tests, _) => {
+            // None: all; else only passed (true) or failed (false) ones.
+            let id = egui::Id::new("tests-filter");
+            let mut only: Option<bool> = ui.data(|d| d.get_temp(id)).flatten();
+            let passed = shown.tests.iter().filter(|t| t.passed).count();
+            let failed = shown.tests.len() - passed;
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut only, None, format!("All ({})", shown.tests.len()));
+                ui.selectable_value(&mut only, Some(true), format!("Passed ({passed})"));
+                ui.selectable_value(&mut only, Some(false), format!("Failed ({failed})"));
+            });
+            ui.data_mut(|d| d.insert_temp(id, only));
             egui::ScrollArea::vertical()
                 .id_salt("response-tests")
                 .auto_shrink(false)
                 .show(ui, |ui| {
-                    for t in &shown.tests {
+                    for t in (shown.tests.iter()).filter(|t| only.is_none_or(|p| t.passed == p)) {
                         ui.horizontal(|ui| {
                             let (badge, color) = if t.passed {
                                 ("PASS", GREEN)
@@ -6457,7 +6518,8 @@ mod ui_tests {
             .headers
             .push(draft.clone());
 
-        h.get_by_label("api").click_secondary();
+        // The tree's "api", drawn before the breadcrumb's.
+        h.get_all_by_label("api").next().unwrap().click_secondary();
         h.run();
         h.get_by_label("Folder settings…").click();
         h.run();
@@ -7259,6 +7321,56 @@ mod ui_tests {
     }
 
     #[test]
+    fn the_tests_tab_narrows_to_failures() {
+        let mut h = with_request("tests-filter");
+        let test = |name: &str, passed| TestResult {
+            name: name.into(),
+            passed,
+            error: (!passed).then(|| "expected 1 to equal 2".into()),
+        };
+        h.state_mut().response = Some(Shown {
+            result: Err("x".into()),
+            tests: vec![
+                test("status ok", true),
+                test("has id", false),
+                test("fast", true),
+            ],
+            logs: Vec::new(),
+            past: None,
+        });
+        h.state_mut().resp_tab = RespTab::Tests;
+        h.run();
+        assert!(h.query_by_label("status ok").is_some());
+        h.get_by_label("Failed (1)").click();
+        h.run();
+        shot(&mut h, "56-tests-filter");
+        assert!(h.query_by_label("status ok").is_none());
+        assert!(h.query_by_label("has id").is_some());
+        h.get_by_label("All (3)").click();
+        h.run();
+        assert!(h.query_by_label("fast").is_some());
+    }
+
+    #[test]
+    fn the_breadcrumb_leads_to_the_folders_above() {
+        let ws = workspace("crumbs");
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let users = ws.create_folder(&api, "users").unwrap();
+        ws.create_request(&users, "get user").unwrap();
+        let mut h = harness(ws);
+        h.state_mut().activate(users.join("get user.toml"), true);
+        h.run();
+        shot(&mut h, "57-breadcrumb");
+        // The tree is folded, so this "users" is the breadcrumb's.
+        h.get_by_label("users").click();
+        h.run();
+        assert_eq!(
+            h.state().folder_editor.as_ref().map(|e| e.dir.clone()),
+            Some(users)
+        );
+    }
+
+    #[test]
     fn the_cookies_tab_lists_what_the_response_sets() {
         let mut h = with_request("resp-cookies");
         let cookie = |v: &str| ("set-cookie".to_owned(), v.to_owned());
@@ -7339,12 +7451,16 @@ mod ui_tests {
         // Kept on disk, so a restart still has them; Clear empties this request's list.
         let path = h.state().open.as_ref().unwrap().path.clone();
         assert_eq!(h.state().ws.responses(&path).len(), 2);
+        // The tree row carries the last status, also after a restart.
+        assert!(h.query_by_label("200").is_some());
+        assert_eq!(h.state().ws.last_statuses().get(&path), Some(&200));
         h.get_by_label("History: just now").click();
         h.run();
         h.get_by_label("Clear history").click();
         h.run();
         assert!(h.state().ws.responses(&path).is_empty());
         assert!(h.query_by_label_contains("History: ").is_none());
+        assert!(h.query_by_label("200").is_none(), "no status left to show");
     }
 
     #[test]

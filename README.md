@@ -23,11 +23,12 @@ such as Citrix VDI. No installer: unzip and run.
   selects the URL; Ctrl+K jumps to any request (by folder and name, letters in order are
   enough) or environment; filter the tree by name; drag a request or folder onto a folder (or the
   empty space under the tree) to move it, open tabs following; a ⋯ on the hovered tree row
-  opens the same menu as right-click; header names and Content-Type values complete while
+  opens the same menu as right-click; each request's last status code on its tree row; a
+  `folder › request` breadcrumb whose folders open their settings; header names and Content-Type values complete while
   typing, and the Headers tab folds out what Send adds (Host, auth, Content-Type…) and
   where each comes from; a response body with JSON colours and line numbers,
   Pretty/Raw, a JSONPath filter (`$.items[*].id`, `..id`; Save… still writes the whole
-  body), word wrap and Save… to a file (bodies past 16 MiB keep their start, to
+  body), a Tests tab filter (All/Passed/Failed with counts), word wrap and Save… to a file (bodies past 16 MiB keep their start, to
   spare RAM); a Timeline tab with the request as it went out (headers reqwest adds and jar
   cookies included), each redirect and the peer address; a History menu in the
   response bar with the last 10 responses of each request (kept on disk, 1 MiB of body
