@@ -4891,8 +4891,21 @@ fn auth_editor(
                         "Client credentials",
                     );
                     ui.selectable_value(&mut o.grant, Grant::Password, "Password");
+                    ui.selectable_value(
+                        &mut o.grant,
+                        Grant::AuthorizationCode,
+                        "Authorization code",
+                    );
                 });
                 ui.end_row();
+                if o.grant == model::Grant::AuthorizationCode {
+                    text(
+                        ui,
+                        "Auth URL",
+                        &mut o.auth_url,
+                        "https://login.example.com/oauth2/authorize",
+                    );
+                }
                 text(
                     ui,
                     "Token URL",
@@ -4906,6 +4919,14 @@ fn auth_editor(
                     text(ui, "Username", &mut o.username, "");
                     secret(ui, "Password", &mut o.password);
                 }
+                if o.grant == model::Grant::AuthorizationCode {
+                    text(
+                        ui,
+                        "Redirect URI",
+                        &mut o.redirect_uri,
+                        "http://127.0.0.1:<any free port>/callback",
+                    );
+                }
             }
         });
     match auth {
@@ -4916,6 +4937,13 @@ fn auth_editor(
             });
         }
         Auth::None => {}
+        Auth::OAuth2(o) if o.grant == model::Grant::AuthorizationCode => {
+            ui.weak(
+                "Send opens your browser to sign in (with PKCE); the token is then reused until \
+                 it expires or is rejected. Register the redirect URI with the provider; the \
+                 client secret is only for confidential clients.",
+            );
+        }
         Auth::OAuth2(_) => {
             ui.weak("The token is fetched on Send and reused until it expires or is rejected.");
         }
@@ -7209,6 +7237,25 @@ mod ui_tests {
         h.get_all_by_label("×").last().unwrap().click();
         h.run();
         assert!(view(&h).0.starts_with("{\n  \"items\""), "{}", view(&h).0);
+    }
+
+    #[test]
+    fn the_authorization_code_grant_asks_for_where_to_sign_in() {
+        let mut h = with_request("oauth-code");
+        h.state_mut().open.as_mut().unwrap().draft.auth = Auth::OAuth2(Default::default());
+        h.state_mut().req_tab = ReqTab::Auth;
+        h.run();
+        assert!(h.query_by_label("Auth URL").is_none());
+        h.get_by_label("Authorization code").click();
+        h.run();
+        shot(&mut h, "55-oauth-code");
+        assert!(matches!(
+            &draft(&h).auth,
+            Auth::OAuth2(o) if o.grant == model::Grant::AuthorizationCode
+        ));
+        assert!(h.query_by_label("Auth URL").is_some());
+        assert!(h.query_by_label("Redirect URI").is_some());
+        assert!(h.query_by_label_contains("opens your browser").is_some());
     }
 
     #[test]

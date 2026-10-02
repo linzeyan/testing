@@ -82,6 +82,7 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
             let grant = match o.grant {
                 Grant::ClientCredentials => "client credentials",
                 Grant::Password => "password",
+                Grant::AuthorizationCode => "authorization code",
             };
             Some(format!(
                 "OAuth 2.0, {grant} grant, token URL `{}`",

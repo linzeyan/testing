@@ -274,8 +274,10 @@ fn auth(v: &Value) -> Result<Auth, String> {
             let grant = match p("grant_type").as_str() {
                 "client_credentials" => Grant::ClientCredentials,
                 "password_credentials" => Grant::Password,
-                // Postman's default.
-                "" => return Err("OAuth 2.0 authorization_code".into()),
+                // "" is Postman's default.
+                "" | "authorization_code" | "authorization_code_with_pkce" => {
+                    Grant::AuthorizationCode
+                }
                 other => return Err(format!("OAuth 2.0 {other}")),
             };
             Auth::OAuth2(OAuth2 {
@@ -286,6 +288,8 @@ fn auth(v: &Value) -> Result<Auth, String> {
                 scope: p("scope"),
                 username: p("username"),
                 password: p("password"),
+                auth_url: p("authUrl"),
+                redirect_uri: p("redirect_uri"),
             })
         }
         "apikey" => Auth::ApiKey {
@@ -585,6 +589,7 @@ fn auth_json(auth: &Auth) -> Option<Value> {
             let grant = match o.grant {
                 Grant::ClientCredentials => "client_credentials",
                 Grant::Password => "password_credentials",
+                Grant::AuthorizationCode => "authorization_code_with_pkce",
             };
             typed(
                 "oauth2",
@@ -596,6 +601,8 @@ fn auth_json(auth: &Auth) -> Option<Value> {
                     ("scope", o.scope.as_str()),
                     ("username", o.username.as_str()),
                     ("password", o.password.as_str()),
+                    ("authUrl", o.auth_url.as_str()),
+                    ("redirect_uri", o.redirect_uri.as_str()),
                 ],
             )
         }
@@ -865,6 +872,7 @@ mod tests {
                 scope: "read".into(),
                 username: "u".into(),
                 password: "p".into(),
+                ..Default::default()
             }),
             pre_request: "console.log(1);\n".into(),
             tests: "pm.test('x', () => {});".into(),
@@ -985,6 +993,14 @@ mod tests {
                         query: "{ me { id } }".into(),
                         variables: "{\"a\": 1}".into(),
                     },
+                    auth: Auth::OAuth2(OAuth2 {
+                        grant: Grant::AuthorizationCode,
+                        auth_url: "{{base}}/authorize".into(),
+                        token_url: "{{base}}/token".into(),
+                        client_id: "spa".into(),
+                        redirect_uri: "http://localhost:8765/cb".into(),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             ),

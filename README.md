@@ -33,7 +33,8 @@ such as Citrix VDI. No installer: unzip and run.
   response bar with the last 10 responses of each request (kept on disk, 1 MiB of body
   each); find in response (Ctrl+F); saved response
   examples; request history; Bearer, Basic, Digest, API key (header or query) and OAuth 2.0
-  (client credentials, password) auth; a Cookies tab with what a response sets; a cookie jar like a browser's, with a manager; folder settings
+  (client credentials, password, and authorization code with PKCE: Send opens the browser
+  to sign in and catches the redirect on 127.0.0.1) auth; a Cookies tab with what a response sets; a cookie jar like a browser's, with a manager; folder settings
   (right-click a folder) with variables, auth and scripts shared by every request inside,
   like Postman collection/folder settings; tabs (a click in the tree previews,
   double-click or editing keeps the tab, Ctrl+W closes; right-click a tab to duplicate it or

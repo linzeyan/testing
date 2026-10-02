@@ -39,25 +39,50 @@ pub async fn oauth2_token(
     o: &OAuth2,
     fresh: bool,
 ) -> Result<String, String> {
+    token(client, o, fresh, open_browser).await
+}
+
+/// `open` shows the sign-in page for the authorization code grant: the system browser, or
+/// a stand-in in tests.
+async fn token(
+    client: &reqwest::Client,
+    o: &OAuth2,
+    fresh: bool,
+    open: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<String, String> {
     if !fresh && let Some(token) = cached_token(o) {
         return Ok(token);
     }
     let grant = match o.grant {
         Grant::ClientCredentials => "client_credentials",
         Grant::Password => "password",
+        Grant::AuthorizationCode => "authorization_code",
     };
-    let mut form = vec![("grant_type", grant), ("client_id", &o.client_id)];
+    let (password, code) = (
+        o.grant == Grant::Password,
+        o.grant == Grant::AuthorizationCode,
+    );
+    let mut form = vec![
+        ("grant_type", grant.to_owned()),
+        ("client_id", o.client_id.clone()),
+    ];
     // client_secret_post: accepted by the common providers (Keycloak, Entra ID, Auth0, Okta).
-    for (key, value) in [
-        ("client_secret", &o.client_secret),
-        ("scope", &o.scope),
-        ("username", &o.username),
-        ("password", &o.password),
+    for (key, value, needed) in [
+        ("client_secret", &o.client_secret, true),
+        // The authorization code grant asks for its scope when signing in.
+        ("scope", &o.scope, !code),
+        ("username", &o.username, password),
+        ("password", &o.password, password),
     ] {
-        let needed = o.grant == Grant::Password || !matches!(key, "username" | "password");
         if needed && !value.is_empty() {
-            form.push((key, value));
+            form.push((key, value.clone()));
         }
+    }
+    if code {
+        let signed = sign_in(o, open).await?;
+        form.push(("code", signed.code));
+        form.push(("redirect_uri", signed.redirect));
+        form.push(("code_verifier", signed.verifier));
     }
     let resp = client
         .post(o.token_url.trim())
@@ -175,6 +200,165 @@ fn challenge_params(s: &str) -> HashMap<String, String> {
     }
 }
 
+/// What the browser brought back, and what the token request must repeat.
+struct SignedIn {
+    code: String,
+    redirect: String,
+    verifier: String,
+}
+
+/// Signing in may take a password and a second factor.
+const SIGN_IN_WAIT: Duration = Duration::from_secs(180);
+
+/// Authorization code with PKCE (RFC 7636) over a loopback redirect (RFC 8252): listen on
+/// this machine, send the browser to the provider, take the code it comes back with.
+/// PKCE is always sent: a provider that doesn't know it ignores the extra parameters.
+async fn sign_in(
+    o: &OAuth2,
+    open: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<SignedIn, String> {
+    let wanted = match o.redirect_uri.trim() {
+        "" => "http://127.0.0.1:0/callback",
+        uri => uri,
+    };
+    let mut redirect =
+        reqwest::Url::parse(wanted).map_err(|e| format!("OAuth 2.0 redirect URI: {e}"))?;
+    if redirect.scheme() != "http"
+        || !matches!(redirect.host_str(), Some("127.0.0.1" | "localhost"))
+    {
+        return Err(
+            "The OAuth 2.0 redirect URI must come back to this machine: http://127.0.0.1:PORT/…"
+                .into(),
+        );
+    }
+    let port = redirect.port().unwrap_or(80);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| format!("Can't listen on port {port} for the OAuth 2.0 sign-in: {e}"))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let _ = redirect.set_port(Some(port));
+    let (verifier, state) = (random_token(32)?, random_token(16)?);
+    let challenge = {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let hash = sha2::Sha256::digest(verifier.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+    };
+    let mut url =
+        reqwest::Url::parse(o.auth_url.trim()).map_err(|e| format!("OAuth 2.0 auth URL: {e}"))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &o.client_id)
+        .append_pair("redirect_uri", redirect.as_str())
+        .append_pair("state", &state)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256");
+    if !o.scope.is_empty() {
+        url.query_pairs_mut().append_pair("scope", &o.scope);
+    }
+    open(url.as_str())?;
+    let code = tokio::time::timeout(SIGN_IN_WAIT, callback(&listener, redirect.path(), &state))
+        .await
+        .map_err(|_| "No OAuth 2.0 sign-in came back from the browser within 3 minutes")??;
+    Ok(SignedIn {
+        code,
+        redirect: redirect.to_string(),
+        verifier,
+    })
+}
+
+/// Answers the browser until a request to `path` brings the code, or the provider's error.
+async fn callback(
+    listener: &tokio::net::TcpListener,
+    path: &str,
+    state: &str,
+) -> Result<String, String> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    loop {
+        let (mut stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        // The whole head: it may arrive in pieces, and closing on unread bytes resets the
+        // connection, so the browser would show an error instead of the page.
+        let (mut head, mut buf) = (Vec::new(), [0u8; 2048]);
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 64 << 10 {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.extend_from_slice(&buf[..n]),
+            }
+        }
+        let head = String::from_utf8_lossy(&head);
+        let target = head.split_whitespace().nth(1).unwrap_or("/");
+        let url = reqwest::Url::parse(&format!("http://localhost{target}"));
+        let Some(url) = url.ok().filter(|u| u.path() == path) else {
+            // The favicon, mostly.
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+            continue;
+        };
+        let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        let result = match (q.get("error"), q.get("code")) {
+            (Some(error), _) => Err(match q.get("error_description") {
+                Some(d) => format!("{error}: {d}"),
+                None => error.clone(),
+            }),
+            // Another sign-in's answer, e.g. from a stale tab: never take its code.
+            _ if q.get("state").map(String::as_str) != Some(state) => {
+                Err("the browser came back from a different sign-in; try again".to_owned())
+            }
+            (None, Some(code)) => Ok(code.clone()),
+            (None, None) => Err("the browser came back without a code".to_owned()),
+        };
+        let (status, text) = match &result {
+            Ok(_) => (
+                "200 OK",
+                "Signed in. You can close this tab and go back to apitool.".to_owned(),
+            ),
+            Err(e) => ("400 Bad Request", format!("Sign-in failed: {e}")),
+        };
+        let text = text.replace('&', "&amp;").replace('<', "&lt;");
+        let page = format!(
+            "<!doctype html><title>apitool</title><p style=\"font: 16px sans-serif\">{text}</p>"
+        );
+        let reply = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
+            page.len()
+        );
+        let _ = stream.write_all(reply.as_bytes()).await;
+        return result.map_err(|e| format!("OAuth 2.0 sign-in: {e}"));
+    }
+}
+
+/// ponytail: the OS's own opener rather than a crate; covers macOS, Windows and Linux
+/// desktops. A failure says where to sign in by hand.
+fn open_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(windows)]
+    let mut cmd = {
+        // Not `cmd /c start`: cmd would split the URL at each `&`.
+        let mut cmd = std::process::Command::new("rundll32");
+        cmd.arg("url.dll,FileProtocolHandler");
+        cmd
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(url)
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("Couldn't open a browser ({e}); sign in at {url}"))
+}
+
+/// Unguessable: a predictable PKCE verifier or state would defeat their purpose.
+fn random_token(len: usize) -> Result<String, String> {
+    use base64::Engine as _;
+    let mut bytes = vec![0u8; len];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| format!("No randomness for the OAuth 2.0 sign-in: {e}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
 pub fn cnonce() -> String {
     let mut bytes = [0u8; 16];
     // A fixed cnonce only weakens replay protection; never worth failing the request over.
@@ -184,7 +368,152 @@ pub fn cnonce() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
     use super::*;
+
+    fn query(url: &str) -> HashMap<String, String> {
+        let url = reqwest::Url::parse(url).unwrap();
+        url.query_pairs().into_owned().collect()
+    }
+
+    fn client(rt: &tokio::runtime::Runtime) -> reqwest::Client {
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        rt.block_on(crate::net::build_client(net)).unwrap().http
+    }
+
+    /// Plays the browser: keeps the sign-in URL in `seen`, then comes back to its redirect
+    /// URI with what `answer` makes of the state (after a favicon request, as browsers do).
+    fn browser(
+        seen: Arc<Mutex<String>>,
+        answer: fn(&str) -> String,
+    ) -> impl FnOnce(&str) -> Result<(), String> {
+        move |url| {
+            *seen.lock().unwrap() = url.to_owned();
+            let q = query(url);
+            let back = reqwest::Url::parse(&q["redirect_uri"]).unwrap();
+            let paths = [
+                "/favicon.ico".to_owned(),
+                format!("{}?{}", back.path(), answer(&q["state"])),
+            ];
+            std::thread::spawn(move || {
+                for path in paths {
+                    let mut s =
+                        std::net::TcpStream::connect(("127.0.0.1", back.port().unwrap())).unwrap();
+                    // In two pieces, as a request may arrive.
+                    s.write_all(b"GET ").unwrap();
+                    std::thread::sleep(Duration::from_millis(20));
+                    write!(s, "{path} HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();
+                    let _ = s.read_to_string(&mut String::new());
+                }
+            });
+            Ok(())
+        }
+    }
+
+    fn code_grant(token_url: String) -> OAuth2 {
+        OAuth2 {
+            grant: Grant::AuthorizationCode,
+            auth_url: "https://idp.test/authorize?tenant=x".into(),
+            token_url,
+            client_id: "app".into(),
+            scope: "read".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The provider gets a PKCE challenge; the token request must prove it with the
+    /// verifier behind it, and bring the code the browser came back with.
+    #[test]
+    fn authorization_code_signs_in_through_the_browser_with_pkce() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let sign_in = seen.clone();
+        let addr = crate::http::tests::serve(move |req| {
+            use base64::Engine as _;
+            use sha2::Digest as _;
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or_default();
+            let form = query(&format!("http://x/?{body}"));
+            let asked = query(&sign_in.lock().unwrap());
+            let proof = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(sha2::Sha256::digest(form["code_verifier"].as_bytes()));
+            let ok = form["grant_type"] == "authorization_code"
+                && form["code"] == "c0de"
+                && form["redirect_uri"] == asked["redirect_uri"]
+                && asked["code_challenge_method"] == "S256"
+                && proof == asked["code_challenge"]
+                && !form.contains_key("scope");
+            match ok {
+                true => (
+                    "200 OK\r\ncontent-type: application/json".into(),
+                    r#"{"access_token":"t1","expires_in":3600}"#.into(),
+                ),
+                false => ("400 Bad Request".into(), format!("{form:?}\n{asked:?}")),
+            }
+        });
+        let o = code_grant(format!("http://{addr}/token"));
+        let client = client(&rt);
+        let answer = |state: &str| format!("code=c0de&state={state}");
+        let token1 = rt.block_on(token(&client, &o, true, browser(seen.clone(), answer)));
+        assert_eq!(token1.as_deref(), Ok("t1"));
+        let asked = seen.lock().unwrap().clone();
+        assert!(
+            asked.starts_with("https://idp.test/authorize?tenant=x&response_type=code"),
+            "{asked}"
+        );
+        assert_eq!(query(&asked)["scope"], "read");
+        // Until it expires, the token comes from the cache: no second sign-in.
+        let again = rt.block_on(token(&client, &o, false, |_: &str| -> Result<(), String> {
+            panic!("signed in twice")
+        }));
+        assert_eq!(again.as_deref(), Ok("t1"));
+    }
+
+    #[test]
+    fn a_foreign_or_refused_sign_in_never_reaches_the_token_endpoint() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        let addr = crate::http::tests::serve(move |_| {
+            count.fetch_add(1, SeqCst);
+            ("200 OK".into(), r#"{"access_token":"t"}"#.into())
+        });
+        let o = code_grant(format!("http://{addr}/token"));
+        let client = client(&rt);
+        let seen = Arc::new(Mutex::new(String::new()));
+        let stale = browser(seen.clone(), |_| "code=c0de&state=other".into());
+        let err = rt.block_on(token(&client, &o, true, stale)).unwrap_err();
+        assert!(err.contains("different sign-in"), "{err}");
+        let refused = browser(seen, |_| {
+            "error=access_denied&error_description=User+cancelled".into()
+        });
+        let err = rt.block_on(token(&client, &o, true, refused)).unwrap_err();
+        assert!(err.contains("access_denied: User cancelled"), "{err}");
+        assert_eq!(hits.load(SeqCst), 0);
+        // A redirect to another machine is refused before any browser opens.
+        let remote = OAuth2 {
+            redirect_uri: "https://app.test/callback".into(),
+            ..o
+        };
+        let err = rt.block_on(token(
+            &client,
+            &remote,
+            true,
+            |_: &str| -> Result<(), String> { panic!("opened a browser") },
+        ));
+        assert!(err.unwrap_err().contains("this machine"));
+    }
 
     /// RFC 7616 §3.9.1. The RFC's printed MD5 response is a known erratum; this one was
     /// computed independently.

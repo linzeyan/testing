@@ -352,6 +352,13 @@ pub struct OAuth2 {
     pub username: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub password: String,
+    /// Authorization code only: where the browser signs in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auth_url: String,
+    /// Authorization code only: a loopback URL the provider sends the browser back to.
+    /// Empty: `http://127.0.0.1:<a free port>/callback`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redirect_uri: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
@@ -360,6 +367,8 @@ pub enum Grant {
     #[default]
     ClientCredentials,
     Password,
+    /// Signs in through the system browser, with PKCE.
+    AuthorizationCode,
 }
 
 impl Auth {
@@ -642,6 +651,8 @@ impl Request {
                     scope: r(&o.scope),
                     username: r(&o.username),
                     password: r(&o.password),
+                    auth_url: r(&o.auth_url),
+                    redirect_uri: r(&o.redirect_uri),
                 }),
                 // Becomes a header or a query parameter below.
                 Auth::ApiKey { .. } => Auth::None,
