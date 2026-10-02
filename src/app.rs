@@ -2040,15 +2040,16 @@ impl App {
                             .hint_text("Name")
                             .desired_width(f32::INFINITY),
                     );
-                    if ui.memory(|m| m.focused().is_none()) {
+                    // Before refocusing: Enter is what made the field let go of focus.
+                    let enter = enter_pressed(ui);
+                    if !enter && ui.memory(|m| m.focused().is_none()) {
                         edit.request_focus();
                     }
                     if !error.is_empty() {
                         ui.colored_label(RED, error.as_str());
                     }
-                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                     ui.horizontal(|ui| {
-                        if ui.button("OK").clicked() || enter {
+                        if ui.add(primary("OK")).clicked() || enter {
                             then = Some(Box::new(|app, _| app.submit_name()));
                         }
                         cancel = ui.button("Cancel").clicked();
@@ -2066,7 +2067,11 @@ impl App {
                         path.file_stem().unwrap_or_default().to_string_lossy()
                     ));
                     ui.horizontal(|ui| {
-                        if ui.button(RichText::new("Delete").color(RED)).clicked() {
+                        let delete = egui::Button::new(
+                            RichText::new("Delete").strong().color(Color32::WHITE),
+                        )
+                        .fill(RED);
+                        if ui.add(delete).clicked() || enter_pressed(ui) {
                             let path = path.clone();
                             then = Some(Box::new(move |app, _| {
                                 app.dialog = None;
@@ -2100,7 +2105,7 @@ impl App {
                     let names = if quit { &unsaved } else { &open_name };
                     ui.label(format!("Save changes to \"{names}\"?"));
                     ui.horizontal(|ui| {
-                        let save = ui.button("Save").clicked();
+                        let save = ui.add(primary("Save")).clicked() || enter_pressed(ui);
                         let discard = ui.button("Discard").clicked();
                         cancel = ui.button("Cancel").clicked();
                         if save || discard {
@@ -2171,15 +2176,16 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| {
                 save = ui
-                    .button("Save")
+                    .add(primary("Save"))
                     .on_hover_text(ui.ctx().format_shortcut(&SAVE))
-                    .clicked();
+                    .clicked()
+                    || enter_pressed(ui);
                 let close_label = if ed.confirm_discard {
                     RichText::new("Discard changes").color(RED)
                 } else {
                     RichText::new("Close")
                 };
-                close = ui.button(close_label).clicked();
+                close = ui.button(close_label).clicked() || escape_pressed(ui);
                 if ed.env.is_some() {
                     duplicate = ui
                         .button("Duplicate…")
@@ -2342,15 +2348,16 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| {
                 save = ui
-                    .button("Save")
+                    .add(primary("Save"))
                     .on_hover_text(ui.ctx().format_shortcut(&SAVE))
-                    .clicked();
+                    .clicked()
+                    || enter_pressed(ui);
                 let close_label = if ed.confirm_discard {
                     RichText::new("Discard changes").color(RED)
                 } else {
                     RichText::new("Close")
                 };
-                close = ui.button(close_label).clicked();
+                close = ui.button(close_label).clicked() || escape_pressed(ui);
             });
         });
         if save {
@@ -2814,8 +2821,8 @@ impl App {
             });
             ui.separator();
             ui.horizontal(|ui| {
-                apply = ui.button("Apply").clicked();
-                cancel = ui.button("Cancel").clicked();
+                apply = ui.add(primary("Apply")).clicked() || enter_pressed(ui);
+                cancel = ui.button("Cancel").clicked() || escape_pressed(ui);
             });
         });
         if apply {
@@ -3551,6 +3558,25 @@ fn scripts_editor(
 
 const GREEN: Color32 = Color32::from_rgb(80, 180, 100);
 
+/// Enter meant for a dialog's OK: pressed in a single-line field (which lets go of focus on
+/// Enter) or with nothing focused. A multi-line editor or a focused button keeps it. Call
+/// after the dialog's fields are drawn. Consumed, so a dialog opened by this one (New
+/// environment → its editor) doesn't take the same press as its own OK.
+fn enter_pressed(ui: &egui::Ui) -> bool {
+    ui.memory(|m| m.focused().is_none())
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter))
+}
+
+fn escape_pressed(ui: &egui::Ui) -> bool {
+    ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+}
+
+/// The button Enter presses, filled so it's clear which one that is.
+fn primary(text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
+        .fill(Color32::from_rgb(40, 110, 200))
+}
+
 /// The methods of a `.proto`, re-read when the path changes.
 type Rpcs = Option<(String, Result<Vec<crate::grpc::Rpc>, String>)>;
 
@@ -4211,25 +4237,38 @@ mod ui_tests {
         let mut h = harness(workspace("env"));
         h.run();
         shot(&mut h, "01-empty");
+        // Keyboard only: Enter is OK in every dialog, Escape cancels.
         h.get_by_label("+ New").click();
         h.run();
         type_into(&mut h, 0, "dev");
-        h.get_by_label("OK").click();
+        h.key_press(Key::Enter);
         h.run();
+        assert!(h.state().dialog.is_none());
+        assert!(
+            h.state().env_editor.is_some(),
+            "the same Enter must not also save and close the new editor"
+        );
         shot(&mut h, "02-env-editor");
         type_into(&mut h, 0, "host");
         let addr = crate::http::tests::echo_server();
         let host = addr.trim_end_matches("/users").to_owned();
         type_into(&mut h, 1, &host);
         shot(&mut h, "03-env-typed");
-        modal_save(&mut h);
+        h.key_press(Key::Enter);
         h.run();
+        assert!(h.state().env_editor.is_none());
         assert_eq!(h.state().vars.get("host"), Some(&host));
+
+        h.get_by_label("+ Folder").click();
+        h.run();
+        h.key_press(Key::Escape);
+        h.run();
+        assert!(h.state().dialog.is_none() && h.state().tree.is_empty());
 
         h.get_by_label("+ Request").click();
         h.run();
         type_into(&mut h, 0, "r1");
-        h.get_by_label("OK").click();
+        h.key_press(Key::Enter);
         h.run();
         // The URL bar is the first text field of the request editor.
         type_into(&mut h, 0, "{{host}}/x");
