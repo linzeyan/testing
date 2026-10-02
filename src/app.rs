@@ -36,13 +36,15 @@ enum Msg {
     Status(String),
     RunItem(u64, RunItem),
     RunDone(u64, Changes, Changes),
-    Stream(u64, Event),
     /// GraphQL introspection result for the URL it was fetched from.
     Schema(String, Result<graphql::Schema, String>),
 }
 
-/// Stream events kept per session; older ones scroll away so a chatty socket can't grow RAM.
+/// Stream events kept per session, by count and by bytes; older ones scroll away.
 const MAX_EVENTS: usize = 5000;
+const MAX_EVENT_BYTES: usize = 8 << 20;
+/// One message past this keeps its start: an MQTT message may be 1 MiB, a WebSocket one 64.
+const MAX_EVENT_TEXT: usize = 64 << 10;
 
 /// Built lazily on first use (a PAC file may need downloading) and replaced wholesale when
 /// network settings change, so in-flight requests keep the client they started with.
@@ -112,7 +114,6 @@ struct Tab {
     /// of adding one. Editing or double-clicking keeps it.
     preview: bool,
     /// Background tabs only; also `None` for tabs restored at startup and not shown yet.
-    // ponytail: background tabs keep their response; drop it on parking if RAM bites.
     parked: Option<Parked>,
 }
 
@@ -129,7 +130,26 @@ impl Tab {
 struct Parked {
     open: Open,
     response: Option<Shown>,
+    /// The response was over `MAX_PARKED_RESPONSE` and wasn't kept.
+    dropped: bool,
     load: Option<LoadView>,
+}
+
+/// What a background tab's response may hold; ten tabs of 16 MiB bodies would be more
+/// RAM than the VDI has free.
+const MAX_PARKED_RESPONSE: usize = 1 << 20;
+
+impl Parked {
+    fn keep(&mut self, shown: Option<Shown>) {
+        let size = |s: &Shown| match &s.result {
+            Ok(view) => view.text.len(),
+            Err(e) => e.len(),
+        };
+        self.dropped = shown
+            .as_ref()
+            .is_some_and(|s| size(s) > MAX_PARKED_RESPONSE);
+        self.response = shown.filter(|_| !self.dropped);
+    }
 }
 
 struct Pending {
@@ -142,10 +162,14 @@ struct Pending {
 
 /// A live (or just ended) WebSocket/SSE connection or gRPC stream for the open request.
 struct StreamSession {
-    id: u64,
     path: PathBuf,
     started: Instant,
-    events: VecDeque<(Duration, Event)>,
+    /// Written by the connection's task, not passed through `Msg`: a queue would grow
+    /// without bound while the window is minimized and nothing drains it.
+    log: Arc<std::sync::Mutex<Log>>,
+    /// The event shown whole below the list, counted from the first one ever logged, and
+    /// its text as shown.
+    selected: Option<(u64, String)>,
     /// WebSocket, MQTT and client-streaming gRPC; dropping it makes the task send a Close
     /// frame (WebSocket), DISCONNECT (MQTT) or half-close (gRPC).
     outgoing: Option<Outgoing>,
@@ -159,6 +183,46 @@ struct StreamSession {
 enum Outgoing {
     Text(tokio::sync::mpsc::UnboundedSender<String>),
     Mqtt(tokio::sync::mpsc::UnboundedSender<crate::mqtt::Command>),
+}
+
+#[derive(Default)]
+struct Log {
+    events: VecDeque<(Duration, Event)>,
+    bytes: usize,
+    /// Events scrolled away or cleared, so selections can point past them.
+    dropped: u64,
+    /// Closed or Error has arrived.
+    ended: bool,
+}
+
+impl Log {
+    fn push(&mut self, at: Duration, mut event: Event) {
+        let text = event_text(&mut event);
+        crate::runner::clip(text, MAX_EVENT_TEXT);
+        self.bytes += text.len();
+        self.ended |= matches!(event, Event::Closed(_) | Event::Error(_));
+        self.events.push_back((at, event));
+        while self.events.len() > MAX_EVENTS || self.bytes > MAX_EVENT_BYTES {
+            let Some((_, mut gone)) = self.events.pop_front() else {
+                break;
+            };
+            self.bytes -= event_text(&mut gone).len();
+            self.dropped += 1;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.dropped += self.events.len() as u64;
+        self.events.clear();
+        self.bytes = 0;
+    }
+}
+
+fn event_text(e: &mut Event) -> &mut String {
+    match e {
+        Event::Open(t) | Event::Info(t) | Event::In(t) => t,
+        Event::Out(t) | Event::Closed(t) | Event::Error(t) => t,
+    }
 }
 
 impl Drop for StreamSession {
@@ -637,10 +701,15 @@ impl App {
         let current = self.open.as_ref().map(|o| o.path.clone());
         if current.as_ref() != Some(&path) {
             let from = current.as_ref().and_then(|p| self.tab_index(p));
-            let parked = self.open.take().map(|open| Parked {
-                open,
-                response: self.response.take(),
-                load: self.load.take(),
+            let parked = self.open.take().map(|open| {
+                let mut p = Parked {
+                    open,
+                    response: None,
+                    dropped: false,
+                    load: self.load.take(),
+                };
+                p.keep(self.response.take());
+                p
             });
             let clean = !parked.as_ref().is_some_and(|p| p.open.dirty());
             let reuse = from.filter(|&i| self.tabs[i].preview && clean);
@@ -665,6 +734,12 @@ impl App {
             match self.tabs[to].parked.take() {
                 Some(p) => {
                     (self.open, self.response, self.load) = (Some(p.open), p.response, p.load);
+                    if p.dropped {
+                        self.status = format!(
+                            "The response was over {} and wasn't kept while the tab was in the background: send again to see it",
+                            human_size(MAX_PARKED_RESPONSE)
+                        );
+                    }
                     self.refresh_open();
                     self.save_state();
                 }
@@ -906,8 +981,6 @@ impl App {
     /// Streams skip scripts: pre-request/tests are per-response, a stream has no single response.
     fn connect(&mut self, ctx: &egui::Context) {
         let Some(open) = &self.open else { return };
-        self.next_run_id += 1;
-        let id = self.next_run_id;
         let (req, _) = open.draft.resolved(&self.all_vars());
         let is_ws = req.method.eq_ignore_ascii_case("WS");
         let is_mqtt = req.method == "MQTT";
@@ -922,15 +995,17 @@ impl App {
             (false, false) => None,
         };
         let ca_file = self.network.ca_file.clone();
-        let (cell, net, tx, ctx) = (
+        let started = Instant::now();
+        let log = Arc::new(std::sync::Mutex::new(Log::default()));
+        let (cell, net, task_log, ctx) = (
             self.client.clone(),
             (self.network.clone(), self.cookies.clone()),
-            self.tx.clone(),
+            log.clone(),
             ctx.clone(),
         );
         let task = self.rt.spawn(async move {
             let emit = |e| {
-                let _ = tx.send(Msg::Stream(id, e));
+                task_log.lock().unwrap().push(started.elapsed(), e);
                 ctx.request_repaint();
             };
             // Not over HTTP: no proxy, so no client (and no PAC download) to wait for.
@@ -952,10 +1027,10 @@ impl App {
             }
         });
         self.stream = Some(StreamSession {
-            id,
             path: open.path.clone(),
-            started: Instant::now(),
-            events: VecDeque::new(),
+            started,
+            log,
+            selected: None,
             outgoing,
             grpc,
             live: true,
@@ -978,8 +1053,8 @@ impl App {
             // how clients stop.
             None => {
                 s.abort.abort();
-                s.events
-                    .push_back((s.started.elapsed(), Event::Closed("disconnected".into())));
+                let mut log = s.log.lock().unwrap();
+                log.push(s.started.elapsed(), Event::Closed("disconnected".into()));
             }
         }
         s.live = false;
@@ -994,6 +1069,12 @@ impl App {
     }
 
     fn receive(&mut self) {
+        if let Some(s) = self.stream.as_mut().filter(|s| s.live)
+            && s.log.lock().unwrap().ended
+        {
+            s.live = false;
+            s.outgoing = None;
+        }
         while let Ok(msg) = self.rx.try_recv() {
             let (path, outcome) = match msg {
                 Msg::Status(s) => {
@@ -1032,19 +1113,6 @@ impl App {
                     }
                     continue;
                 }
-                Msg::Stream(id, event) => {
-                    if let Some(s) = self.stream.as_mut().filter(|s| s.id == id) {
-                        if matches!(event, Event::Closed(_) | Event::Error(_)) {
-                            s.live = false;
-                            s.outgoing = None;
-                        }
-                        if s.events.len() == MAX_EVENTS {
-                            s.events.pop_front();
-                        }
-                        s.events.push_back((s.started.elapsed(), event));
-                    }
-                    continue;
-                }
                 Msg::Response(path, outcome) => (path, *outcome),
             };
             if let Some(i) = self.pending.iter().position(|p| p.path == path) {
@@ -1076,7 +1144,7 @@ impl App {
             } else if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path)
                 && let Some(p) = &mut t.parked
             {
-                p.response = Some(shown());
+                p.keep(Some(shown()));
             }
         }
     }
@@ -4507,6 +4575,11 @@ impl StreamSession {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn events(&self) -> Vec<(Duration, Event)> {
+        self.log.lock().unwrap().events.iter().cloned().collect()
+    }
+
     /// MQTT: has the live connection follow the request's topics.
     fn resubscribe(&self, req: &Request, vars: &HashMap<String, String>) {
         if let Some(Outgoing::Mqtt(tx)) = &self.outgoing {
@@ -4534,9 +4607,10 @@ fn stream_ui(
         } else {
             ui.weak("Not connected");
         }
-        ui.weak(format!("· {} events", s.events.len()));
+        ui.weak(format!("· {} events", s.log.lock().unwrap().events.len()));
         if ui.small_button("Clear").clicked() {
-            s.events.clear();
+            s.log.lock().unwrap().clear();
+            s.selected = None;
         }
     });
     if matches!(s.outgoing, Some(Outgoing::Mqtt(_))) {
@@ -4578,12 +4652,45 @@ fn stream_ui(
         });
     }
     ui.separator();
+    let log = s.log.lock().unwrap();
+    // The selected event, whole, under the list; gone once it scrolls out of the log.
+    let selected = s.selected.as_ref().map(|(n, _)| *n);
+    let at = |n: u64| n.checked_sub(log.dropped).map(|i| i as usize);
+    if selected.and_then(at).is_none_or(|i| i >= log.events.len()) {
+        s.selected = None;
+    }
+    if let Some((_, text)) = &s.selected {
+        egui::Panel::bottom("stream-detail")
+            .resizable(true)
+            .default_size(160.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                    ui.weak(human_size(text.len()));
+                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(text.as_str()).monospace())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                    });
+            });
+    }
+    // One line per event and only the rows in view laid out: 5000 wrapped messages
+    // would cost gigabytes of text layout every frame.
     let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
+    let mut clicked = None;
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .stick_to_bottom(true)
-        .show(ui, |ui| {
-            for (at, event) in &s.events {
+        .show_rows(ui, row_h, log.events.len(), |ui, rows| {
+            for i in rows {
+                let (at, event) = &log.events[i];
                 let (badge, color, text) = match event {
                     Event::Open(t) => ("OPEN", GREEN, t),
                     Event::Info(t) => ("INFO", Color32::GRAY, t),
@@ -4592,23 +4699,43 @@ fn stream_ui(
                     Event::Closed(t) => ("CLOSED", Color32::GRAY, t),
                     Event::Error(t) => ("ERROR", RED, t),
                 };
-                ui.horizontal_top(|ui| {
-                    ui.set_min_height(row_h);
+                let n = log.dropped + i as u64;
+                ui.horizontal(|ui| {
+                    ui.set_height(row_h);
                     ui.weak(format!("{:>8.3}", at.as_secs_f32()));
                     ui.add_sized(
                         [56.0, row_h],
                         egui::Label::new(RichText::new(badge).color(color).strong().monospace()),
                     );
-                    // Selectable so payloads can be copied; clipped like the body viewer.
-                    let text: String = text.chars().take(MAX_LINE).collect();
-                    ui.add(
-                        egui::Label::new(RichText::new(text).monospace())
-                            .selectable(true)
-                            .wrap(),
+                    let line: String = text
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(300)
+                        .collect();
+                    let mut line = RichText::new(line).monospace();
+                    if selected == Some(n) {
+                        line = line.background_color(ui.visuals().selection.bg_fill);
+                    }
+                    let row = ui.add(
+                        egui::Label::new(line)
+                            .truncate()
+                            .sense(egui::Sense::click()),
                     );
+                    if row.on_hover_text("Click to see it whole").clicked() {
+                        clicked = Some((n, text));
+                    }
                 });
             }
         });
+    if let Some((n, text)) = clicked {
+        s.selected = match selected == Some(n) {
+            true => None,
+            // Pretty when it's JSON; already capped at MAX_EVENT_TEXT.
+            false => Some((n, http::pretty_json(text).unwrap_or_else(|| text.clone()))),
+        };
+    }
     sent
 }
 
@@ -4626,7 +4753,12 @@ fn response_ui(ui: &mut egui::Ui, shown: &mut Shown, tab: &mut RespTab) -> Optio
                         .color(status_color(h.status)),
                 );
                 ui.weak(format!("{} ms", h.elapsed.as_millis()));
-                ui.weak(human_size(view.raw_size));
+                if h.truncated {
+                    ui.colored_label(ORANGE, format!("{} (cut)", human_size(view.raw_size)))
+                        .on_hover_text("Only the first 16 MiB were read, to save memory; scripts saw the same.");
+                } else {
+                    ui.weak(human_size(view.raw_size));
+                }
                 ui.weak(&h.version);
                 ui.separator();
                 ui.selectable_value(tab, RespTab::Body, "Body");
@@ -5570,6 +5702,7 @@ mod ui_tests {
                 elapsed: Duration::ZERO,
                 headers: vec![("content-type".into(), content_type.into())],
                 body,
+                truncated: false,
             })),
             tests: Vec::new(),
             logs: Vec::new(),
@@ -5767,7 +5900,7 @@ mod ui_tests {
         h.run();
         h.get_by_label("Connect").click();
         let got = |app: &App, text: &str| {
-            let events = &app.stream.as_ref().unwrap().events;
+            let events = app.stream.as_ref().unwrap().events();
             events
                 .iter()
                 .any(|(_, e)| matches!(e, Event::In(t) if t == text))
@@ -5794,14 +5927,14 @@ mod ui_tests {
         );
         ticks[1].click();
         wait_live(&mut h, |app| {
-            let events = &app.stream.as_ref().unwrap().events;
+            let events = app.stream.as_ref().unwrap().events();
             (events.iter()).any(|(_, e)| *e == Event::Info("unsubscribed: denied".into()))
         });
 
         h.get_by_label("Disconnect").click();
         wait(&mut h, |app| !app.stream.as_ref().unwrap().live);
-        let events = &h.state().stream.as_ref().unwrap().events;
-        let (_, last) = events.back().unwrap();
+        let events = h.state().stream.as_ref().unwrap().events();
+        let (_, last) = events.last().unwrap();
         assert_eq!(*last, Event::Closed("disconnected".into()), "{events:?}");
     }
 
@@ -5825,7 +5958,7 @@ mod ui_tests {
         h.get_by_label("Connect").click();
         let replies = |app: &App| {
             let s = app.stream.as_ref().unwrap();
-            s.events
+            s.events()
                 .iter()
                 .filter(|(_, e)| matches!(e, Event::In(_)))
                 .count()
@@ -5850,7 +5983,7 @@ mod ui_tests {
             .stream
             .as_ref()
             .unwrap()
-            .events
+            .events()
             .iter()
             .map(|(_, e)| e.clone())
             .collect();
@@ -5941,6 +6074,138 @@ mod ui_tests {
     fn wait(h: &mut Harness<'_, App>, done: impl Fn(&App) -> bool) {
         wait_live(h, done);
         h.run();
+    }
+
+    /// A chatty stream keeps a bounded log: big messages keep their start, and old
+    /// events scroll away by bytes as well as by count.
+    #[test]
+    fn the_stream_log_is_capped_in_bytes() {
+        let mut log = Log::default();
+        for i in 0..400 {
+            log.push(
+                Duration::ZERO,
+                Event::In(format!("{i} {}", "x".repeat(100_000))),
+            );
+        }
+        assert!(log.bytes <= MAX_EVENT_BYTES, "{}", log.bytes);
+        let kept = log.events.len() as u64;
+        assert_eq!(log.dropped + kept, 400);
+        let (_, Event::In(last)) = log.events.back().unwrap() else {
+            panic!()
+        };
+        assert!(last.starts_with("399 xxx") && last.ends_with("bytes in all)"));
+        assert!(last.len() < MAX_EVENT_TEXT + 32);
+        log.push(Duration::ZERO, Event::Closed("bye".into()));
+        assert!(log.ended);
+    }
+
+    /// Ten background tabs of big responses would be more than the VDI has free: a big
+    /// one isn't kept, and coming back says why it's gone. A small one is kept.
+    #[test]
+    fn background_tabs_keep_only_small_responses() {
+        let mut h = with_request("parked");
+        let ws = h.state().ws.clone();
+        let s = ws.create_request(&ws.collections(), "s").unwrap();
+        let r = h.state().open.as_ref().unwrap().path.clone();
+        h.state_mut().reload();
+        // Pinned: a preview tab would be reused for `s` rather than parked.
+        h.state_mut().activate(r.clone(), true);
+        for (size, kept) in [(MAX_PARKED_RESPONSE + 1, false), (100, true)] {
+            show_response(&mut h, "text/plain", "x".repeat(size));
+            h.state_mut().activate(s.clone(), true);
+            h.state_mut().activate(r.clone(), true);
+            h.run();
+            assert_eq!(h.state().response.is_some(), kept, "{size} bytes");
+            assert_eq!(h.state().status.contains("wasn't kept"), !kept);
+            h.state_mut().status.clear();
+        }
+    }
+
+    /// Not a check: prints what a big response and a chatty stream cost in RAM, for
+    /// comparing builds. Run alone so other tests don't share the process:
+    /// `cargo test --release memory_footprint -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn memory_footprint() {
+        use std::io::{Read as _, Write as _};
+        let rss = || memory_stats::memory_stats().unwrap().physical_mem >> 20;
+        // Generated while it's written, so the server holds no copy in this process.
+        let serve =
+            |head: &'static str,
+             (first, chunk, n, tail): (&'static str, String, usize, &'static str)| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                std::thread::spawn(move || {
+                    let (mut s, _) = listener.accept().unwrap();
+                    let _ = s.read(&mut [0; 8192]);
+                    let len = first.len() + chunk.len() * n + tail.len();
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\n{head}content-length: {len}\r\nconnection: close\r\n\r\n{first}"
+                    );
+                    for _ in 0..n {
+                        if s.write_all(chunk.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                    let _ = s.write_all(tail.as_bytes());
+                });
+                format!("http://{addr}")
+            };
+        let settle = |h: &mut Harness<'_, App>, done: &dyn Fn(&App) -> bool| {
+            let mut peak = rss();
+            for _ in 0..3000 {
+                h.step();
+                peak = peak.max(rss());
+                if done(h.state()) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            for _ in 0..5 {
+                h.step();
+            }
+            peak
+        };
+
+        let mut h = with_request("memory");
+        println!("idle: {} MiB", rss());
+
+        // JSON as "[" + objects + "{}]": 15 MB is shown pretty, 100 MB is cut at 16 MiB.
+        let object = r#"{"id":12345,"name":"abcdefghijklmnopqrstuvwxyz","ok":true},"#;
+        let chunk = object.repeat(64 * 1024 / object.len());
+        for mb in [15, 100] {
+            let n = mb * 1024 * 1024 / chunk.len();
+            let body = ("[", chunk.clone(), n, "{}]");
+            h.state_mut().open.as_mut().unwrap().draft.url =
+                serve("content-type: application/json\r\n", body);
+            h.get_by_label("Send").click();
+            let peak = settle(&mut h, &|app| {
+                app.pending.is_empty() && app.response.is_some()
+            });
+            println!("{mb} MB JSON response: peak {peak} MiB, then {} MiB", rss());
+            h.state_mut().response = None;
+            h.step();
+        }
+
+        // SSE: 20 000 events of 50 KB, 1 GB in all.
+        let event = format!("data: {}\n\n", "x".repeat(50 * 1024));
+        let url = serve(
+            "content-type: text/event-stream\r\n",
+            ("", event, 20_000, ""),
+        );
+        {
+            let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+            (d.method, d.url) = ("SSE".into(), url);
+        }
+        h.step();
+        h.get_by_label("Connect").click();
+        let peak = settle(&mut h, &|app| app.stream.as_ref().is_some_and(|s| !s.live));
+        let kept = h.state().stream.as_ref().unwrap().events().len();
+        println!(
+            "1 GB of SSE events: peak {peak} MiB, then {} MiB ({kept} events kept)",
+            rss()
+        );
     }
 
     /// Without settling: a live stream's spinner keeps repainting, which `run` rejects.

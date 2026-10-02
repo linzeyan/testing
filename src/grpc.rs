@@ -178,6 +178,12 @@ fn status(code: Option<&str>, message: Option<&str>) -> Result<(), String> {
 /// Takes the first response message off `buf` once it has fully arrived.
 fn take_message(method: &MethodDescriptor, buf: &mut Vec<u8>) -> Option<Result<Value, String>> {
     let len = u32::from_be_bytes(buf.get(1..5)?.try_into().unwrap()) as usize;
+    // The length prefix allows 4 GiB; buffering toward that would sink the machine.
+    if len > crate::http::MAX_BODY {
+        return Some(Err(format!(
+            "A {len}-byte response message is over the 16 MiB limit"
+        )));
+    }
     if buf.len() < 5 + len {
         return None;
     }
@@ -249,6 +255,7 @@ pub async fn call(client: reqwest::Client, req: Request) -> Result<Response, Str
         elapsed,
         headers,
         body: body.to_string(),
+        truncated: false,
     })
 }
 

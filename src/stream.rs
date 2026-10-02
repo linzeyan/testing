@@ -126,13 +126,28 @@ pub async fn websocket(
 #[derive(Default)]
 struct SseParser {
     buf: Vec<u8>,
+    /// Dropping the rest of a line that went past `MAX_SSE`.
+    skipping: bool,
     event: String,
     data: Vec<String>,
+    data_len: usize,
 }
+
+/// A line, or one event's data, past this keeps its start: a server that never sends a
+/// newline would otherwise fill RAM.
+const MAX_SSE: usize = 1 << 20;
 
 impl SseParser {
     /// Returns one display string per dispatched event.
-    fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+    fn feed(&mut self, mut chunk: &[u8]) -> Vec<String> {
+        if self.skipping {
+            let Some(nl) = chunk.iter().position(|&b| b == b'\n') else {
+                return Vec::new();
+            };
+            self.skipping = false;
+            self.buf.push(b'\n');
+            chunk = &chunk[nl + 1..];
+        }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
@@ -148,6 +163,7 @@ impl SseParser {
                     });
                 }
                 self.data.clear();
+                self.data_len = 0;
                 self.event.clear();
                 continue;
             }
@@ -157,10 +173,17 @@ impl SseParser {
             let (field, value) = line.split_once(':').unwrap_or((line, ""));
             let value = value.strip_prefix(' ').unwrap_or(value);
             match field {
-                "data" => self.data.push(value.to_owned()),
+                "data" if self.data_len < MAX_SSE => {
+                    self.data_len += value.len();
+                    self.data.push(value.to_owned());
+                }
                 "event" => self.event = value.to_owned(),
                 _ => {} // id / retry don't change what we display
             }
+        }
+        if self.buf.len() > MAX_SSE {
+            self.buf.truncate(MAX_SSE);
+            self.skipping = true;
         }
         out
     }
@@ -308,5 +331,21 @@ mod tests {
                 Event::Closed("disconnected".into()),
             ]
         );
+    }
+
+    /// A server that never ends a line can't fill RAM: the line keeps its first MiB and
+    /// the stream carries on after the next newline.
+    #[test]
+    fn an_endless_line_is_capped_and_the_stream_goes_on() {
+        let mut p = SseParser::default();
+        let mut events = p.feed(b"data: ");
+        for _ in 0..40 {
+            events.extend(p.feed(&[b'x'; 64 * 1024]));
+            assert!(p.buf.len() <= MAX_SSE);
+        }
+        events.extend(p.feed(b"xx\n\ndata: next\n\n"));
+        assert_eq!(events.len(), 2);
+        assert!(events[0].len() < MAX_SSE && events[0].starts_with("xxx"));
+        assert_eq!(events[1], "next");
     }
 }

@@ -12,7 +12,13 @@ pub struct Response {
     pub elapsed: Duration,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// The body went past `MAX_BODY` and only its start was kept.
+    pub truncated: bool,
 }
+
+/// What a response body may hold in RAM. ponytail: past it the rest isn't read; stream
+/// it to a file instead if bodies this big need keeping whole.
+pub const MAX_BODY: usize = 16 << 20;
 
 impl Response {
     pub fn is_json(&self) -> bool {
@@ -206,7 +212,7 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
     let status = resp.status();
     let version = format!("{:?}", resp.version());
     let headers = header_list(resp.headers());
-    let body = resp.text().await.map_err(|e| error_chain(&e))?;
+    let (body, truncated) = read_body(resp).await?;
     Ok(Response {
         status: status.as_u16(),
         reason: status.canonical_reason().unwrap_or("").to_owned(),
@@ -214,7 +220,37 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
         elapsed: started.elapsed(),
         headers,
         body,
+        truncated,
     })
+}
+
+/// Up to `MAX_BODY` bytes, decoded by the Content-Type's charset as `text()` would (Big5
+/// and friends included). `text()` itself takes whatever arrives: a 1 GB download, or a
+/// small gzip that inflates to one.
+async fn read_body(mut resp: reqwest::Response) -> Result<(String, bool), String> {
+    let charset = (resp.headers().get(CONTENT_TYPE))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').find_map(|p| p.trim().strip_prefix("charset=")))
+        .and_then(|c| encoding_rs::Encoding::for_label(c.trim_matches('"').as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| error_chain(&e))? {
+        let room = MAX_BODY - bytes.len();
+        if chunk.len() > room {
+            bytes.extend_from_slice(&chunk[..room]);
+            truncated = true;
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let text = match String::from_utf8(bytes) {
+        // The usual case, without a copy.
+        Ok(text) if charset == encoding_rs::UTF_8 => text,
+        Ok(text) => charset.decode(text.as_bytes()).0.into_owned(),
+        Err(e) => charset.decode(e.as_bytes()).0.into_owned(),
+    };
+    Ok((text, truncated))
 }
 
 pub fn header_list(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
@@ -229,9 +265,59 @@ pub fn header_list(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)
         .collect()
 }
 
+/// Indented like `serde_json::to_string_pretty`, but without building a value tree: a
+/// tree costs several times the text (a 100 MB body went past 1 GB). Numbers and escapes
+/// stay exactly as the server wrote them.
 pub fn pretty_json(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    serde_json::to_string_pretty(&value).ok()
+    // Checks it's JSON without keeping anything.
+    serde_json::from_str::<serde::de::IgnoredAny>(body).ok()?;
+    let bytes = body.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 2);
+    let mut depth = 0;
+    let newline = |out: &mut Vec<u8>, depth: usize| {
+        out.push(b'\n');
+        out.resize(out.len() + 2 * depth, b' ');
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        i += 1;
+        match b {
+            b'"' => {
+                let start = i - 1;
+                while bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+                out.extend_from_slice(&bytes[start..i]);
+            }
+            b'{' | b'[' => {
+                let next = bytes[i..].iter().position(|c| !c.is_ascii_whitespace());
+                if let Some(n) = next.filter(|&n| matches!(bytes[i + n], b'}' | b']')) {
+                    // {} and [] stay on one line.
+                    out.extend_from_slice(&[b, bytes[i + n]]);
+                    i += n + 1;
+                } else {
+                    out.push(b);
+                    depth += 1;
+                    newline(&mut out, depth);
+                }
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                newline(&mut out, depth);
+                out.push(b);
+            }
+            b',' => {
+                out.push(b',');
+                newline(&mut out, depth);
+            }
+            b':' => out.extend_from_slice(b": "),
+            b if b.is_ascii_whitespace() => {}
+            b => out.push(b),
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// reqwest's Display hides the cause; on a locked-down VDI the cause (proxy refused,
@@ -483,5 +569,72 @@ pub(crate) mod tests {
         };
         assert!(e.contains("missing.txt"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Serves `body` as raw bytes, which `serve` can't (it takes a String).
+    fn serve_bytes(head: &'static str, body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_request(&mut s);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\n{head}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(&body);
+        });
+        format!("http://{addr}/")
+    }
+
+    fn get(rt: &tokio::runtime::Runtime, url: String) -> Response {
+        let req = Request {
+            method: "GET".into(),
+            url,
+            ..Default::default()
+        };
+        rt.block_on(execute(client(rt), req)).unwrap()
+    }
+
+    /// A body past MAX_BODY keeps its start and says so, instead of taking whatever the
+    /// server sends into a machine with under 1 GB free.
+    #[test]
+    fn a_huge_body_is_cut_and_marked() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let body = vec![b'a'; MAX_BODY + 1000];
+        let resp = get(&rt, serve_bytes("content-type: text/plain", body));
+        assert!(resp.truncated);
+        assert_eq!(resp.body.len(), MAX_BODY);
+        let resp = get(
+            &rt,
+            serve_bytes("content-type: text/plain", b"small".to_vec()),
+        );
+        assert!(!resp.truncated);
+        assert_eq!(resp.body, "small");
+    }
+
+    /// Reading in capped chunks must still decode like `text()` did: legacy Taiwanese
+    /// APIs answer in Big5.
+    #[test]
+    fn the_charset_still_decodes_the_body() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let big5 = vec![0xA4, 0xA4, 0xA4, 0xE5]; // 中文
+        let url = serve_bytes("content-type: text/plain; charset=Big5", big5);
+        assert_eq!(get(&rt, url).body, "中文");
+    }
+
+    /// Same text as serde_json's pretty printer, without its value tree.
+    #[test]
+    fn pretty_json_matches_serde_json() {
+        let doc = r#" {"a":[1,2.5,-3e2,{"b":null,"c":true}],"e":{},"f":[ ],
+            "s":"q\"uo,te:{[]}\\","u":"中文é","n":[[[]]],"z":{"y":[{}]}} "#;
+        let ours = pretty_json(doc).unwrap();
+        let value: serde_json::Value = serde_json::from_str(doc).unwrap();
+        let theirs = serde_json::to_string_pretty(&value).unwrap();
+        // serde_json rewrites numbers (-3e2 becomes -300.0); ours keeps them as sent.
+        assert_eq!(ours.replace("-3e2", "-300.0"), theirs);
+        assert_eq!(pretty_json("[1,"), None, "not JSON: shown as it came");
+        assert_eq!(pretty_json("\"x\"").unwrap(), "\"x\"");
     }
 }

@@ -333,9 +333,37 @@ fn absorb(
     out.env.extend(r.env);
     out.globals.extend(r.globals);
     // Tests from the pre-request script are unusual but legal; keep them in order.
-    out.tests.extend(r.tests);
-    out.logs.extend(r.logs);
+    out.tests.extend(r.tests.into_iter().map(|mut t| {
+        if let Some(e) = &mut t.error {
+            clip(e, MAX_LOG_LINE);
+        }
+        t
+    }));
+    for mut line in r.logs {
+        match out.logs.len().cmp(&MAX_LOGS) {
+            std::cmp::Ordering::Less => {
+                clip(&mut line, MAX_LOG_LINE);
+                out.logs.push(line);
+            }
+            std::cmp::Ordering::Equal => out.logs.push("… later lines not kept".into()),
+            std::cmp::Ordering::Greater => break,
+        }
+    }
     r.request
+}
+
+/// What one console line or test failure keeps: `console.log(pm.response.text())` is a
+/// common habit, chai quotes whole values in its failures, and the UI lays out all of it.
+const MAX_LOG_LINE: usize = 4096;
+const MAX_LOGS: usize = 1000;
+
+/// Cuts `text` to at most `max` bytes (on a character boundary) and says how long it was.
+pub fn clip(text: &mut String, max: usize) {
+    if text.len() > max {
+        let all = text.len();
+        text.truncate(text.floor_char_boundary(max));
+        text.push_str(&format!("… ({all} bytes in all)"));
+    }
 }
 
 #[cfg(test)]
@@ -695,5 +723,26 @@ mod tests {
             err.contains("Pre-request script failed") && err.contains("nope"),
             "{err}"
         );
+    }
+
+    /// `console.log(pm.response.text())` on a big body must not become a giant line in
+    /// the console, nor a flood of lines an endless list.
+    #[test]
+    fn script_logs_and_failures_are_clipped() {
+        let mut out = Outcome::failed(String::new());
+        let r = Output {
+            logs: vec!["é".repeat(10_000); MAX_LOGS + 50],
+            tests: vec![TestResult {
+                name: "t".into(),
+                passed: false,
+                error: Some("y".repeat(100_000)),
+            }],
+            ..Default::default()
+        };
+        absorb(&mut out, &mut Vars::default(), &mut HashMap::new(), r);
+        assert_eq!(out.logs.len(), MAX_LOGS + 1);
+        assert!(out.logs[0].len() < MAX_LOG_LINE + 32 && out.logs[0].ends_with("bytes in all)"));
+        assert_eq!(out.logs[MAX_LOGS], "… later lines not kept");
+        assert!(out.tests[0].error.as_ref().unwrap().len() < MAX_LOG_LINE + 32);
     }
 }

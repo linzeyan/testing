@@ -29,6 +29,9 @@ mime_guess = { version = "2", default-features = false }
 # Digest auth. sha2 is already in the tree (p12-keystore); md-5 shares its digest crate.
 md-5 = "0.11"
 sha2 = "0.11"
+# Already in the tree via reqwest's charset feature: decodes a body read in capped chunks
+# the way reqwest's text() would.
+encoding_rs = "0.8"
 # reqwest's own cookie store; used directly to list, delete and persist cookies.
 cookie_store = "0.22"
 toml = "1"
