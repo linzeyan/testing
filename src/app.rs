@@ -338,6 +338,8 @@ struct Shown {
     result: Result<ResponseView, String>,
     tests: Vec<TestResult>,
     logs: Vec<String>,
+    /// Its id in the request's response history.
+    past: Option<i64>,
 }
 
 enum NameKind {
@@ -1255,10 +1257,17 @@ impl App {
             }
             let failed = outcome.response.is_err() || outcome.tests.iter().any(|t| !t.passed);
             let to_tests = failed && !outcome.tests.is_empty();
+            let past = match &outcome.response {
+                Ok(r) => (self.ws.add_response(&path, r))
+                    .inspect_err(|e| self.status = format!("Keeping the response: {e}"))
+                    .ok(),
+                Err(_) => None,
+            };
             let shown = || Shown {
                 result: outcome.response.map(into_view),
                 tests: outcome.tests,
                 logs: outcome.logs,
+                past,
             };
             // Kept only while the request has a tab: bodies can be MBs and RAM is the constraint.
             if self.open.as_ref().is_some_and(|o| o.path == path) {
@@ -2590,6 +2599,13 @@ impl App {
                 });
         });
 
+        // ponytail: read from SQLite every frame (an indexed query for at most
+        // MAX_RESPONSES rows); cache it per request if it ever shows up in a profile.
+        let mut past = Past {
+            list: self.ws.responses(&open.path),
+            pick: None,
+            clear: false,
+        };
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(p) = pending {
                 ui.horizontal(|ui| {
@@ -2624,14 +2640,41 @@ impl App {
             }
             match &mut self.response {
                 None => {
-                    ui.weak(format!("Press Send or {} to see the response.", ui.ctx().format_shortcut(&SEND)));
+                    ui.horizontal(|ui| {
+                        ui.weak(format!("Press Send or {} to see the response.", ui.ctx().format_shortcut(&SEND)));
+                        past_menu(ui, &mut past, None);
+                    });
                 }
                 Some(shown) => {
                     let wrap = &mut self.wrap_response;
-                    example = response_ui(ui, shown, &mut self.resp_tab, wrap, &mut save_file);
+                    let tab = &mut self.resp_tab;
+                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut past);
                 }
             }
         });
+        let path = self.open.as_ref().map(|o| o.path.clone());
+        if past.clear
+            && let Some(path) = &path
+        {
+            match self.ws.clear_responses(path) {
+                Ok(()) => self.status = "Cleared this request's response history".into(),
+                Err(e) => self.status = e,
+            }
+        }
+        if let Some(id) = past.pick {
+            match self.ws.load_response(id) {
+                // Tests and console output aren't kept: the response is what's looked back at.
+                Ok(r) => {
+                    self.response = Some(Shown {
+                        result: Ok(into_view(r)),
+                        tests: Vec::new(),
+                        logs: Vec::new(),
+                        past: Some(id),
+                    })
+                }
+                Err(e) => self.status = format!("Reading that response: {e}"),
+            }
+        }
         if let Some(example) = example {
             self.save_example(example);
         }
@@ -5112,6 +5155,45 @@ fn stream_ui(
     sent
 }
 
+/// The open request's past responses, newest first, and what the user did with them.
+struct Past {
+    list: Vec<store::ResponseMeta>,
+    pick: Option<i64>,
+    clear: bool,
+}
+
+/// Postman's response history: earlier responses of this request, to look back at.
+fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
+    if past.list.is_empty() {
+        return;
+    }
+    let label = match past.list.iter().find(|m| Some(m.id) == shown) {
+        Some(m) => format!("History: {}", ago(m.at)),
+        None => "History".into(),
+    };
+    ui.menu_button(label, |ui| {
+        for m in &past.list {
+            let text = RichText::new(format!("{}  ·  {} ms  ·  {}", m.status, m.ms, ago(m.at)))
+                .color(status_color(m.status));
+            if ui
+                .add(egui::Button::selectable(shown == Some(m.id), text))
+                .clicked()
+            {
+                past.pick = Some(m.id);
+            }
+        }
+        ui.separator();
+        if ui.button("Clear history").clicked() {
+            past.clear = true;
+        }
+    })
+    .response
+    .on_hover_text(format!(
+        "Earlier responses to this request (the last {})",
+        store::MAX_RESPONSES
+    ));
+}
+
 /// Returns an example to save when the user asked for one.
 /// `wrap` is the word-wrap switch; `save_file` is set when the user asks to save the body.
 fn response_ui(
@@ -5120,6 +5202,7 @@ fn response_ui(
     tab: &mut RespTab,
     wrap: &mut bool,
     save_file: &mut bool,
+    past: &mut Past,
 ) -> Option<Example> {
     let mut example = None;
     let passed = shown.tests.iter().filter(|t| t.passed).count();
@@ -5144,7 +5227,8 @@ fn response_ui(
                 if h.truncated {
                     ui.colored_label(ORANGE, format!("{} (cut)", human_size(view.raw_size)))
                         .on_hover_text(format!(
-                            "{sizes}\nOnly the first 16 MiB were read, to save memory; scripts saw the same."
+                            "{sizes}\nOnly the first {} were kept, to save memory.",
+                            human_size(view.raw_size)
                         ));
                 } else {
                     ui.weak(human_size(view.raw_size)).on_hover_text(sizes);
@@ -5186,10 +5270,15 @@ fn response_ui(
                 format!("Console ({})", shown.logs.len()),
             );
         }
+        past_menu(ui, past, shown.past);
         if let Ok(view) = &mut shown.result {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let timeline = *tab == RespTab::Timeline;
-                let what = if timeline { "Copy the timeline" } else { "Copy body" };
+                let what = if timeline {
+                    "Copy the timeline"
+                } else {
+                    "Copy body"
+                };
                 if ui.small_button("Copy").on_hover_text(what).clicked() {
                     let text = match timeline {
                         true => view.head.timeline(),
@@ -6359,8 +6448,49 @@ mod ui_tests {
             })),
             tests: Vec::new(),
             logs: Vec::new(),
+            past: None,
         });
         h.run();
+    }
+
+    #[test]
+    fn an_earlier_response_can_be_looked_back_at() {
+        let mut h = with_request("past");
+        let url = crate::http::tests::echo_server();
+        let body = |app: &App| match app.response.as_ref().map(|s| &s.result) {
+            Some(Ok(view)) => view.text.to_lowercase(),
+            _ => String::new(),
+        };
+        for path in ["first", "second"] {
+            h.state_mut().open.as_mut().unwrap().draft.url = format!("{url}/{path}");
+            h.get_by_label("Send").click();
+            wait(&mut h, |app| {
+                body(app).starts_with(&format!("get /users/{path} "))
+            });
+        }
+        h.get_by_label("History: just now").click();
+        h.run();
+        shot(&mut h, "46-response-history");
+        // Newest first: the second entry is the first send.
+        h.get_all_by_label_contains("200  ·  ")
+            .nth(1)
+            .unwrap()
+            .click();
+        h.run();
+        assert!(
+            body(h.state()).starts_with("get /users/first "),
+            "{}",
+            body(h.state())
+        );
+        // Kept on disk, so a restart still has them; Clear empties this request's list.
+        let path = h.state().open.as_ref().unwrap().path.clone();
+        assert_eq!(h.state().ws.responses(&path).len(), 2);
+        h.get_by_label("History: just now").click();
+        h.run();
+        h.get_by_label("Clear history").click();
+        h.run();
+        assert!(h.state().ws.responses(&path).is_empty());
+        assert!(h.query_by_label_contains("History: ").is_none());
     }
 
     #[test]

@@ -44,7 +44,23 @@ CREATE TABLE IF NOT EXISTS requests (path TEXT PRIMARY KEY, method TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS envs (name TEXT PRIMARY KEY, shared TEXT NOT NULL, secret TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, entry TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS responses (id INTEGER PRIMARY KEY, path TEXT NOT NULL, at INTEGER NOT NULL, status INTEGER NOT NULL, ms INTEGER NOT NULL, response TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS responses_path ON responses (path);
 ";
+/// Past responses kept per request, newest first; older ones are deleted.
+pub const MAX_RESPONSES: usize = 10;
+/// A past response keeps this much of its body: they live on disk, but one is read back
+/// whole when picked.
+const MAX_RESPONSE_BODY: usize = 1 << 20;
+
+/// One past response of a request, without its body.
+pub struct ResponseMeta {
+    pub id: i64,
+    /// Unix seconds.
+    pub at: u64,
+    pub status: u16,
+    pub ms: u64,
+}
 
 /// One request sent from the app, as it was edited at the time (variables unresolved).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -70,11 +86,8 @@ impl HistoryEntry {
         if body_dropped {
             request.body = crate::model::Body::None;
         }
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
         Self {
-            at,
+            at: unix_now(),
             path,
             status,
             ms,
@@ -82,6 +95,12 @@ impl HistoryEntry {
             body_dropped,
         }
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[derive(Clone)]
@@ -339,6 +358,71 @@ impl Workspace {
 
     pub fn clear_history(&self) -> Result<(), String> {
         sql(self.db().execute("DELETE FROM history", [])).map(drop)
+    }
+
+    /// Keeps a response of the request at `path`; returns its id.
+    pub fn add_response(&self, path: &Path, resp: &crate::http::Response) -> Result<i64, String> {
+        let json = match resp.body.len() > MAX_RESPONSE_BODY {
+            false => to_json(resp)?,
+            true => to_json(&crate::http::Response {
+                body: resp.body[..resp.body.floor_char_boundary(MAX_RESPONSE_BODY)].to_owned(),
+                truncated: true,
+                headers: resp.headers.clone(),
+                sent: resp.sent.clone(),
+                reason: resp.reason.clone(),
+                version: resp.version.clone(),
+                ..*resp
+            })?,
+        };
+        let key = self.key(path);
+        let at = unix_now() as i64;
+        let ms = resp.elapsed.as_millis() as i64;
+        let db = self.db();
+        sql(db.execute(
+            "INSERT INTO responses (path, at, status, ms, response) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![key, at, resp.status, ms, json],
+        ))?;
+        let id = db.last_insert_rowid();
+        sql(db.execute(
+            "DELETE FROM responses WHERE path = ?1 AND id NOT IN \
+             (SELECT id FROM responses WHERE path = ?1 ORDER BY id DESC LIMIT ?2)",
+            rusqlite::params![key, MAX_RESPONSES as i64],
+        ))?;
+        Ok(id)
+    }
+
+    /// Newest first.
+    pub fn responses(&self, path: &Path) -> Vec<ResponseMeta> {
+        let db = self.db();
+        let rows = db
+            .prepare("SELECT id, at, status, ms FROM responses WHERE path = ?1 ORDER BY id DESC")
+            .and_then(|mut q| {
+                let rows = q.query_map([self.key(path)], |r| {
+                    Ok(ResponseMeta {
+                        id: r.get(0)?,
+                        at: r.get::<_, i64>(1)? as u64,
+                        status: r.get(2)?,
+                        ms: r.get::<_, i64>(3)? as u64,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            });
+        rows.unwrap_or_default()
+    }
+
+    pub fn load_response(&self, id: i64) -> Result<crate::http::Response, String> {
+        let db = self.db();
+        let json: String = sql(db.query_row(
+            "SELECT response FROM responses WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        ))?;
+        serde_json::from_str(&json).map_err(|e| e.to_string())
+    }
+
+    pub fn clear_responses(&self, path: &Path) -> Result<(), String> {
+        let db = self.db();
+        sql(db.execute("DELETE FROM responses WHERE path = ?1", [self.key(path)])).map(drop)
     }
 
     /// The cookie jar as `Jar::to_json` wrote it; empty when there is none yet.
@@ -614,8 +698,8 @@ impl Workspace {
         let mut db = self.db();
         let tx = sql(db.transaction())?;
         let tables: &[&str] = match request {
-            true => &["requests"],
-            false => &["folders", "requests"],
+            true => &["requests", "responses"],
+            false => &["folders", "requests", "responses"],
         };
         let rows = rows_of(request);
         for table in tables {
@@ -674,8 +758,8 @@ impl Workspace {
         let key = self.key(path);
         let request = is_request(path);
         let tables: &[&str] = match request {
-            true => &["requests"],
-            false => &["folders", "requests"],
+            true => &["requests", "responses"],
+            false => &["folders", "requests", "responses"],
         };
         let rows = rows_of(request);
         let mut db = self.db();
@@ -1327,6 +1411,48 @@ mod tests {
         assert_eq!(loaded[0].path, "5", "oldest entries go first");
         ws.clear_history().unwrap();
         assert!(ws.load_history().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn past_responses_are_bounded_and_follow_their_request() {
+        let root = fresh("responses");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let path = ws.create_request(&ws.collections(), "r").unwrap();
+        let resp = |status: u16, body: String| crate::http::Response {
+            status,
+            reason: String::new(),
+            version: "HTTP/1.1".into(),
+            elapsed: std::time::Duration::from_millis(7),
+            headers: Vec::new(),
+            body,
+            truncated: false,
+            sent: Default::default(),
+        };
+        let big = ws
+            .add_response(&path, &resp(500, "é".repeat(MAX_RESPONSE_BODY)))
+            .unwrap();
+        // A big body keeps its start, cut on a character boundary, and says so.
+        let kept = ws.load_response(big).unwrap();
+        assert!(kept.truncated && kept.body.len() <= MAX_RESPONSE_BODY && kept.status == 500);
+        for i in 0..MAX_RESPONSES {
+            ws.add_response(&path, &resp(200 + i as u16, String::new()))
+                .unwrap();
+        }
+        let list = ws.responses(&path);
+        assert_eq!(list.len(), MAX_RESPONSES, "the oldest goes");
+        assert_eq!((list[0].status, list[0].ms), (209, 7), "newest first");
+        assert!(ws.load_response(big).is_err());
+        // Renaming keeps them with the request; deleting takes them along.
+        let renamed = ws.rename(&path, "s").unwrap();
+        assert!(ws.responses(&path).is_empty());
+        assert_eq!(ws.responses(&renamed).len(), MAX_RESPONSES);
+        ws.delete(&renamed).unwrap();
+        let again = ws.create_request(&ws.collections(), "s").unwrap();
+        assert!(
+            ws.responses(&again).is_empty(),
+            "a new request starts fresh"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

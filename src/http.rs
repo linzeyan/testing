@@ -7,7 +7,7 @@ use crate::model::{Auth, Body, KeyValue, Request};
 
 /// What went out for one send, for the Timeline tab: the first request as the server got
 /// it, then each redirect followed.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Sent {
     pub method: String,
     pub url: String,
@@ -40,6 +40,7 @@ pub fn trace(f: impl FnOnce(&mut Trace)) {
     let _ = TRACE.try_with(|t| f(&mut t.borrow_mut()));
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Response {
     pub status: u16,
     pub reason: String,
