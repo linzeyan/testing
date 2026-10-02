@@ -3167,8 +3167,8 @@ fn tree_ui(
 }
 
 /// Key/value grid with a trailing blank row: typing into it creates a new row, like Postman.
-/// `describe` adds a Description column (request tables; variables have none, as in
-/// Postman). Returns whether any row changed.
+/// `describe` marks a request table: it gets a Description column (variables have none,
+/// as in Postman) and Bulk Edit. Returns whether any row changed.
 fn kv_table(
     ui: &mut egui::Ui,
     id: &str,
@@ -3177,6 +3177,51 @@ fn kv_table(
     describe: bool,
 ) -> bool {
     let before = rows.clone();
+    if describe {
+        // The text lives in egui's memory while editing, so a half-typed line isn't
+        // rewritten from the rows under the cursor.
+        let bulk_id = egui::Id::new((id, "bulk"));
+        let mut bulk: Option<String> = ui.data(|d| d.get_temp(bulk_id));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            let label = if bulk.is_some() {
+                "Key-Value Edit"
+            } else {
+                "Bulk Edit"
+            };
+            if ui.small_button(label).clicked() {
+                bulk = match bulk {
+                    Some(_) => None,
+                    None => Some(to_bulk(rows)),
+                };
+            }
+        });
+        if let Some(text) = &mut bulk {
+            // Rows changed elsewhere (the URL, another request) replace the text.
+            if from_bulk(text, rows) != *rows {
+                *text = to_bulk(rows);
+            }
+            let edited = ui.add(
+                egui::TextEdit::multiline(text)
+                    .code_editor()
+                    .hint_text(BULK_HINT)
+                    .desired_rows(8)
+                    .desired_width(f32::INFINITY),
+            );
+            if edited.changed() {
+                *rows = from_bulk(text, rows);
+            }
+        }
+        let shown = bulk.is_some();
+        ui.data_mut(|d| match bulk {
+            Some(text) => {
+                d.insert_temp(bulk_id, text);
+            }
+            None => d.remove::<String>(bulk_id),
+        });
+        if shown {
+            return *rows != before;
+        }
+    }
     let key_width = 200.0;
     let rest = (ui.available_width() - key_width - 90.0).max(120.0);
     let (value_width, desc_width) = match describe {
@@ -3242,6 +3287,39 @@ fn kv_table(
         rows.push(blank);
     }
     *rows != before
+}
+
+const BULK_HINT: &str = "key: value, one per line; // in front turns a line off";
+
+/// Postman's bulk format: `key: value` per line, `//` in front of a disabled one.
+fn to_bulk(rows: &[KeyValue]) -> String {
+    let line = |r: &KeyValue| {
+        let off = if r.enabled { "" } else { "//" };
+        format!("{off}{}: {}", r.key, r.value)
+    };
+    rows.iter().map(line).collect::<Vec<_>>().join("\n")
+}
+
+/// Descriptions aren't in the text, so each line keeps the one its key had.
+fn from_bulk(text: &str, old: &[KeyValue]) -> Vec<KeyValue> {
+    let mut used = vec![false; old.len()];
+    let lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    lines
+        .map(|line| {
+            let (enabled, line) = match line.strip_prefix("//") {
+                Some(rest) => (false, rest.trim_start()),
+                None => (true, line),
+            };
+            let (key, value) = line.split_once(':').unwrap_or((line, ""));
+            let mut row = KeyValue::new(key.trim(), value.trim());
+            row.enabled = enabled;
+            if let Some(i) = (0..old.len()).find(|&i| !used[i] && old[i].key == row.key) {
+                used[i] = true;
+                row.description = old[i].description.clone();
+            }
+            row
+        })
+        .collect()
 }
 
 /// Returns true when the GraphQL explorer asked to fetch the schema.
@@ -4499,7 +4577,8 @@ mod ui_tests {
     }
 
     /// The nth text box, not counting the sidebar filter (there whenever the tree isn't
-    /// empty), so the URL is 0 with a request open.
+    /// empty), so the URL is 0 with a request open. The filter is told by its placeholder,
+    /// which egui exposes only while it's empty.
     fn text_input<'h>(h: &'h Harness<'_, App>, nth: usize) -> egui_kittest::Node<'h> {
         h.get_all_by_role(Role::TextInput)
             .filter(|n| n.accesskit_node().placeholder() != Some(FILTER_HINT))
@@ -4848,6 +4927,44 @@ mod ui_tests {
         h.run();
         assert_eq!(h.state().tree_filter, "");
         h.get_by_label("health");
+    }
+
+    #[test]
+    fn bulk_edit_takes_pasted_lines_and_keeps_descriptions() {
+        let mut h = with_request("bulk");
+        h.state_mut().open.as_mut().unwrap().draft.headers = vec![KeyValue {
+            description: "who is asking".into(),
+            ..KeyValue::new("x-user", "bob")
+        }];
+        h.run();
+        h.get_by_label("Headers (1)").click();
+        h.run();
+        h.get_by_label("Bulk Edit").click();
+        h.run();
+        // The only multi-line box on the Headers tab.
+        let editor = |h: &Harness<'_, App>| {
+            let n = h.query_by_role(Role::MultilineTextInput);
+            n.map(|n| n.value().unwrap_or_default())
+        };
+        assert_eq!(editor(&h).as_deref(), Some("x-user: bob"));
+        // Replace it all with what devtools shows, one header switched off.
+        h.get_by_role(Role::MultilineTextInput).click();
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(egui::Event::Paste("x-user: alice\n//x-debug: 1".into()));
+        h.run();
+        let user = KeyValue {
+            description: "who is asking".into(),
+            ..KeyValue::new("x-user", "alice")
+        };
+        let debug = KeyValue {
+            enabled: false,
+            ..KeyValue::new("x-debug", "1")
+        };
+        assert_eq!(draft(&h).headers, [user, debug]);
+        h.get_by_label("Key-Value Edit").click();
+        h.run();
+        assert_eq!(editor(&h), None, "back to the table");
     }
 
     #[test]

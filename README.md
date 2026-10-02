@@ -8,7 +8,7 @@ such as Citrix VDI. No installer: unzip and run.
   Postman-style pre-request/test scripts (`pm.*`, chai, `jsonSchema`); collection runner with
   CSV/JSON data; load test pane; proxy/PAC/WPAD, custom CA and client certificates.
   JSON, text, form and multipart bodies (a value `@path` uploads a file); a description
-  per param, header and form field; per-request settings (HTTP version, redirects, TLS
+  per param, header and form field, and Bulk Edit (`key: value` lines) for those tables; per-request settings (HTTP version, redirects, TLS
   check, cookies, timeout); paste a curl command into the URL bar to import it, and
   "</> Code" for the request as curl, wget, HTTPie, PowerShell, raw HTTP, Python, fetch,
   axios, Go, Java, C#, PHP, Ruby, Rust, Swift or Kotlin; duplicate requests and folders
