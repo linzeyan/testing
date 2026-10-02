@@ -31,6 +31,13 @@ const FILTER_HINT: &str = "Filter by name";
 const MAX_LINE: usize = 4096;
 const RED: Color32 = Color32::from_rgb(220, 80, 80);
 const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
+/// The raw body's languages and the Content-Type each sets; Text sends the default.
+const RAW_TYPES: [(&str, &str); 4] = [
+    ("Text", ""),
+    ("XML", "application/xml"),
+    ("HTML", "text/html"),
+    ("JavaScript", "application/javascript"),
+];
 const ENV_COLORS: [(&str, Color32); 5] = [
     ("Red", RED),
     ("Orange", ORANGE),
@@ -1477,7 +1484,13 @@ fn into_view(mut head: http::Response) -> ResponseView {
     let body = std::mem::take(&mut head.body);
     let raw_size = body.len();
     let json = head.is_json() || body.trim_start().starts_with(['{', '[']);
-    let (text, other) = match json.then(|| http::pretty_json(&body)).flatten() {
+    let xml = !json && (head.headers.iter()).any(|(k, v)| k == "content-type" && v.contains("xml"));
+    let pretty = match (json, xml) {
+        (true, _) => http::pretty_json(&body),
+        (_, true) => http::pretty_xml(&body),
+        _ => None,
+    };
+    let (text, other) = match pretty {
         Some(pretty) => (pretty, Some(body)),
         None => (body, None),
     };
@@ -2813,8 +2826,13 @@ impl App {
                                 graphql_editor(ui, query, variables, &all_vars, &mut self.explorer);
                             return;
                         }
-                        fetch_schema |=
-                            body_editor(ui, &mut open.draft.body, &all_vars, &mut self.explorer);
+                        fetch_schema |= body_editor(
+                            ui,
+                            &mut open.draft.body,
+                            &mut open.draft.headers,
+                            &all_vars,
+                            &mut self.explorer,
+                        );
                     }
                     ReqTab::Auth => auth_editor(
                         ui,
@@ -4585,6 +4603,7 @@ fn from_bulk(text: &str, old: &[KeyValue]) -> Vec<KeyValue> {
 fn body_editor(
     ui: &mut egui::Ui,
     body: &mut Body,
+    headers: &mut Vec<KeyValue>,
     vars: &HashMap<String, String>,
     explorer: &mut Explorer,
 ) -> bool {
@@ -4648,7 +4667,40 @@ fn body_editor(
             });
             code_editor(ui, "body", text, vars);
         }
-        Body::Text { text } => code_editor(ui, "body", text, vars),
+        Body::Text { text } => {
+            // The language is the Content-Type header row, as Postman imports come in: one
+            // place to see and change it.
+            let typed =
+                (headers.iter()).find(|h| h.enabled && h.key.eq_ignore_ascii_case("content-type"));
+            let typed = typed.map(|h| h.value.to_lowercase()).unwrap_or_default();
+            let shown = RAW_TYPES.iter().find(|(_, mime)| {
+                !mime.is_empty() && typed.contains(&mime[mime.find('/').unwrap_or(0) + 1..])
+            });
+            let shown = shown.map_or("Text", |(label, _)| *label);
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("raw-type")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        for (label, mime) in RAW_TYPES {
+                            if ui.selectable_label(shown == label, label).clicked() {
+                                headers.retain(|h| !h.key.eq_ignore_ascii_case("content-type"));
+                                if !mime.is_empty() {
+                                    headers.push(KeyValue::new("Content-Type", mime));
+                                }
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Sets the Content-Type header");
+                if shown == "XML"
+                    && ui.small_button("Beautify").clicked()
+                    && let Some(pretty) = http::pretty_xml(text)
+                {
+                    *text = pretty;
+                }
+            });
+            code_editor(ui, "body", text, vars);
+        }
         Body::Form { fields } => {
             kv_table(ui, "form", fields, vars, true);
         }
@@ -7420,6 +7472,61 @@ mod ui_tests {
         h.get_by_label("None").click();
         h.run();
         assert_eq!(h.state().env_color(), None);
+    }
+
+    #[test]
+    fn a_raw_body_says_its_type_and_xml_comes_out_indented() {
+        let mut h = with_request("raw-xml");
+        let text = "<a><b>1</b></a>".to_owned();
+        h.state_mut().open.as_mut().unwrap().draft.body = Body::Text { text };
+        h.state_mut().req_tab = ReqTab::Body;
+        h.run();
+        let content_type = |h: &Harness<'_, App>| {
+            let headers = &draft(h).headers;
+            let row = headers.iter().find(|r| r.key == "Content-Type");
+            row.map(|r| r.value.clone())
+        };
+        let picker = |h: &Harness<'_, App>, value: &str| {
+            (h.get_all_by_role(Role::ComboBox))
+                .find(|n| n.accesskit_node().value().as_deref() == Some(value))
+                .unwrap()
+                .click();
+        };
+        picker(&h, "Text");
+        h.run();
+        h.get_by_label("XML").click();
+        h.run();
+        assert_eq!(content_type(&h).as_deref(), Some("application/xml"));
+        h.get_by_label("Beautify").click();
+        h.run();
+        shot(&mut h, "59-raw-xml");
+        let Body::Text { text } = &draft(&h).body else {
+            panic!("not text")
+        };
+        assert_eq!(text, "<a>\n  <b>1</b>\n</a>");
+        picker(&h, "XML");
+        h.run();
+        // The body mode row has a "Text" too; the list's comes last.
+        h.get_all_by_label("Text").last().unwrap().click();
+        h.run();
+        assert_eq!(content_type(&h), None, "plain text needs no header");
+
+        // An XML response reads indented; Raw is what came.
+        let view = into_view(http::Response {
+            status: 200,
+            reason: "OK".into(),
+            version: "HTTP/1.1".into(),
+            elapsed: Duration::ZERO,
+            headers: vec![("content-type".into(), "text/xml".into())],
+            body: "<a><b>1</b></a>".into(),
+            truncated: false,
+            sent: Default::default(),
+        });
+        assert_eq!(
+            (view.text.as_str(), view.raw()),
+            ("<a>\n  <b>1</b>\n</a>", "<a><b>1</b></a>")
+        );
+        assert!(!view.json, "no JSON colours on XML");
     }
 
     #[test]

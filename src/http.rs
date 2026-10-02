@@ -470,6 +470,64 @@ pub fn header_list(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)
         .collect()
 }
 
+/// XML indented two spaces a level, with `<a>text</a>` kept on one line. Tags are found by
+/// their brackets, not parsed: meant for well-formed documents; None when one doesn't close.
+/// ponytail: the token list costs about the text's size again; stream it if big XML bodies
+/// get common.
+pub fn pretty_xml(xml: &str) -> Option<String> {
+    let mut tokens = Vec::new();
+    let mut rest = xml.trim();
+    while !rest.is_empty() {
+        let end = if !rest.starts_with('<') {
+            rest.find('<').unwrap_or(rest.len())
+        } else if rest.starts_with("<!--") {
+            rest.find("-->")? + 3
+        } else if rest.starts_with("<![CDATA[") {
+            rest.find("]]>")? + 3
+        } else {
+            rest.find('>')? + 1
+        };
+        let token = rest[..end].trim();
+        if !token.is_empty() {
+            tokens.push(token);
+        }
+        rest = &rest[end..];
+    }
+    // An element's start tag: not text, a closing tag, `<?…?>`, `<!…>` or self-closing.
+    let opens = |t: &str| {
+        let after = t.strip_prefix('<').and_then(|t| t.chars().next());
+        after.is_some_and(|c| !matches!(c, '/' | '?' | '!')) && !t.ends_with("/>")
+    };
+    let mut out = String::with_capacity(xml.len() + xml.len() / 4);
+    let (mut depth, mut i) = (0usize, 0);
+    while i < tokens.len() {
+        let t = tokens[i];
+        if t.starts_with("</") {
+            depth = depth.saturating_sub(1);
+        }
+        out.extend(std::iter::repeat_n("  ", depth));
+        out.push_str(t);
+        if opens(t) {
+            match (tokens.get(i + 1), tokens.get(i + 2)) {
+                (Some(close), _) if close.starts_with("</") => {
+                    out.push_str(close);
+                    i += 1;
+                }
+                (Some(text), Some(close)) if !text.starts_with('<') && close.starts_with("</") => {
+                    out.push_str(text);
+                    out.push_str(close);
+                    i += 2;
+                }
+                _ => depth += 1,
+            }
+        }
+        out.push('\n');
+        i += 1;
+    }
+    out.pop();
+    Some(out)
+}
+
 /// Indented like `serde_json::to_string_pretty`, but without building a value tree: a
 /// tree costs several times the text (a 100 MB body went past 1 GB). Numbers and escapes
 /// stay exactly as the server wrote them.
@@ -823,6 +881,19 @@ pub(crate) mod tests {
         let value = |name: &str| auto.iter().find(|(k, ..)| k == name).unwrap().1.clone();
         assert_eq!(value("content-type"), "multipart/form-data; boundary=…");
         assert!(value("authorization").starts_with("Digest"));
+    }
+
+    #[test]
+    fn xml_is_indented_with_leaves_on_one_line() {
+        let xml = r#"<?xml version="1.0"?><a x="1"><b>text</b><c/><d></d><!-- <no> --><e><f>1</f></e></a>"#;
+        let pretty = "<?xml version=\"1.0\"?>\n<a x=\"1\">\n  <b>text</b>\n  <c/>\n  <d></d>\n  <!-- <no> -->\n  <e>\n    <f>1</f>\n  </e>\n</a>";
+        assert_eq!(pretty_xml(xml).as_deref(), Some(pretty));
+        assert_eq!(
+            pretty_xml(pretty).as_deref(),
+            Some(pretty),
+            "already pretty stays put"
+        );
+        assert_eq!(pretty_xml("<a><b"), None);
     }
 
     /// The header lines an echo server got, as (lowercase name, value), sorted.

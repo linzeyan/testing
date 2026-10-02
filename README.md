@@ -9,7 +9,8 @@ such as Citrix VDI. No installer: unzip and run.
   `wss://`) subscribes to the request's topics on Connect, follows changes to them while
   connected, and publishes from the message panel with QoS and retain; Postman-style pre-request/test
   scripts (`pm.*`, chai, `jsonSchema`); collection runner with CSV/JSON data; load test
-  pane; proxy/PAC/WPAD, custom CA and client certificates. JSON, text, form and multipart
+  pane; proxy/PAC/WPAD, custom CA and client certificates. JSON, text (Text/XML/HTML/JavaScript
+  sets the Content-Type; XML has Beautify), form and multipart
   bodies (a value `@path` uploads a file), and a Binary body that sends a file as it is,
   streamed from disk with its type guessed from the extension; a description per param, header and form
   field, and Bulk Edit (`key: value` lines) for those tables; path variables (`/users/:id`
@@ -27,7 +28,7 @@ such as Citrix VDI. No installer: unzip and run.
   `folder › request` breadcrumb whose folders open their settings; header names and Content-Type values complete while
   typing, and the Headers tab folds out what Send adds (Host, auth, Content-Type…) and
   where each comes from; a response body with JSON colours and line numbers,
-  Pretty/Raw, a JSONPath filter (`$.items[*].id`, `..id`; Save… still writes the whole
+  Pretty/Raw (XML responses are indented too), a JSONPath filter (`$.items[*].id`, `..id`; Save… still writes the whole
   body), a Tests tab filter (All/Passed/Failed with counts), word wrap and Save… to a file (bodies past 16 MiB keep their start, to
   spare RAM); a Timeline tab with the request as it went out (headers reqwest adds and jar
   cookies included), each redirect and the peer address; a History menu in the
