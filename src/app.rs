@@ -83,6 +83,7 @@ enum ScriptTab {
 enum RespTab {
     Body,
     Headers,
+    Timeline,
     Tests,
     Console,
 }
@@ -5156,6 +5157,11 @@ fn response_ui(
                     RespTab::Headers,
                     format!("Headers ({})", h.headers.len()),
                 );
+                // gRPC goes out its own way and isn't recorded.
+                if !h.sent.method.is_empty() {
+                    ui.selectable_value(tab, RespTab::Timeline, "Timeline")
+                        .on_hover_text("What was sent, redirects, and what came back");
+                }
             }
             Err(_) => {
                 ui.colored_label(RED, "Request failed");
@@ -5182,8 +5188,14 @@ fn response_ui(
         }
         if let Ok(view) = &mut shown.result {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Copy").on_hover_text("Copy body").clicked() {
-                    ui.ctx().copy_text(view.text.clone());
+                let timeline = *tab == RespTab::Timeline;
+                let what = if timeline { "Copy the timeline" } else { "Copy body" };
+                if ui.small_button("Copy").on_hover_text(what).clicked() {
+                    let text = match timeline {
+                        true => view.head.timeline(),
+                        false => view.text.clone(),
+                    };
+                    ui.ctx().copy_text(text);
                 }
                 if (ui.small_button("Save…"))
                     .on_hover_text("Save the body to a file, as received")
@@ -5241,6 +5253,12 @@ fn response_ui(
         RespTab::Tests if shown.tests.is_empty() => RespTab::Body,
         RespTab::Console if shown.logs.is_empty() => RespTab::Body,
         RespTab::Headers if shown.result.is_err() => RespTab::Body,
+        RespTab::Timeline
+            if (shown.result.as_ref()).is_ok_and(|v| v.head.sent.method.is_empty())
+                || shown.result.is_err() =>
+        {
+            RespTab::Body
+        }
         t => t,
     };
     match (current, &mut shown.result) {
@@ -5298,6 +5316,15 @@ fn response_ui(
                                 ui.end_row();
                             }
                         });
+                });
+        }
+        (RespTab::Timeline, Ok(view)) => {
+            egui::ScrollArea::both()
+                .id_salt("response-timeline")
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    let text = RichText::new(view.head.timeline()).monospace();
+                    ui.add(egui::Label::new(text).selectable(true).extend());
                 });
         }
         (_, Ok(view)) => {
@@ -5726,6 +5753,12 @@ mod ui_tests {
             "{}",
             view.text
         );
+        // The Timeline shows the URL with the variable filled in, as it went out.
+        h.get_by_label("Timeline").click();
+        h.run();
+        shot(&mut h, "45-timeline");
+        let sent = format!("> GET http://{host}/x\n");
+        assert!(h.query_by_label_contains(&sent).is_some(), "no {sent:?}");
     }
 
     #[test]
@@ -6322,6 +6355,7 @@ mod ui_tests {
                 headers: vec![("content-type".into(), content_type.into())],
                 body,
                 truncated: false,
+                sent: Default::default(),
             })),
             tests: Vec::new(),
             logs: Vec::new(),

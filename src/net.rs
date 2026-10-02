@@ -167,7 +167,16 @@ pub async fn build_client_with_jar(
             .timeout(Duration::from_secs(net.timeout_secs.max(1)))
             .tls_danger_accept_invalid_certs(net.insecure || v.insecure)
             .redirect(match v.redirects {
-                Some(n) => reqwest::redirect::Policy::limited(n as usize),
+                // `Policy::limited`, plus noting each hop for the Timeline.
+                Some(n) => reqwest::redirect::Policy::custom(move |attempt| {
+                    // The first of `previous` is the URL asked for, not a redirect.
+                    if attempt.previous().len() > n as usize {
+                        return attempt.error("too many redirects");
+                    }
+                    let hop = (attempt.status().as_u16(), attempt.url().to_string());
+                    crate::http::trace(|t| t.hops.push(hop));
+                    attempt.follow()
+                }),
                 None => reqwest::redirect::Policy::none(),
             });
         if v.cookies {

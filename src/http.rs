@@ -5,6 +5,41 @@ use reqwest::header::CONTENT_TYPE;
 
 use crate::model::{Auth, Body, KeyValue, Request};
 
+/// What went out for one send, for the Timeline tab: the first request as the server got
+/// it, then each redirect followed.
+#[derive(Clone, Debug, Default)]
+pub struct Sent {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    /// None: streamed from files (multipart), so never in memory.
+    pub body: Option<String>,
+    /// The status that sent it on, and where to.
+    pub hops: Vec<(u16, String)>,
+    /// The peer the response came from; the proxy's address when going through one.
+    pub remote: Option<String>,
+}
+
+/// The Timeline keeps this much of a request body.
+const MAX_SENT_BODY: usize = 64 << 10;
+
+/// Filled in during a send by the cookie jar and the redirect policy: reqwest calls both
+/// from inside the send, and has no other way to say what it added.
+#[derive(Default)]
+pub struct Trace {
+    pub cookie: Option<String>,
+    pub hops: Vec<(u16, String)>,
+}
+
+tokio::task_local! {
+    static TRACE: std::cell::RefCell<Trace>;
+}
+
+/// No-op outside a traced send (WebSocket, SSE, gRPC, the PAC fetch).
+pub fn trace(f: impl FnOnce(&mut Trace)) {
+    let _ = TRACE.try_with(|t| f(&mut t.borrow_mut()));
+}
+
 pub struct Response {
     pub status: u16,
     pub reason: String,
@@ -14,6 +49,7 @@ pub struct Response {
     pub body: String,
     /// The body went past `MAX_BODY` and only its start was kept.
     pub truncated: bool,
+    pub sent: Sent,
 }
 
 /// What a response body may hold in RAM. ponytail: past it the rest isn't read; stream
@@ -21,6 +57,41 @@ pub struct Response {
 pub const MAX_BODY: usize = 16 << 20;
 
 impl Response {
+    /// Like `curl -v`: what went out, each redirect, and what came back (the body is in
+    /// the Body tab).
+    pub fn timeline(&self) -> String {
+        let s = &self.sent;
+        let mut out = String::new();
+        if !s.method.is_empty() {
+            let _ = writeln!(out, "> {} {}", s.method, s.url);
+            for (k, v) in &s.headers {
+                let _ = writeln!(out, "> {k}: {v}");
+            }
+            match &s.body {
+                None => out.push_str(">\n> (streamed from files, not kept)\n"),
+                Some(b) if b.is_empty() => {}
+                Some(b) => {
+                    out.push_str(">\n");
+                    for line in b.lines() {
+                        let _ = writeln!(out, "> {line}");
+                    }
+                }
+            }
+        }
+        for (status, url) in &s.hops {
+            let _ = writeln!(out, "* {status}: redirected to {url}");
+        }
+        if let Some(remote) = &s.remote {
+            let _ = writeln!(out, "* answered by {remote}");
+        }
+        let _ = writeln!(out, "< {} {} {}", self.version, self.status, self.reason);
+        for (k, v) in &self.headers {
+            let _ = writeln!(out, "< {k}: {v}");
+        }
+        let _ = write!(out, "* {} ms", self.elapsed.as_millis());
+        out
+    }
+
     pub fn is_json(&self) -> bool {
         self.headers
             .iter()
@@ -206,9 +277,34 @@ pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, 
 }
 
 async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, String> {
-    let b = build(client, req)?;
+    let wire = build(client, req)?.build().map_err(|e| error_chain(&e))?;
+    let body_len = wire.body().and_then(|b| b.as_bytes()).map(<[u8]>::len);
+    let mut sent = Sent {
+        method: wire.method().to_string(),
+        url: wire.url().to_string(),
+        headers: header_list(wire.headers()),
+        body: wire.body().map_or(Some(String::new()), |b| {
+            b.as_bytes().map(|b| {
+                let mut text =
+                    String::from_utf8_lossy(&b[..b.len().min(MAX_SENT_BODY)]).into_owned();
+                if b.len() > MAX_SENT_BODY {
+                    crate::runner::clip(&mut text, MAX_SENT_BODY);
+                }
+                text
+            })
+        }),
+        ..Default::default()
+    };
     let started = Instant::now();
-    let resp = b.send().await.map_err(|e| error_chain(&e))?;
+    let send = async {
+        let resp = client.execute(wire).await;
+        (resp, TRACE.with(|t| t.take()))
+    };
+    let (resp, trace) = TRACE.scope(Default::default(), send).await;
+    let resp = resp.map_err(|e| error_chain(&e))?;
+    sent.added(trace.cookie, body_len);
+    sent.hops = trace.hops;
+    sent.remote = resp.remote_addr().map(|a| a.to_string());
     let status = resp.status();
     let version = format!("{:?}", resp.version());
     let headers = header_list(resp.headers());
@@ -221,7 +317,42 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
         headers,
         body,
         truncated,
+        sent,
     })
+}
+
+impl Sent {
+    /// The headers reqwest and hyper add on the way out, as they add them.
+    /// ponytail: mirrors reqwest 0.13's rules (checked by a test against what a server
+    /// receives); revisit when upgrading reqwest.
+    fn added(&mut self, cookie: Option<String>, body_len: Option<usize>) {
+        let has = |h: &[(String, String)], name: &str| h.iter().any(|(k, _)| k == name);
+        let mut auto = Vec::new();
+        if let Ok(url) = reqwest::Url::parse(&self.url)
+            && let Some(host) = url.host_str()
+        {
+            let host = match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_owned(),
+            };
+            auto.push(("host".to_owned(), host));
+        }
+        auto.append(&mut self.headers);
+        self.headers = auto;
+        if !has(&self.headers, "accept") {
+            self.headers.push(("accept".into(), "*/*".into()));
+        }
+        if !has(&self.headers, "accept-encoding") && !has(&self.headers, "range") {
+            self.headers.push(("accept-encoding".into(), "gzip".into()));
+        }
+        if let Some(cookie) = cookie.filter(|_| !has(&self.headers, "cookie")) {
+            self.headers.push(("cookie".into(), cookie));
+        }
+        if let Some(len) = body_len.filter(|n| *n > 0) {
+            self.headers
+                .push(("content-length".into(), len.to_string()));
+        }
+    }
 }
 
 /// Up to `MAX_BODY` bytes, decoded by the Content-Type's charset as `text()` would (Big5
@@ -517,6 +648,81 @@ pub(crate) mod tests {
         assert!(wire.contains("authorization: bearer t0k"), "{wire}");
         assert!(wire.contains("content-type: application/json"), "{wire}");
         assert!(wire.ends_with("{\"n\":1}"), "{wire}");
+        // The Timeline lists exactly what arrived, the headers reqwest adds included.
+        assert_eq!(shown(&resp), received(&resp));
+        assert_eq!(resp.sent.body.as_deref(), Some("{\"n\":1}"));
+    }
+
+    /// The header lines an echo server got, as (lowercase name, value), sorted.
+    fn received(resp: &Response) -> Vec<(String, String)> {
+        let head = resp.body.split("\r\n\r\n").next().unwrap();
+        let mut lines: Vec<_> = (head.lines().skip(1))
+            .map(|l| l.split_once(": ").unwrap())
+            .map(|(k, v)| (k.to_lowercase(), v.to_owned()))
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    fn shown(resp: &Response) -> Vec<(String, String)> {
+        let mut lines = resp.sent.headers.clone();
+        lines.sort();
+        lines
+    }
+
+    #[test]
+    fn the_timeline_shows_redirects_and_jar_cookies_as_sent() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let addr = serve(|req| {
+            if req.starts_with("GET /a ") {
+                (
+                    "302 Found\r\nlocation: /b\r\nset-cookie: sid=1".into(),
+                    String::new(),
+                )
+            } else if req.starts_with("GET /loop ") {
+                ("302 Found\r\nlocation: /loop".into(), String::new())
+            } else {
+                ("200 OK".into(), req.to_owned())
+            }
+        });
+        let client = client(&rt);
+        let req = Request {
+            url: format!("http://{addr}/a"),
+            headers: vec![KeyValue::new("X-Trace", "1")],
+            ..Default::default()
+        };
+        let first = rt.block_on(execute(client.clone(), req.clone())).unwrap();
+        assert_eq!(first.sent.hops, [(302, format!("http://{addr}/b"))]);
+        assert_eq!(first.sent.remote, Some(addr.to_string()));
+        // The second time the jar has a cookie: it's in the Timeline because it was sent.
+        let again = rt.block_on(execute(client.clone(), req)).unwrap();
+        assert!(
+            again
+                .sent
+                .headers
+                .contains(&("cookie".into(), "sid=1".into()))
+        );
+        // The server saw the hop, which differs from the first request by a Referer only.
+        let mut hop = received(&again);
+        hop.retain(|(k, _)| k != "referer");
+        assert_eq!(shown(&again), hop);
+        let timeline = again.timeline();
+        assert!(
+            timeline.starts_with(&format!("> GET http://{addr}/a\n")),
+            "{timeline}"
+        );
+        assert!(timeline.contains("\n> cookie: sid=1\n"), "{timeline}");
+        assert!(timeline.contains("* 302: redirected to"), "{timeline}");
+        // Noting hops must not lift the limit (10 by default).
+        let looping = Request {
+            url: format!("http://{addr}/loop"),
+            ..Default::default()
+        };
+        let err = rt.block_on(execute(client, looping)).err().unwrap();
+        assert!(err.contains("too many redirects"), "{err}");
     }
 
     #[test]

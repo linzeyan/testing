@@ -92,8 +92,14 @@ impl reqwest::cookie::CookieStore for Jar {
             .get_request_values(url)
             .map(|(name, value)| format!("{name}={value}"))
             .collect();
-        (!pairs.is_empty())
-            .then(|| HeaderValue::from_str(&pairs.join("; ")).ok())
-            .flatten()
+        if pairs.is_empty() {
+            return None;
+        }
+        let value = pairs.join("; ");
+        // The first hop's, for the Timeline.
+        crate::http::trace(|t| {
+            t.cookie.get_or_insert_with(|| value.clone());
+        });
+        HeaderValue::from_str(&value).ok()
     }
 }
