@@ -41,6 +41,9 @@ pub struct Trace {
 
 tokio::task_local! {
     static TRACE: std::cell::RefCell<Trace>;
+    /// "Send and download": a successful response's body goes to this file, not RAM.
+    /// A task-local like TRACE so the runner and its scripts don't carry it.
+    pub static DOWNLOAD: std::path::PathBuf;
 }
 
 /// No-op outside a traced send (WebSocket, SSE, gRPC, the PAC fetch).
@@ -433,6 +436,13 @@ pub fn auto_headers(mut req: Request, own: &[KeyValue]) -> Vec<(String, String, 
 /// and friends included). `text()` itself takes whatever arrives: a 1 GB download, or a
 /// small gzip that inflates to one.
 async fn read_body(mut resp: reqwest::Response) -> Result<(String, bool), String> {
+    // Only a success: an error body (or Digest's first 401) is small and worth reading here.
+    if resp.status().is_success()
+        && let Ok(path) = DOWNLOAD.try_with(Clone::clone)
+    {
+        let n = download(resp, &path).await?;
+        return Ok((format!("Saved {n} bytes to {}", path.display()), false));
+    }
     let charset = (resp.headers().get(CONTENT_TYPE))
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(';').find_map(|p| p.trim().strip_prefix("charset=")))
@@ -456,6 +466,28 @@ async fn read_body(mut resp: reqwest::Response) -> Result<(String, bool), String
         Err(e) => charset.decode(e.as_bytes()).0.into_owned(),
     };
     Ok((text, truncated))
+}
+
+/// Streams the body to `path`, whatever its size. A failed download removes the file
+/// rather than leave a cut one that looks whole. ponytail: Cancel drops this mid-write
+/// and leaves the partial file; clean up on abort if that confuses anyone.
+async fn download(mut resp: reqwest::Response, path: &std::path::Path) -> Result<u64, String> {
+    use tokio::io::AsyncWriteExt;
+    let failed = |e: std::io::Error| format!("{}: {e}", path.display());
+    let mut file = tokio::fs::File::create(path).await.map_err(failed)?;
+    let mut n = 0;
+    let written = async {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| error_chain(&e))? {
+            file.write_all(&chunk).await.map_err(failed)?;
+            n += chunk.len() as u64;
+        }
+        file.flush().await.map_err(failed)
+    }
+    .await;
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    written.map(|()| n)
 }
 
 pub fn header_list(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
@@ -1061,6 +1093,46 @@ pub(crate) mod tests {
         );
         assert!(!resp.truncated);
         assert_eq!(resp.body, "small");
+    }
+
+    /// "Send and download" is how a body past MAX_BODY is kept whole: it goes to disk as
+    /// it arrives. An error answer stays on screen, where it can be read.
+    #[test]
+    fn a_download_keeps_the_whole_body_on_disk_not_in_ram() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = std::env::temp_dir().join(format!("apitool-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client = client(&rt);
+        let fetch = |url: String, to: &std::path::Path| {
+            let req = Request {
+                method: "GET".into(),
+                url,
+                ..Default::default()
+            };
+            let send = DOWNLOAD.scope(to.to_owned(), execute(client.clone(), req));
+            rt.block_on(send).unwrap()
+        };
+        let file = dir.join("big.bin");
+        let body: Vec<u8> = (0..MAX_BODY + 1000).map(|i| i as u8).collect();
+        let url = serve_bytes("content-type: application/octet-stream", body.clone());
+        let resp = fetch(url, &file);
+        assert!(!resp.truncated);
+        assert!(
+            resp.body.contains(&file.display().to_string()),
+            "{}",
+            resp.body
+        );
+        assert!(
+            std::fs::read(&file).unwrap() == body,
+            "every byte, past MAX_BODY"
+        );
+
+        let missing = dir.join("not-found.txt");
+        let addr = serve(|_| ("404 Not Found".into(), "no such thing".into()));
+        let resp = fetch(format!("http://{addr}/"), &missing);
+        assert_eq!(resp.body, "no such thing");
+        assert!(!missing.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Reading in capped chunks must still decode like `text()` did: legacy Taiwanese

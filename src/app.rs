@@ -421,10 +421,11 @@ enum Dialog {
         text: String,
         note: String,
     },
-    /// Where to save the response body.
+    /// Where to save the response body; with `download`, where Send streams the next one.
     SaveBody {
         path: String,
         error: String,
+        download: bool,
     },
     /// Ctrl+K: jump to a request or environment by typing part of its name.
     Switch {
@@ -662,23 +663,48 @@ impl App {
             c if c.starts_with("text/") => "txt",
             _ => "bin",
         };
-        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
-        let dir = (home.map(|h| PathBuf::from(h).join("Downloads")))
-            .filter(|d| d.is_dir())
-            .unwrap_or_else(|| self.ws.root.clone());
         let name = self.open.as_ref().map(Open::name).unwrap_or_default();
         let file = format!("{}.{ext}", crate::store::safe_name(&name));
         self.dialog = Some(Dialog::SaveBody {
-            path: dir.join(file).display().to_string(),
+            path: self.downloads().join(file).display().to_string(),
             error: String::new(),
+            download: false,
         });
     }
 
-    fn save_body(&mut self) {
-        let Some(Dialog::SaveBody { path, .. }) = &self.dialog else {
+    /// Before Send, so no content type yet: the URL's file name if it has one
+    /// (`/files/report.pdf`), else the request's name.
+    fn ask_download(&mut self) {
+        let Some(open) = &self.open else { return };
+        let url = open.draft.url.split(['?', '#']).next().unwrap_or("");
+        let last = url.rsplit('/').next().unwrap_or("");
+        let file = match last.contains('.') && !last.contains("{{") {
+            true => crate::store::safe_name(last),
+            false => crate::store::safe_name(&open.name()),
+        };
+        self.dialog = Some(Dialog::SaveBody {
+            path: self.downloads().join(file).display().to_string(),
+            error: String::new(),
+            download: true,
+        });
+    }
+
+    fn downloads(&self) -> PathBuf {
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+        (home.map(|h| PathBuf::from(h).join("Downloads")))
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(|| self.ws.root.clone())
+    }
+
+    fn save_body(&mut self, ctx: &egui::Context) {
+        let Some(Dialog::SaveBody { path, download, .. }) = &self.dialog else {
             return;
         };
         let path = path.trim().to_owned();
+        if *download {
+            self.dialog = None;
+            return self.send(ctx, Some(path.into()));
+        }
         let Some(Ok(view)) = self.response.as_ref().map(|s| &s.result) else {
             self.dialog = None;
             return;
@@ -1138,7 +1164,8 @@ impl App {
         }
     }
 
-    fn send(&mut self, ctx: &egui::Context) {
+    /// `download`: stream a successful body to this file instead of keeping it.
+    fn send(&mut self, ctx: &egui::Context, download: Option<PathBuf>) {
         let Some(open) = &self.open else { return };
         if streams(&open.draft, &self.grpc_methods) {
             return self.connect(ctx);
@@ -1169,7 +1196,12 @@ impl App {
                 .await
             {
                 Ok(client) => {
-                    runner::run(client.clone(), &runner::Info::single(name), req, vars).await
+                    let info = runner::Info::single(name);
+                    let run = runner::run(client.clone(), &info, req, vars);
+                    match download {
+                        Some(file) => crate::http::DOWNLOAD.scope(file, run).await,
+                        None => run.await,
+                    }
                 }
                 Err(e) => Outcome::failed(format!("Network settings: {e}")),
             };
@@ -1713,7 +1745,7 @@ impl eframe::App for App {
                         self.status = e;
                     }
                 }
-                None => self.send(ui.ctx()),
+                None => self.send(ui.ctx(), None),
             }
         }
         if ui.input_mut(|i| i.consume_shortcut(&CLOSE_TAB))
@@ -2471,6 +2503,7 @@ impl App {
         };
         let (mut send, mut save, mut cancel) = (false, false, false);
         let (mut toggle_load, mut start_load) = (false, false);
+        let mut download = false;
         let mut define: Option<Vec<String>> = None;
         let mut fetch_schema = false;
         let mut example = None;
@@ -2621,7 +2654,13 @@ impl App {
                     self.req_tab = ReqTab::Body;
                 }
                 let button = [80.0, 22.0];
-                let width = ui.available_width() - button[0] - 8.0;
+                // gRPC answers aren't read as an HTTP body, so they can't go to a file.
+                let downloadable = !streaming && open.draft.method != "GRPC";
+                let more = match downloadable {
+                    true => 20.0 + ui.spacing().item_spacing.x,
+                    false => 0.0,
+                };
+                let width = ui.available_width() - button[0] - 8.0 - more;
                 let hint = match open.draft.method.as_str() {
                     "MQTT" => "mqtt://{{broker}}:1883",
                     _ => "https://{{host}}/path",
@@ -2676,6 +2715,20 @@ impl App {
                         )
                         .on_hover_text(ui.ctx().format_shortcut(&SEND))
                         .clicked();
+                }
+                if downloadable {
+                    let button = ui.add_enabled(
+                        pending.is_none(),
+                        egui::Button::new("⏷").min_size(egui::vec2(20.0, 22.0)),
+                    );
+                    egui::Popup::menu(&button)
+                        .id(egui::Id::new("send-more"))
+                        .show(|ui| {
+                            download = ui
+                                .button("Send and download…")
+                                .on_hover_text("Save the response straight to a file, for big ones")
+                                .clicked();
+                        });
                 }
             });
             if open.draft.method == "GRPC"
@@ -2965,7 +3018,10 @@ impl App {
             }
         }
         if send {
-            self.send(ui.ctx());
+            self.send(ui.ctx(), None);
+        }
+        if download {
+            self.ask_download();
         }
         if fetch_schema {
             self.fetch_schema(ui.ctx());
@@ -3201,8 +3257,18 @@ impl App {
                         }
                     });
                 }
-                Dialog::SaveBody { path, error } => {
-                    ui.heading("Save response body");
+                Dialog::SaveBody {
+                    path,
+                    error,
+                    download,
+                } => {
+                    ui.heading(match download {
+                        true => "Send and download",
+                        false => "Save response body",
+                    });
+                    if *download {
+                        ui.weak("A successful response goes straight to this file, however big.");
+                    }
                     let edit = ui.add(
                         egui::TextEdit::singleline(path)
                             .hint_text("File path")
@@ -3216,8 +3282,9 @@ impl App {
                         ui.colored_label(RED, error.as_str());
                     }
                     ui.horizontal(|ui| {
-                        if ui.add(primary("Save")).clicked() || enter {
-                            then = Some(Box::new(|app, _| app.save_body()));
+                        let label = if *download { "Send" } else { "Save" };
+                        if ui.add(primary(label)).clicked() || enter {
+                            then = Some(Box::new(|app, ctx| app.save_body(ctx)));
                         }
                         cancel = ui.button("Cancel").clicked();
                     });
@@ -7311,6 +7378,47 @@ mod ui_tests {
         shot(&mut h, "52-auto-headers");
         assert!(h.query_by_label("Bearer t0k").is_some());
         assert!(h.query_by_label("from Auth").is_some());
+    }
+
+    /// A body too big for RAM needs a way to disk: Send ▾ asks where (named after the
+    /// URL's file), and the pane says where it went instead of showing it.
+    #[test]
+    fn send_and_download_puts_the_body_in_the_chosen_file() {
+        let mut h = with_request("dl");
+        let addr = crate::http::tests::serve(|_| ("200 OK".into(), "a,b\n1,2\n".into()));
+        let url = format!("http://{addr}/files/report.csv?v=2");
+        h.state_mut().open.as_mut().unwrap().draft.url = url;
+        h.run();
+        h.get_by_label("⏷").click();
+        h.run();
+        h.get_by_label("Send and download…").click();
+        h.run();
+        shot(&mut h, "60-send-and-download");
+        let file = h.state().ws.root.join("saved.csv");
+        let Some(Dialog::SaveBody {
+            path,
+            download: true,
+            ..
+        }) = &mut h.state_mut().dialog
+        else {
+            panic!("the download dialog should be open");
+        };
+        assert!(path.ends_with("report.csv"), "named after the URL: {path}");
+        *path = file.display().to_string();
+        h.key_press(Key::Enter);
+        wait(&mut h, |app| {
+            app.pending.is_empty() && app.response.is_some()
+        });
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a,b\n1,2\n");
+        let view = h
+            .state()
+            .response
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap();
+        assert!(view.text.contains("saved.csv"), "{}", view.text);
     }
 
     #[test]

@@ -30,7 +30,8 @@ such as Citrix VDI. No installer: unzip and run.
   where each comes from; a response body with JSON colours and line numbers,
   Pretty/Raw (XML responses are indented too), a JSONPath filter (`$.items[*].id`, `..id`; Save… still writes the whole
   body), a Tests tab filter (All/Passed/Failed with counts), word wrap and Save… to a file (bodies past 16 MiB keep their start, to
-  spare RAM); a Timeline tab with the request as it went out (headers reqwest adds and jar
+  spare RAM; Send ⏷ "Send and download…" streams a successful response straight to a
+  file instead, however big); a Timeline tab with the request as it went out (headers reqwest adds and jar
   cookies included), each redirect and the peer address; a History menu in the
   response bar with the last 10 responses of each request (kept on disk, 1 MiB of body
   each); find in response (Ctrl+F); saved response
