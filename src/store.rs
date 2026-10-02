@@ -91,6 +91,8 @@ pub struct State {
     /// Every open tab, in order.
     pub tabs: Vec<PathBuf>,
     pub network: crate::net::Network,
+    /// The language the code panel shows.
+    pub code_lang: String,
 }
 
 #[derive(Clone)]

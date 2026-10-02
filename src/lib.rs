@@ -3,6 +3,7 @@
 pub mod app;
 mod auth;
 pub mod cli;
+mod codegen;
 mod cookies;
 mod curl;
 mod docs;

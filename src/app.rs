@@ -339,6 +339,9 @@ pub struct App {
     /// Outlives client rebuilds; saved to the workspace after responses.
     cookies: Arc<Jar>,
     cookie_manager: bool,
+    /// The code snippet panel, and its language (kept in the workspace state).
+    code: bool,
+    code_lang: String,
     mock: Option<MockServer>,
     active_env: Option<String>,
     vars: HashMap<String, String>,
@@ -387,6 +390,10 @@ impl App {
             show_history: false,
             cookies: Arc::new(Jar::load(&ws.cookies_path())),
             cookie_manager: false,
+            code: false,
+            code_lang: Some(state.code_lang)
+                .filter(|l| crate::codegen::TARGETS.iter().any(|(n, _)| l == n))
+                .unwrap_or_else(|| "cURL".into()),
             mock: None,
             ws,
             active_env: None,
@@ -441,6 +448,7 @@ impl App {
             open: self.open.as_ref().map(|o| o.path.clone()),
             tabs: self.tabs.iter().map(|t| t.path.clone()).collect(),
             network: self.network.clone(),
+            code_lang: self.code_lang.clone(),
         });
     }
 
@@ -1636,6 +1644,57 @@ impl App {
             .as_ref()
             .is_some_and(|s| s.grpc.is_some() && s.outgoing.is_some());
 
+        // As in Postman: beside both the request and its response, so edits show live.
+        let mut lang_changed = false;
+        if self.code {
+            egui::Panel::right("code")
+                .resizable(true)
+                .default_size(380.0)
+                .show(ui, |ui| {
+                    let (wire, _) = open.draft.resolved(&all_vars);
+                    let code = crate::codegen::generate(&self.code_lang, wire);
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("code_lang")
+                            .selected_text(&self.code_lang)
+                            .show_ui(ui, |ui| {
+                                for (name, _) in crate::codegen::TARGETS {
+                                    let lang = &mut self.code_lang;
+                                    let r = ui.selectable_value(lang, (*name).to_owned(), *name);
+                                    lang_changed |= r.changed();
+                                }
+                            });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").on_hover_text("Close").clicked() {
+                                self.code = false;
+                            }
+                            if let Ok(code) = &code
+                                && ui.add(primary("Copy")).clicked()
+                            {
+                                ui.ctx().copy_text(code.clone());
+                                self.status = format!("Copied {} snippet", self.code_lang);
+                            }
+                        });
+                    });
+                    ui.weak("Variables are filled in; scripts don't run.");
+                    ui.separator();
+                    match code {
+                        Ok(code) => {
+                            egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut code.as_str())
+                                        .code_editor()
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                        }
+                        Err(e) => {
+                            ui.colored_label(ORANGE, e);
+                        }
+                    }
+                });
+        }
+
         egui::Panel::top("request")
             .resizable(true)
             .default_size(320.0)
@@ -1659,22 +1718,8 @@ impl App {
                         }
                         ui.toggle_value(&mut self.cookie_manager, "Cookies")
                             .on_hover_text("Cookies the server set, sent back automatically");
-                        // curl can't speak gRPC or WebSocket; a command for those would lie.
-                        if !matches!(open.draft.method.as_str(), "GRPC" | "WS")
-                            && ui
-                                .button("Copy as curl")
-                                .on_hover_text("With variables filled in; scripts don't run")
-                                .clicked()
-                        {
-                            let (wire, _) = open.draft.resolved(&all_vars);
-                            match crate::curl::to_curl(wire) {
-                                Ok(cmd) => {
-                                    ui.ctx().copy_text(cmd);
-                                    self.status = "Copied curl command".into();
-                                }
-                                Err(e) => self.status = e,
-                            }
-                        }
+                        ui.toggle_value(&mut self.code, "</> Code")
+                            .on_hover_text("This request as curl, Python, Go, … to copy");
                     });
                 });
                 ui.horizontal(|ui| {
@@ -1719,6 +1764,7 @@ impl App {
                                 let d = &mut open.draft;
                                 (d.method, d.url, d.params) = (r.method, r.url, r.params);
                                 (d.headers, d.body, d.auth) = (r.headers, r.body, r.auth);
+                                d.settings = r.settings;
                                 self.status = "Imported curl command".into();
                             }
                             Err(e) => self.status = format!("curl import: {e}"),
@@ -1940,6 +1986,9 @@ impl App {
         });
         if let Some(example) = example {
             self.save_example(example);
+        }
+        if lang_changed {
+            self.save_state();
         }
 
         if save {
@@ -4633,6 +4682,44 @@ mod ui_tests {
             "the original keeps its edits"
         );
         assert!(app.status.contains("r copy"), "{}", app.status);
+    }
+
+    #[test]
+    fn code_panel_shows_what_send_sends_and_keeps_the_language() {
+        let mut h = with_request("code");
+        h.state_mut().open.as_mut().unwrap().draft.url = "{{host}}/items".into();
+        h.get_by_label("</> Code").click();
+        h.run();
+        let snippet = |h: &Harness<'_, App>| {
+            let roles = [Role::MultilineTextInput, Role::TextInput];
+            let nodes = roles.into_iter().flat_map(|r| h.get_all_by_role(r));
+            nodes
+                .filter_map(|n| n.value())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Variables are filled in, as for Send.
+        let code = snippet(&h);
+        assert!(
+            code.contains("curl --location 'http://127.0.0.1:1/items'"),
+            "{code}"
+        );
+        let picker = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("cURL");
+        h.get(picker).click();
+        h.run();
+        h.get_by_label("Go (net/http)").click();
+        h.run();
+        let code = snippet(&h);
+        assert!(
+            code.contains(r#"http.NewRequest("GET", "http://127.0.0.1:1/items", nil)"#),
+            "{code}"
+        );
+        shot(&mut h, "code-panel");
+        let mut h = harness(h.state().ws.clone());
+        h.run();
+        assert_eq!(h.state().code_lang, "Go (net/http)", "kept for next time");
     }
 
     #[test]

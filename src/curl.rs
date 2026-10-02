@@ -1,69 +1,7 @@
-//! curl commands in and out: "Copy as curl" for sharing a request, and pasting a curl
-//! command (e.g. from browser devtools) into the URL bar to import one.
+//! Pasting a curl command (e.g. from browser devtools) into the URL bar imports it. The
+//! other direction is the cURL target in `codegen`.
 
-use crate::http::{build, error_chain};
-use crate::model::{Auth, Body, KeyValue, Request};
-
-/// A curl command for an already-resolved request. Derived from `http::build`, so it
-/// carries exactly the headers, auth and body that Send would. POSIX shell quoting.
-pub fn to_curl(mut req: Request) -> Result<String, String> {
-    // Client::new panics without a provider, and nothing may have been sent yet.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    // A multipart body is a stream with a random boundary; curl builds its own from -F.
-    let parts = match std::mem::take(&mut req.body) {
-        Body::Multipart { parts } => parts,
-        body => {
-            req.body = body;
-            Vec::new()
-        }
-    };
-    // curl answers the Digest challenge itself; OAuth 2.0 needs a token fetched by Send.
-    let mut digest = None;
-    match std::mem::take(&mut req.auth) {
-        Auth::Digest { username, password } => digest = Some(format!("{username}:{password}")),
-        Auth::OAuth2(o) => {
-            let token = crate::auth::cached_token(&o)
-                .unwrap_or_else(|| "<press Send once to fetch a token>".into());
-            req.auth = Auth::Bearer { token };
-        }
-        auth => req.auth = auth,
-    }
-    let wire = build(&reqwest::Client::new(), req)?
-        .build()
-        .map_err(|e| error_chain(&e))?;
-    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
-    let mut out = String::from("curl");
-    match wire.method().as_str() {
-        "GET" => {}
-        // `-X HEAD` makes curl wait for a body that never comes.
-        "HEAD" => out.push_str(" --head"),
-        m => out.push_str(&format!(" -X {m}")),
-    }
-    if let Some(user) = digest {
-        out.push_str(&format!(" --digest -u {}", quote(&user)));
-    }
-    out.push(' ');
-    out.push_str(&quote(wire.url().as_str()));
-    for (k, v) in wire.headers() {
-        let line = format!("{k}: {}", String::from_utf8_lossy(v.as_bytes()));
-        out.push_str(&format!(" \\\n  -H {}", quote(&line)));
-    }
-    if let Some(body) = wire.body().and_then(|b| b.as_bytes()) {
-        let body = String::from_utf8_lossy(body);
-        out.push_str(&format!(" \\\n  --data-raw {}", quote(&body)));
-    }
-    for p in parts.iter().filter(|p| p.enabled && !p.key.is_empty()) {
-        // --form-string sends text as is; -F would treat `;` and a leading `<` specially.
-        let flag = if p.value.starts_with('@') {
-            "-F"
-        } else {
-            "--form-string"
-        };
-        let part = quote(&format!("{}={}", p.key, p.value));
-        out.push_str(&format!(" \\\n  {flag} {part}"));
-    }
-    Ok(out)
-}
+use crate::model::{Auth, Body, HttpVersion, KeyValue, Request};
 
 /// Options whose value we don't use but must skip, so it isn't taken for the URL.
 const IGNORED_WITH_VALUE: &[&str] = &[
@@ -71,8 +9,6 @@ const IGNORED_WITH_VALUE: &[&str] = &[
     "--output",
     "-x",
     "--proxy",
-    "-m",
-    "--max-time",
     "--connect-timeout",
     "--cacert",
     "--capath",
@@ -97,7 +33,6 @@ const IGNORED_WITH_VALUE: &[&str] = &[
     "--config",
     "-D",
     "--dump-header",
-    "--max-redirs",
     "--limit-rate",
     "--interface",
     "-y",
@@ -203,10 +138,25 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
             "-I" | "--head" => head = true,
             "--digest" => digest = true,
             "-G" | "--get" => get = true,
+            // The request's settings. -L is left alone: Send follows redirects anyway, and
+            // devtools never adds it.
+            "-k" | "--insecure" => req.settings.verify_tls = false,
+            "--http1.1" => req.settings.http_version = HttpVersion::Http1,
+            "--http2" | "--http2-prior-knowledge" => req.settings.http_version = HttpVersion::Http2,
+            "-m" | "--max-time" => {
+                let v = value()?;
+                let secs: f64 = v.parse().map_err(|_| format!("{flag} {v} isn't seconds"))?;
+                req.settings.timeout_ms = (secs * 1000.0).round() as u64;
+            }
+            "--max-redirs" => {
+                let v = value()?;
+                req.settings.max_redirects =
+                    v.parse().map_err(|_| format!("{flag} {v} isn't a count"))?;
+            }
             f if IGNORED_WITH_VALUE.contains(&f) => {
                 value()?;
             }
-            f if f.starts_with('-') && f.len() > 1 => {} // -s, -L, --compressed, -k, …
+            f if f.starts_with('-') && f.len() > 1 => {} // -s, -L, --compressed, …
             _ if url.is_none() => url = Some(word),
             _ => return Err(format!("unexpected argument \"{word}\"")),
         }
@@ -412,6 +362,11 @@ fn uncaret(cmd: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Settings;
+
+    fn to_curl(req: Request) -> Result<String, String> {
+        crate::codegen::generate("cURL", req)
+    }
 
     #[test]
     fn curl_export_carries_auth_body_and_survives_shell_quoting() {
@@ -430,7 +385,7 @@ mod tests {
         let exported = to_curl(req).unwrap();
         assert_eq!(
             exported,
-            r#"curl -X POST 'http://api.test/users?q=a%20b' \
+            r#"curl --location -X POST 'http://api.test/users?q=a%20b' \
   -H 'x-note: it'\''s' \
   -H 'authorization: Bearer t0k' \
   -H 'content-type: application/json' \
@@ -446,7 +401,40 @@ mod tests {
             url: "http://x/".into(),
             ..Default::default()
         };
-        assert_eq!(to_curl(head).unwrap(), "curl --head 'http://x/'");
+        assert_eq!(to_curl(head).unwrap(), "curl --location --head 'http://x/'");
+    }
+
+    #[test]
+    fn request_settings_survive_copy_and_paste_as_curl() {
+        let settings = Settings {
+            http_version: HttpVersion::Http2,
+            max_redirects: 3,
+            verify_tls: false,
+            timeout_ms: 1500,
+            ..Default::default()
+        };
+        let req = Request {
+            url: "http://h/".into(),
+            settings: settings.clone(),
+            ..Default::default()
+        };
+        let exported = to_curl(req).unwrap();
+        // Plain http has no TLS to negotiate HTTP/2 in, so it must be prior knowledge.
+        assert_eq!(
+            exported,
+            "curl --location --max-redirs 3 --insecure --http2-prior-knowledge --max-time 1.5 'http://h/'"
+        );
+        assert_eq!(from_curl(&exported).unwrap().settings, settings);
+        let req = Request {
+            url: "http://h/".into(),
+            settings: Settings {
+                follow_redirects: false,
+                http_version: HttpVersion::Http1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(to_curl(req).unwrap(), "curl --http1.1 'http://h/'");
     }
 
     #[test]
@@ -523,7 +511,7 @@ mod tests {
         assert_eq!(req.auth, digest);
         assert_eq!(
             to_curl(req).unwrap(),
-            "curl --digest -u 'u:p w' 'http://h/x'"
+            "curl --location --digest -u 'u:p w' 'http://h/x'"
         );
         // Multipart: files by path, text kept literally, and it round-trips.
         let req = from_curl(
@@ -544,7 +532,7 @@ mod tests {
         let exported = to_curl(req).unwrap();
         assert_eq!(
             exported,
-            "curl -X POST 'http://h/up' \\\n  -F 'doc=@files/a b.pdf' \\\n  --form-string 'note=x;y'"
+            "curl --location -X POST 'http://h/up' \\\n  -F 'doc=@files/a b.pdf' \\\n  --form-string 'note=x;y'"
         );
         assert_eq!(
             from_curl(&exported).unwrap().body,
