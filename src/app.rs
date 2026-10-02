@@ -31,6 +31,13 @@ const FILTER_HINT: &str = "Filter by name";
 const MAX_LINE: usize = 4096;
 const RED: Color32 = Color32::from_rgb(220, 80, 80);
 const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
+const ENV_COLORS: [(&str, Color32); 5] = [
+    ("Red", RED),
+    ("Orange", ORANGE),
+    ("Green", Color32::from_rgb(80, 180, 100)),
+    ("Blue", Color32::from_rgb(70, 130, 220)),
+    ("Purple", Color32::from_rgb(160, 100, 220)),
+];
 
 enum Msg {
     Response(PathBuf, Box<Outcome>),
@@ -524,6 +531,8 @@ pub struct App {
     wrap_response: bool,
     /// The response beside the request instead of under it (Postman's two-pane view).
     side_by_side: bool,
+    hide_sidebar: bool,
+    env_colors: HashMap<String, [u8; 3]>,
     mock: Option<MockServer>,
     active_env: Option<String>,
     vars: HashMap<String, String>,
@@ -581,6 +590,8 @@ impl App {
                 .unwrap_or_else(|| "cURL".into()),
             wrap_response: state.wrap_response,
             side_by_side: state.side_by_side,
+            hide_sidebar: state.hide_sidebar,
+            env_colors: state.env_colors.clone(),
             mock: None,
             ws,
             active_env: None,
@@ -693,6 +704,8 @@ impl App {
             code_lang: self.code_lang.clone(),
             wrap_response: self.wrap_response,
             side_by_side: self.side_by_side,
+            hide_sidebar: self.hide_sidebar,
+            env_colors: self.env_colors.clone(),
         });
     }
 
@@ -718,6 +731,14 @@ impl App {
             let _ = tx.send(Msg::Status(msg));
             ctx.request_repaint();
         });
+    }
+
+    fn env_color(&self) -> Option<Color32> {
+        let rgb = self
+            .active_env
+            .as_ref()
+            .and_then(|e| self.env_colors.get(e))?;
+        Some(Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
     }
 
     fn set_env(&mut self, name: Option<String>) {
@@ -1739,10 +1760,19 @@ impl eframe::App for App {
             self.dialog = Some(Dialog::Unsaved(Next::Quit));
         }
 
+        // The active environment's colour across the top: hard to miss when it's prod.
+        if let Some(color) = self.env_color() {
+            egui::Panel::top("env-color")
+                .exact_size(3.0)
+                .frame(egui::Frame::NONE.fill(color))
+                .show(ui, |_| {});
+        }
         self.status_bar(ui);
-        egui::Panel::left("sidebar")
-            .default_size(260.0)
-            .show(ui, |ui| self.sidebar(ui));
+        if !self.hide_sidebar {
+            egui::Panel::left("sidebar")
+                .default_size(260.0)
+                .show(ui, |ui| self.sidebar(ui));
+        }
         egui::CentralPanel::default().show(ui, |ui| self.main_area(ui));
         // Editing turns a preview tab into a normal one, as in VS Code.
         let dirty = self.open.as_ref().filter(|o| o.dirty());
@@ -1788,6 +1818,15 @@ impl App {
                     .clicked()
                 {
                     self.network_editor = Some(self.network.clone());
+                }
+                ui.separator();
+                let mut sidebar = !self.hide_sidebar;
+                if (ui.toggle_value(&mut sidebar, "Sidebar"))
+                    .on_hover_text("Show or hide collections and history, for more room")
+                    .changed()
+                {
+                    self.hide_sidebar = !sidebar;
+                    self.save_state();
                 }
                 ui.separator();
                 if ui
@@ -1860,10 +1899,14 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            let label = self
-                .active_env
-                .clone()
-                .unwrap_or_else(|| "No environment".into());
+            let mut label = RichText::new(
+                self.active_env
+                    .clone()
+                    .unwrap_or_else(|| "No environment".into()),
+            );
+            if let Some(color) = self.env_color() {
+                label = label.color(color).strong();
+            }
             let mut chosen = None;
             egui::ComboBox::from_id_salt("env")
                 .selected_text(label)
@@ -1886,6 +1929,31 @@ impl App {
                 });
             if let Some(env) = chosen {
                 self.set_env(env);
+            }
+            if let Some(name) = self.active_env.clone() {
+                let dot = RichText::new("●").color(self.env_color().unwrap_or(Color32::GRAY));
+                ui.menu_button(dot, |ui| {
+                    let mut pick = |ui: &mut egui::Ui, label: RichText, rgb: Option<[u8; 3]>| {
+                        if ui.button(label).clicked() {
+                            match rgb {
+                                Some(rgb) => self.env_colors.insert(name.clone(), rgb),
+                                None => self.env_colors.remove(&name),
+                            };
+                            self.save_state();
+                            ui.close();
+                        }
+                    };
+                    for (label, c) in ENV_COLORS {
+                        pick(
+                            ui,
+                            RichText::new(format!("● {label}")).color(c),
+                            Some([c.r(), c.g(), c.b()]),
+                        );
+                    }
+                    pick(ui, RichText::new("None"), None);
+                })
+                .response
+                .on_hover_text("Colour this environment, e.g. prod in red");
             }
             if let Some(name) = self.active_env.clone()
                 && ui
@@ -7318,6 +7386,40 @@ mod ui_tests {
         assert!(h.query_by_label("Auth URL").is_some());
         assert!(h.query_by_label("Redirect URI").is_some());
         assert!(h.query_by_label_contains("opens your browser").is_some());
+    }
+
+    #[test]
+    fn the_sidebar_folds_away_and_prod_can_be_painted_red() {
+        let ws = workspace("env-color");
+        ws.create_request(&ws.collections(), "r").unwrap();
+        ws.save_env(Some("prod"), &[], &[]).unwrap();
+        let mut h = harness(ws);
+        h.state_mut().set_env(Some("prod".into()));
+        h.run();
+        h.get_by_label("Sidebar").click();
+        h.run();
+        assert!(h.query_by_label("+ Request").is_none(), "the tree is gone");
+        assert!(h.state().ws.load_state().hide_sidebar, "and stays gone");
+        h.get_by_label("Sidebar").click();
+        h.run();
+        h.get_by_label("●").click();
+        h.run();
+        h.get_by_label("● Red").click();
+        h.run();
+        shot(&mut h, "58-env-color");
+        assert_eq!(h.state().env_color(), Some(RED));
+        let kept = h.state().ws.load_state().env_colors;
+        assert_eq!(kept.get("prod"), Some(&[RED.r(), RED.g(), RED.b()]));
+        // Other environments aren't painted.
+        h.state_mut().set_env(None);
+        assert_eq!(h.state().env_color(), None);
+        h.state_mut().set_env(Some("prod".into()));
+        h.run();
+        h.get_by_label("●").click();
+        h.run();
+        h.get_by_label("None").click();
+        h.run();
+        assert_eq!(h.state().env_color(), None);
     }
 
     #[test]

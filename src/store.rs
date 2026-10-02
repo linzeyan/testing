@@ -136,6 +136,10 @@ pub struct State {
     pub code_lang: String,
     pub wrap_response: bool,
     pub side_by_side: bool,
+    pub hide_sidebar: bool,
+    /// By environment name. ponytail: a renamed or deleted environment leaves its entry
+    /// behind; harmless, prune it if the list ever matters.
+    pub env_colors: HashMap<String, [u8; 3]>,
 }
 
 /// Clones share one connection: the GUI's mock server reads from its own thread.

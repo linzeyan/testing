@@ -41,7 +41,9 @@ such as Citrix VDI. No installer: unzip and run.
   double-click or editing keeps the tab, Ctrl+W closes; right-click a tab to duplicate it or
   close others, those to the right or all, which leaves tabs with unsaved edits open);
   hover the status code for what it means and the size for headers vs body; "Side by side"
-  in the status bar puts the response beside the request (kept across restarts); Markdown API docs from
+  in the status bar puts the response beside the request and "Sidebar" folds the tree away
+  (both kept across restarts); an environment can have a colour (prod in red) shown on its
+  selector and as a strip across the top; Markdown API docs from
   request/folder descriptions and saved examples (right-click a folder > "Copy docs as
   Markdown", or `apitool-cli docs [folder] [-o api.md]`); a local mock server answering
   with saved examples (right-click a folder > "Start mock server", or
