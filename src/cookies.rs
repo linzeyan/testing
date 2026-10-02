@@ -2,7 +2,6 @@
 //! (redirect hops included) and sent back to matching URLs. A request with its own Cookie
 //! header sends only that.
 
-use std::path::Path;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use cookie_store::{CookieStore, RawCookie};
@@ -31,21 +30,18 @@ impl Jar {
         self.0.write().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A missing or unreadable file is an empty jar: cookies are a cache the server refills.
-    pub fn load(path: &Path) -> Self {
-        let store = std::fs::File::open(path)
-            .ok()
-            .and_then(|f| cookie_store::serde::json::load_all(std::io::BufReader::new(f)).ok())
-            .unwrap_or_default();
+    /// Missing or unreadable JSON is an empty jar: cookies are a cache the server refills.
+    pub fn from_json(json: &str) -> Self {
+        let store = cookie_store::serde::json::load_all(json.as_bytes()).unwrap_or_default();
         Self(RwLock::new(store))
     }
 
     /// Session cookies are kept too: in an API client, "logged in" should survive a restart.
-    pub fn save(&self, path: &Path) -> Result<(), String> {
+    pub fn to_json(&self) -> Result<String, String> {
         let mut out = Vec::new();
         cookie_store::serde::json::save_incl_expired_and_nonpersistent(&self.read(), &mut out)
             .map_err(|e| format!("cookies: {e}"))?;
-        std::fs::write(path, out).map_err(|e| format!("cookies: {e}"))
+        String::from_utf8(out).map_err(|e| format!("cookies: {e}"))
     }
 
     /// Unexpired cookies, by domain then name.

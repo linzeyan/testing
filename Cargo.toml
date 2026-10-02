@@ -32,6 +32,8 @@ sha2 = "0.11"
 # reqwest's own cookie store; used directly to list, delete and persist cookies.
 cookie_store = "0.22"
 toml = "1"
+# The workspace store. Bundled: no system SQLite on Windows, and one version everywhere.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [target."cfg(windows)".dependencies]
 # WinHTTP reads IE/Edge proxy settings and does WPAD discovery the way the OS does.

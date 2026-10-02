@@ -394,7 +394,7 @@ impl App {
             history: ws.load_history(),
             show_history: false,
             tree_filter: String::new(),
-            cookies: Arc::new(Jar::load(&ws.cookies_path())),
+            cookies: Arc::new(Jar::from_json(&ws.load_cookies())),
             cookie_manager: false,
             code: false,
             code_lang: Some(state.code_lang)
@@ -440,9 +440,9 @@ impl App {
         };
         let env = state.active_env.filter(|e| app.envs.contains(e));
         app.set_env(env);
-        let tabs = state.tabs.into_iter().filter(|p| p.exists());
+        let tabs = state.tabs.into_iter().filter(|p| app.ws.exists(p));
         app.tabs = tabs.map(|p| Tab::new(p, false)).collect();
-        if let Some(path) = state.open.filter(|p| p.exists()) {
+        if let Some(path) = state.open.filter(|p| app.ws.exists(p)) {
             app.activate(path, true);
         }
         app
@@ -572,7 +572,7 @@ impl App {
                     open.name()
                 )
             }
-            Err(_) if !open.path.exists() => {
+            Err(_) if !self.ws.exists(&open.path) => {
                 self.status = format!("{} was deleted on disk; Save recreates it", open.name())
             }
             Err(e) => self.status = e,
@@ -748,7 +748,8 @@ impl App {
     }
 
     fn save_cookies(&mut self) {
-        if let Err(e) = self.cookies.save(&self.ws.cookies_path()) {
+        let saved = self.cookies.to_json();
+        if let Err(e) = saved.and_then(|json| self.ws.save_cookies(&json)) {
             self.status = e;
         }
     }
@@ -1493,7 +1494,7 @@ impl App {
             Ok(new) => {
                 self.reload();
                 self.status = format!("Duplicated as \"{}\"", self.ws.display_name(&new));
-                if new.is_file() && !self.runner_busy() {
+                if crate::store::is_request(&new) && !self.runner_busy() {
                     self.runner = None;
                     self.activate(new, true);
                 }
@@ -1609,7 +1610,7 @@ impl App {
         if let Some(i) = restore {
             let e = &self.history[i];
             match self.ws.request_path(&e.path) {
-                Ok(path) if path.is_file() => {
+                Ok(path) if self.ws.exists(&path) => {
                     let draft = Box::new(e.request.clone());
                     self.runner = None;
                     self.restore(path, draft);
@@ -2208,7 +2209,7 @@ impl App {
                 }
                 Dialog::Delete(path) => {
                     ui.heading("Delete");
-                    let what = if path.is_dir() {
+                    let what = if !crate::store::is_request(path) {
                         "folder and everything in it"
                     } else {
                         "request"
@@ -5041,7 +5042,7 @@ mod ui_tests {
             shown.text
         );
         // Survives a restart.
-        let saved = std::fs::read_to_string(h.state().ws.cookies_path()).unwrap();
+        let saved = h.state().ws.load_cookies();
         assert!(saved.contains("sid"), "{saved}");
 
         h.get_by_label("Cookies").click();
@@ -5050,11 +5051,7 @@ mod ui_tests {
         h.get_by_label("🗑").click();
         h.run();
         assert!(h.state().cookies.rows().is_empty());
-        assert!(
-            !std::fs::read_to_string(h.state().ws.cookies_path())
-                .unwrap()
-                .contains("sid")
-        );
+        assert!(!h.state().ws.load_cookies().contains("sid"));
     }
 
     /// As if the open request had just been sent and answered 200 with this body.
@@ -5227,13 +5224,9 @@ mod ui_tests {
         type_into(&mut h, key + 1, "k-123");
         modal_save(&mut h);
         h.run();
-        let root = h.state().ws.root.clone();
         assert_eq!(h.state().globals["apiKey"], "k-123");
-        assert!(
-            std::fs::read_to_string(root.join("globals.toml"))
-                .unwrap()
-                .contains("k-123")
-        );
+        let reopened = Workspace::open(h.state().ws.root.clone()).unwrap();
+        assert_eq!(reopened.env_vars(None).unwrap()["apiKey"], "k-123");
         h.get_by_label("👁").click();
         h.run();
         shot(&mut h, "21-quick-look");

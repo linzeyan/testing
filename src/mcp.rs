@@ -50,7 +50,7 @@ fn error(id: Value, code: i32, message: &str) -> Value {
 struct Server {
     ws: Workspace,
     rt: tokio::runtime::Runtime,
-    /// Rebuilt when the network settings in .state.toml change (the GUI edits them).
+    /// Rebuilt when the network settings in the workspace state change (the GUI edits them).
     client: Option<(Network, Clients)>,
 }
 
@@ -181,17 +181,14 @@ impl Server {
             return Err(format!("method must be one of {:?}", model::METHODS));
         }
         req.sync_params();
-        let existed = path.exists();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("create folder: {e}"))?;
-        }
+        let existed = self.ws.exists(&path);
         self.ws.save_request(&path, &req)?;
         Ok(json!({ "path": self.ws.display_name(&path), "created": !existed }))
     }
 
     fn delete_request(&self, args: &Value) -> Result<Value, String> {
         let path = self.ws.request_path(required(args, "path")?)?;
-        if !path.is_file() {
+        if !self.ws.exists(&path) {
             return Err(format!("no request at {}", self.ws.display_name(&path)));
         }
         self.ws.delete(&path)?;
@@ -360,7 +357,7 @@ impl Server {
             None => self.ws.collections(),
             Some(p) => {
                 let folder = self.ws.collections().join(p.trim_matches('/'));
-                if folder.is_dir() {
+                if self.ws.exists(&folder) {
                     folder
                 } else {
                     self.ws.request_path(p)?

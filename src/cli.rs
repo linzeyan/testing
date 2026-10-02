@@ -7,13 +7,14 @@ use std::time::Duration;
 use crate::runner::{self, RunPlan, Vars};
 use crate::{net, store};
 
-const USAGE: &str = "usage: apitool-cli <collection|folder|request.toml> [options]
+const USAGE: &str = "usage: apitool-cli <folder|request> [options]
        apitool-cli mcp [--workspace <dir>]
-       apitool-cli docs [collection|folder] [--workspace <dir>] [-o <file.md>]
-       apitool-cli mock [collection|folder] [--workspace <dir>] [--port <n>]
+       apitool-cli docs [folder] [--workspace <dir>] [-o <file.md>]
+       apitool-cli mock [folder] [--workspace <dir>] [--port <n>]
 
-Runs every request under the path (relative to the current directory, or to the
-workspace's collections/ folder) and exits with 1 if any request or test fails.
+Runs every request under the folder or request, named as in the tree (`users`,
+`users/get user`; `.` is the whole collection), and exits with 1 if any request or
+test fails.
 
 `mcp` serves the workspace to an LLM client (Model Context Protocol over stdio).
 `docs` writes Markdown API docs (default: the whole collection, to stdout).
@@ -87,14 +88,11 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         }
     }
     let target = target.ok_or_else(|| USAGE.to_owned())?;
-    let (target_abs, data) = (
-        absolute(&target)?,
-        data.as_deref().map(absolute).transpose()?,
-    );
+    let data = data.as_deref().map(absolute).transpose()?;
     let junit = junit.as_deref().map(absolute).transpose()?;
 
     let ws = store::open_workspace(workspace)?;
-    let requests = ws.load_requests_in(&scope(&ws, target_abs, &target))?;
+    let requests = ws.load_requests_in(&scope(&ws, &target))?;
     let env = match env {
         Some(name) if !ws.env_names().contains(&name) => {
             return Err(format!("unknown environment \"{name}\""));
@@ -164,13 +162,11 @@ fn run(args: Vec<String>) -> Result<bool, String> {
     Ok(failed == 0)
 }
 
-/// A path as given on the command line, or else inside the collections folder.
-fn scope(ws: &store::Workspace, absolute: PathBuf, given: &Path) -> PathBuf {
-    if absolute.exists() {
-        absolute
-    } else {
-        ws.collections().join(given)
-    }
+/// A request ("users/get user", ".toml" or not) or else a folder of the collection.
+fn scope(ws: &store::Workspace, given: &Path) -> PathBuf {
+    let request = ws.request_path(&given.to_string_lossy()).ok();
+    let request = request.filter(|p| ws.exists(p));
+    request.unwrap_or_else(|| ws.collections().join(given))
 }
 
 /// `[collection|folder]` plus `--option value` pairs, for `docs` and `mock`.
@@ -201,11 +197,10 @@ fn open_folder(
     target: Option<PathBuf>,
     values: &HashMap<String, String>,
 ) -> Result<(store::Workspace, PathBuf), String> {
-    let target_abs = target.as_deref().map(absolute).transpose()?;
     let ws = store::open_workspace(values.get("--workspace").map(PathBuf::from))?;
-    let dir = match (target_abs, target) {
-        (Some(abs), Some(given)) => scope(&ws, abs, &given),
-        _ => ws.collections(),
+    let dir = match target {
+        Some(given) => scope(&ws, &given),
+        None => ws.collections(),
     };
     Ok((ws, dir))
 }
@@ -314,17 +309,16 @@ mod tests {
         let dir = ws.join("collections/smoke");
         std::fs::create_dir_all(&dir).unwrap();
         let url = crate::http::tests::echo_server();
-        let write = |name: &str, status: u16| {
-            let req = crate::model::Request {
-                url: url.clone(),
-                tests: format!(
-                    "pm.test('status', function () {{ pm.response.to.have.status({status}); }});"
-                ),
-                ..Default::default()
-            };
-            std::fs::write(dir.join(name), toml::to_string(&req).unwrap()).unwrap();
+        let request = |status: u16| crate::model::Request {
+            url: url.clone(),
+            tests: format!(
+                "pm.test('status', function () {{ pm.response.to.have.status({status}); }});"
+            ),
+            ..Default::default()
         };
-        write("a.toml", 200);
+        // A CI checkout has the exported files and no database yet.
+        let text = toml::to_string(&request(200)).unwrap();
+        std::fs::write(dir.join("a.toml"), text).unwrap();
         let args = |target: &str| {
             vec![
                 target.to_owned(),
@@ -334,7 +328,14 @@ mod tests {
         };
         // A CI job relies on this: green only when every test passed.
         assert_eq!(run(args("smoke")), Ok(true));
-        write("b.toml", 404);
+        let workspace = store::Workspace::open(ws.clone()).unwrap();
+        let b = workspace.request_path("smoke/b").unwrap();
+        workspace.save_request(&b, &request(404)).unwrap();
+        assert_eq!(
+            run(args("smoke/b")),
+            Ok(false),
+            "a single request by its tree name"
+        );
         let report = ws.join("report.xml");
         let mut with_junit = args("smoke");
         with_junit.extend(["--junit".into(), report.display().to_string()]);
