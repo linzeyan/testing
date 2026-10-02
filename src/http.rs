@@ -20,6 +20,14 @@ pub struct Sent {
     pub remote: Option<String>,
 }
 
+/// Only used to build requests, never to send: the code panel and the Headers tab rebuild
+/// every frame, and a client loads root certificates and system proxies when made.
+pub(crate) static OFFLINE: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    // Client::new panics without a provider, and nothing may have been sent yet.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::new()
+});
+
 /// The Timeline keeps this much of a request body.
 const MAX_SENT_BODY: usize = 64 << 10;
 
@@ -369,6 +377,58 @@ impl Sent {
     }
 }
 
+/// What Send will add to the headers the user typed (`own`), with where each comes from, for
+/// the Headers tab. `req` is the resolved request. Empty when it can't be built yet.
+pub fn auto_headers(mut req: Request, own: &[KeyValue]) -> Vec<(String, String, &'static str)> {
+    let mut later = None;
+    match &req.auth {
+        Auth::OAuth2(o) => {
+            let token = crate::auth::cached_token(o).unwrap_or_else(|| "<fetched on Send>".into());
+            req.auth = Auth::Bearer { token };
+        }
+        Auth::Digest { .. } => {
+            later = Some((
+                "authorization".to_owned(),
+                "Digest … (answers the server's challenge)".to_owned(),
+            ));
+            req.auth = Auth::None;
+        }
+        _ => {}
+    }
+    let Ok(wire) = build(&OFFLINE, req).and_then(|b| b.build().map_err(|e| error_chain(&e))) else {
+        return Vec::new();
+    };
+    let mut sent = Sent {
+        url: wire.url().to_string(),
+        headers: header_list(wire.headers()),
+        ..Default::default()
+    };
+    sent.headers.extend(later);
+    sent.added(
+        None,
+        wire.body().and_then(|b| b.as_bytes()).map(<[u8]>::len),
+    );
+    let own: Vec<String> = (own.iter().filter(|h| h.enabled))
+        .map(|h| h.key.trim().to_lowercase())
+        .collect();
+    let auto = sent.headers.into_iter().filter(|(k, _)| !own.contains(k));
+    auto.map(|(k, v)| {
+        let from = match k.as_str() {
+            "host" | "accept" | "accept-encoding" => "HTTP client",
+            "content-type" | "content-length" => "Body",
+            // Authorization, or an API key's header.
+            _ => "Auth",
+        };
+        // A fresh multipart boundary each build would flicker.
+        let v = match v.split_once("boundary=") {
+            Some((head, _)) => format!("{head}boundary=…"),
+            None => v,
+        };
+        (k, v, from)
+    })
+    .collect()
+}
+
 /// Up to `MAX_BODY` bytes, decoded by the Content-Type's charset as `text()` would (Big5
 /// and friends included). `text()` itself takes whatever arrives: a 1 GB download, or a
 /// small gzip that inflates to one.
@@ -690,6 +750,79 @@ pub(crate) mod tests {
         assert!(wire.contains("content-length: 16"), "{wire}");
         assert!(wire.ends_with("\r\n\r\nnot really a png"), "{wire}");
         assert_eq!(shown(&resp), received(&resp));
+    }
+
+    /// The Headers tab's "added on Send" plus the user's own must be exactly what arrives.
+    #[test]
+    fn the_headers_tab_predicts_every_header_that_arrives() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let req = Request {
+            method: "POST".into(),
+            url: echo_server(),
+            headers: vec![
+                KeyValue::new("X-Trace", "1"),
+                KeyValue::new("Accept", "text/csv"),
+            ],
+            body: Body::Json { text: "{}".into() },
+            auth: Auth::Bearer { token: "t".into() },
+            ..Default::default()
+        };
+        let auto = auto_headers(req.clone(), &req.headers);
+        let mut predicted: Vec<String> = (auto.iter().map(|(k, ..)| k.clone()))
+            .chain(req.headers.iter().map(|h| h.key.to_lowercase()))
+            .collect();
+        predicted.sort();
+        let resp = rt.block_on(execute(client(&rt), req)).unwrap();
+        let arrived: Vec<String> = received(&resp).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(predicted, arrived);
+        let from = |name: &str| auto.iter().find(|(k, ..)| k == name).map(|(.., f)| *f);
+        assert_eq!(from("authorization"), Some("Auth"));
+        assert_eq!(from("content-type"), Some("Body"));
+        assert_eq!(from("accept"), None, "the user's own replaces it");
+
+        // A file body, built outside any runtime as the UI does.
+        let path = std::env::temp_dir().join(format!("apitool-auto-{}.png", std::process::id()));
+        std::fs::write(&path, "1234").unwrap();
+        let file = Request {
+            method: "PUT".into(),
+            url: "http://x.test/a".into(),
+            body: Body::File {
+                path: path.display().to_string(),
+            },
+            ..Default::default()
+        };
+        let auto = auto_headers(file, &[]);
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            auto.contains(&("content-type".into(), "image/png".into(), "Body")),
+            "{auto:?}"
+        );
+        assert!(
+            auto.contains(&("content-length".into(), "4".into(), "Body")),
+            "{auto:?}"
+        );
+
+        // Shown every frame: a fresh boundary each time would flicker. Digest's header
+        // only exists after the server's challenge.
+        let form = Request {
+            method: "POST".into(),
+            url: "http://x.test/a".into(),
+            body: Body::Multipart {
+                parts: vec![KeyValue::new("a", "1")],
+            },
+            auth: Auth::Digest {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            ..Default::default()
+        };
+        let auto = auto_headers(form, &[]);
+        let value = |name: &str| auto.iter().find(|(k, ..)| k == name).unwrap().1.clone();
+        assert_eq!(value("content-type"), "multipart/form-data; boundary=…");
+        assert!(value("authorization").starts_with("Digest"));
     }
 
     /// The header lines an echo server got, as (lowercase name, value), sorted.

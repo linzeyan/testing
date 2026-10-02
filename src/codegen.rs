@@ -3,9 +3,8 @@
 //! `http::build`, so every snippet carries the headers, auth and body that Send would.
 
 use std::fmt::Write as _;
-use std::sync::LazyLock;
 
-use crate::http::{build, error_chain};
+use crate::http::{OFFLINE, build, error_chain};
 use crate::model::{Auth, Body, HttpVersion, Request, Settings};
 
 type Generator = fn(&Wire) -> String;
@@ -61,14 +60,6 @@ enum Part {
     File(String),
 }
 
-/// Only used to build requests, never to send. The code panel regenerates every frame,
-/// and a client loads root certificates and system proxies when made.
-static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    // Client::new panics without a provider, and nothing may have been sent yet.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::new()
-});
-
 impl Wire {
     fn new(mut req: Request) -> Result<Self, String> {
         // ponytail: no generator writes a file body yet; add per language when asked for.
@@ -101,7 +92,7 @@ impl Wire {
             auth => req.auth = auth,
         }
         let settings = req.settings.clone();
-        let wire = build(&CLIENT, req)?.build().map_err(|e| error_chain(&e))?;
+        let wire = build(&OFFLINE, req)?.build().map_err(|e| error_chain(&e))?;
         let headers = wire
             .headers()
             .iter()

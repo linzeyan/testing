@@ -2609,6 +2609,8 @@ impl App {
                     }
                     ReqTab::Headers => {
                         kv_table(ui, "headers", &mut open.draft.headers, &all_vars, true);
+                        let (wire, _) = open.draft.resolved(&all_vars);
+                        auto_headers_ui(ui, http::auto_headers(wire, &open.draft.headers));
                     }
                     ReqTab::Body => {
                         // GRAPHQL requests are always a query; no body type to pick.
@@ -4023,6 +4025,31 @@ const CONTENT_TYPES: &[(&str, &str)] = &[
     ("text/csv", ""),
     ("application/octet-stream", "raw bytes"),
 ];
+
+/// What Send adds to the user's headers, greyed and folded away by default like Postman's
+/// hidden headers: they explain the Timeline without crowding the table.
+fn auto_headers_ui(ui: &mut egui::Ui, auto: Vec<(String, String, &str)>) {
+    if auto.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    let title = RichText::new(format!("{} added on Send", auto.len())).weak();
+    egui::CollapsingHeader::new(title)
+        .id_salt("auto-headers")
+        .show(ui, |ui| {
+            egui::Grid::new("auto-headers-grid")
+                .num_columns(3)
+                .spacing([16.0, 4.0])
+                .show(ui, |ui| {
+                    for (name, value, from) in auto {
+                        ui.weak(name);
+                        ui.weak(clip(&value, 80)).on_hover_text(value);
+                        ui.weak(format!("from {from}"));
+                        ui.end_row();
+                    }
+                });
+        });
+}
 
 /// Key/value grid with a trailing blank row: typing into it creates a new row, like Postman.
 /// `describe` marks a request table: it gets a Description column (variables have none,
@@ -6841,6 +6868,25 @@ mod ui_tests {
         std::fs::remove_file(&file).unwrap();
         h.run();
         assert!(h.query_by_label_contains("File not found").is_some());
+    }
+
+    #[test]
+    fn the_headers_tab_lists_what_send_adds() {
+        let mut h = with_request("auto-headers");
+        let draft = &mut h.state_mut().open.as_mut().unwrap().draft;
+        draft.url = "http://api.test/a".into();
+        draft.auth = Auth::Bearer {
+            token: "t0k".into(),
+        };
+        h.state_mut().req_tab = ReqTab::Headers;
+        h.run();
+        // Folded away until asked for: host, authorization, accept, accept-encoding.
+        assert!(h.query_by_label("from Auth").is_none());
+        h.get_by_label_contains("added on Send").click();
+        h.run();
+        shot(&mut h, "52-auto-headers");
+        assert!(h.query_by_label("Bearer t0k").is_some());
+        assert!(h.query_by_label("from Auth").is_some());
     }
 
     #[test]
