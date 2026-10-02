@@ -99,12 +99,14 @@ pub struct Mqtt {
     /// connections with the same ID.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub client_id: String,
+    /// MQTT 5 instead of 3.1.1: reason codes on refusals and broker hang-ups.
+    pub v5: bool,
     /// 0 sends no pings.
     pub keep_alive_secs: u16,
     /// Off: the broker keeps this client ID's subscriptions and queued messages between
     /// connections.
     pub clean_session: bool,
-    /// Subscribed to on Connect.
+    /// Subscribed to on Connect, and kept in step while connected.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub topics: Vec<Topic>,
     /// Where Send publishes.
@@ -119,6 +121,7 @@ impl Default for Mqtt {
     fn default() -> Self {
         Self {
             client_id: String::new(),
+            v5: false,
             keep_alive_secs: 60,
             clean_session: true,
             topics: Vec::new(),
@@ -755,6 +758,7 @@ mod tests {
             },
             mqtt: Mqtt {
                 client_id: "{{device}}".into(),
+                v5: true,
                 keep_alive_secs: 0,
                 clean_session: false,
                 topics: vec![Topic {

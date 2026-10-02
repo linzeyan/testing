@@ -5,8 +5,9 @@ such as Citrix VDI. No installer: unzip and run.
 
 - **apitool** — the GUI. REST, GraphQL, WebSocket, SSE, MQTT and gRPC (runtime `.proto`;
   streaming methods connect like a WebSocket, and a JSON array body sends several
-  messages); MQTT 3.1.1 over TCP or TLS subscribes to the request's topics on Connect and
-  publishes from the message panel with QoS and retain; Postman-style pre-request/test
+  messages); MQTT 3.1.1 or 5 over TCP, TLS or WebSocket (`mqtt://`, `mqtts://`, `ws://`,
+  `wss://`) subscribes to the request's topics on Connect, follows changes to them while
+  connected, and publishes from the message panel with QoS and retain; Postman-style pre-request/test
   scripts (`pm.*`, chai, `jsonSchema`); collection runner with CSV/JSON data; load test
   pane; proxy/PAC/WPAD, custom CA and client certificates. JSON, text, form and multipart
   bodies (a value `@path` uploads a file); a description per param, header and form

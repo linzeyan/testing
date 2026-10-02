@@ -158,7 +158,7 @@ struct StreamSession {
 
 enum Outgoing {
     Text(tokio::sync::mpsc::UnboundedSender<String>),
-    Mqtt(tokio::sync::mpsc::UnboundedSender<crate::mqtt::Publish>),
+    Mqtt(tokio::sync::mpsc::UnboundedSender<crate::mqtt::Command>),
 }
 
 impl Drop for StreamSession {
@@ -2118,6 +2118,7 @@ impl App {
                         let default = match mqtt {
                             true => {
                                 open.draft.mqtt.client_id.is_empty()
+                                    && !open.draft.mqtt.v5
                                     && open.draft.mqtt.keep_alive_secs == 60
                                     && open.draft.mqtt.clean_session
                             }
@@ -2199,7 +2200,13 @@ impl App {
                         ReqTab::Settings => {
                             settings_editor(ui, &mut open.draft.settings, self.network.timeout_secs)
                         }
-                        ReqTab::Topics => topics_editor(ui, &mut open.draft.mqtt.topics, live),
+                        ReqTab::Topics => {
+                            if topics_editor(ui, &mut open.draft.mqtt.topics, live)
+                                && let Some(s) = session.as_deref()
+                            {
+                                s.resubscribe(&open.draft, &all_vars);
+                            }
+                        }
                         ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
                         ReqTab::Docs => docs_editor(ui, &mut open.draft.description),
                     });
@@ -3985,7 +3992,9 @@ fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
     );
 }
 
-fn qos_box(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, qos: &mut u8) {
+/// True when a QoS was picked.
+fn qos_box(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, qos: &mut u8) -> bool {
+    let before = *qos;
     egui::ComboBox::from_id_salt(id)
         .width(64.0)
         .selected_text(format!("QoS {qos}"))
@@ -3996,27 +4005,34 @@ fn qos_box(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, qos: &
         })
         .response
         .on_hover_text("0: at most once · 1: at least once · 2: exactly once");
+    *qos != before
 }
 
-fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) {
+/// True when an edit is complete (a box ticked, a QoS picked, a row removed, a filter
+/// left): the moment a live connection should follow. Not every keystroke: "a/b" would
+/// subscribe to "a" and "a/" on the way.
+fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) -> bool {
     ui.weak(match live {
-        true => "Changes apply on the next Connect.",
+        true => "Connected: a change is (un)subscribed as soon as you finish it.",
         false => "Subscribed to on Connect. + matches one level, # everything below.",
     });
+    let mut done = false;
     let mut remove = None;
     egui::Grid::new("topics")
         .num_columns(4)
         .spacing([8.0, 6.0])
         .show(ui, |ui| {
             for (i, t) in topics.iter_mut().enumerate() {
-                ui.checkbox(&mut t.enabled, "");
-                ui.add(
-                    egui::TextEdit::singleline(&mut t.filter)
-                        .hint_text("sensors/+/temperature")
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(320.0),
-                );
-                qos_box(ui, ("topic-qos", i), &mut t.qos);
+                done |= ui.checkbox(&mut t.enabled, "").changed();
+                done |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut t.filter)
+                            .hint_text("sensors/+/temperature")
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(320.0),
+                    )
+                    .lost_focus();
+                done |= qos_box(ui, ("topic-qos", i), &mut t.qos);
                 if ui.small_button("🗑").on_hover_text("Remove").clicked() {
                     remove = Some(i);
                 }
@@ -4025,10 +4041,12 @@ fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) 
         });
     if let Some(i) = remove {
         topics.remove(i);
+        done = true;
     }
     if ui.small_button("+ Topic").clicked() {
         topics.push(model::Topic::default());
     }
+    done
 }
 
 fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
@@ -4036,6 +4054,17 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
         .num_columns(3)
         .spacing([16.0, 10.0])
         .show(ui, |ui| {
+            ui.label("Version");
+            egui::ComboBox::from_id_salt("mqtt-version")
+                .width(80.0)
+                .selected_text(if m.v5 { "5.0" } else { "3.1.1" })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut m.v5, false, "3.1.1");
+                    ui.selectable_value(&mut m.v5, true, "5.0");
+                });
+            ui.weak("5.0 says why a broker refuses or hangs up");
+            ui.end_row();
+
             ui.label("Client ID");
             ui.add(
                 egui::TextEdit::singleline(&mut m.client_id)
@@ -4060,7 +4089,7 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
             ui.end_row();
         });
     ui.add_space(8.0);
-    ui.weak("Username and password go in Auth (Basic). mqtts:// trusts the system's certificates and the CA file in Network settings.");
+    ui.weak("Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// trust the system's certificates and the CA file in Network settings.");
 }
 
 fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_secs: u64) {
@@ -4467,15 +4496,24 @@ impl StreamSession {
                 if topic.contains(['+', '#']) {
                     return Err("+ and # are for subscribing; publish to one topic".into());
                 }
-                let _ = tx.send(crate::mqtt::Publish {
+                let _ = tx.send(crate::mqtt::Command::Publish(crate::mqtt::Publish {
                     topic,
                     qos: m.qos,
                     retain: m.retain,
                     payload: self.compose.clone(),
-                });
+                }));
             }
         }
         Ok(())
+    }
+
+    /// MQTT: has the live connection follow the request's topics.
+    fn resubscribe(&self, req: &Request, vars: &HashMap<String, String>) {
+        if let Some(Outgoing::Mqtt(tx)) = &self.outgoing {
+            let (req, _) = req.resolved(vars);
+            let want = req.mqtt.topics.into_iter().map(|t| (t.filter, t.qos));
+            let _ = tx.send(crate::mqtt::Command::Topics(want.collect()));
+        }
     }
 }
 
@@ -5747,6 +5785,18 @@ mod ui_tests {
         h.get_by_label("Send").click();
         wait_live(&mut h, |app| got(app, "[a/echo] echo cmd ping"));
         shot(&mut h, "33-mqtt");
+
+        // Unticking a topic while connected unsubscribes it then and there.
+        let ticks: Vec<_> = h.get_all_by_role(Role::CheckBox).collect();
+        assert_eq!(
+            ticks[1].accesskit_node().toggled(),
+            Some(egui::accesskit::Toggled::True)
+        );
+        ticks[1].click();
+        wait_live(&mut h, |app| {
+            let events = &app.stream.as_ref().unwrap().events;
+            (events.iter()).any(|(_, e)| *e == Event::Info("unsubscribed: denied".into()))
+        });
 
         h.get_by_label("Disconnect").click();
         wait(&mut h, |app| !app.stream.as_ref().unwrap().live);

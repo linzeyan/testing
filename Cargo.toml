@@ -35,7 +35,7 @@ toml = "1"
 # The workspace store. Bundled: no system SQLite on Windows, and one version everywhere.
 rusqlite = { version = "0.40", features = ["bundled"] }
 # MQTT client. No provider of its own: TLS uses the ring one net.rs installs.
-rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider", "websocket"] }
 # Already in the tree via reqwest: the OS trust store (policy-installed roots on Windows)
 # for mqtts://, as reqwest uses it for https.
 rustls-platform-verifier = "0.7"
