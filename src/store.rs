@@ -176,8 +176,31 @@ fn parent_of(key: &str) -> &str {
     key.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-/// `key` itself or anything inside it, for a folder's rows.
-const UNDER: &str = "(path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')";
+/// The rows of the request or folder `?1`. A folder may share its name with a request
+/// next to it, so only a folder takes what's inside.
+fn rows_of(request: bool) -> &'static str {
+    match request {
+        true => "path = ?1",
+        false => "(path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/')",
+    }
+}
+
+/// "<name> copy", then "<name> copy 2", …
+pub fn copy_name(name: &str, n: usize) -> String {
+    match n {
+        1 => format!("{name} copy"),
+        n => format!("{name} copy {n}"),
+    }
+}
+
+fn folder_json(folder: &Folder) -> Result<String, String> {
+    let mut folder = folder.clone();
+    folder.vars.retain(|v| !v.key.is_empty());
+    match folder == Folder::default() {
+        true => Ok(String::new()),
+        false => to_json(&folder),
+    }
+}
 
 /// Adds the folders of `key` ("a/b" → "a", "a/b") that aren't there yet.
 fn ensure_folders(db: &Connection, key: &str) -> Result<(), String> {
@@ -469,12 +492,7 @@ impl Workspace {
     }
 
     pub fn save_folder(&self, dir: &Path, folder: &Folder) -> Result<(), String> {
-        let mut folder = folder.clone();
-        folder.vars.retain(|v| !v.key.is_empty());
-        let json = match folder == Folder::default() {
-            true => String::new(),
-            false => to_json(&folder)?,
-        };
+        let json = folder_json(folder)?;
         let key = self.key(dir);
         let mut db = self.db();
         let tx = sql(db.transaction())?;
@@ -597,10 +615,10 @@ impl Workspace {
             true => &["requests"],
             false => &["folders", "requests"],
         };
+        let rows = rows_of(request);
         for table in tables {
-            // For a request, `UNDER` matches just itself: no row is "name/…".
             let update = format!(
-                "UPDATE {table} SET path = ?2 || substr(path, length(?1) + 1) WHERE {UNDER}"
+                "UPDATE {table} SET path = ?2 || substr(path, length(?1) + 1) WHERE {rows}"
             );
             sql(tx.execute(&update, [&old_key, &new_key]))?;
         }
@@ -608,8 +626,8 @@ impl Workspace {
         Ok(new)
     }
 
-    /// Copies a request or a whole folder next to itself as "<name> copy" ("copy 2", …).
-    pub fn duplicate(&self, path: &Path) -> Result<PathBuf, String> {
+    /// The first free "<name> copy", "<name> copy 2", … next to `path`.
+    fn copy_of(&self, path: &Path) -> PathBuf {
         let request = is_request(path);
         // A dot in a folder name is not an extension.
         let stem = match request {
@@ -617,17 +635,20 @@ impl Workspace {
             false => path.file_name(),
         };
         let stem = stem.unwrap_or_default().to_string_lossy();
-        let new = (1..)
-            .map(|n| match n {
-                1 => format!("{stem} copy"),
-                n => format!("{stem} copy {n}"),
-            })
+        (1..)
+            .map(|n| copy_name(&stem, n))
             .map(|name| match request {
                 true => path.with_file_name(format!("{name}.toml")),
                 false => path.with_file_name(name),
             })
             .find(|p| !self.exists(p))
-            .expect("some name is free");
+            .expect("some name is free")
+    }
+
+    /// Copies a request or a whole folder next to itself as "<name> copy" ("copy 2", …).
+    pub fn duplicate(&self, path: &Path) -> Result<PathBuf, String> {
+        let request = is_request(path);
+        let new = self.copy_of(path);
         let (old_key, new_key) = (self.key(path), self.key(&new));
         let mut db = self.db();
         let tx = sql(db.transaction())?;
@@ -635,10 +656,11 @@ impl Workspace {
             true => &[("requests", "method, request")],
             false => &[("folders", "settings"), ("requests", "method, request")],
         };
+        let rows = rows_of(request);
         for (table, columns) in tables {
             let copy = format!(
                 "INSERT INTO {table} (path, {columns}) \
-                 SELECT ?2 || substr(path, length(?1) + 1), {columns} FROM {table} WHERE {UNDER}"
+                 SELECT ?2 || substr(path, length(?1) + 1), {columns} FROM {table} WHERE {rows}"
             );
             sql(tx.execute(&copy, [&old_key, &new_key]))?;
         }
@@ -648,14 +670,16 @@ impl Workspace {
 
     pub fn delete(&self, path: &Path) -> Result<(), String> {
         let key = self.key(path);
-        let tables: &[&str] = match is_request(path) {
+        let request = is_request(path);
+        let tables: &[&str] = match request {
             true => &["requests"],
             false => &["folders", "requests"],
         };
+        let rows = rows_of(request);
         let mut db = self.db();
         let tx = sql(db.transaction())?;
         for table in tables {
-            let delete = format!("DELETE FROM {table} WHERE {UNDER}");
+            let delete = format!("DELETE FROM {table} WHERE {rows}");
             sql(tx.execute(&delete, [&key]))?;
         }
         sql(tx.commit())
@@ -775,25 +799,7 @@ impl Workspace {
                 vars.push((name, shared.unwrap_or_default(), secret.unwrap_or_default()));
             }
         }
-        let count = requests.len();
-        {
-            let mut db = self.db();
-            let tx = sql(db.transaction())?;
-            for (key, settings) in &folders {
-                ensure_folders(&tx, key)?;
-                sql(tx.execute(
-                    "INSERT OR REPLACE INTO folders (path, settings) VALUES (?1, ?2)",
-                    [key, settings],
-                ))?;
-            }
-            for (key, req) in &requests {
-                sql(tx.execute(
-                    "INSERT OR REPLACE INTO requests (path, method, request) VALUES (?1, ?2, ?3)",
-                    [key, &req.method, &to_json(req)?],
-                ))?;
-            }
-            sql(tx.commit())?;
-        }
+        self.put_tree(&folders, &requests)?;
         for (name, shared, secret) in vars {
             let env = Some(name.as_str()).filter(|n| !n.is_empty());
             self.save_env(env, &shared, &secret)?;
@@ -801,7 +807,67 @@ impl Workspace {
         if first {
             self.import_local(dir)?;
         }
-        Ok(count)
+        Ok(requests.len())
+    }
+
+    /// Folders (settings as JSON, "" for none) and requests, all or none.
+    fn put_tree(
+        &self,
+        folders: &[(String, String)],
+        requests: &[(String, Request)],
+    ) -> Result<(), String> {
+        let mut db = self.db();
+        let tx = sql(db.transaction())?;
+        for (key, settings) in folders {
+            ensure_folders(&tx, key)?;
+            sql(tx.execute(
+                "INSERT OR REPLACE INTO folders (path, settings) VALUES (?1, ?2)",
+                [key, settings],
+            ))?;
+        }
+        for (key, req) in requests {
+            ensure_folders(&tx, parent_of(key))?;
+            sql(tx.execute(
+                "INSERT OR REPLACE INTO requests (path, method, request) VALUES (?1, ?2, ?3)",
+                [key, &req.method, &to_json(req)?],
+            ))?;
+        }
+        sql(tx.commit())
+    }
+
+    /// Adds a top-level folder `name` ("<name> copy" when taken, so nothing is replaced)
+    /// holding `folders` and `requests`, keyed below it ("" is the folder itself).
+    pub fn add_tree(
+        &self,
+        name: &str,
+        folders: &[(String, Folder)],
+        requests: &[(String, Request)],
+    ) -> Result<PathBuf, String> {
+        let dir = self.collections().join(valid_folder_name(name)?);
+        let dir = match self.exists(&dir) {
+            true => self.copy_of(&dir),
+            false => dir,
+        };
+        let top = self.key(&dir);
+        let under = |key: &str| -> Result<String, String> {
+            for part in key.split('/').filter(|p| !p.is_empty()) {
+                valid_name(part)?;
+            }
+            Ok(match key.is_empty() {
+                true => top.clone(),
+                false => format!("{top}/{key}"),
+            })
+        };
+        let folders: Vec<(String, String)> = folders
+            .iter()
+            .map(|(key, f)| Ok((under(key)?, folder_json(f)?)))
+            .collect::<Result<_, String>>()?;
+        let requests: Vec<(String, Request)> = requests
+            .iter()
+            .map(|(key, r)| Ok((under(key)?, r.clone())))
+            .collect::<Result<_, String>>()?;
+        self.put_tree(&folders, &requests)?;
+        Ok(dir)
     }
 
     /// History, cookies and UI state of a workspace from before the database.
@@ -1018,6 +1084,22 @@ fn valid_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
+/// A name from elsewhere (Postman allows any), made valid: what a file name can't hold
+/// becomes '-'.
+pub fn safe_name(name: &str) -> String {
+    let name: String = name
+        .chars()
+        .map(|c| match r#"<>:"/\|?*"#.contains(c) || c.is_control() {
+            true => '-',
+            false => c,
+        })
+        .collect();
+    match name.trim().trim_matches('.').trim() {
+        "" => "untitled".into(),
+        name => name.into(),
+    }
+}
+
 /// A folder named like a request file would be read back as one.
 fn valid_folder_name(name: &str) -> Result<&str, String> {
     let name = valid_name(name)?;
@@ -1154,6 +1236,23 @@ mod tests {
         // Deleting the copy leaves the original whole.
         ws.delete(&folder).unwrap();
         assert_eq!(ws.load_requests_in(&api).unwrap().len(), 3);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_request_and_a_folder_may_share_a_name() {
+        let root = fresh("same-name");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let folder = ws.create_folder(&ws.collections(), "users").unwrap();
+        ws.create_request(&folder, "inside").unwrap();
+        let request = ws.create_request(&ws.collections(), "users").unwrap();
+        let copy = ws.duplicate(&request).unwrap();
+        let renamed = ws.rename(&request, "people").unwrap();
+        ws.delete(&renamed).unwrap();
+        ws.delete(&copy).unwrap();
+        let left = ws.load_requests_in(&ws.collections()).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, "users/inside", "the folder keeps what's inside");
         fs::remove_dir_all(&root).unwrap();
     }
 

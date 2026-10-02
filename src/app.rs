@@ -253,6 +253,11 @@ enum Dialog {
     Unsaved(Next),
     /// Confirmed first: it replaces what was edited here since the last export.
     Import,
+    /// Pasted JSON or a file path; `note` says what went wrong or didn't come over.
+    Postman {
+        text: String,
+        note: String,
+    },
 }
 
 impl Dialog {
@@ -304,6 +309,7 @@ enum TreeAction {
     Run(PathBuf),
     FolderSettings(PathBuf),
     CopyDocs(PathBuf),
+    CopyPostman(PathBuf),
     Mock(PathBuf),
 }
 
@@ -1435,11 +1441,22 @@ impl App {
                     self.copy_docs(&root, ui.ctx());
                     ui.close();
                 }
+                if ui.button("Copy as Postman collection").clicked() {
+                    self.copy_postman(&root, ui.ctx());
+                    ui.close();
+                }
                 if ui.button("Start mock server").clicked() {
                     self.start_mock(root.clone(), ui.ctx());
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Import from Postman…").clicked() {
+                    self.dialog = Some(Dialog::Postman {
+                        text: String::new(),
+                        note: String::new(),
+                    });
+                    ui.close();
+                }
                 let export = ui.button("Export to files").on_hover_text(
                     "Writes collections/, environments/ and globals.toml into the workspace \
                      folder, for git. Secrets, history and cookies stay out.",
@@ -1519,6 +1536,7 @@ impl App {
                 TreeAction::Run(path) => self.open_runner(path),
                 TreeAction::FolderSettings(dir) => self.open_folder_editor(dir),
                 TreeAction::CopyDocs(dir) => self.copy_docs(&dir, ui.ctx()),
+                TreeAction::CopyPostman(dir) => self.copy_postman(&dir, ui.ctx()),
                 TreeAction::Mock(dir) => self.start_mock(dir, ui.ctx()),
             }
         }
@@ -1539,6 +1557,93 @@ impl App {
             }
             Err(e) => self.status = e,
         }
+    }
+
+    /// Closes the dialog when everything came over; else it stays to say what didn't.
+    fn submit_postman(&mut self, input: &str) {
+        let result = self.import_postman(input);
+        let Some(Dialog::Postman { text, note }) = &mut self.dialog else {
+            return;
+        };
+        match result {
+            Ok(warnings) if warnings.is_empty() => self.dialog = None,
+            Ok(warnings) => {
+                const SHOWN: usize = 12;
+                let mut lines: Vec<String> = warnings
+                    .iter()
+                    .take(SHOWN)
+                    .map(|w| format!("• {w}"))
+                    .collect();
+                if warnings.len() > SHOWN {
+                    lines.push(format!("… and {} more", warnings.len() - SHOWN));
+                }
+                text.clear();
+                *note = format!(
+                    "{}. Not carried over as it was:\n{}",
+                    self.status,
+                    lines.join("\n")
+                );
+            }
+            Err(e) => *note = e,
+        }
+    }
+
+    /// For Postman's Import > Raw text.
+    fn copy_postman(&mut self, dir: &Path, ctx: &egui::Context) {
+        self.status = match crate::postman::collection(&self.ws, dir) {
+            Ok((json, count, skipped)) => {
+                ctx.copy_text(json);
+                let left = match skipped {
+                    0 => String::new(),
+                    n => format!("; left out {n} WebSocket/SSE/gRPC, which collections can't hold"),
+                };
+                format!("Copied {count} requests as a Postman collection{left}")
+            }
+            Err(e) => e,
+        };
+    }
+
+    /// `input` is the JSON, or the path to its file (quoted, as Explorer's "Copy as path"
+    /// gives it). What didn't come over as it was comes back to show the user.
+    fn import_postman(&mut self, input: &str) -> Result<Vec<String>, String> {
+        let input = input.trim();
+        let text = match input.starts_with('{') {
+            true => input.to_owned(),
+            false => {
+                let path = input.trim_matches('"');
+                std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?
+            }
+        };
+        let warnings = match crate::postman::parse(&text)? {
+            crate::postman::Import::Collection {
+                name,
+                folders,
+                requests,
+                warnings,
+            } => {
+                let dir = self.ws.add_tree(&name, &folders, &requests)?;
+                let name = self.ws.display_name(&dir);
+                self.status = format!("Imported {} requests into \"{name}\"", requests.len());
+                warnings
+            }
+            crate::postman::Import::Environment {
+                name,
+                shared,
+                secret,
+            } => {
+                // Never replaces one: a same-named environment may hold this machine's secrets.
+                let names = self.ws.env_names();
+                let name = std::iter::once(name.clone())
+                    .chain((1..).map(|n| crate::store::copy_name(&name, n)))
+                    .find(|n| !names.contains(n))
+                    .expect("some name is free");
+                self.ws.save_env(Some(&name), &shared, &secret)?;
+                self.status = format!("Imported environment \"{name}\"");
+                Vec::new()
+            }
+        };
+        self.reload();
+        Ok(warnings)
     }
 
     fn copy_docs(&mut self, dir: &Path, ctx: &egui::Context) {
@@ -2338,6 +2443,45 @@ impl App {
                             }));
                         }
                         cancel = ui.button("Cancel").clicked();
+                    });
+                }
+                Dialog::Postman { text, note } => {
+                    ui.heading("Import from Postman");
+                    ui.label(
+                        "A collection (v2.1) or an environment as Postman exports it: paste the \
+                         JSON or the file's path, or drop the file here. Nothing already here \
+                         is replaced.",
+                    );
+                    let edit = egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(text)
+                                    .hint_text("JSON or path")
+                                    .code_editor()
+                                    .desired_rows(4)
+                                    .desired_width(f32::INFINITY),
+                            )
+                        })
+                        .inner;
+                    // Ready for Ctrl+V.
+                    if ui.memory(|m| m.focused().is_none()) {
+                        edit.request_focus();
+                    }
+                    if !note.is_empty() {
+                        ui.colored_label(ORANGE, note.as_str());
+                    }
+                    let dropped = ui.input(|i| {
+                        let file = i.raw.dropped_files.first();
+                        file.map(|f| f.path().display().to_string())
+                    });
+                    ui.horizontal(|ui| {
+                        let typed = !text.trim().is_empty();
+                        let import = ui.add_enabled(typed, primary("Import")).clicked();
+                        if let Some(input) = dropped.or(import.then(|| text.clone())) {
+                            then = Some(Box::new(move |app, _| app.submit_postman(&input)));
+                        }
+                        cancel = ui.button("Close").clicked();
                     });
                 }
             }
@@ -3171,6 +3315,10 @@ fn tree_ui(
                         actions.push(TreeAction::CopyDocs(path.clone()));
                         ui.close();
                     }
+                    if ui.button("Copy as Postman collection").clicked() {
+                        actions.push(TreeAction::CopyPostman(path.clone()));
+                        ui.close();
+                    }
                     if ui.button("Start mock server").clicked() {
                         actions.push(TreeAction::Mock(path.clone()));
                         ui.close();
@@ -3446,12 +3594,11 @@ fn body_editor(
         }
         Body::Multipart { parts } => {
             ui.weak("A value starting with @ uploads that file, e.g. @files/photo.png (relative to the workspace). Or drop files here.");
+            // A file dropped while a dialog is up is the dialog's (Import from Postman).
+            let modal = ui.ctx().memory(|m| m.top_modal_layer().is_some());
             let dropped: Vec<PathBuf> = ui.input(|i| {
-                i.raw
-                    .dropped_files
-                    .iter()
-                    .map(|f| f.path().to_owned())
-                    .collect()
+                let files = i.raw.dropped_files.iter().filter(|_| !modal);
+                files.map(|f| f.path().to_owned()).collect()
             });
             let workspace = std::env::current_dir().unwrap_or_default();
             for path in dropped {
@@ -4917,6 +5064,73 @@ mod ui_tests {
         h.run();
         assert_eq!(draft(&h).url, "http://pulled.test");
         assert!(h.state().dialog.is_none());
+    }
+
+    #[derive(Debug)]
+    struct Dropped(PathBuf);
+
+    impl egui::DroppedFile for Dropped {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+
+    /// Dropping Postman's export on the dialog is the whole import; what didn't come over
+    /// stays listed until the user has read it.
+    #[test]
+    fn a_postman_file_dropped_on_the_dialog_is_imported() {
+        let mut h = with_request("postman");
+        // The multipart editor behind the dialog takes dropped files too, but not this one.
+        let parts = Body::Multipart { parts: Vec::new() };
+        h.state_mut().open.as_mut().unwrap().draft.body = parts.clone();
+        h.state_mut().req_tab = ReqTab::Body;
+        let file = h.state().ws.root.join("shop.postman_collection.json");
+        let shop = r#"{ "info": { "name": "Shop" }, "item": [
+            { "name": "list", "request": { "method": "GET", "url": "{{base}}/items" } },
+            { "name": "bin", "request": { "method": "POST", "url": "{{base}}/bin",
+                                          "body": { "mode": "file" } } } ] }"#;
+        std::fs::write(&file, shop).unwrap();
+        h.get_by_label("⋯").click();
+        h.run();
+        h.get_by_label("Import from Postman…").click();
+        h.run();
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(file)));
+        h.run();
+        let app = h.state();
+        let shop = app.ws.collections().join("Shop");
+        assert_eq!(app.ws.load_requests_in(&shop).unwrap().len(), 2);
+        let Some(Dialog::Postman { note, .. }) = &app.dialog else {
+            panic!("the dialog stays to say what didn't come over");
+        };
+        assert!(note.contains("bin: a file body"), "{note}");
+        assert_eq!(draft(&h).body, parts);
+
+        // A second import of the same environment never replaces the first, which may
+        // hold this machine's secrets by now.
+        let env = r#"{ "name": "Prod", "values": [{ "key": "host", "value": "h" }] }"#;
+        for _ in 0..2 {
+            h.state_mut().dialog = Some(Dialog::Postman {
+                text: env.into(),
+                note: String::new(),
+            });
+            // The modal re-centres a frame after its content shrinks; a pointer click
+            // must aim where the button ends up.
+            h.run_steps(2);
+            h.get_by_label("Import").click();
+            h.run();
+            let note = match &h.state().dialog {
+                Some(Dialog::Postman { note, .. }) => Some(note.as_str()),
+                _ => None,
+            };
+            assert_eq!(note, None, "nothing to report closes it");
+        }
+        assert_eq!(h.state().envs, ["dev", "Prod", "Prod copy"]);
     }
 
     #[test]

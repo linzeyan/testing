@@ -15,6 +15,7 @@ mod mcp;
 mod mock;
 mod model;
 mod net;
+mod postman;
 mod runner;
 mod script;
 pub mod store;

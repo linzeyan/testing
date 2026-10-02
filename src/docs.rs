@@ -28,7 +28,7 @@ pub fn markdown(ws: &Workspace, scope: &Path) -> Result<String, String> {
     Ok(out)
 }
 
-fn find<'a>(nodes: &'a [Node], dir: &Path) -> Option<&'a [Node]> {
+pub(crate) fn find<'a>(nodes: &'a [Node], dir: &Path) -> Option<&'a [Node]> {
     nodes.iter().find_map(|n| match n {
         Node::Folder { path, children, .. } if path == dir => Some(&children[..]),
         Node::Folder { path, children, .. } if dir.starts_with(path) => find(children, dir),
