@@ -20,7 +20,8 @@ such as Citrix VDI. No installer: unzip and run.
   Postman v2.1 collection or environment (⋯ > "Import from Postman…": paste it, give its
   path or drop the file) and copy a folder or the whole collection as a Postman
   collection; duplicate requests and folders (Ctrl+D); new request (Ctrl+N); Ctrl+L
-  selects the URL; filter the tree by name; drag a request or folder onto a folder (or the
+  selects the URL; Ctrl+K jumps to any request (by folder and name, letters in order are
+  enough) or environment; filter the tree by name; drag a request or folder onto a folder (or the
   empty space under the tree) to move it, open tabs following; a ⋯ on the hovered tree row
   opens the same menu as right-click; header names and Content-Type values complete while
   typing, and the Headers tab folds out what Send adds (Host, auth, Content-Type…) and

@@ -24,6 +24,7 @@ const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Ke
 const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
 const NEW_REQUEST: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
 const FOCUS_URL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::L);
+const SWITCH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::K);
 const FILTER_HINT: &str = "Filter by name";
 /// Lines longer than this are clipped in the viewer; JSON is pretty-printed first so
 /// only non-JSON minified bodies hit it.
@@ -377,6 +378,11 @@ enum Dialog {
     SaveBody {
         path: String,
         error: String,
+    },
+    /// Ctrl+K: jump to a request or environment by typing part of its name.
+    Switch {
+        query: String,
+        selected: usize,
     },
 }
 
@@ -1620,6 +1626,16 @@ impl eframe::App for App {
             let root = self.ws.collections();
             self.dialog = Some(Dialog::name(NameKind::NewRequest(root), ""));
         }
+        if ui.input_mut(|i| i.consume_shortcut(&SWITCH))
+            && self.dialog.is_none()
+            && self.env_editor.is_none()
+            && self.folder_editor.is_none()
+        {
+            self.dialog = Some(Dialog::Switch {
+                query: String::new(),
+                selected: 0,
+            });
+        }
         if ui.input_mut(|i| i.consume_shortcut(&FOCUS_URL))
             && let Some(open) = &self.open
         {
@@ -1890,6 +1906,9 @@ impl App {
                             .hint_text(FILTER_HINT)
                             .desired_width(f32::INFINITY),
                     );
+                    let switch = ui.ctx().format_shortcut(&SWITCH);
+                    let filter = filter
+                        .on_hover_text(format!("{switch} jumps to any request or environment"));
                     // Escape leaves the box, and clears it like a search field.
                     if clear || (filter.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape))) {
                         self.tree_filter.clear();
@@ -2865,7 +2884,18 @@ impl App {
         let root = self.ws.root.display().to_string();
         let mut cancel = false;
         let mut then: Option<Then> = None;
-        let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
+        let targets = match dialog {
+            Dialog::Switch { .. } => switch_targets(&self.tree, &self.ws.collections(), &self.envs),
+            _ => Vec::new(),
+        };
+        let mut modal = egui::Modal::new(egui::Id::new("dialog"));
+        if let Dialog::Switch { .. } = dialog {
+            // Pinned to the top: centred, it would jump as the list grows and shrinks.
+            let area = egui::Modal::default_area(egui::Id::new("dialog"))
+                .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0]);
+            modal = modal.area(area);
+        }
+        let modal = modal.show(ctx, |ui| {
             ui.set_width(360.0);
             match dialog {
                 Dialog::Name { kind, name, error } => {
@@ -2993,6 +3023,69 @@ impl App {
                         }
                         cancel = ui.button("Cancel").clicked();
                     });
+                }
+                Dialog::Switch { query, selected } => {
+                    // Taken before the field sees them: they'd move its cursor.
+                    ui.input_mut(|i| {
+                        if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                            *selected += 1;
+                        }
+                        if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                            *selected = selected.saturating_sub(1);
+                        }
+                    });
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(query)
+                            .hint_text("Go to a request or environment")
+                            .desired_width(f32::INFINITY),
+                    );
+                    let enter = enter_pressed(ui);
+                    if !enter && ui.memory(|m| m.focused().is_none()) {
+                        edit.request_focus();
+                    }
+                    let mut hits: Vec<_> = (targets.iter())
+                        .filter_map(|t| fuzzy(&t.0, query).map(|rank| (rank, t)))
+                        .collect();
+                    hits.sort_by_key(|(rank, _)| *rank);
+                    hits.truncate(12);
+                    *selected = (*selected).min(hits.len().saturating_sub(1));
+                    let mut go = None;
+                    for (i, (_, (label, badge, target))) in hits.iter().enumerate() {
+                        let row = ui.horizontal(|ui| {
+                            let color = match target {
+                                Go::Request(_) => method_color(badge),
+                                Go::Env(_) => ui.visuals().weak_text_color(),
+                            };
+                            ui.add_sized(
+                                [44.0, 18.0],
+                                egui::Label::new(
+                                    RichText::new(badge.as_str())
+                                        .monospace()
+                                        .small()
+                                        .color(color),
+                                ),
+                            );
+                            ui.add(egui::Button::selectable(i == *selected, label.as_str()))
+                        });
+                        if row.inner.clicked() || (enter && i == *selected) {
+                            go = Some(target.clone());
+                        }
+                    }
+                    if hits.is_empty() {
+                        ui.weak("Nothing matches.");
+                    }
+                    if let Some(go) = go {
+                        then = Some(Box::new(move |app, _| {
+                            app.dialog = None;
+                            match go {
+                                Go::Request(path) => {
+                                    app.reveal = Some(path.clone());
+                                    app.activate(path, true);
+                                }
+                                Go::Env(name) => app.set_env(Some(name)),
+                            }
+                        }));
+                    }
                 }
                 Dialog::Import => {
                     ui.heading("Import from files");
@@ -3805,6 +3898,51 @@ fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
             ui.add(egui::Label::new(RichText::new(text).monospace().color(RED)).selectable(true));
         });
     }
+}
+
+#[derive(Clone)]
+enum Go {
+    Request(PathBuf),
+    Env(String),
+}
+
+/// What Ctrl+K can jump to: (label, badge, target). Requests are labelled by their place in
+/// the tree, so two "get user"s in different folders can be told apart.
+fn switch_targets(nodes: &[Node], root: &Path, envs: &[String]) -> Vec<(String, String, Go)> {
+    fn walk(nodes: &[Node], root: &Path, out: &mut Vec<(String, String, Go)>) {
+        for node in nodes {
+            match node {
+                Node::Folder { children, .. } => walk(children, root, out),
+                Node::Request { path, method, .. } => {
+                    let label = path.strip_prefix(root).unwrap_or(path).with_extension("");
+                    out.push((
+                        label.to_string_lossy().replace('\\', "/"),
+                        short_method(method).to_owned(),
+                        Go::Request(path.clone()),
+                    ));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(nodes, root, &mut out);
+    out.extend((envs.iter()).map(|e| (e.clone(), "ENV".to_owned(), Go::Env(e.clone()))));
+    out
+}
+
+/// Case-insensitive: `query`'s letters in `label` in order, or None. Lower ranks first: a
+/// plain substring before scattered letters, then the earlier match, then the shorter label.
+fn fuzzy(label: &str, query: &str) -> Option<(bool, usize, usize)> {
+    let (label, query) = (label.to_lowercase(), query.trim().to_lowercase());
+    if let Some(at) = label.find(&query) {
+        return Some((false, at, label.len()));
+    }
+    let mut rest = label.chars();
+    let scattered = query.chars().filter(|c| !c.is_whitespace());
+    scattered
+        .clone()
+        .all(|c| rest.any(|l| l == c))
+        .then_some((true, 0, label.len()))
 }
 
 /// The tree with only the requests whose name contains `query` (lowercase), and the
@@ -6887,6 +7025,58 @@ mod ui_tests {
         shot(&mut h, "52-auto-headers");
         assert!(h.query_by_label("Bearer t0k").is_some());
         assert!(h.query_by_label("from Auth").is_some());
+    }
+
+    #[test]
+    fn fuzzy_ranks_whole_words_before_scattered_letters() {
+        assert_eq!(fuzzy("users/get user", "adm"), None);
+        let mut labels = ["admin/get user", "users/get", "orders/target"];
+        labels.sort_by_key(|l| fuzzy(l, "get").unwrap());
+        // Earlier first ("target" holds "get" late); the same place goes to the shorter.
+        assert_eq!(labels, ["users/get", "admin/get user", "orders/target"]);
+        assert!(fuzzy("admin/get user", "adm get").is_some_and(|r| r.0));
+        assert!(fuzzy("orders/target", "ordtar").is_some_and(|r| r.0));
+        assert!(fuzzy("orders/get", "get") < fuzzy("orders/gxext", "get"));
+    }
+
+    #[test]
+    fn ctrl_k_jumps_to_a_request_or_environment_from_the_keyboard() {
+        let ws = workspace("switch");
+        let top = ws.collections();
+        for folder in ["admin", "users"] {
+            let dir = ws.create_folder(&top, folder).unwrap();
+            ws.create_request(&dir, "get user").unwrap();
+        }
+        ws.save_env(Some("prod"), &[], &[]).unwrap();
+        let mut h = harness(ws);
+        h.run();
+        let switch = |h: &mut Harness<'_, App>, text: &str, downs: usize| {
+            h.key_press_modifiers(Modifiers::COMMAND, Key::K);
+            h.run();
+            let hint = Some("Go to a request or environment");
+            (h.get_all_by_role(Role::TextInput))
+                .find(|n| n.accesskit_node().placeholder() == hint)
+                .unwrap()
+                .type_text(text);
+            h.run();
+            for _ in 0..downs {
+                h.key_press(Key::ArrowDown);
+                h.run();
+            }
+            shot(h, "53-switcher");
+            h.key_press(Key::Enter);
+            h.run();
+        };
+        let open = |h: &Harness<'_, App>| h.state().open.as_ref().map(|o| o.path.clone());
+        // Scattered letters across the folder and the name.
+        switch(&mut h, "adm get", 0);
+        assert_eq!(open(&h), Some(top.join("admin/get user.toml")));
+        assert!(h.state().dialog.is_none());
+        // Same name in two folders: the second one is a ↓ away.
+        switch(&mut h, "get user", 1);
+        assert_eq!(open(&h), Some(top.join("users/get user.toml")));
+        switch(&mut h, "prod", 0);
+        assert_eq!(h.state().active_env.as_deref(), Some("prod"));
     }
 
     #[test]
