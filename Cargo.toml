@@ -34,12 +34,19 @@ cookie_store = "0.22"
 toml = "1"
 # The workspace store. Bundled: no system SQLite on Windows, and one version everywhere.
 rusqlite = { version = "0.40", features = ["bundled"] }
+# MQTT client. No provider of its own: TLS uses the ring one net.rs installs.
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
+# Already in the tree via reqwest: the OS trust store (policy-installed roots on Windows)
+# for mqtts://, as reqwest uses it for https.
+rustls-platform-verifier = "0.7"
 
 [target."cfg(windows)".dependencies]
 # WinHTTP reads IE/Edge proxy settings and does WPAD discovery the way the OS does.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinHttp"] }
 
 [dev-dependencies]
+# A fake MQTT broker's buffers, for rumqttc's packet codec.
+bytes = "1"
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
 h2 = "0.4.19"
 http = "1.5.0"

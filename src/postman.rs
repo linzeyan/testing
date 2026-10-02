@@ -449,7 +449,9 @@ fn group(
                 g.extend(inner);
                 items.push(Value::Object(g));
             }
-            Node::Request { method, .. } if matches!(method.as_str(), "WS" | "SSE" | "GRPC") => {
+            Node::Request { method, .. }
+                if matches!(method.as_str(), "WS" | "SSE" | "GRPC" | "MQTT") =>
+            {
                 counts.1 += 1
             }
             Node::Request { name, path, .. } => {

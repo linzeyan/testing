@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 
 pub const METHODS: &[&str] = &[
     "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "GRAPHQL", "WS", "SSE", "GRPC",
+    "MQTT",
 ];
 
 /// Methods whose response is a stream of messages rather than one body.
 pub fn is_streaming(method: &str) -> bool {
-    matches!(method, "WS" | "SSE")
+    matches!(method, "WS" | "SSE" | "MQTT")
 }
 
 /// One request per file on disk, so field order and `skip_serializing_if` matter:
@@ -43,6 +44,8 @@ pub struct Request {
     pub tests: String,
     #[serde(skip_serializing_if = "Settings::is_default")]
     pub settings: Settings,
+    #[serde(skip_serializing_if = "Mqtt::is_default")]
+    pub mqtt: Mqtt,
     /// Saved responses, for reference and documentation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<Example>,
@@ -84,6 +87,71 @@ impl Default for Settings {
 impl Settings {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+/// MQTT only: the connection, what it subscribes to, and where Send publishes, as in
+/// Postman's MQTT request.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct Mqtt {
+    /// Empty: a new random one per connection. A broker drops the older of two
+    /// connections with the same ID.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub client_id: String,
+    /// 0 sends no pings.
+    pub keep_alive_secs: u16,
+    /// Off: the broker keeps this client ID's subscriptions and queued messages between
+    /// connections.
+    pub clean_session: bool,
+    /// Subscribed to on Connect.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<Topic>,
+    /// Where Send publishes.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub topic: String,
+    pub qos: u8,
+    /// The broker keeps the last retained message for whoever subscribes later.
+    pub retain: bool,
+}
+
+impl Default for Mqtt {
+    fn default() -> Self {
+        Self {
+            client_id: String::new(),
+            keep_alive_secs: 60,
+            clean_session: true,
+            topics: Vec::new(),
+            topic: String::new(),
+            qos: 0,
+            retain: false,
+        }
+    }
+}
+
+impl Mqtt {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct Topic {
+    /// `+` matches one level, `#` everything below.
+    pub filter: String,
+    pub qos: u8,
+    #[serde(skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for Topic {
+    fn default() -> Self {
+        Self {
+            filter: String::new(),
+            qos: 0,
+            enabled: true,
+        }
     }
 }
 
@@ -157,6 +225,7 @@ impl Default for Request {
             pre_request: String::new(),
             tests: String::new(),
             settings: Settings::default(),
+            mqtt: Mqtt::default(),
             examples: Vec::new(),
             inherited: Inherited::default(),
         }
@@ -500,6 +569,18 @@ impl Request {
             pre_request: String::new(),
             tests: String::new(),
             settings: self.settings.clone(),
+            mqtt: Mqtt {
+                client_id: r(&self.mqtt.client_id),
+                topics: (self.mqtt.topics.iter())
+                    .filter(|t| t.enabled && !t.filter.trim().is_empty())
+                    .map(|t| Topic {
+                        filter: r(t.filter.trim()),
+                        ..t.clone()
+                    })
+                    .collect(),
+                topic: r(&self.mqtt.topic),
+                ..self.mqtt.clone()
+            },
             examples: Vec::new(),
             inherited: Inherited::default(),
         };
@@ -671,6 +752,19 @@ mod tests {
                 follow_redirects: false,
                 timeout_ms: 1500,
                 ..Default::default()
+            },
+            mqtt: Mqtt {
+                client_id: "{{device}}".into(),
+                keep_alive_secs: 0,
+                clean_session: false,
+                topics: vec![Topic {
+                    filter: "sensors/+/temp".into(),
+                    qos: 2,
+                    enabled: false,
+                }],
+                topic: "cmd".into(),
+                qos: 1,
+                retain: true,
             },
             examples: vec![Example {
                 name: "found".into(),

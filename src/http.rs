@@ -27,6 +27,8 @@ pub fn wire_method(method: &str) -> Result<reqwest::Method, String> {
     match method.trim().to_uppercase().as_str() {
         "WS" | "SSE" => Ok(reqwest::Method::GET),
         "GRPC" | "GRAPHQL" => Ok(reqwest::Method::POST),
+        // Else it would go out as an HTTP request with an "MQTT" verb.
+        "MQTT" => Err("MQTT connects instead of sending: open it in the app and Connect".into()),
         m => reqwest::Method::from_bytes(m.as_bytes())
             .map_err(|_| format!("invalid method \"{method}\"")),
     }

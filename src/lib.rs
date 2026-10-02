@@ -14,6 +14,7 @@ mod loadtest;
 mod mcp;
 mod mock;
 mod model;
+mod mqtt;
 mod net;
 mod postman;
 mod runner;

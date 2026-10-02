@@ -36,8 +36,8 @@ pub fn generate(target: &str, req: Request) -> Result<String, String> {
         .iter()
         .find(|(name, _)| *name == target)
         .ok_or_else(|| format!("no code generator named {target}"))?;
-    if matches!(req.method.as_str(), "WS" | "GRPC") {
-        return Err("Code snippets are for HTTP requests, not WebSocket or gRPC".into());
+    if matches!(req.method.as_str(), "WS" | "GRPC" | "MQTT") {
+        return Err("Code snippets are for HTTP requests, not WebSocket, gRPC or MQTT".into());
     }
     Ok(generator(&Wire::new(req)?))
 }

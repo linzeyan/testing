@@ -13,6 +13,8 @@ use crate::model::Request;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     Open(String),
+    /// About the session, not a message: what an MQTT broker subscribed to.
+    Info(String),
     In(String),
     Out(String),
     Closed(String),

@@ -59,6 +59,8 @@ enum ReqTab {
     Settings,
     Examples,
     Docs,
+    /// MQTT only.
+    Topics,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -144,14 +146,19 @@ struct StreamSession {
     path: PathBuf,
     started: Instant,
     events: VecDeque<(Duration, Event)>,
-    /// WebSocket and client-streaming gRPC; dropping it makes the task send a Close frame
-    /// (WebSocket) or half-close (gRPC).
-    outgoing: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// WebSocket, MQTT and client-streaming gRPC; dropping it makes the task send a Close
+    /// frame (WebSocket), DISCONNECT (MQTT) or half-close (gRPC).
+    outgoing: Option<Outgoing>,
     /// gRPC: (proto, method), to check messages before they are sent.
     grpc: Option<(String, String)>,
     live: bool,
     compose: String,
     abort: tokio::task::AbortHandle,
+}
+
+enum Outgoing {
+    Text(tokio::sync::mpsc::UnboundedSender<String>),
+    Mqtt(tokio::sync::mpsc::UnboundedSender<crate::mqtt::Publish>),
 }
 
 impl Drop for StreamSession {
@@ -903,10 +910,18 @@ impl App {
         let id = self.next_run_id;
         let (req, _) = open.draft.resolved(&self.all_vars());
         let is_ws = req.method.eq_ignore_ascii_case("WS");
+        let is_mqtt = req.method == "MQTT";
         let grpc = (req.method == "GRPC").then(|| (req.proto.clone(), req.rpc.clone()));
         let sends =
             is_ws || rpc_of(&open.draft, &self.grpc_methods).is_some_and(|r| r.client_streaming);
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let outgoing = match (is_mqtt, sends) {
+            (true, _) => Some(Outgoing::Mqtt(pub_tx)),
+            (false, true) => Some(Outgoing::Text(out_tx)),
+            (false, false) => None,
+        };
+        let ca_file = self.network.ca_file.clone();
         let (cell, net, tx, ctx) = (
             self.client.clone(),
             (self.network.clone(), self.cookies.clone()),
@@ -918,6 +933,10 @@ impl App {
                 let _ = tx.send(Msg::Stream(id, e));
                 ctx.request_repaint();
             };
+            // Not over HTTP: no proxy, so no client (and no PAC download) to wait for.
+            if is_mqtt {
+                return crate::mqtt::session(req, ca_file, pub_rx, emit).await;
+            }
             match cell
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
                 .await
@@ -937,7 +956,7 @@ impl App {
             path: open.path.clone(),
             started: Instant::now(),
             events: VecDeque::new(),
-            outgoing: sends.then_some(out_tx),
+            outgoing,
             grpc,
             live: true,
             compose: self
@@ -1200,9 +1219,11 @@ impl eframe::App for App {
             self.focus_request = Some(egui::Id::new("find"));
         }
         if ui.input_mut(|i| i.consume_shortcut(&SEND)) {
+            let vars = self.all_vars();
+            let mqtt = self.open.as_ref().map(|o| &o.draft.mqtt);
             match self.stream.as_mut().filter(|s| s.live) {
                 Some(s) => {
-                    if let Err(e) = s.send_compose() {
+                    if let Err(e) = s.send_compose(mqtt, &vars) {
                         self.status = e;
                     }
                 }
@@ -1953,6 +1974,10 @@ impl App {
                     }
                     let button = [80.0, 22.0];
                     let width = ui.available_width() - button[0] - 8.0;
+                    let hint = match open.draft.method.as_str() {
+                        "MQTT" => "mqtt://{{broker}}:1883",
+                        _ => "https://{{host}}/path",
+                    };
                     let url = var_edit(
                         ui,
                         egui::Id::new("url"),
@@ -1960,7 +1985,7 @@ impl App {
                         &all_vars,
                         egui::TextStyle::Monospace,
                         false,
-                        |e| e.hint_text("https://{{host}}/path").desired_width(width),
+                        |e| e.hint_text(hint).desired_width(width),
                     );
                     // Pasting a curl command (e.g. devtools "Copy as cURL") imports it, like Postman.
                     if url.changed() && open.draft.url.trim_start().starts_with("curl ") {
@@ -2032,16 +2057,6 @@ impl App {
                             name.to_owned()
                         }
                     };
-                    ui.selectable_value(
-                        &mut self.req_tab,
-                        ReqTab::Params,
-                        tab(count(&open.draft.params), "Params"),
-                    );
-                    ui.selectable_value(
-                        &mut self.req_tab,
-                        ReqTab::Headers,
-                        tab(count(&open.draft.headers), "Headers"),
-                    );
                     let dot = |none: bool, name: &str| {
                         if none {
                             name.to_owned()
@@ -2049,15 +2064,39 @@ impl App {
                             format!("{name} ●")
                         }
                     };
-                    ui.selectable_value(
-                        &mut self.req_tab,
-                        ReqTab::Body,
-                        if open.draft.method == "GRAPHQL" {
-                            "Query".to_owned()
-                        } else {
-                            dot(matches!(open.draft.body, Body::None), "Body")
-                        },
-                    );
+                    // MQTT has no query, headers or body: topics take their place.
+                    let mqtt = open.draft.method == "MQTT";
+                    let http_only = [ReqTab::Params, ReqTab::Headers, ReqTab::Body];
+                    if mqtt && http_only.contains(&self.req_tab) {
+                        self.req_tab = ReqTab::Topics;
+                    } else if !mqtt && self.req_tab == ReqTab::Topics {
+                        self.req_tab = ReqTab::Params;
+                    }
+                    if mqtt {
+                        let topics = open.draft.mqtt.topics.iter();
+                        let on = topics.filter(|t| t.enabled && !t.filter.is_empty()).count();
+                        ui.selectable_value(&mut self.req_tab, ReqTab::Topics, tab(on, "Topics"));
+                    } else {
+                        ui.selectable_value(
+                            &mut self.req_tab,
+                            ReqTab::Params,
+                            tab(count(&open.draft.params), "Params"),
+                        );
+                        ui.selectable_value(
+                            &mut self.req_tab,
+                            ReqTab::Headers,
+                            tab(count(&open.draft.headers), "Headers"),
+                        );
+                        ui.selectable_value(
+                            &mut self.req_tab,
+                            ReqTab::Body,
+                            if open.draft.method == "GRAPHQL" {
+                                "Query".to_owned()
+                            } else {
+                                dot(matches!(open.draft.body, Body::None), "Body")
+                            },
+                        );
+                    }
                     ui.selectable_value(
                         &mut self.req_tab,
                         ReqTab::Auth,
@@ -2073,12 +2112,21 @@ impl App {
                         ReqTab::Scripts,
                         dot(no_scripts, "Scripts"),
                     );
-                    // How a single HTTP exchange goes out; streams and gRPC don't use them.
+                    // How a single HTTP exchange goes out, or MQTT's connection; other
+                    // streams and gRPC have none.
                     if !matches!(open.draft.method.as_str(), "WS" | "SSE" | "GRPC") {
+                        let default = match mqtt {
+                            true => {
+                                open.draft.mqtt.client_id.is_empty()
+                                    && open.draft.mqtt.keep_alive_secs == 60
+                                    && open.draft.mqtt.clean_session
+                            }
+                            false => open.draft.settings.is_default(),
+                        };
                         ui.selectable_value(
                             &mut self.req_tab,
                             ReqTab::Settings,
-                            dot(open.draft.settings.is_default(), "Settings"),
+                            dot(default, "Settings"),
                         );
                     } else if self.req_tab == ReqTab::Settings {
                         self.req_tab = ReqTab::Params;
@@ -2145,9 +2193,13 @@ impl App {
                             &mut open.draft.tests,
                             &open.draft.inherited,
                         ),
+                        ReqTab::Settings if open.draft.method == "MQTT" => {
+                            mqtt_settings(ui, &mut open.draft.mqtt)
+                        }
                         ReqTab::Settings => {
                             settings_editor(ui, &mut open.draft.settings, self.network.timeout_secs)
                         }
+                        ReqTab::Topics => topics_editor(ui, &mut open.draft.mqtt.topics, live),
                         ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
                         ReqTab::Docs => docs_editor(ui, &mut open.draft.description),
                     });
@@ -2169,9 +2221,12 @@ impl App {
             if streaming {
                 match session {
                     Some(s) => {
-                        if let Err(e) = stream_ui(ui, s) {
+                        if let Err(e) = stream_ui(ui, s, &mut open.draft.mqtt, &all_vars) {
                             self.status = e;
                         }
+                    }
+                    None if open.draft.method == "MQTT" => {
+                        ui.weak("Press Connect to reach the broker; it subscribes to the topics in the Topics tab. Scripts don't run for MQTT.");
                     }
                     None if open.draft.method == "GRPC" => {
                         ui.weak("Press Connect to start the call. The body is the first message (for a client stream, an array is several, empty is none). Scripts don't run for streams.");
@@ -3930,6 +3985,84 @@ fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
     );
 }
 
+fn qos_box(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, qos: &mut u8) {
+    egui::ComboBox::from_id_salt(id)
+        .width(64.0)
+        .selected_text(format!("QoS {qos}"))
+        .show_ui(ui, |ui| {
+            for q in 0..=2u8 {
+                ui.selectable_value(qos, q, format!("QoS {q}"));
+            }
+        })
+        .response
+        .on_hover_text("0: at most once · 1: at least once · 2: exactly once");
+}
+
+fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) {
+    ui.weak(match live {
+        true => "Changes apply on the next Connect.",
+        false => "Subscribed to on Connect. + matches one level, # everything below.",
+    });
+    let mut remove = None;
+    egui::Grid::new("topics")
+        .num_columns(4)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            for (i, t) in topics.iter_mut().enumerate() {
+                ui.checkbox(&mut t.enabled, "");
+                ui.add(
+                    egui::TextEdit::singleline(&mut t.filter)
+                        .hint_text("sensors/+/temperature")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(320.0),
+                );
+                qos_box(ui, ("topic-qos", i), &mut t.qos);
+                if ui.small_button("🗑").on_hover_text("Remove").clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(i) = remove {
+        topics.remove(i);
+    }
+    if ui.small_button("+ Topic").clicked() {
+        topics.push(model::Topic::default());
+    }
+}
+
+fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
+    egui::Grid::new("mqtt-settings")
+        .num_columns(3)
+        .spacing([16.0, 10.0])
+        .show(ui, |ui| {
+            ui.label("Client ID");
+            ui.add(
+                egui::TextEdit::singleline(&mut m.client_id)
+                    .hint_text("random")
+                    .desired_width(240.0),
+            );
+            ui.weak("A broker drops the older of two connections with the same ID");
+            ui.end_row();
+
+            ui.label("Keep alive");
+            ui.add(
+                egui::DragValue::new(&mut m.keep_alive_secs)
+                    .range(0..=3600)
+                    .suffix(" s"),
+            );
+            ui.weak("0 sends no pings");
+            ui.end_row();
+
+            ui.label("Clean session");
+            ui.checkbox(&mut m.clean_session, "");
+            ui.weak("Off: the broker keeps subscriptions and queued messages for this client ID");
+            ui.end_row();
+        });
+    ui.add_space(8.0);
+    ui.weak("Username and password go in Auth (Basic). mqtts:// trusts the system's certificates and the CA file in Network settings.");
+}
+
 fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_secs: u64) {
     use model::HttpVersion;
     egui::Grid::new("settings")
@@ -4309,23 +4442,49 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
 
 impl StreamSession {
     /// Err when a gRPC message doesn't fit the method: refused here, so a typo doesn't
-    /// end the call.
-    fn send_compose(&mut self) -> Result<(), String> {
-        let Some(tx) = &self.outgoing else {
-            return Ok(());
-        };
-        if self.compose.is_empty() {
-            return Ok(());
+    /// end the call. MQTT publishes to the open request's topic, as it is now.
+    fn send_compose(
+        &mut self,
+        mqtt: Option<&model::Mqtt>,
+        vars: &HashMap<String, String>,
+    ) -> Result<(), String> {
+        match &self.outgoing {
+            None => {}
+            Some(Outgoing::Text(_)) if self.compose.is_empty() => {}
+            Some(Outgoing::Text(tx)) => {
+                if let Some((proto, rpc)) = &self.grpc {
+                    crate::grpc::check(proto, rpc, &self.compose)?;
+                }
+                let _ = tx.send(self.compose.clone());
+            }
+            // An empty message is fine: retained, it clears what the broker keeps.
+            Some(Outgoing::Mqtt(tx)) => {
+                let m = mqtt.ok_or("no request is open")?;
+                let topic = model::resolve(m.topic.trim(), vars, &mut Vec::new());
+                if topic.is_empty() {
+                    return Err("Publish needs a topic".into());
+                }
+                if topic.contains(['+', '#']) {
+                    return Err("+ and # are for subscribing; publish to one topic".into());
+                }
+                let _ = tx.send(crate::mqtt::Publish {
+                    topic,
+                    qos: m.qos,
+                    retain: m.retain,
+                    payload: self.compose.clone(),
+                });
+            }
         }
-        if let Some((proto, rpc)) = &self.grpc {
-            crate::grpc::check(proto, rpc, &self.compose)?;
-        }
-        let _ = tx.send(self.compose.clone());
         Ok(())
     }
 }
 
-fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) -> Result<(), String> {
+fn stream_ui(
+    ui: &mut egui::Ui,
+    s: &mut StreamSession,
+    mqtt: &mut model::Mqtt,
+    vars: &HashMap<String, String>,
+) -> Result<(), String> {
     let mut sent = Ok(());
     ui.horizontal(|ui| {
         if s.live {
@@ -4342,6 +4501,21 @@ fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) -> Result<(), String> {
             s.events.clear();
         }
     });
+    if matches!(s.outgoing, Some(Outgoing::Mqtt(_))) {
+        // Part of the request, as in Postman, so it's there next time.
+        ui.horizontal(|ui| {
+            ui.label("Publish to");
+            ui.add(
+                egui::TextEdit::singleline(&mut mqtt.topic)
+                    .hint_text("devices/42/cmd")
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(240.0),
+            );
+            qos_box(ui, "publish-qos", &mut mqtt.qos);
+            ui.checkbox(&mut mqtt.retain, "Retain")
+                .on_hover_text("The broker keeps it for whoever subscribes later");
+        });
+    }
     if s.outgoing.is_some() {
         ui.horizontal(|ui| {
             let send_w = 70.0;
@@ -4361,7 +4535,7 @@ fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) -> Result<(), String> {
                 .on_hover_text(ui.ctx().format_shortcut(&SEND))
                 .clicked()
             {
-                sent = s.send_compose();
+                sent = s.send_compose(Some(mqtt), vars);
             }
         });
     }
@@ -4374,6 +4548,7 @@ fn stream_ui(ui: &mut egui::Ui, s: &mut StreamSession) -> Result<(), String> {
             for (at, event) in &s.events {
                 let (badge, color, text) = match event {
                     Event::Open(t) => ("OPEN", GREEN, t),
+                    Event::Info(t) => ("INFO", Color32::GRAY, t),
                     Event::In(t) => ("IN", Color32::from_rgb(90, 160, 230), t),
                     Event::Out(t) => ("OUT", ORANGE, t),
                     Event::Closed(t) => ("CLOSED", Color32::GRAY, t),
@@ -5528,6 +5703,56 @@ mod ui_tests {
             h.query_by_label("127.0.0.1:1").is_some(),
             "env vars listed too"
         );
+    }
+
+    /// Topics subscribe on Connect, Send publishes where the request says, and a topic
+    /// that can't be published to is refused before it reaches the broker.
+    #[test]
+    fn mqtt_subscribes_publishes_and_disconnects() {
+        let mut h = with_request("mqtt");
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        d.method = "MQTT".into();
+        d.url = format!("mqtt://127.0.0.1:{}", crate::mqtt::tests::broker());
+        d.auth = Auth::Basic {
+            username: "u".into(),
+            password: "p".into(),
+        };
+        d.mqtt.client_id = "tester".into();
+        let topic = |filter: &str| model::Topic {
+            filter: filter.into(),
+            ..Default::default()
+        };
+        d.mqtt.topics = vec![topic("a/#"), topic("denied")];
+        h.run();
+        assert!(h.query_by_label("Params").is_none(), "MQTT has no query");
+        h.get_by_label("Topics (2)").click();
+        h.run();
+        h.get_by_label("Connect").click();
+        let got = |app: &App, text: &str| {
+            let events = &app.stream.as_ref().unwrap().events;
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::In(t) if t == text))
+        };
+        wait_live(&mut h, |app| got(app, "[a/1] hello"));
+
+        h.state_mut().stream.as_mut().unwrap().compose = "ping".into();
+        for (topic, why) in [("", "needs a topic"), ("cmd/#", "subscribing")] {
+            h.state_mut().open.as_mut().unwrap().draft.mqtt.topic = topic.into();
+            h.get_by_label("Send").click();
+            h.run_steps(2);
+            assert!(h.state().status.contains(why), "{}", h.state().status);
+        }
+        h.state_mut().open.as_mut().unwrap().draft.mqtt.topic = "cmd".into();
+        h.get_by_label("Send").click();
+        wait_live(&mut h, |app| got(app, "[a/echo] echo cmd ping"));
+        shot(&mut h, "33-mqtt");
+
+        h.get_by_label("Disconnect").click();
+        wait(&mut h, |app| !app.stream.as_ref().unwrap().live);
+        let events = &h.state().stream.as_ref().unwrap().events;
+        let (_, last) = events.back().unwrap();
+        assert_eq!(*last, Event::Closed("disconnected".into()), "{events:?}");
     }
 
     #[test]
