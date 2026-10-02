@@ -22,6 +22,9 @@ const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::En
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
 const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
+const NEW_REQUEST: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
+const FOCUS_URL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::L);
+const FILTER_HINT: &str = "Filter by name";
 /// Lines longer than this are clipped in the viewer; JSON is pretty-printed first so
 /// only non-JSON minified bodies hit it.
 const MAX_LINE: usize = 4096;
@@ -336,6 +339,8 @@ pub struct App {
     /// Oldest first.
     history: Vec<HistoryEntry>,
     show_history: bool,
+    /// Sidebar filter: requests whose name contains it, and the folders leading to them.
+    tree_filter: String,
     /// Outlives client rebuilds; saved to the workspace after responses.
     cookies: Arc<Jar>,
     cookie_manager: bool,
@@ -388,6 +393,7 @@ impl App {
             envs: ws.env_names(),
             history: ws.load_history(),
             show_history: false,
+            tree_filter: String::new(),
             cookies: Arc::new(Jar::load(&ws.cookies_path())),
             cookie_manager: false,
             code: false,
@@ -1190,6 +1196,28 @@ impl eframe::App for App {
         {
             self.duplicate(&path);
         }
+        if ui.input_mut(|i| i.consume_shortcut(&NEW_REQUEST))
+            && self.dialog.is_none()
+            && self.env_editor.is_none()
+            && self.folder_editor.is_none()
+        {
+            let root = self.ws.collections();
+            self.dialog = Some(Dialog::name(NameKind::NewRequest(root), ""));
+        }
+        if ui.input_mut(|i| i.consume_shortcut(&FOCUS_URL))
+            && let Some(open) = &self.open
+        {
+            // Selected, as in a browser's address bar, so typing replaces it.
+            let id = egui::Id::new("url");
+            let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+            let end = egui::text::CCursor::new(open.draft.url.chars().count());
+            let all = egui::text_selection::CCursorRange::two(egui::text::CCursor::new(0), end);
+            state.cursor.set_char_range(Some(all));
+            state.store(ui.ctx(), id);
+            // Focused now, not via `focus_request`: an unfocused TextEdit collapses the
+            // selection when it draws.
+            ui.memory_mut(|m| m.request_focus(id));
+        }
         if ui.input(|i| i.viewport().close_requested())
             && !self.allow_close
             && !self.unsaved().is_empty()
@@ -1369,7 +1397,11 @@ impl App {
         }
         ui.horizontal(|ui| {
             let root = self.ws.collections();
-            if ui.small_button("+ Request").clicked() {
+            if ui
+                .small_button("+ Request")
+                .on_hover_text(ui.ctx().format_shortcut(&NEW_REQUEST))
+                .clicked()
+            {
                 self.dialog = Some(Dialog::name(NameKind::NewRequest(root.clone()), ""));
             }
             if ui.small_button("+ Folder").clicked() {
@@ -1395,15 +1427,44 @@ impl App {
                 self.open_runner(root);
             }
         });
+        if !self.tree.is_empty() {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let clear = !self.tree_filter.is_empty()
+                        && ui.small_button("×").on_hover_text("Clear").clicked();
+                    let filter = ui.add(
+                        egui::TextEdit::singleline(&mut self.tree_filter)
+                            // Not an auto id: the × appearing would change it and drop focus.
+                            .id(egui::Id::new("tree-filter"))
+                            .hint_text(FILTER_HINT)
+                            .desired_width(f32::INFINITY),
+                    );
+                    // Escape leaves the box, and clears it like a search field.
+                    if clear || (filter.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape))) {
+                        self.tree_filter.clear();
+                    }
+                });
+            });
+        }
         let mut actions = Vec::new();
         let selected = self.open.as_ref().map(|o| o.path.as_path());
+        let query = self.tree_filter.trim().to_lowercase();
+        let found;
+        let nodes = if query.is_empty() {
+            &self.tree
+        } else {
+            found = filtered(&self.tree, &query);
+            &found
+        };
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
                 if self.tree.is_empty() {
                     ui.weak("No requests yet. Click \"+ Request\".");
+                } else if nodes.is_empty() {
+                    ui.weak("Nothing matches.");
                 }
-                tree_ui(ui, &self.tree, selected, &mut actions);
+                tree_ui(ui, nodes, selected, !query.is_empty(), &mut actions);
             });
         for action in actions {
             match action {
@@ -2979,10 +3040,37 @@ fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
     }
 }
 
+/// The tree with only the requests whose name contains `query` (lowercase), and the
+/// folders leading to them. A folder whose own name matches keeps all it holds.
+fn filtered(nodes: &[Node], query: &str) -> Vec<Node> {
+    let hit = |name: &str| name.to_lowercase().contains(query);
+    nodes
+        .iter()
+        .filter_map(|node| match node {
+            Node::Folder { name, .. } if hit(name) => Some(node.clone()),
+            Node::Folder {
+                name,
+                path,
+                children,
+            } => {
+                let children = filtered(children, query);
+                (!children.is_empty()).then(|| Node::Folder {
+                    name: name.clone(),
+                    path: path.clone(),
+                    children,
+                })
+            }
+            Node::Request { name, .. } => hit(name).then(|| node.clone()),
+        })
+        .collect()
+}
+
+/// `expand` opens every folder, so what a filter found is in view.
 fn tree_ui(
     ui: &mut egui::Ui,
     nodes: &[Node],
     selected: Option<&Path>,
+    expand: bool,
     actions: &mut Vec<TreeAction>,
 ) {
     for node in nodes {
@@ -2996,7 +3084,8 @@ fn tree_ui(
                     .id_salt(path)
                     // Reveal the open request on startup instead of hiding it in a collapsed folder.
                     .default_open(selected.is_some_and(|s| s.starts_with(path)))
-                    .show(ui, |ui| tree_ui(ui, children, selected, actions));
+                    .open(expand.then_some(true))
+                    .show(ui, |ui| tree_ui(ui, children, selected, expand, actions));
                 resp.header_response.context_menu(|ui| {
                     let mut item = |label: &str, a: TreeAction| {
                         if ui.button(label).clicked() {
@@ -4383,7 +4472,7 @@ fn mb(bytes: usize) -> f64 {
 mod ui_tests {
     use egui::accesskit::Role;
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     use super::*;
 
@@ -4409,13 +4498,19 @@ mod ui_tests {
         img.save(format!("/tmp/apitool-shots/{name}.png")).unwrap();
     }
 
-    fn type_into(h: &mut Harness<'_, App>, nth: usize, text: &str) {
-        h.get_all_by_role(Role::TextInput).nth(nth).unwrap().click();
-        h.run();
+    /// The nth text box, not counting the sidebar filter (there whenever the tree isn't
+    /// empty), so the URL is 0 with a request open.
+    fn text_input<'h>(h: &'h Harness<'_, App>, nth: usize) -> egui_kittest::Node<'h> {
         h.get_all_by_role(Role::TextInput)
+            .filter(|n| n.accesskit_node().placeholder() != Some(FILTER_HINT))
             .nth(nth)
             .unwrap()
-            .type_text(text);
+    }
+
+    fn type_into(h: &mut Harness<'_, App>, nth: usize, text: &str) {
+        text_input(h, nth).click();
+        h.run();
+        text_input(h, nth).type_text(text);
         h.run();
     }
 
@@ -4723,6 +4818,61 @@ mod ui_tests {
     }
 
     #[test]
+    fn sidebar_filter_finds_requests_inside_closed_folders() {
+        let ws = workspace("filter");
+        let root = ws.collections();
+        let users = ws.create_folder(&root, "users").unwrap();
+        ws.create_request(&users, "list users").unwrap();
+        ws.create_request(&root, "health").unwrap();
+        let mut h = harness(ws);
+        h.run();
+        assert!(
+            h.query_by_label("list users").is_none(),
+            "folders start closed"
+        );
+        h.get_all_by_role(Role::TextInput)
+            .find(|n| n.accesskit_node().placeholder() == Some(FILTER_HINT))
+            .unwrap()
+            .click();
+        h.run();
+        // One key at a time: the × appearing after the first must not take the focus.
+        for c in ["L", "I", "S", "T"] {
+            h.event(egui::Event::Text(c.into()));
+            h.run();
+        }
+        assert_eq!(h.state().tree_filter, "LIST");
+        h.get_by_label("list users");
+        assert!(h.query_by_label("health").is_none());
+        // Escape clears it, as in a search field.
+        h.key_press(Key::Escape);
+        h.run();
+        assert_eq!(h.state().tree_filter, "");
+        h.get_by_label("health");
+    }
+
+    #[test]
+    fn keyboard_reaches_new_request_and_the_url() {
+        let mut h = with_request("keys");
+        h.state_mut().open.as_mut().unwrap().draft.url = "http://old.test/x".into();
+        h.run();
+        // Like a browser's address bar: focused and selected, so typing replaces it.
+        h.key_press_modifiers(Modifiers::COMMAND, Key::L);
+        h.run();
+        h.event(egui::Event::Text("http://new.test".into()));
+        h.run();
+        assert_eq!(draft(&h).url, "http://new.test");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::N);
+        h.run();
+        assert!(matches!(
+            h.state().dialog,
+            Some(Dialog::Name {
+                kind: NameKind::NewRequest(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn history_brings_back_what_was_sent() {
         let mut h = with_request("history");
         let sent = crate::http::tests::echo_server();
@@ -4861,7 +5011,7 @@ mod ui_tests {
     #[test]
     fn pasting_a_curl_command_into_the_url_imports_it() {
         let mut h = with_request("curl");
-        h.get_all_by_role(Role::TextInput).next().unwrap().click();
+        text_input(&h, 0).click();
         h.run();
         h.event(egui::Event::Paste(
             "curl 'https://api.test/x?a=1' \\\n  -H 'accept: text/plain' \\\n  --data-raw 'k=v'"
@@ -4951,7 +5101,11 @@ mod ui_tests {
         h.get_by_label("Globals").click();
         h.run();
         // The modal's fields come after the request editor's: shared key/value, then secret.
-        let key = h.get_all_by_role(Role::TextInput).count() - 4;
+        let inputs = h.get_all_by_role(Role::TextInput);
+        let key = inputs
+            .filter(|n| n.accesskit_node().placeholder() != Some(FILTER_HINT))
+            .count()
+            - 4;
         type_into(&mut h, key, "apiKey");
         type_into(&mut h, key + 1, "k-123");
         modal_save(&mut h);

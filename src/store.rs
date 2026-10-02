@@ -63,6 +63,7 @@ impl HistoryEntry {
     }
 }
 
+#[derive(Clone)]
 pub enum Node {
     Folder {
         name: String,

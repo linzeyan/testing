@@ -12,8 +12,8 @@ such as Citrix VDI. No installer: unzip and run.
   check, cookies, timeout); paste a curl command into the URL bar to import it, and
   "</> Code" for the request as curl, wget, HTTPie, PowerShell, raw HTTP, Python, fetch,
   axios, Go, Java, C#, PHP, Ruby, Rust, Swift or Kotlin; duplicate requests and folders
-  (Ctrl+D); find in response
-  (Ctrl+F); saved response examples; request history; Bearer, Basic, Digest and OAuth 2.0
+  (Ctrl+D); new request (Ctrl+N); Ctrl+L selects the URL; filter the tree by name; find in
+  response (Ctrl+F); saved response examples; request history; Bearer, Basic, Digest and OAuth 2.0
   (client credentials, password) auth; a cookie jar like a browser's, with a manager;
   folder settings (right-click a folder) with variables, auth and scripts shared by every
   request inside, like Postman collection/folder settings; tabs (a click in the tree
