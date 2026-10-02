@@ -2428,6 +2428,7 @@ impl App {
                     &all_vars,
                     egui::TextStyle::Monospace,
                     false,
+                    &[],
                     |e| e.hint_text(hint).desired_width(width),
                 );
                 // Pasting a curl command (e.g. devtools "Copy as cURL") imports it, like Postman.
@@ -3856,47 +3857,8 @@ fn tree_ui(
                     .interact(egui::Sense::drag())
                     .dnd_set_drag_payload(path.clone());
                 drop_into(ui, header, path, actions);
-                resp.header_response.context_menu(|ui| {
-                    let mut item = |label: &str, a: TreeAction| {
-                        if ui.button(label).clicked() {
-                            actions.push(a);
-                            ui.close();
-                        }
-                    };
-                    let dialog = |kind| TreeAction::Dialog(Dialog::name(kind, ""));
-                    item("New request", dialog(NameKind::NewRequest(path.clone())));
-                    item("New folder", dialog(NameKind::NewFolder(path.clone())));
-                    item(
-                        "Rename",
-                        TreeAction::Dialog(Dialog::name(
-                            NameKind::Rename(path.clone()),
-                            name.as_str(),
-                        )),
-                    );
-                    item("Duplicate", TreeAction::Duplicate(path.clone()));
-                    item("Delete", TreeAction::Dialog(Dialog::Delete(path.clone())));
-                    ui.separator();
-                    if ui.button("Folder settings…").clicked() {
-                        actions.push(TreeAction::FolderSettings(path.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Copy docs as Markdown").clicked() {
-                        actions.push(TreeAction::CopyDocs(path.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Copy as Postman collection").clicked() {
-                        actions.push(TreeAction::CopyPostman(path.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Start mock server").clicked() {
-                        actions.push(TreeAction::Mock(path.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Run folder").clicked() {
-                        actions.push(TreeAction::Run(path.clone()));
-                        ui.close();
-                    }
-                });
+                header.context_menu(|ui| folder_menu(ui, path, name, actions));
+                more_button(ui, header, path, |ui| folder_menu(ui, path, name, actions));
             }
             Node::Request { name, path, method } => {
                 let resp = ui
@@ -3922,28 +3884,92 @@ fn tree_ui(
                 if let Some(folder) = path.parent() {
                     drop_into(ui, &resp, folder, actions);
                 }
-                resp.context_menu(|ui| {
-                    if ui.button("Rename").clicked() {
-                        actions.push(TreeAction::Dialog(Dialog::name(
-                            NameKind::Rename(path.clone()),
-                            name.as_str(),
-                        )));
-                        ui.close();
-                    }
-                    let duplicate = egui::Button::new("Duplicate")
-                        .shortcut_text(ui.ctx().format_shortcut(&DUPLICATE));
-                    if ui.add(duplicate).clicked() {
-                        actions.push(TreeAction::Duplicate(path.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Delete").clicked() {
-                        actions.push(TreeAction::Dialog(Dialog::Delete(path.clone())));
-                        ui.close();
-                    }
-                });
+                resp.context_menu(|ui| request_menu(ui, path, name, actions));
+                more_button(ui, &resp, path, |ui| request_menu(ui, path, name, actions));
             }
         }
     }
+}
+
+fn folder_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<TreeAction>) {
+    let mut item = |ui: &mut egui::Ui, label: &str, a: TreeAction| {
+        if ui.button(label).clicked() {
+            actions.push(a);
+            ui.close();
+        }
+    };
+    let dialog = |kind| TreeAction::Dialog(Dialog::name(kind, ""));
+    let path = path.to_path_buf();
+    item(
+        ui,
+        "New request",
+        dialog(NameKind::NewRequest(path.clone())),
+    );
+    item(ui, "New folder", dialog(NameKind::NewFolder(path.clone())));
+    let rename = Dialog::name(NameKind::Rename(path.clone()), name);
+    item(ui, "Rename", TreeAction::Dialog(rename));
+    item(ui, "Duplicate", TreeAction::Duplicate(path.clone()));
+    item(
+        ui,
+        "Delete",
+        TreeAction::Dialog(Dialog::Delete(path.clone())),
+    );
+    ui.separator();
+    item(
+        ui,
+        "Folder settings…",
+        TreeAction::FolderSettings(path.clone()),
+    );
+    item(
+        ui,
+        "Copy docs as Markdown",
+        TreeAction::CopyDocs(path.clone()),
+    );
+    item(
+        ui,
+        "Copy as Postman collection",
+        TreeAction::CopyPostman(path.clone()),
+    );
+    item(ui, "Start mock server", TreeAction::Mock(path.clone()));
+    item(ui, "Run folder", TreeAction::Run(path));
+}
+
+fn request_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<TreeAction>) {
+    if ui.button("Rename").clicked() {
+        let rename = Dialog::name(NameKind::Rename(path.to_path_buf()), name);
+        actions.push(TreeAction::Dialog(rename));
+        ui.close();
+    }
+    let duplicate =
+        egui::Button::new("Duplicate").shortcut_text(ui.ctx().format_shortcut(&DUPLICATE));
+    if ui.add(duplicate).clicked() {
+        actions.push(TreeAction::Duplicate(path.to_path_buf()));
+        ui.close();
+    }
+    if ui.button("Delete").clicked() {
+        actions.push(TreeAction::Dialog(Dialog::Delete(path.to_path_buf())));
+        ui.close();
+    }
+}
+
+/// A "⋯" at the right end of a hovered tree row, opening the row's right-click menu:
+/// right-clicking is easy to miss. The hover area is the full row width, so the pointer
+/// can travel to the button.
+fn more_button(
+    ui: &mut egui::Ui,
+    row: &egui::Response,
+    path: &Path,
+    menu: impl FnOnce(&mut egui::Ui),
+) {
+    let id = egui::Id::new(("tree-more", path));
+    let line = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), row.rect.y_range());
+    if !ui.rect_contains_pointer(line) && !egui::Popup::is_id_open(ui.ctx(), id) {
+        return;
+    }
+    let size = egui::vec2(22.0, row.rect.height());
+    let rect = egui::Rect::from_min_size(egui::pos2(line.right() - size.x, line.top()), size);
+    let button = ui.put(rect, egui::Button::new("⋯").small());
+    egui::Popup::menu(&button).id(id).show(menu);
 }
 
 /// A tree drop target: outlined while something is held over it; a release moves that into
@@ -3958,6 +3984,46 @@ fn drop_into(ui: &egui::Ui, resp: &egui::Response, folder: &Path, actions: &mut 
     }
 }
 
+const HEADER_NAMES: &[(&str, &str)] = &[
+    ("Accept", "media types the client takes"),
+    ("Accept-Encoding", "gzip, deflate, br"),
+    ("Accept-Language", "en-US, zh-TW"),
+    ("Authorization", "credentials (or use the Auth tab)"),
+    ("Cache-Control", "no-cache, max-age=0"),
+    ("Connection", "keep-alive, close"),
+    ("Content-Disposition", "attachment; filename=…"),
+    ("Content-Encoding", "gzip"),
+    ("Content-Type", "media type of the body"),
+    ("Cookie", "name=value; …"),
+    ("If-Match", "ETag to match"),
+    ("If-Modified-Since", "HTTP date"),
+    ("If-None-Match", "ETag from an earlier response"),
+    ("Origin", "for CORS"),
+    ("Pragma", "no-cache"),
+    ("Range", "bytes=0-1023"),
+    ("Referer", "the page linking here"),
+    ("User-Agent", "client name and version"),
+    ("X-API-Key", "API key (or use the Auth tab)"),
+    ("X-Correlation-ID", "id to trace a call across services"),
+    ("X-Forwarded-For", "client IP behind a proxy"),
+    ("X-Request-ID", "id for this request"),
+    ("X-Requested-With", "XMLHttpRequest"),
+];
+
+const CONTENT_TYPES: &[(&str, &str)] = &[
+    ("application/json", ""),
+    ("application/xml", ""),
+    ("application/x-www-form-urlencoded", ""),
+    (
+        "multipart/form-data",
+        "set by the Body tab's form-data mode",
+    ),
+    ("text/plain", ""),
+    ("text/html", ""),
+    ("text/csv", ""),
+    ("application/octet-stream", "raw bytes"),
+];
+
 /// Key/value grid with a trailing blank row: typing into it creates a new row, like Postman.
 /// `describe` marks a request table: it gets a Description column (variables have none,
 /// as in Postman) and Bulk Edit. Returns whether any row changed.
@@ -3969,6 +4035,9 @@ fn kv_table(
     describe: bool,
 ) -> bool {
     let before = rows.clone();
+    // The request's own headers table: other tables (params, form, folder headers…) get
+    // no header names.
+    let headers = id == "headers";
     if describe {
         // The text lives in egui's memory while editing, so a half-typed line isn't
         // rewritten from the rows under the cursor.
@@ -4049,6 +4118,7 @@ fn kv_table(
                 vars,
                 style.clone(),
                 false,
+                if headers { HEADER_NAMES } else { &[] },
                 |e| e.hint_text("Key").desired_width(key_width),
             );
             var_edit(
@@ -4058,6 +4128,10 @@ fn kv_table(
                 vars,
                 style,
                 false,
+                match headers && row.key.trim().eq_ignore_ascii_case("content-type") {
+                    true => CONTENT_TYPES,
+                    false => &[],
+                },
                 |e| e.hint_text("Value").desired_width(value_width),
             );
             if describe {
@@ -4105,6 +4179,7 @@ fn path_vars_table(ui: &mut egui::Ui, rows: &mut [KeyValue], vars: &HashMap<Stri
                 vars,
                 egui::TextStyle::Body,
                 false,
+                &[],
                 |e| e.hint_text("Value").desired_width(rest * 0.6),
             );
             ui.add(
@@ -4272,6 +4347,7 @@ fn graphql_editor(
             vars,
             egui::TextStyle::Monospace,
             true,
+            &[],
             |e| {
                 e.code_editor()
                     .hint_text("Fetch the schema and click a field →\nor type a query here.")
@@ -4294,6 +4370,7 @@ fn graphql_editor(
             vars,
             egui::TextStyle::Monospace,
             true,
+            &[],
             |e| {
                 e.code_editor()
                     .hint_text("{ \"id\": \"{{userId}}\" }")
@@ -4408,6 +4485,7 @@ fn code_editor(ui: &mut egui::Ui, id: &str, text: &mut String, vars: &HashMap<St
         vars,
         egui::TextStyle::Monospace,
         true,
+        &[],
         |e| {
             e.code_editor()
                 .desired_rows(12)
@@ -4480,6 +4558,7 @@ fn auth_editor(
             vars,
             egui::TextStyle::Body,
             false,
+            &[],
             |e| e.hint_text(hint).desired_width(420.0),
         );
         ui.end_row();
@@ -6269,14 +6348,15 @@ mod ui_tests {
     fn export_and_import_go_through_the_collection_menu() {
         let mut h = with_request("export");
         let file = h.state().ws.root.join("collections/r.toml");
-        h.get_by_label("⋯").click();
+        // The collection's ⋯, drawn before the hovered tree row's.
+        h.get_all_by_label("⋯").next().unwrap().click();
         h.run();
         h.get_by_label("Export to files").click();
         h.run();
         assert!(file.exists(), "{}", h.state().status);
 
         std::fs::write(&file, "url = 'http://pulled.test'\n").unwrap();
-        h.get_by_label("⋯").click();
+        h.get_all_by_label("⋯").next().unwrap().click();
         h.run();
         h.get_by_label("Import from files…").click();
         h.run();
@@ -6315,7 +6395,7 @@ mod ui_tests {
             { "name": "bin", "request": { "method": "POST", "url": "{{base}}/bin",
                                           "body": { "mode": "file" } } } ] }"#;
         std::fs::write(&file, shop).unwrap();
-        h.get_by_label("⋯").click();
+        h.get_all_by_label("⋯").next().unwrap().click();
         h.run();
         h.get_by_label("Import from Postman…").click();
         h.run();
@@ -6628,6 +6708,69 @@ mod ui_tests {
         drag(&mut h, r, egui::pos2(r.x, 600.0));
         assert!(h.state().ws.load_request(&top.join("r.toml")).is_ok());
         assert_eq!(h.state().open.as_ref().unwrap().path, top.join("r.toml"));
+    }
+
+    #[test]
+    fn a_hovered_tree_row_offers_its_menu_without_a_right_click() {
+        let ws = workspace("more");
+        let top = ws.collections();
+        ws.create_request(&top, "r").unwrap();
+        let mut h = harness(ws);
+        h.run();
+        let row = h.get_all_by_label("r").next().unwrap().rect();
+        // The collection header has its own ⋯; the row's is the one on the row's line.
+        let on_row = |h: &Harness<'_, App>| {
+            h.get_all_by_label("⋯")
+                .filter(|n| n.rect().center().y.round() == row.center().y.round())
+                .count()
+        };
+        assert_eq!(on_row(&h), 0, "only shown while hovered");
+        h.hover_at(row.center());
+        h.run();
+        let more = h
+            .get_all_by_label("⋯")
+            .find(|n| n.rect().center().y.round() == row.center().y.round())
+            .unwrap()
+            .rect()
+            .center();
+        // Reaching for the button must not hide it.
+        h.hover_at(more);
+        h.run();
+        assert_eq!(on_row(&h), 1);
+        h.get_all_by_label("⋯")
+            .find(|n| n.rect().center() == more)
+            .unwrap()
+            .click();
+        h.run();
+        shot(&mut h, "49-tree-more");
+        h.get_by_label("Rename").click();
+        h.run();
+        assert!(matches!(
+            &h.state().dialog,
+            Some(Dialog::Name { kind: NameKind::Rename(p), .. }) if *p == top.join("r.toml")
+        ));
+    }
+
+    #[test]
+    fn header_names_and_content_types_complete_while_typing() {
+        let mut h = with_request("hdr-complete");
+        h.state_mut().req_tab = ReqTab::Headers;
+        h.run();
+        // URL is 0; then the blank row's key and value.
+        type_into(&mut h, 1, "content-t");
+        shot(&mut h, "50-header-complete");
+        h.key_press(Key::Enter);
+        h.run();
+        assert_eq!(draft(&h).headers[0].key, "Content-Type");
+        type_into(&mut h, 2, "json");
+        h.get_by_label("application/json").click();
+        h.run();
+        assert_eq!(draft(&h).headers[0].value, "application/json");
+        // Query parameters aren't headers.
+        h.state_mut().req_tab = ReqTab::Params;
+        h.run();
+        type_into(&mut h, 1, "acc");
+        assert!(h.query_by_label("Accept").is_none());
     }
 
     #[test]

@@ -27,7 +27,10 @@ pub fn is_known(name: &str, vars: &HashMap<String, String>) -> bool {
 }
 
 /// `configure` adds hint text, width, rows… to the TextEdit; `id` must be stable across
-/// frames because the autocomplete state is keyed by it.
+/// frames because the autocomplete state is keyed by it. `words` complete the whole field
+/// outside `{{` (header names).
+// A builder for one function would be more code than the long argument list.
+#[allow(clippy::too_many_arguments)]
 pub fn var_edit(
     ui: &mut egui::Ui,
     id: Id,
@@ -35,6 +38,7 @@ pub fn var_edit(
     vars: &HashMap<String, String>,
     style: TextStyle,
     multiline: bool,
+    words: &[(&str, &str)],
     configure: impl FnOnce(egui::TextEdit<'_>) -> egui::TextEdit<'_>,
 ) -> egui::Response {
     let popup_id = id.with("vars-popup");
@@ -80,16 +84,25 @@ pub fn var_edit(
     let context = cursor
         .filter(|_| focused)
         .and_then(|c| completion_context(text, c));
+    // Outside a `{{`, the field as a whole completes from `words`.
+    let start = match &context {
+        Some((start, ..)) => Some(*start),
+        None if focused && cursor.is_some() && !words.is_empty() => Some(usize::MAX),
+        None => None,
+    };
     let mut suggestions = Vec::new();
-    if let Some((start, _, prefix)) = &context {
-        if popup.start != *start {
+    if let Some(start) = start {
+        if popup.start != start {
             popup = Popup {
-                start: *start,
+                start,
                 ..Default::default()
             };
         }
         if !popup.dismissed {
-            suggestions = suggest(prefix, vars);
+            suggestions = match &context {
+                Some((_, _, prefix)) => suggest(prefix, vars),
+                None => suggest_words(text, words),
+            };
         }
     }
     let showing = !suggestions.is_empty();
@@ -120,11 +133,15 @@ pub fn var_edit(
             });
     }
 
-    if accept
-        && showing
-        && let Some((start, cursor_byte, _)) = context
-    {
-        let index = insert(text, start, cursor_byte, &suggestions[popup.selected].0);
+    if accept && showing {
+        let pick = &suggestions[popup.selected].0;
+        let index = match context {
+            Some((start, cursor_byte, _)) => insert(text, start, cursor_byte, pick),
+            None => {
+                pick.clone_into(text);
+                text.chars().count()
+            }
+        };
         let mut state = output.state;
         state
             .cursor
@@ -215,6 +232,23 @@ fn suggest(prefix: &str, vars: &HashMap<String, String>) -> Vec<(String, String)
     out
 }
 
+/// Words containing what's typed, those starting with it first, else in list order. Nothing
+/// for an empty field (the list would cover the rows below) or a finished word.
+fn suggest_words(text: &str, words: &[(&str, &str)]) -> Vec<(String, String)> {
+    let typed = text.trim().to_lowercase();
+    if typed.is_empty() || words.iter().any(|(w, _)| w.to_lowercase() == typed) {
+        return Vec::new();
+    }
+    let mut out: Vec<(String, String)> = words
+        .iter()
+        .filter(|(w, _)| w.to_lowercase().contains(&typed))
+        .map(|(w, d)| (w.to_string(), d.to_string()))
+        .collect();
+    out.sort_by_key(|(w, _)| !w.to_lowercase().starts_with(&typed));
+    out.truncate(MAX_SUGGESTIONS);
+    out
+}
+
 /// Replaces the typed prefix with `name}}` (reusing a `}}` already after the cursor) and
 /// returns the char index just past the closing braces.
 fn insert(text: &mut String, open: usize, cursor: usize, name: &str) -> usize {
@@ -273,5 +307,23 @@ mod tests {
         let names: Vec<_> = suggest("t", &vars).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names[..2], ["token".to_owned(), "authToken".to_owned()]);
         assert!(names.contains(&"$timestamp".to_owned()));
+    }
+
+    #[test]
+    fn words_complete_by_substring_and_go_quiet_once_typed_out() {
+        let words = [("Accept", ""), ("X-Content-Id", ""), ("Content-Type", "")];
+        let names = |t| -> Vec<_> {
+            suggest_words(t, &words)
+                .into_iter()
+                .map(|(w, _)| w)
+                .collect()
+        };
+        assert_eq!(names("content"), ["Content-Type", "X-Content-Id"]);
+        assert_eq!(names("type"), ["Content-Type"]);
+        assert!(names("").is_empty());
+        assert!(
+            names("content-type").is_empty(),
+            "a finished word needs no list"
+        );
     }
 }

@@ -20,7 +20,9 @@ such as Citrix VDI. No installer: unzip and run.
   path or drop the file) and copy a folder or the whole collection as a Postman
   collection; duplicate requests and folders (Ctrl+D); new request (Ctrl+N); Ctrl+L
   selects the URL; filter the tree by name; drag a request or folder onto a folder (or the
-  empty space under the tree) to move it, open tabs following; a response body with JSON colours and line numbers,
+  empty space under the tree) to move it, open tabs following; a ⋯ on the hovered tree row
+  opens the same menu as right-click; header names and Content-Type values complete while
+  typing; a response body with JSON colours and line numbers,
   Pretty/Raw, word wrap and Save… to a file (bodies past 16 MiB keep their start, to
   spare RAM); a Timeline tab with the request as it went out (headers reqwest adds and jar
   cookies included), each redirect and the peer address; a History menu in the
