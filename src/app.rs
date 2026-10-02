@@ -251,6 +251,8 @@ enum Dialog {
     },
     Delete(PathBuf),
     Unsaved(Next),
+    /// Confirmed first: it replaces what was edited here since the last export.
+    Import,
 }
 
 impl Dialog {
@@ -537,6 +539,26 @@ impl App {
     fn reload(&mut self) {
         self.tree = self.ws.tree();
         self.envs = self.ws.env_names();
+    }
+
+    fn export(&mut self) {
+        let root = self.ws.root.clone();
+        self.status = match self.ws.export(&root) {
+            Ok(n) => format!("Exported {n} requests to {}", root.display()),
+            Err(e) => format!("Export failed: {e}"),
+        };
+    }
+
+    fn import(&mut self) {
+        let root = self.ws.root.clone();
+        match self.ws.import(&root, false) {
+            Ok(n) => {
+                self.status = format!("Imported {n} requests from {}", root.display());
+                // May replace the status: an open request with unsaved edits is flagged.
+                self.refresh_from_disk();
+            }
+            Err(e) => self.status = format!("Import failed: {e}"),
+        }
     }
 
     /// Picks up edits made outside the window (git pull, an MCP client, an editor) when the
@@ -1417,6 +1439,22 @@ impl App {
                     self.start_mock(root.clone(), ui.ctx());
                     ui.close();
                 }
+                ui.separator();
+                let export = ui.button("Export to files").on_hover_text(
+                    "Writes collections/, environments/ and globals.toml into the workspace \
+                     folder, for git. Secrets, history and cookies stay out.",
+                );
+                if export.clicked() {
+                    self.export();
+                    ui.close();
+                }
+                let import = ui
+                    .button("Import from files…")
+                    .on_hover_text("Reads those files back, e.g. after a git pull");
+                if import.clicked() {
+                    self.dialog = Some(Dialog::Import);
+                    ui.close();
+                }
             })
             .response
             .on_hover_text("The whole collection");
@@ -2174,6 +2212,7 @@ impl App {
             return;
         };
         let open_name = self.open.as_ref().map(Open::name).unwrap_or_default();
+        let root = self.ws.root.display().to_string();
         let mut cancel = false;
         let mut then: Option<Then> = None;
         let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
@@ -2282,6 +2321,23 @@ impl App {
                                 }
                             }));
                         }
+                    });
+                }
+                Dialog::Import => {
+                    ui.heading("Import from files");
+                    ui.label(format!(
+                        "Read collections/, environments/ and globals.toml in {root}? \
+                         Requests, folder settings and shared variables of the same name are \
+                         replaced. Nothing is deleted, and secrets stay."
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.add(primary("Import")).clicked() || enter_pressed(ui) {
+                            then = Some(Box::new(|app, _| {
+                                app.dialog = None;
+                                app.import();
+                            }));
+                        }
+                        cancel = ui.button("Cancel").clicked();
                     });
                 }
             }
@@ -4838,6 +4894,29 @@ mod ui_tests {
 
     fn draft<'h>(h: &'h Harness<'_, App>) -> &'h Request {
         &h.state().open.as_ref().unwrap().draft
+    }
+
+    /// The git round trip: export, a teammate's change arrives with a pull, import.
+    #[test]
+    fn export_and_import_go_through_the_collection_menu() {
+        let mut h = with_request("export");
+        let file = h.state().ws.root.join("collections/r.toml");
+        h.get_by_label("⋯").click();
+        h.run();
+        h.get_by_label("Export to files").click();
+        h.run();
+        assert!(file.exists(), "{}", h.state().status);
+
+        std::fs::write(&file, "url = 'http://pulled.test'\n").unwrap();
+        h.get_by_label("⋯").click();
+        h.run();
+        h.get_by_label("Import from files…").click();
+        h.run();
+        assert_eq!(draft(&h).url, "", "nothing changes before the confirmation");
+        h.get_by_label("Import").click();
+        h.run();
+        assert_eq!(draft(&h).url, "http://pulled.test");
+        assert!(h.state().dialog.is_none());
     }
 
     #[test]
