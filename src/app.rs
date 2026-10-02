@@ -430,6 +430,8 @@ enum TreeAction {
     CopyDocs(PathBuf),
     CopyPostman(PathBuf),
     Mock(PathBuf),
+    /// Drag and drop: this request or folder into that folder.
+    Move(PathBuf, PathBuf),
 }
 
 /// Collection runner pane. Settings persist while the pane is open; results are summaries only.
@@ -468,6 +470,8 @@ pub struct App {
     show_history: bool,
     /// Sidebar filter: requests whose name contains it, and the folders leading to them.
     tree_filter: String,
+    /// Set by a drop: the folders above it open on the next frame, so it stays in sight.
+    reveal: Option<PathBuf>,
     /// Outlives client rebuilds; saved to the workspace after responses.
     cookies: Arc<Jar>,
     cookie_manager: bool,
@@ -525,6 +529,7 @@ impl App {
             history: ws.load_history(),
             show_history: false,
             tree_filter: String::new(),
+            reveal: None,
             cookies: Arc::new(Jar::from_json(&ws.load_cookies())),
             cookie_manager: false,
             code: false,
@@ -1321,8 +1326,38 @@ impl App {
         all
     }
 
+    /// Keeps tabs (and their unsaved drafts) pointing at moved or renamed files.
+    fn follow_move(&mut self, old: &Path, new: &Path) {
+        let moved = |p: &mut PathBuf| {
+            if p == old {
+                *p = new.to_owned();
+            } else if let Ok(rest) = p.strip_prefix(old) {
+                *p = new.join(rest);
+            }
+        };
+        let parked = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut());
+        let opens = self.open.iter_mut().chain(parked.map(|p| &mut p.open));
+        opens.for_each(|o| moved(&mut o.path));
+        self.tabs.iter_mut().for_each(|t| moved(&mut t.path));
+    }
+
+    /// Drag and drop in the tree.
+    fn move_into(&mut self, path: &Path, folder: &Path) {
+        match self.ws.move_into(path, folder) {
+            Ok(new) if new == path => {}
+            Ok(new) => {
+                self.follow_move(path, &new);
+                self.reload();
+                self.save_state();
+                self.reveal = Some(new.clone());
+                self.status = format!("Moved to \"{}\"", self.ws.display_name(&new));
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
     fn submit_name(&mut self) {
-        let Some(Dialog::Name { kind, name, error }) = &mut self.dialog else {
+        let Some(Dialog::Name { kind, name, .. }) = &mut self.dialog else {
             return;
         };
         let name = name.trim().to_owned();
@@ -1339,21 +1374,16 @@ impl App {
                 .load_env(Some(from))
                 .and_then(|(shared, secret)| self.ws.save_env(Some(&name), &shared, &secret))
                 .map(|()| None),
-            NameKind::Rename(old) => self.ws.rename(old, &name).map(|new| {
-                // Keep tabs (and their unsaved drafts) pointing at the moved files.
-                let moved = |p: &mut PathBuf| {
-                    if *p == *old {
-                        *p = new.clone();
-                    } else if let Ok(rest) = p.strip_prefix(&*old) {
-                        *p = new.join(rest);
-                    }
-                };
-                let parked = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut());
-                let opens = self.open.iter_mut().chain(parked.map(|p| &mut p.open));
-                opens.for_each(|o| moved(&mut o.path));
-                self.tabs.iter_mut().for_each(|t| moved(&mut t.path));
-                None
-            }),
+            NameKind::Rename(old) => {
+                let old = old.clone();
+                self.ws.rename(&old, &name).map(|new| {
+                    self.follow_move(&old, &new);
+                    None
+                })
+            }
+        };
+        let Some(Dialog::Name { kind, error, .. }) = &mut self.dialog else {
+            return;
         };
         match result {
             Err(e) => *error = e,
@@ -1876,6 +1906,9 @@ impl App {
             found = filtered(&self.tree, &query);
             &found
         };
+        let reveal = self.reveal.take();
+        let expand =
+            |p: &Path| !query.is_empty() || reveal.as_ref().is_some_and(|r| r.starts_with(p));
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -1884,8 +1917,26 @@ impl App {
                 } else if nodes.is_empty() {
                     ui.weak("Nothing matches.");
                 }
-                tree_ui(ui, nodes, selected, !query.is_empty(), &mut actions);
+                tree_ui(ui, nodes, selected, &expand, &mut actions);
+                // The empty space under the tree takes a drop to the top level.
+                let size = egui::vec2(ui.available_width(), ui.available_height().max(24.0));
+                let rest = ui.allocate_response(size, egui::Sense::hover());
+                drop_into(ui, &rest, &self.ws.collections(), &mut actions);
             });
+        // What is being dragged follows the pointer.
+        if let Some(path) = egui::DragAndDrop::payload::<PathBuf>(ui.ctx())
+            && let Some(pos) = ui.ctx().pointer_interact_pos()
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tree-drag"));
+            ui.ctx().layer_painter(layer).text(
+                pos + egui::vec2(14.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                path.file_stem().unwrap_or_default().to_string_lossy(),
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().strong_text_color(),
+            );
+        }
         for action in actions {
             match action {
                 TreeAction::Open(path, pin) => {
@@ -1902,6 +1953,7 @@ impl App {
                 TreeAction::CopyDocs(dir) => self.copy_docs(&dir, ui.ctx()),
                 TreeAction::CopyPostman(dir) => self.copy_postman(&dir, ui.ctx()),
                 TreeAction::Mock(dir) => self.start_mock(dir, ui.ctx()),
+                TreeAction::Move(path, folder) => self.move_into(&path, &folder),
             }
         }
     }
@@ -3776,12 +3828,13 @@ fn filtered(nodes: &[Node], query: &str) -> Vec<Node> {
         .collect()
 }
 
-/// `expand` opens every folder, so what a filter found is in view.
+/// Folders for which `expand` is true are opened, so what a filter found or a drop moved
+/// is in view.
 fn tree_ui(
     ui: &mut egui::Ui,
     nodes: &[Node],
     selected: Option<&Path>,
-    expand: bool,
+    expand: &dyn Fn(&Path) -> bool,
     actions: &mut Vec<TreeAction>,
 ) {
     for node in nodes {
@@ -3795,8 +3848,13 @@ fn tree_ui(
                     .id_salt(path)
                     // Reveal the open request on startup instead of hiding it in a collapsed folder.
                     .default_open(selected.is_some_and(|s| s.starts_with(path)))
-                    .open(expand.then_some(true))
+                    .open(expand(path).then_some(true))
                     .show(ui, |ui| tree_ui(ui, children, selected, expand, actions));
+                let header = &resp.header_response;
+                header
+                    .interact(egui::Sense::drag())
+                    .dnd_set_drag_payload(path.clone());
+                drop_into(ui, header, path, actions);
                 resp.header_response.context_menu(|ui| {
                     let mut item = |label: &str, a: TreeAction| {
                         if ui.button(label).clicked() {
@@ -3857,6 +3915,12 @@ fn tree_ui(
                 } else if resp.clicked() {
                     actions.push(TreeAction::Open(path.clone(), false));
                 }
+                resp.interact(egui::Sense::drag())
+                    .dnd_set_drag_payload(path.clone());
+                // Dropped on a request: next to it, in its folder.
+                if let Some(folder) = path.parent() {
+                    drop_into(ui, &resp, folder, actions);
+                }
                 resp.context_menu(|ui| {
                     if ui.button("Rename").clicked() {
                         actions.push(TreeAction::Dialog(Dialog::name(
@@ -3878,6 +3942,18 @@ fn tree_ui(
                 });
             }
         }
+    }
+}
+
+/// A tree drop target: outlined while something is held over it; a release moves that into
+/// `folder`.
+fn drop_into(ui: &egui::Ui, resp: &egui::Response, folder: &Path, actions: &mut Vec<TreeAction>) {
+    if resp.dnd_hover_payload::<PathBuf>().is_some() {
+        let stroke = ui.visuals().selection.stroke;
+        (ui.painter()).rect_stroke(resp.rect, 2.0, stroke, egui::StrokeKind::Inside);
+    }
+    if let Some(path) = resp.dnd_release_payload::<PathBuf>() {
+        actions.push(TreeAction::Move((*path).clone(), folder.to_owned()));
     }
 }
 
@@ -6451,6 +6527,48 @@ mod ui_tests {
             past: None,
         });
         h.run();
+    }
+
+    #[test]
+    fn dragging_in_the_tree_moves_requests_and_their_tabs_follow() {
+        let ws = workspace("drag");
+        let top = ws.collections();
+        let api = ws.create_folder(&top, "api").unwrap();
+        ws.create_request(&top, "r").unwrap();
+        let mut h = harness(ws);
+        h.run();
+        h.state_mut().activate(top.join("r.toml"), true);
+        h.state_mut().open.as_mut().unwrap().draft.url = "http://unsaved".into();
+        h.run();
+        let drag = |h: &mut Harness<'_, App>, from: egui::Pos2, to: egui::Pos2| {
+            h.drag_at(from);
+            h.run();
+            // Past egui's drag threshold, then over the target.
+            h.hover_at(from + egui::vec2(0.0, 12.0));
+            h.run();
+            h.hover_at(to);
+            h.run();
+            shot(h, "47-tree-drag");
+            h.drop_at(to);
+            h.run();
+        };
+        let r = h.get_all_by_label("r").next().unwrap().rect().center();
+        let folder = h.get_by_label("api").rect().center();
+        drag(&mut h, r, folder);
+        let moved = api.join("r.toml");
+        assert!(
+            h.state().ws.load_request(&moved).is_ok(),
+            "{}",
+            h.state().status
+        );
+        // The tab follows the file, unsaved edits and all.
+        assert_eq!(h.state().tabs[0].path, moved);
+        assert_eq!(draft(&h).url, "http://unsaved");
+        // And back out: the space under the tree is the top level.
+        let r = h.get_all_by_label("r").next().unwrap().rect().center();
+        drag(&mut h, r, egui::pos2(r.x, 600.0));
+        assert!(h.state().ws.load_request(&top.join("r.toml")).is_ok());
+        assert_eq!(h.state().open.as_ref().unwrap().path, top.join("r.toml"));
     }
 
     #[test]

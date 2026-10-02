@@ -694,7 +694,36 @@ impl Workspace {
         if self.exists(&new) {
             return Err(format!("\"{}\" already exists", name.trim()));
         }
-        let (old_key, new_key) = (self.key(path), self.key(&new));
+        self.relocate(path, &new)?;
+        Ok(new)
+    }
+
+    /// Moves a request or folder into `folder` (the collections root included), keeping
+    /// its name; returns the new path.
+    pub fn move_into(&self, path: &Path, folder: &Path) -> Result<PathBuf, String> {
+        let name = path.file_name().unwrap_or_default();
+        let new = folder.join(name);
+        if folder.starts_with(path) {
+            return Err("A folder can't go inside itself".into());
+        }
+        if new == path {
+            return Ok(new);
+        }
+        if self.exists(&new) {
+            let name = Path::new(name)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            return Err(format!("\"{name}\" already exists there"));
+        }
+        self.relocate(path, &new)?;
+        Ok(new)
+    }
+
+    /// Re-keys a request (or a folder and everything in it) from `path` to `new`.
+    fn relocate(&self, path: &Path, new: &Path) -> Result<(), String> {
+        let request = is_request(path);
+        let (old_key, new_key) = (self.key(path), self.key(new));
         let mut db = self.db();
         let tx = sql(db.transaction())?;
         let tables: &[&str] = match request {
@@ -708,8 +737,7 @@ impl Workspace {
             );
             sql(tx.execute(&update, [&old_key, &new_key]))?;
         }
-        sql(tx.commit())?;
-        Ok(new)
+        sql(tx.commit())
     }
 
     /// The first free "<name> copy", "<name> copy 2", … next to `path`.
@@ -1453,6 +1481,34 @@ mod tests {
             ws.responses(&again).is_empty(),
             "a new request starts fresh"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn moving_takes_contents_along_and_never_overwrites() {
+        let root = fresh("move");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let top = ws.collections();
+        let api = ws.create_folder(&top, "api").unwrap();
+        let v1 = ws.create_folder(&top, "v1").unwrap();
+        let r = ws.create_request(&top, "r").unwrap();
+        let req = Request {
+            url: "http://x".into(),
+            ..Default::default()
+        };
+        ws.save_request(&r, &req).unwrap();
+        let r = ws.move_into(&r, &v1).unwrap();
+        assert_eq!(r, v1.join("r.toml"));
+        assert_eq!(ws.load_request(&r).unwrap().url, "http://x");
+        // A folder moves with everything in it.
+        let v1 = ws.move_into(&v1, &api).unwrap();
+        assert_eq!(ws.load_request(&v1.join("r.toml")).unwrap().url, "http://x");
+        assert!(ws.move_into(&api, &v1).is_err(), "not into itself");
+        // A same-named request there stays as it is.
+        let other = ws.create_request(&top, "r").unwrap();
+        let err = ws.move_into(&other, &v1).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(ws.load_request(&v1.join("r.toml")).unwrap().url, "http://x");
         let _ = fs::remove_dir_all(&root);
     }
 
