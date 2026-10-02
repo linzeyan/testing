@@ -288,6 +288,12 @@ struct ResponseView {
     /// Visual rows for word wrap at a given width in columns, see `wrap_rows`.
     wrapped: Option<(usize, Vec<Row>)>,
     find: Find,
+    /// The JSON filter as typed, the one `text` shows the result of, and why it can't apply.
+    filter: String,
+    applied: String,
+    filter_error: String,
+    /// The body as shown before a filter replaced `text`.
+    unfiltered: Option<String>,
 }
 
 impl ResponseView {
@@ -296,8 +302,35 @@ impl ResponseView {
             return;
         }
         let Some(other) = &mut self.other else { return };
+        if let Some(body) = self.unfiltered.take() {
+            self.text = body;
+        }
         std::mem::swap(&mut self.text, other);
         self.pretty = pretty;
+        self.apply_filter();
+    }
+
+    /// Shows what the filter selects in place of the body (pretty JSON); an empty filter
+    /// brings the body back. Also re-derives what depends on `text`.
+    fn apply_filter(&mut self) {
+        self.applied = self.filter.clone();
+        self.filter_error.clear();
+        if let Some(body) = self.unfiltered.take() {
+            self.text = body;
+        }
+        let query = self.filter.trim();
+        if !query.is_empty() {
+            let picked = serde_json::from_str(self.raw())
+                .map_err(|e| e.to_string())
+                .and_then(|json| crate::jsonpath::select(&json, query));
+            match picked {
+                Ok(v) => {
+                    let shown = serde_json::to_string_pretty(&v).unwrap_or_default();
+                    self.unfiltered = Some(std::mem::replace(&mut self.text, shown));
+                }
+                Err(e) => self.filter_error = e,
+            }
+        }
         self.line_starts = line_starts(&self.text);
         self.wrapped = None;
         self.find = Find::default();
@@ -307,7 +340,7 @@ impl ResponseView {
     fn raw(&self) -> &str {
         match (&self.other, self.pretty) {
             (Some(raw), true) => raw,
-            _ => &self.text,
+            _ => self.unfiltered.as_deref().unwrap_or(&self.text),
         }
     }
 }
@@ -1430,7 +1463,47 @@ fn into_view(mut head: http::Response) -> ResponseView {
         raw_size,
         wrapped: None,
         find: Find::default(),
+        filter: String::new(),
+        applied: String::new(),
+        filter_error: String::new(),
+        unfiltered: None,
     }
+}
+
+/// Bodies up to this size are filtered as the path is typed; past it, each run re-parses a
+/// big body (a transient several times its size), so Enter applies the filter instead.
+const LIVE_FILTER_MAX: usize = 1 << 20;
+
+fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
+    ui.horizontal(|ui| {
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut view.filter)
+                // Not an auto id: the × appearing would change it and drop focus.
+                .id(egui::Id::new("json-filter"))
+                .hint_text("Filter: $.items[*].id")
+                .font(egui::TextStyle::Monospace)
+                .desired_width(280.0),
+        );
+        let edit = edit.on_hover_text(
+            "JSONPath: $, .key, ['key'], [0], [-1], [*], .*, ..key (filters [?()] aren't supported)",
+        );
+        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        let live = view.raw_size <= LIVE_FILTER_MAX;
+        if view.filter != view.applied && (live || enter) {
+            view.apply_filter();
+        }
+        if !view.filter.is_empty()
+            && ui.small_button("×").on_hover_text("Show the whole body").clicked()
+        {
+            view.filter.clear();
+            view.apply_filter();
+        }
+        if !view.filter_error.is_empty() {
+            ui.colored_label(ORANGE, view.filter_error.as_str());
+        } else if view.filter != view.applied {
+            ui.weak("Enter to apply");
+        }
+    });
 }
 
 fn line_starts(text: &str) -> Vec<usize> {
@@ -5703,7 +5776,7 @@ fn response_ui(
                         name: format!("{} {}", h.status, h.reason).trim().to_owned(),
                         status: h.status,
                         content_type,
-                        body: view.text.clone(),
+                        body: view.unfiltered.clone().unwrap_or_else(|| view.text.clone()),
                     });
                 }
                 if *tab == RespTab::Body {
@@ -5843,6 +5916,9 @@ fn response_ui(
                 });
         }
         (_, Ok(view)) => {
+            if view.other.is_some() {
+                filter_bar(ui, view);
+            }
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
             let font = egui::TextStyle::Monospace.resolve(ui.style());
             let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '0'));
@@ -7077,6 +7153,62 @@ mod ui_tests {
         assert_eq!(open(&h), Some(top.join("users/get user.toml")));
         switch(&mut h, "prod", 0);
         assert_eq!(h.state().active_env.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn a_json_filter_narrows_the_body_but_save_keeps_it_whole() {
+        let mut h = with_request("json-filter");
+        let body = r#"{"items":[{"id":1},{"id":2}]}"#;
+        h.state_mut().response = Some(Shown {
+            result: Ok(into_view(http::Response {
+                status: 200,
+                reason: "OK".into(),
+                version: "HTTP/1.1".into(),
+                elapsed: Duration::ZERO,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: body.into(),
+                truncated: false,
+                sent: Default::default(),
+            })),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            past: None,
+        });
+        h.run();
+        let view = |h: &Harness<'_, App>| {
+            let shown = h.state().response.as_ref().unwrap();
+            let view = shown.result.as_ref().unwrap();
+            (view.text.clone(), view.raw().to_owned())
+        };
+        let hint = Some("Filter: $.items[*].id");
+        // Found by its placeholder, which stays until something is typed.
+        for step in 0..2 {
+            let field = (h.get_all_by_role(Role::TextInput))
+                .find(|n| n.accesskit_node().placeholder() == hint)
+                .unwrap();
+            match step {
+                0 => field.click(),
+                _ => field.type_text("$.items[*].id"),
+            }
+            h.run();
+        }
+        shot(&mut h, "54-json-filter");
+        assert_eq!(view(&h), ("[\n  1,\n  2\n]".into(), body.into()));
+        // Raw and back: still filtered, still the server's bytes underneath.
+        h.get_by_label("Raw").click();
+        h.run();
+        assert_eq!(view(&h), ("[\n  1,\n  2\n]".into(), body.into()));
+        h.get_by_label("Pretty").click();
+        h.run();
+        assert_eq!(view(&h).0, "[\n  1,\n  2\n]");
+        // An example is the response, not the view of it.
+        h.get_by_label("Save as example").click();
+        h.run();
+        assert!(draft(&h).examples[0].body.contains("\"items\""));
+        // The filter's ×, drawn after the tab strip's.
+        h.get_all_by_label("×").last().unwrap().click();
+        h.run();
+        assert!(view(&h).0.starts_with("{\n  \"items\""), "{}", view(&h).0);
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod docs;
 mod graphql;
 mod grpc;
 mod http;
+mod jsonpath;
 mod loadtest;
 mod mcp;
 mod mock;
