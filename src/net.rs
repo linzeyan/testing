@@ -61,6 +61,8 @@ impl Default for Network {
 pub struct Clients {
     pub http: reqwest::Client,
     pub grpc: reqwest::Client,
+    /// Why the system's PAC script was skipped, to show next to the proxy mode.
+    pub note: Option<String>,
 }
 
 /// With a fresh cookie jar for this client's lifetime (a CLI run, an MCP session).
@@ -79,11 +81,13 @@ pub async fn build_client_with_jar(
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Any explicit `.proxy()` turns off reqwest's own system-proxy lookup.
+    let mut note = None;
     let proxy = match net.proxy {
-        ProxyMode::System => match system_pac_url().await? {
-            Some(url) => Some(pac_proxy(&url).await?),
-            None => None,
-        },
+        ProxyMode::System => {
+            let (proxy, skipped) = system_proxy(system_pac_url().await?).await;
+            note = skipped;
+            proxy
+        }
         ProxyMode::None => None,
         ProxyMode::Manual => {
             let proxy = reqwest::Proxy::all(net.proxy_url.trim())
@@ -137,7 +141,26 @@ pub async fn build_client_with_jar(
     Ok(Clients {
         http: build(false)?,
         grpc: build(true)?,
+        note,
     })
+}
+
+/// The system's PAC script, or direct when it can't be used, as browsers do: WPAD often
+/// finds an intranet web page instead of a script. The second value says why it was skipped.
+async fn system_proxy(pac: Option<String>) -> (Option<reqwest::Proxy>, Option<String>) {
+    let Some(url) = pac else {
+        return (None, None);
+    };
+    match pac_proxy(&url).await {
+        Ok(proxy) => (Some(proxy), None),
+        Err(e) => (
+            None,
+            Some(format!(
+                "The system's proxy script {url} can't be used, so requests go out directly \
+                 (as in a browser).\n{e}"
+            )),
+        ),
+    }
 }
 
 /// Accepts a PEM file (key + certificate chain) or a PFX/P12 bundle.
@@ -450,6 +473,26 @@ mod tests {
             at("https://example.com/"),
             Some("http://proxy.corp.local:8080".into())
         );
+    }
+
+    #[test]
+    fn a_system_pac_that_is_a_web_page_means_direct_not_broken() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // What WPAD found on a real network: wpad.<domain> served the intranet home page.
+        let page = crate::http::tests::json_server("<!DOCTYPE html><html></html>".into());
+        let (proxy, note) = rt.block_on(system_proxy(Some(page.clone())));
+        assert!(proxy.is_none());
+        let note = note.unwrap();
+        assert!(note.contains(&page) && note.contains("directly"), "{note}");
+        let script = r#"function FindProxyForURL(u, h) { return "PROXY p:8080"; }"#;
+        let (proxy, note) = rt.block_on(system_proxy(Some(crate::http::tests::json_server(
+            script.into(),
+        ))));
+        assert!(proxy.is_some() && note.is_none());
+        assert!(rt.block_on(system_proxy(None)).0.is_none());
     }
 
     #[test]

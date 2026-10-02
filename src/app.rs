@@ -1212,13 +1212,20 @@ impl App {
                     ProxyMode::Manual => "Manual proxy",
                     ProxyMode::Pac => "PAC",
                 };
+                let note = match self.client.get() {
+                    Some(Ok(c)) => c.note.as_deref(),
+                    _ => None,
+                };
                 let mut label = RichText::new(format!("⚙ {proxy}"));
+                if note.is_some() {
+                    label = RichText::new(format!("⚙ {proxy} · direct")).color(ORANGE);
+                }
                 if self.network.insecure {
                     label = RichText::new(format!("⚙ {proxy} · TLS verify OFF")).color(RED);
                 }
                 if ui
                     .small_button(label)
-                    .on_hover_text("Network settings")
+                    .on_hover_text(note.unwrap_or("Network settings"))
                     .clicked()
                 {
                     self.network_editor = Some(self.network.clone());
@@ -2762,7 +2769,8 @@ impl App {
                     (None, true) => {
                         ui.weak(
                             "Windows has \"Automatically detect settings\" on: the PAC script is \
-                             looked up via WPAD (DHCP, then DNS) before the first request.",
+                             looked up via WPAD (DHCP, then DNS) before the first request. If \
+                             what it finds isn't a usable script, requests go out directly.",
                         );
                     }
                     (None, false) => {
