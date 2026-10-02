@@ -456,6 +456,7 @@ fn tools() -> Value {
                 "key": { "type": "string" },
                 "value": { "type": "string" },
                 "enabled": { "type": "boolean", "default": true },
+                "description": { "type": "string", "description": "Documentation only; not sent" },
             },
             "required": ["key", "value"],
         },

@@ -120,6 +120,9 @@ pub struct KeyValue {
     pub value: String,
     #[serde(default = "enabled", skip_serializing_if = "is_enabled")]
     pub enabled: bool,
+    /// What the row is for; documentation only, never sent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 fn enabled() -> bool {
@@ -136,6 +139,7 @@ impl KeyValue {
             key: key.into(),
             value: value.into(),
             enabled: true,
+            description: String::new(),
         }
     }
 }
@@ -342,6 +346,17 @@ impl Request {
                 KeyValue::new(k, v)
             })
             .collect();
+        // The URL has no room for descriptions; keep each one with its row: same key, or
+        // else the same place (that row's key is being edited).
+        let old: Vec<&KeyValue> = self.params.iter().filter(|p| p.enabled).collect();
+        let keys: Vec<String> = params.iter().map(|p| p.key.clone()).collect();
+        for (i, p) in params.iter_mut().enumerate() {
+            let same_key = old.iter().find(|o| o.key == p.key);
+            let same_place = old.get(i).filter(|o| !keys.contains(&o.key));
+            if let Some(o) = same_key.or(same_place) {
+                p.description = o.description.clone();
+            }
+        }
         params.extend(self.params.iter().filter(|p| !p.enabled).cloned());
         self.params = params;
     }
@@ -528,6 +543,41 @@ mod tests {
     }
 
     #[test]
+    fn param_descriptions_survive_url_edits() {
+        let described = |k: &str, v: &str, d: &str| KeyValue {
+            description: d.into(),
+            ..KeyValue::new(k, v)
+        };
+        // Loading a file rebuilds the table from the URL; that must not wipe descriptions.
+        let mut req = Request {
+            url: "http://x/a?page=1&size=10".into(),
+            params: vec![
+                described("page", "1", "1-based"),
+                described("size", "10", "max 100"),
+            ],
+            ..Default::default()
+        };
+        req.sync_params();
+        assert_eq!(req.params[0].description, "1-based");
+        // Typing a value, reordering, and renaming a key in place keep them too.
+        for url in [
+            "http://x/a?page=2&size=10",
+            "http://x/a?size=10&page=2",
+            "http://x/a?size=10&p=2",
+        ] {
+            req.url = url.into();
+            req.params_from_url();
+        }
+        assert_eq!(
+            req.params,
+            [
+                described("size", "10", "max 100"),
+                described("p", "2", "1-based")
+            ]
+        );
+    }
+
+    #[test]
     fn resolved_drops_disabled_rows() {
         let mut off = KeyValue::new("debug", "1");
         off.enabled = false;
@@ -551,7 +601,10 @@ mod tests {
             proto: "protos/users.proto".into(),
             rpc: "users.v1.Users/Get".into(),
             description: "Fetches **one** user.\n".into(),
-            params: vec![KeyValue::new("page", "2")],
+            params: vec![KeyValue {
+                description: "1-based".into(),
+                ..KeyValue::new("page", "2")
+            }],
             headers: vec![off],
             body: Body::Json {
                 text: "{\n  \"name\": \"測試\"\n}".into(),

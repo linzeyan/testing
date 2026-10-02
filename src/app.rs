@@ -1842,12 +1842,12 @@ impl App {
                     .auto_shrink(false)
                     .show(ui, |ui| match self.req_tab {
                         ReqTab::Params => {
-                            if kv_table(ui, "params", &mut open.draft.params, &all_vars) {
+                            if kv_table(ui, "params", &mut open.draft.params, &all_vars, true) {
                                 open.draft.url_from_params();
                             }
                         }
                         ReqTab::Headers => {
-                            kv_table(ui, "headers", &mut open.draft.headers, &all_vars);
+                            kv_table(ui, "headers", &mut open.draft.headers, &all_vars, true);
                         }
                         ReqTab::Body => {
                             // GRAPHQL requests are always a query; no body type to pick.
@@ -2188,14 +2188,14 @@ impl App {
             egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                 ui.label(RichText::new("Shared").strong());
                 ui.weak(format!("Saved to {file}.toml and committed to git."));
-                kv_table(ui, "env-shared", &mut ed.shared, &HashMap::new());
+                kv_table(ui, "env-shared", &mut ed.shared, &HashMap::new(), false);
                 ui.add_space(10.0);
                 ui.label(RichText::new("Secret").strong());
                 ui.weak(format!(
                     "Saved to {file}.secret.toml, which is gitignored. Overrides shared values; \
                      values set by scripts land here."
                 ));
-                kv_table(ui, "env-secret", &mut ed.secret, &HashMap::new());
+                kv_table(ui, "env-secret", &mut ed.secret, &HashMap::new(), false);
             });
             if !ed.error.is_empty() {
                 ui.colored_label(RED, ed.error.as_str());
@@ -2353,7 +2353,13 @@ impl App {
                             "Below environments: an environment variable with the same name \
                              wins. Keep secrets in a secret environment.",
                         );
-                        kv_table(ui, "folder-vars", &mut ed.folder.vars, &HashMap::new());
+                        kv_table(
+                            ui,
+                            "folder-vars",
+                            &mut ed.folder.vars,
+                            &HashMap::new(),
+                            false,
+                        );
                     }
                     FolderTab::Auth => {
                         let parent = ed.parent.auth.as_ref();
@@ -3009,16 +3015,22 @@ fn tree_ui(
 }
 
 /// Key/value grid with a trailing blank row: typing into it creates a new row, like Postman.
-/// Returns whether any row changed.
+/// `describe` adds a Description column (request tables; variables have none, as in
+/// Postman). Returns whether any row changed.
 fn kv_table(
     ui: &mut egui::Ui,
     id: &str,
     rows: &mut Vec<KeyValue>,
     vars: &HashMap<String, String>,
+    describe: bool,
 ) -> bool {
     let before = rows.clone();
     let key_width = 200.0;
-    let value_width = (ui.available_width() - key_width - 90.0).max(120.0);
+    let rest = (ui.available_width() - key_width - 90.0).max(120.0);
+    let (value_width, desc_width) = match describe {
+        true => (rest * 0.6, rest * 0.4 - ui.spacing().item_spacing.x),
+        false => (rest, 0.0),
+    };
     let mut remove = None;
     let mut blank = KeyValue::new("", "");
     let existing = rows.len();
@@ -3058,6 +3070,14 @@ fn kv_table(
                 false,
                 |e| e.hint_text("Value").desired_width(value_width),
             );
+            if describe {
+                ui.add(
+                    egui::TextEdit::singleline(&mut row.description)
+                        .id(egui::Id::new((id, i, 2)))
+                        .hint_text("Description")
+                        .desired_width(desc_width),
+                );
+            }
             if real && ui.small_button("🗑").on_hover_text("Remove").clicked() {
                 remove = Some(i);
             }
@@ -3066,7 +3086,7 @@ fn kv_table(
     if let Some(i) = remove {
         rows.remove(i);
     }
-    if !blank.key.is_empty() || !blank.value.is_empty() {
+    if blank != KeyValue::new("", "") {
         rows.push(blank);
     }
     *rows != before
@@ -3135,7 +3155,7 @@ fn body_editor(
         }
         Body::Text { text } => code_editor(ui, "body", text, vars),
         Body::Form { fields } => {
-            kv_table(ui, "form", fields, vars);
+            kv_table(ui, "form", fields, vars, true);
         }
         Body::Multipart { parts } => {
             ui.weak("A value starting with @ uploads that file, e.g. @files/photo.png (relative to the workspace). Or drop files here.");
@@ -3157,7 +3177,7 @@ fn body_editor(
                 let path = path.strip_prefix(&workspace).unwrap_or(&path);
                 parts.push(KeyValue::new(key, format!("@{}", path.display())));
             }
-            kv_table(ui, "multipart", parts, vars);
+            kv_table(ui, "multipart", parts, vars, true);
             for p in parts.iter().filter(|p| p.enabled) {
                 if let Some(file) = p.value.strip_prefix('@')
                     && !file.contains("{{")
@@ -4697,8 +4717,12 @@ mod ui_tests {
             draft(&h).params,
             [KeyValue::new("page", "2"), KeyValue::new("q", "b")]
         );
-        // Inputs: URL, then key/value per row, then the blank row.
-        type_into(&mut h, 5, "debug");
+        // Inputs: URL, then key/value/description per row, then the blank row.
+        type_into(&mut h, 7, "debug");
+        assert_eq!(draft(&h).url, "http://x/a?page=2&q=b&debug");
+        // A description documents the row; the URL has no place for it.
+        type_into(&mut h, 3, "1-based");
+        assert_eq!(draft(&h).params[0].description, "1-based");
         assert_eq!(draft(&h).url, "http://x/a?page=2&q=b&debug");
         // Unticking a row drops it from the URL but keeps it in the table.
         h.get_all_by_role(Role::CheckBox).next().unwrap().click();

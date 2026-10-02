@@ -137,9 +137,18 @@ fn table(out: &mut String, title: &str, rows: &[KeyValue]) {
         return;
     }
     let cell = |s: &str| s.replace('|', "\\|").replace('\n', "<br>");
-    let _ = write!(out, "**{title}**\n\n| Name | Value |\n| --- | --- |\n");
-    for r in rows {
-        let _ = writeln!(out, "| {} | {} |", cell(&r.key), cell(&r.value));
+    let _ = write!(out, "**{title}**\n\n");
+    if rows.iter().any(|r| !r.description.trim().is_empty()) {
+        out.push_str("| Name | Value | Description |\n| --- | --- | --- |\n");
+        for r in rows {
+            let (k, v, d) = (cell(&r.key), cell(&r.value), cell(r.description.trim()));
+            let _ = writeln!(out, "| {k} | {v} | {d} |");
+        }
+    } else {
+        out.push_str("| Name | Value |\n| --- | --- |\n");
+        for r in rows {
+            let _ = writeln!(out, "| {} | {} |", cell(&r.key), cell(&r.value));
+        }
     }
     out.push('\n');
 }
@@ -186,6 +195,10 @@ mod tests {
         let get = Request {
             url: "{{base}}/users/{{id}}?expand=a|b".into(),
             description: "Fetches one user.".into(),
+            params: vec![KeyValue {
+                description: "Related records to embed".into(),
+                ..KeyValue::new("expand", "a|b")
+            }],
             headers: vec![KeyValue::new("Accept", "application/json"), off],
             examples: vec![Example {
                 name: "found".into(),
@@ -235,6 +248,11 @@ mod tests {
         assert!(md.contains("**Auth:** Basic\n"));
         // Disabled rows aren't part of the API; pipes would break the table.
         assert!(md.contains("| Accept | application/json |") && !md.contains("X-Debug"));
+        assert!(
+            md.contains("| Name | Value | Description |")
+                && md.contains("| expand | a\\|b | Related records to embed |"),
+            "{md}"
+        );
         assert!(md.contains("**Example: found — 200 · `application/json`**\n\n````json\n"));
         assert_eq!(markdown(&ws, &ws.collections()).unwrap()[..6], *"# API\n");
         assert!(markdown(&ws, &root.join("nope")).is_err());
