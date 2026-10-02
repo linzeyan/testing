@@ -83,6 +83,7 @@ enum ScriptTab {
 enum RespTab {
     Body,
     Headers,
+    Cookies,
     Timeline,
     Tests,
     Console,
@@ -4442,6 +4443,14 @@ fn auth_editor(
             },
         ),
         ("OAuth 2.0", Auth::OAuth2(model::OAuth2::default())),
+        (
+            "API key",
+            Auth::ApiKey {
+                key: user(),
+                value: pass(),
+                in_query: false,
+            },
+        ),
     ];
     let label_of = |a: &Auth| {
         let d = std::mem::discriminant(a);
@@ -4493,6 +4502,20 @@ fn auth_editor(
             Auth::Basic { username, password } | Auth::Digest { username, password } => {
                 text(ui, "Username", username, "");
                 secret(ui, "Password", password);
+            }
+            Auth::ApiKey {
+                key,
+                value,
+                in_query,
+            } => {
+                text(ui, "Key", key, "X-API-Key");
+                text(ui, "Value", value, "{{api_key}}");
+                ui.label("Add to");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(in_query, false, "Header");
+                    ui.selectable_value(in_query, true, "Query params");
+                });
+                ui.end_row();
             }
             Auth::OAuth2(o) => {
                 ui.label("Grant");
@@ -5317,6 +5340,11 @@ fn response_ui(
                     RespTab::Headers,
                     format!("Headers ({})", h.headers.len()),
                 );
+                let cookies = crate::cookies::from_response(&h.headers).len();
+                if cookies > 0 {
+                    ui.selectable_value(tab, RespTab::Cookies, format!("Cookies ({cookies})"))
+                        .on_hover_text("What this response's Set-Cookie headers set");
+                }
                 // gRPC goes out its own way and isn't recorded.
                 if !h.sent.method.is_empty() {
                     ui.selectable_value(tab, RespTab::Timeline, "Timeline")
@@ -5418,6 +5446,13 @@ fn response_ui(
         RespTab::Tests if shown.tests.is_empty() => RespTab::Body,
         RespTab::Console if shown.logs.is_empty() => RespTab::Body,
         RespTab::Headers if shown.result.is_err() => RespTab::Body,
+        RespTab::Cookies
+            if (shown.result.as_ref())
+                .is_ok_and(|v| crate::cookies::from_response(&v.head.headers).is_empty())
+                || shown.result.is_err() =>
+        {
+            RespTab::Body
+        }
         RespTab::Timeline
             if (shown.result.as_ref()).is_ok_and(|v| v.head.sent.method.is_empty())
                 || shown.result.is_err() =>
@@ -5478,6 +5513,30 @@ fn response_ui(
                                     egui::Label::new(RichText::new(k).strong()).selectable(true),
                                 );
                                 ui.add(egui::Label::new(v.as_str()).selectable(true));
+                                ui.end_row();
+                            }
+                        });
+                });
+        }
+        (RespTab::Cookies, Ok(view)) => {
+            egui::ScrollArea::both()
+                .id_salt("response-cookies")
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("resp-cookies")
+                        .num_columns(5)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for title in ["Name", "Value", "Domain", "Path", "Expires"] {
+                                ui.strong(title);
+                            }
+                            ui.end_row();
+                            for c in crate::cookies::from_response(&view.head.headers) {
+                                let expires = c.expires.as_deref().unwrap_or("session");
+                                for cell in [&c.name, &c.value, &c.domain, &c.path] {
+                                    ui.add(egui::Label::new(cell.as_str()).selectable(true));
+                                }
+                                ui.label(expires);
                                 ui.end_row();
                             }
                         });
@@ -6569,6 +6628,55 @@ mod ui_tests {
         drag(&mut h, r, egui::pos2(r.x, 600.0));
         assert!(h.state().ws.load_request(&top.join("r.toml")).is_ok());
         assert_eq!(h.state().open.as_ref().unwrap().path, top.join("r.toml"));
+    }
+
+    #[test]
+    fn the_cookies_tab_lists_what_the_response_sets() {
+        let mut h = with_request("resp-cookies");
+        let cookie = |v: &str| ("set-cookie".to_owned(), v.to_owned());
+        let head = |headers| http::Response {
+            status: 200,
+            reason: "OK".into(),
+            version: "HTTP/1.1".into(),
+            elapsed: Duration::ZERO,
+            headers,
+            body: String::new(),
+            truncated: false,
+            sent: Default::default(),
+        };
+        let headers = vec![
+            cookie("sid=abc; Path=/; Max-Age=3600; HttpOnly"),
+            ("content-type".into(), "text/plain".into()),
+            cookie("theme=dark; Domain=example.com; Expires=Wed, 21 Oct 2037 07:28:00 GMT"),
+        ];
+        h.state_mut().response = Some(Shown {
+            result: Ok(into_view(head(headers))),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            past: None,
+        });
+        h.run();
+        h.get_by_label("Cookies (2)").click();
+        h.run();
+        shot(&mut h, "48-response-cookies");
+        for cell in [
+            "sid",
+            "abc",
+            "in 3600 s",
+            "example.com",
+            "2037-10-21 07:28 UTC",
+        ] {
+            assert!(h.query_by_label(cell).is_some(), "no {cell}");
+        }
+        // No Set-Cookie, no tab: it doesn't stay stuck on an empty one.
+        h.state_mut().response.as_mut().unwrap().result = Ok(into_view(head(Vec::new())));
+        h.run();
+        assert!(h.query_by_label_contains("Cookies (").is_none());
+        assert!(h.query_by_label("sid").is_none());
+        assert!(
+            h.query_by_label("Expires").is_none(),
+            "back on the body, not an empty table"
+        );
     }
 
     #[test]

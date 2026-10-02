@@ -123,20 +123,7 @@ impl Reader {
         if matches!(req.body, Body::GraphQL { .. }) {
             req.method = "GRAPHQL".into();
         }
-        let auth = &r["auth"];
-        req.auth = if str_of(&auth["type"]) == "apikey" {
-            // A header or query parameter is all an API key is.
-            let (name, value) = (param(auth, "key"), param(auth, "value"));
-            if param(auth, "in") == "query" {
-                let sep = if req.url.contains('?') { '&' } else { '?' };
-                req.url = format!("{}{sep}{name}={value}", req.url);
-            } else {
-                req.headers.push(KeyValue::new(name, value));
-            }
-            Auth::None
-        } else {
-            self.auth(key, auth)
-        };
+        req.auth = self.auth(key, &r["auth"]);
         req.pre_request = script(&item["event"], "prerequest");
         req.tests = script(&item["event"], "test");
         req.settings = settings(&item["protocolProfileBehavior"]);
@@ -298,7 +285,11 @@ fn auth(v: &Value) -> Result<Auth, String> {
                 password: p("password"),
             })
         }
-        "apikey" => return Err("API key (on a folder)".into()),
+        "apikey" => Auth::ApiKey {
+            key: p("key"),
+            value: p("value"),
+            in_query: p("in") == "query",
+        },
         other => return Err(other.into()),
     })
 }
@@ -574,6 +565,18 @@ fn auth_json(auth: &Auth) -> Option<Value> {
                 ("password", password.as_str()),
             ],
         ),
+        Auth::ApiKey {
+            key,
+            value,
+            in_query,
+        } => typed(
+            "apikey",
+            &[
+                ("key", key.as_str()),
+                ("value", value.as_str()),
+                ("in", if *in_query { "query" } else { "header" }),
+            ],
+        ),
         Auth::OAuth2(o) => {
             let grant = match o.grant {
                 Grant::ClientCredentials => "client_credentials",
@@ -778,16 +781,21 @@ mod tests {
                 text: "{\"a\": 1}".into()
             }
         );
-        assert_eq!(create.headers, [KeyValue::new("X-Api-Key", "{{key}}")]);
-        assert_eq!(
-            create.auth,
-            Auth::None,
-            "the key replaces the folder's auth"
-        );
+        assert!(create.headers.is_empty());
+        let key = Auth::ApiKey {
+            key: "X-Api-Key".into(),
+            value: "{{key}}".into(),
+            in_query: false,
+        };
+        assert_eq!(create.auth, key, "the key replaces the folder's auth");
         let s = &create.settings;
         assert!(!s.follow_redirects && !s.verify_tls && !s.cookies);
-        assert_eq!(r["feed"].url, "{{base}}/feed?x=1&api_key=k");
-        assert_eq!(r["feed"].params.len(), 2);
+        // Stays an auth setting, so the URL isn't touched.
+        assert_eq!(r["feed"].url, "{{base}}/feed?x=1");
+        assert!(matches!(
+            r["feed"].auth,
+            Auth::ApiKey { in_query: true, .. }
+        ));
 
         let upload = &r["upload-avatar"];
         let parts = vec![
@@ -954,6 +962,11 @@ mod tests {
                     url: "{{base}}/note".into(),
                     body: Body::Text {
                         text: "plain".into(),
+                    },
+                    auth: Auth::ApiKey {
+                        key: "api_key".into(),
+                        value: "{{k}}".into(),
+                        in_query: true,
                     },
                     ..Default::default()
                 },

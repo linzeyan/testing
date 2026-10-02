@@ -74,6 +74,10 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
         Auth::Bearer { .. } => Some("Bearer token".into()),
         Auth::Basic { .. } => Some("Basic".into()),
         Auth::Digest { .. } => Some("Digest".into()),
+        Auth::ApiKey { key, in_query, .. } => Some(match in_query {
+            true => format!("API key, query parameter `{key}`"),
+            false => format!("API key, header `{key}`"),
+        }),
         Auth::OAuth2(o) => {
             let grant = match o.grant {
                 Grant::ClientCredentials => "client credentials",

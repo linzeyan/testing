@@ -322,6 +322,14 @@ pub enum Auth {
     },
     #[serde(rename = "oauth2")]
     OAuth2(OAuth2),
+    /// A key/value pair sent as a header, or as a query parameter.
+    #[serde(rename = "apikey")]
+    ApiKey {
+        key: String,
+        value: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        in_query: bool,
+    },
 }
 
 /// OAuth 2.0 grants that need no browser. ponytail: authorization code (browser + local
@@ -586,7 +594,7 @@ impl Request {
         let url = (self.path_vars.iter())
             .filter(|p| !p.value.is_empty())
             .fold(self.url.clone(), |url, p| fill(&url, &p.key, &p.value));
-        let req = Request {
+        let mut req = Request {
             method: self.method.clone(),
             url: r(&url),
             proto: r(&self.proto),
@@ -630,6 +638,8 @@ impl Request {
                     username: r(&o.username),
                     password: r(&o.password),
                 }),
+                // Becomes a header or a query parameter below.
+                Auth::ApiKey { .. } => Auth::None,
             },
             // Scripts have already run by the time a request is resolved for the wire.
             pre_request: String::new(),
@@ -650,6 +660,27 @@ impl Request {
             examples: Vec::new(),
             inherited: Inherited::default(),
         };
+        if let Auth::ApiKey {
+            key,
+            value,
+            in_query,
+        } = self.effective_auth()
+            && !key.trim().is_empty()
+        {
+            let (key, value) = (r(key.trim()), r(value));
+            if *in_query {
+                // Kept as typed, like the params table; encoding happens when sending.
+                let (base, query, fragment) = split_url(&req.url);
+                let query = match query {
+                    "" => format!("{key}={value}"),
+                    q => format!("{q}&{key}={value}"),
+                };
+                req.url = format!("{base}?{query}{fragment}");
+                req.params.push(KeyValue::new(key, value));
+            } else {
+                req.headers.push(KeyValue::new(key, value));
+            }
+        }
         (req, missing)
     }
 
@@ -810,6 +841,37 @@ mod tests {
             fill("http://h/:id/:idx/:id", "id", "7"),
             "http://h/7/:idx/7"
         );
+    }
+
+    #[test]
+    fn an_api_key_goes_out_as_a_header_or_a_query_parameter() {
+        let vars = HashMap::from([("k".to_owned(), "s3cr3t".to_owned())]);
+        let mut req = Request {
+            url: "http://x/a?page=1#top".into(),
+            auth: Auth::ApiKey {
+                key: "X-Key".into(),
+                value: "{{k}}".into(),
+                in_query: false,
+            },
+            ..Default::default()
+        };
+        let (wire, _) = req.resolved(&vars);
+        assert_eq!(wire.headers, [KeyValue::new("X-Key", "s3cr3t")]);
+        assert_eq!(
+            (wire.url.as_str(), &wire.auth),
+            ("http://x/a?page=1#top", &Auth::None)
+        );
+        // In the query it joins the others, before the fragment.
+        req.auth = Auth::ApiKey {
+            key: "key".into(),
+            value: "{{k}}".into(),
+            in_query: true,
+        };
+        let (wire, _) = req.resolved(&vars);
+        assert_eq!(wire.url, "http://x/a?page=1&key=s3cr3t#top");
+        assert!(wire.headers.is_empty());
+        req.url = "http://x/a".into();
+        assert_eq!(req.resolved(&vars).0.url, "http://x/a?key=s3cr3t");
     }
 
     #[test]

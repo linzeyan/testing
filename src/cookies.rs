@@ -21,6 +21,32 @@ pub struct Row {
     pub expires: Option<String>,
 }
 
+/// The cookies a response sets, in header order. Domain and path are as the header gives
+/// them (empty: the request's host and path).
+pub fn from_response(headers: &[(String, String)]) -> Vec<Row> {
+    let set = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"));
+    set.filter_map(|(_, v)| RawCookie::parse(v.as_str()).ok())
+        .map(|c| Row {
+            domain: c.domain().unwrap_or_default().to_owned(),
+            path: c.path().unwrap_or_default().to_owned(),
+            name: c.name().to_owned(),
+            value: c.value().to_owned(),
+            expires: match (c.max_age(), c.expires_datetime()) {
+                (Some(age), _) => Some(format!("in {} s", age.whole_seconds())),
+                (None, Some(t)) => Some(format!(
+                    "{} {:02}:{:02} UTC",
+                    t.date(),
+                    t.hour(),
+                    t.minute()
+                )),
+                (None, None) => None,
+            },
+        })
+        .collect()
+}
+
 impl Jar {
     fn read(&self) -> RwLockReadGuard<'_, CookieStore> {
         self.0.read().unwrap_or_else(|e| e.into_inner())

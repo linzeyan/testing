@@ -147,7 +147,8 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
         b = b.header(h.key.as_str(), h.value.as_str());
     }
     b = match req.auth {
-        Auth::None | Auth::Inherit => b,
+        // `resolved` has already made an API key a header or query parameter.
+        Auth::None | Auth::Inherit | Auth::ApiKey { .. } => b,
         Auth::Bearer { token } => b.bearer_auth(token),
         Auth::Basic { username, password } => b.basic_auth(username, Some(password)),
         // Both need a round trip first; `execute` and `with_token` take care of it.
