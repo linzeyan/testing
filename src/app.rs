@@ -870,18 +870,36 @@ impl App {
         let Some(i) = self.tab_index(path) else {
             return;
         };
-        let dirty = match &self.tabs[i].parked {
-            Some(p) => p.open.dirty(),
-            None => self
-                .open
-                .as_ref()
-                .is_some_and(|o| o.path == path && o.dirty()),
-        };
-        if dirty {
+        if self.tab_dirty(i) {
             self.activate(path.to_owned(), false);
             self.dialog = Some(Dialog::Unsaved(Next::Close(path.to_owned())));
         } else {
             self.drop_tab(i);
+        }
+    }
+
+    fn tab_dirty(&self, i: usize) -> bool {
+        let path = &self.tabs[i].path;
+        match &self.tabs[i].parked {
+            Some(p) => p.open.dirty(),
+            None => (self.open.as_ref()).is_some_and(|o| &o.path == path && o.dirty()),
+        }
+    }
+
+    /// Closes the given tabs except those with unsaved edits: one question per tab would
+    /// turn "Close All" into a chore, so they stay open and the status bar says so.
+    fn close_tabs(&mut self, paths: Vec<PathBuf>) {
+        let mut kept = 0;
+        for path in paths {
+            match self.tab_index(&path) {
+                Some(i) if self.tab_dirty(i) => kept += 1,
+                Some(i) => self.drop_tab(i),
+                None => {}
+            }
+        }
+        if kept > 0 {
+            let tabs = if kept == 1 { "tab" } else { "tabs" };
+            self.status = format!("{kept} {tabs} with unsaved edits left open");
         }
     }
 
@@ -2088,11 +2106,17 @@ impl App {
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        enum Menu {
+            Duplicate,
+            Others,
+            Right,
+            All,
+        }
         let active = self.open.as_ref().map(|o| o.path.clone());
-        let (mut show, mut close) = (None, None);
+        let (mut show, mut close, mut menu) = (None, None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
-                for tab in &self.tabs {
+                for (i, tab) in self.tabs.iter().enumerate() {
                     let is_active = active.as_ref() == Some(&tab.path);
                     let open = match &tab.parked {
                         _ if is_active => self.open.as_ref(),
@@ -2118,6 +2142,30 @@ impl App {
                     if label.clicked() {
                         show = Some(tab.path.clone());
                     }
+                    label.context_menu(|ui| {
+                        let ctx = ui.ctx().clone();
+                        let shortcut = |s| ctx.format_shortcut(s);
+                        let item =
+                            egui::Button::new("Duplicate Tab").shortcut_text(shortcut(&DUPLICATE));
+                        if ui.add(item).clicked() {
+                            menu = Some((i, Menu::Duplicate));
+                        }
+                        ui.separator();
+                        let item =
+                            egui::Button::new("Close Tab").shortcut_text(shortcut(&CLOSE_TAB));
+                        if ui.add(item).clicked() {
+                            close = Some(tab.path.clone());
+                        }
+                        for (label, action) in [
+                            ("Close Other Tabs", Menu::Others),
+                            ("Close Tabs to the Right", Menu::Right),
+                            ("Close All Tabs", Menu::All),
+                        ] {
+                            if ui.button(label).clicked() {
+                                menu = Some((i, action));
+                            }
+                        }
+                    });
                     let x = ui
                         .small_button("×")
                         .on_hover_text(format!("Close ({})", ui.ctx().format_shortcut(&CLOSE_TAB)));
@@ -2128,7 +2176,20 @@ impl App {
                 }
             });
         });
-        if let Some(path) = close {
+        if let Some((i, action)) = menu {
+            let paths = self.tabs.iter().map(|t| t.path.clone());
+            let paths: Vec<PathBuf> = match action {
+                Menu::Duplicate => return self.duplicate(&self.tabs[i].path.clone()),
+                Menu::Others => paths
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, p)| p)
+                    .collect(),
+                Menu::Right => paths.skip(i + 1).collect(),
+                Menu::All => paths.collect(),
+            };
+            self.close_tabs(paths);
+        } else if let Some(path) = close {
             self.close_tab(&path);
         } else if let Some(path) = show
             && !self.runner_busy()
@@ -2307,6 +2368,9 @@ impl App {
                     } else if url.changed() {
                         open.draft.params_from_url();
                     }
+                    if url.changed() {
+                        open.draft.path_vars_from_url();
+                    }
                     if url.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         send = true;
                     }
@@ -2385,7 +2449,10 @@ impl App {
                         ui.selectable_value(
                             &mut self.req_tab,
                             ReqTab::Params,
-                            tab(count(&open.draft.params), "Params"),
+                            tab(
+                                count(&open.draft.params) + count(&open.draft.path_vars),
+                                "Params",
+                            ),
                         );
                         ui.selectable_value(
                             &mut self.req_tab,
@@ -2461,6 +2528,7 @@ impl App {
                             if kv_table(ui, "params", &mut open.draft.params, &all_vars, true) {
                                 open.draft.url_from_params();
                             }
+                            path_vars_table(ui, &mut open.draft.path_vars, &all_vars);
                         }
                         ReqTab::Headers => {
                             kv_table(ui, "headers", &mut open.draft.headers, &all_vars, true);
@@ -3888,6 +3956,40 @@ fn kv_table(
     *rows != before
 }
 
+/// Postman's Path Variables: one row per `/:name` in the URL. The names follow the URL, so
+/// only values and descriptions are edited here, laid out like `kv_table`'s rows.
+fn path_vars_table(ui: &mut egui::Ui, rows: &mut [KeyValue], vars: &HashMap<String, String>) {
+    if rows.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.strong("Path Variables");
+    let key_width = 200.0;
+    let rest = (ui.available_width() - key_width - 90.0).max(120.0);
+    for (i, row) in rows.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add_visible(false, egui::Checkbox::new(&mut true, ""));
+            // A `&str` buffer is read-only but looks like the key fields above.
+            ui.add(egui::TextEdit::singleline(&mut row.key.as_str()).desired_width(key_width));
+            var_edit(
+                ui,
+                egui::Id::new(("path_vars", i, 1)),
+                &mut row.value,
+                vars,
+                egui::TextStyle::Body,
+                false,
+                |e| e.hint_text("Value").desired_width(rest * 0.6),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut row.description)
+                    .id(egui::Id::new(("path_vars", i, 2)))
+                    .hint_text("Description")
+                    .desired_width(rest * 0.4 - ui.spacing().item_spacing.x),
+            );
+        });
+    }
+}
+
 const BULK_HINT: &str = "key: value, one per line; // in front turns a line off";
 
 /// Postman's bulk format: `key: value` per line, `//` in front of a disabled one.
@@ -5022,13 +5124,23 @@ fn response_ui(
                     RichText::new(format!("{} {}", h.status, h.reason))
                         .strong()
                         .color(status_color(h.status)),
-                );
+                )
+                .on_hover_text(status_meaning(h.status));
                 ui.weak(format!("{} ms", h.elapsed.as_millis()));
+                // As received, before any re-indenting for display.
+                let headers: usize = (h.headers.iter()).map(|(k, v)| k.len() + v.len() + 4).sum();
+                let sizes = format!(
+                    "Headers {}\nBody {}",
+                    human_size(headers),
+                    human_size(view.raw_size)
+                );
                 if h.truncated {
                     ui.colored_label(ORANGE, format!("{} (cut)", human_size(view.raw_size)))
-                        .on_hover_text("Only the first 16 MiB were read, to save memory; scripts saw the same.");
+                        .on_hover_text(format!(
+                            "{sizes}\nOnly the first 16 MiB were read, to save memory; scripts saw the same."
+                        ));
                 } else {
-                    ui.weak(human_size(view.raw_size));
+                    ui.weak(human_size(view.raw_size)).on_hover_text(sizes);
                 }
                 ui.weak(&h.version);
                 ui.separator();
@@ -5451,6 +5563,50 @@ fn status_color(status: u16) -> Color32 {
     }
 }
 
+/// What a status code means, for the hover on it, as Postman shows.
+fn status_meaning(status: u16) -> &'static str {
+    match status {
+        200 => "OK: the request succeeded.",
+        201 => "Created: the request succeeded and a new resource was created.",
+        202 => "Accepted: received, but not acted on yet.",
+        204 => "No Content: succeeded, with no body to return.",
+        206 => "Partial Content: only the requested range is returned.",
+        301 => "Moved Permanently: the resource has a new URL for good.",
+        302 => "Found: the resource is at another URL for now.",
+        303 => "See Other: get the result from another URL with GET.",
+        304 => "Not Modified: the cached copy is still good.",
+        307 => "Temporary Redirect: repeat the same request at another URL.",
+        308 => "Permanent Redirect: repeat the same request at another URL, from now on.",
+        400 => {
+            "Bad Request: the server can't process the request as sent (syntax, framing, values)."
+        }
+        401 => "Unauthorized: credentials are missing or wrong.",
+        403 => "Forbidden: the credentials are known but not allowed to do this.",
+        404 => "Not Found: nothing at this URL.",
+        405 => "Method Not Allowed: the URL exists but not for this method.",
+        406 => "Not Acceptable: nothing matches the Accept headers.",
+        408 => "Request Timeout: the server gave up waiting for the request.",
+        409 => "Conflict: the request clashes with the resource's current state.",
+        410 => "Gone: the resource was here and was removed for good.",
+        413 => "Content Too Large: the body is bigger than the server accepts.",
+        415 => "Unsupported Media Type: the server doesn't take this Content-Type.",
+        422 => "Unprocessable Content: well-formed, but the values don't pass validation.",
+        429 => "Too Many Requests: rate limited; see Retry-After.",
+        500 => "Internal Server Error: the server failed while handling the request.",
+        501 => "Not Implemented: the server doesn't support this method.",
+        502 => "Bad Gateway: a proxy or gateway got a bad answer from upstream.",
+        503 => "Service Unavailable: overloaded or down for maintenance; see Retry-After.",
+        504 => "Gateway Timeout: a proxy or gateway got no answer from upstream in time.",
+        _ => match status / 100 {
+            1 => "Informational: the request was received and goes on.",
+            2 => "Success: the request was received, understood and accepted.",
+            3 => "Redirection: more action is needed to complete the request.",
+            4 => "Client error: the request is wrong or can't be fulfilled.",
+            _ => "Server error: the server failed to fulfil a valid request.",
+        },
+    }
+}
+
 fn human_size(bytes: usize) -> String {
     match bytes {
         0..1024 => format!("{bytes} B"),
@@ -5733,6 +5889,73 @@ mod ui_tests {
         h.key_press_modifiers(Modifiers::COMMAND, Key::W);
         h.run();
         assert!(h.state().tabs.is_empty() && h.state().open.is_none());
+    }
+
+    #[test]
+    fn the_tab_menu_closes_in_bulk_but_never_drops_edits() {
+        let ws = workspace("tabmenu");
+        let dir = ws.collections();
+        for name in ["a", "b", "c", "d"] {
+            ws.create_request(&dir, name).unwrap();
+        }
+        let mut h = harness(ws);
+        h.run();
+        for name in ["a", "b", "c", "d", "b"] {
+            h.state_mut()
+                .activate(dir.join(format!("{name}.toml")), true);
+            h.run();
+        }
+        h.state_mut().open.as_mut().unwrap().draft.url = "http://edited".into();
+        h.run();
+        let tabs = |h: &Harness<'_, App>| -> Vec<String> {
+            let stem = |t: &Tab| t.path.file_stem().unwrap().to_string_lossy().into_owned();
+            h.state().tabs.iter().map(stem).collect()
+        };
+        // The tree's label comes first, then the tab's (the active one's title is a third).
+        let menu = |h: &mut Harness<'_, App>, tab: &str, item: &str| {
+            h.get_all_by_label(tab).nth(1).unwrap().click_secondary();
+            h.run();
+            shot(h, "42-tab-menu");
+            // A shortcut is part of its button's label.
+            h.get(egui_kittest::kittest::By::new().label_contains(item))
+                .click();
+            h.run();
+        };
+        menu(&mut h, "c", "Close Tabs to the Right");
+        assert_eq!(tabs(&h), ["a", "b", "c"]);
+        // Bulk closing never asks, so the edited tab stays and the status bar says why.
+        menu(&mut h, "c", "Close Other Tabs");
+        assert_eq!(tabs(&h), ["b", "c"]);
+        assert!(h.state().dialog.is_none());
+        assert_eq!(h.state().status, "1 tab with unsaved edits left open");
+        menu(&mut h, "c", "Duplicate Tab");
+        assert!(tabs(&h).contains(&"c copy".to_owned()), "{:?}", tabs(&h));
+        menu(&mut h, "c copy", "Close All Tabs");
+        assert_eq!(tabs(&h), ["b"]);
+        assert_eq!(draft(&h).url, "http://edited");
+    }
+
+    #[test]
+    fn path_variables_appear_with_the_url_and_take_values() {
+        let mut h = with_request("pathvars");
+        type_into(&mut h, 0, "{{host}}/users/:id");
+        assert!(h.query_by_label("Params (1)").is_some());
+        // The name follows the URL; the field after it is the value.
+        let inputs = h.get_all_by_role(Role::TextInput);
+        let inputs = inputs.filter(|n| n.accesskit_node().placeholder() != Some(FILTER_HINT));
+        let key = (inputs.map(|n| n.value()))
+            .position(|v| v.as_deref() == Some("id"))
+            .expect("a row for :id");
+        type_into(&mut h, key + 1, "{{uid}}");
+        shot(&mut h, "43-path-variables");
+        assert_eq!(draft(&h).path_vars, [KeyValue::new("id", "{{uid}}")]);
+        assert_eq!(
+            draft(&h).url,
+            "{{host}}/users/:id",
+            "the URL keeps the name"
+        );
+        // Its value is resolved like the rest of the request.
+        assert!(h.query_by_label("Undefined: uid").is_some());
     }
 
     /// A workspace with one request `r` (and env `dev` with `host`), opened in the app.

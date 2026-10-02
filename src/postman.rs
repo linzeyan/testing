@@ -109,11 +109,14 @@ impl Reader {
             self.warn(key, format!("method {method} isn't supported; set to GET"));
         }
         // A request may be just its URL.
-        let (url, params, unfilled) = url(if r.is_string() { r } else { &r["url"] });
-        for name in unfilled {
-            self.warn(key, format!("path variable :{name} has no value"));
-        }
-        (req.url, req.params) = (url, params);
+        let url = if r.is_string() { r } else { &r["url"] };
+        // ponytail: the raw URL, which Postman always writes; building one from host and
+        // path parts waits for a collection without it.
+        req.url = match url {
+            Value::String(raw) => raw.clone(),
+            v => str_of(&v["raw"]).to_owned(),
+        };
+        (req.params, req.path_vars) = (rows(&url["query"]), rows(&url["variable"]));
         req.headers = rows(&r["header"]);
         req.description = description_of(&r["description"]);
         req.body = self.body(key, &r["body"], &mut req.headers);
@@ -247,46 +250,6 @@ fn rows(v: &Value) -> Vec<KeyValue> {
             description: description_of(&r["description"]),
         })
         .collect()
-}
-
-/// The URL with its path variables (`/:id`) filled in, the query rows (disabled ones too),
-/// and the path variables without a value, which stay as they were.
-fn url(v: &Value) -> (String, Vec<KeyValue>, Vec<String>) {
-    // ponytail: the raw URL, which Postman always writes; building one from host and path
-    // parts waits for a collection without it.
-    let mut url = match v {
-        Value::String(raw) => raw.clone(),
-        v => str_of(&v["raw"]).to_owned(),
-    };
-    let mut unfilled = Vec::new();
-    for var in v["variable"].as_array().into_iter().flatten() {
-        let (name, value) = (str_of(&var["key"]), value_of(&var["value"]));
-        match value.is_empty() {
-            true => unfilled.push(name.to_owned()),
-            false => url = fill(&url, name, &value),
-        }
-    }
-    (url, rows(&v["query"]), unfilled)
-}
-
-/// `/:name` as a whole path segment becomes `/value`.
-fn fill(url: &str, name: &str, value: &str) -> String {
-    let segment = format!("/:{name}");
-    let mut out = String::new();
-    let mut rest = url;
-    while let Some(i) = rest.find(&segment) {
-        let after = &rest[i + segment.len()..];
-        let whole = after
-            .chars()
-            .next()
-            .is_none_or(|c| matches!(c, '/' | '?' | '#'));
-        out.push_str(&rest[..i]);
-        out.push('/');
-        out.push_str(if whole { value } else { &segment[1..] });
-        rest = after;
-    }
-    out.push_str(rest);
-    out
 }
 
 fn script(events: &Value, listen: &str) -> String {
@@ -549,6 +512,9 @@ fn url_json(req: &Request) -> Value {
     if !req.params.is_empty() {
         url["query"] = rows_json(&req.params);
     }
+    if !req.path_vars.is_empty() {
+        url["variable"] = rows_json(&req.path_vars);
+    }
     url
 }
 
@@ -773,8 +739,8 @@ mod tests {
         assert_eq!(&keys[6..], ["users/Get User 2", "users/get user"]);
 
         let get = &r["users/get user"];
-        // apitool has no path variables: the value goes into the URL.
-        assert_eq!(get.url, "{{base}}/users/{{userId}}?fields=name");
+        assert_eq!(get.url, "{{base}}/users/:id?fields=name");
+        assert_eq!(get.path_vars, [KeyValue::new("id", "{{userId}}")]);
         let fields = KeyValue {
             description: "comma separated".into(),
             ..KeyValue::new("fields", "name")
@@ -936,7 +902,11 @@ mod tests {
                 "api/admin/create",
                 Request {
                     method: "POST".into(),
-                    url: "http://localhost:3000/items".into(),
+                    url: "http://localhost:3000/items/:kind".into(),
+                    path_vars: vec![KeyValue {
+                        description: "book or pen".into(),
+                        ..KeyValue::new("kind", "{{kind}}")
+                    }],
                     body: Body::Json {
                         text: "{\n  \"a\": 1\n}".into(),
                     },

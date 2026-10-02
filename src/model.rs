@@ -30,6 +30,9 @@ pub struct Request {
     pub description: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<KeyValue>,
+    /// Values for the URL's `/:name` segments, as in Postman; the keys follow the URL.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub path_vars: Vec<KeyValue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<KeyValue>,
     #[serde(skip_serializing_if = "Body::is_none")]
@@ -222,6 +225,7 @@ impl Default for Request {
             rpc: String::new(),
             description: String::new(),
             params: Vec::new(),
+            path_vars: Vec::new(),
             headers: Vec::new(),
             body: Body::None,
             auth: Auth::Inherit,
@@ -454,6 +458,39 @@ fn split_url(url: &str) -> (&str, &str, &str) {
     }
 }
 
+/// The names of the `/:name` path segments, in order. A port's ':' never starts a segment,
+/// so `host:8080` is not taken for one.
+fn path_names(url: &str) -> Vec<String> {
+    let (base, _, _) = split_url(url);
+    let mut names: Vec<String> = Vec::new();
+    for name in base.split('/').skip(1).filter_map(|s| s.strip_prefix(':')) {
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
+/// `/:name` as a whole path segment becomes `/value`.
+pub fn fill(url: &str, name: &str, value: &str) -> String {
+    let segment = format!("/:{name}");
+    let mut out = String::new();
+    let mut rest = url;
+    while let Some(i) = rest.find(&segment) {
+        let after = &rest[i + segment.len()..];
+        let whole = after
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, '/' | '?' | '#'));
+        out.push_str(&rest[..i]);
+        out.push('/');
+        out.push_str(if whole { value } else { &segment[1..] });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 impl Request {
     /// Rebuilds the params table from the URL's query string. The URL is what gets sent;
     /// disabled rows exist only in the table, as in Postman, so they are kept at the end.
@@ -480,6 +517,26 @@ impl Request {
         }
         params.extend(self.params.iter().filter(|p| !p.enabled).cloned());
         self.params = params;
+    }
+
+    /// Rebuilds the path variable rows from the URL's `/:name` segments. A row keeps its
+    /// value and description by name, or else by place (its name is being edited).
+    pub fn path_vars_from_url(&mut self) {
+        let names = path_names(&self.url);
+        let old = std::mem::take(&mut self.path_vars);
+        self.path_vars = (names.iter().enumerate())
+            .map(|(i, name)| {
+                let same_name = old.iter().find(|o| &o.key == name);
+                let same_place = old.get(i).filter(|o| !names.contains(&o.key));
+                match same_name.or(same_place) {
+                    Some(o) => KeyValue {
+                        key: name.clone(),
+                        ..o.clone()
+                    },
+                    None => KeyValue::new(name, ""),
+                }
+            })
+            .collect();
     }
 
     /// Rewrites the URL's query string from the enabled params rows (text kept as typed;
@@ -512,6 +569,7 @@ impl Request {
         } else {
             self.params_from_url();
         }
+        self.path_vars_from_url();
     }
 
     /// A copy with variables substituted and disabled rows dropped: exactly what goes on the wire.
@@ -524,13 +582,18 @@ impl Request {
         }
         let mut missing = Vec::new();
         let mut r = |s: &str| resolve(s, vars, &mut missing);
+        // An empty value leaves `:name` in the URL, which shows what was left out.
+        let url = (self.path_vars.iter())
+            .filter(|p| !p.value.is_empty())
+            .fold(self.url.clone(), |url, p| fill(&url, &p.key, &p.value));
         let req = Request {
             method: self.method.clone(),
-            url: r(&self.url),
+            url: r(&url),
             proto: r(&self.proto),
             rpc: r(&self.rpc),
             description: String::new(),
             params: kv(&self.params, &mut r),
+            path_vars: Vec::new(),
             headers: kv(&self.headers, &mut r),
             body: match &self.body {
                 Body::None => Body::None,
@@ -712,6 +775,44 @@ mod tests {
     }
 
     #[test]
+    fn path_variables_follow_the_url_and_fill_it_on_send() {
+        let mut req = Request {
+            url: "http://localhost:8080/orgs/:org/users/:id?x=:no#:no".into(),
+            ..Default::default()
+        };
+        // The port and the query are not path segments.
+        req.sync_params();
+        let keys: Vec<_> = req.path_vars.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, ["org", "id"]);
+        req.path_vars[0].value = "acme".into();
+        req.path_vars[1] = KeyValue {
+            description: "numeric".into(),
+            ..KeyValue::new("id", "{{uid}}")
+        };
+        // Renaming a segment in the URL keeps what was typed for it; a new one starts empty.
+        req.url = "http://localhost:8080/orgs/:org/users/:user/:tab?x=:no#:no".into();
+        req.path_vars_from_url();
+        let user = KeyValue {
+            description: "numeric".into(),
+            ..KeyValue::new("user", "{{uid}}")
+        };
+        assert_eq!(req.path_vars[1], user);
+        assert_eq!(req.path_vars[2], KeyValue::new("tab", ""));
+        // Sending fills whole segments only; an empty value leaves `:tab` to show the gap.
+        let vars = HashMap::from([("uid".to_owned(), "7".to_owned())]);
+        let (wire, missing) = req.resolved(&vars);
+        assert_eq!(
+            wire.url,
+            "http://localhost:8080/orgs/acme/users/7/:tab?x=:no#:no"
+        );
+        assert!(missing.is_empty());
+        assert_eq!(
+            fill("http://h/:id/:idx/:id", "id", "7"),
+            "http://h/7/:idx/7"
+        );
+    }
+
+    #[test]
     fn resolved_drops_disabled_rows() {
         let mut off = KeyValue::new("debug", "1");
         off.enabled = false;
@@ -731,13 +832,17 @@ mod tests {
         off.enabled = false;
         let req = Request {
             method: "POST".into(),
-            url: "https://{{host}}/users".into(),
+            url: "https://{{host}}/users/:id".into(),
             proto: "protos/users.proto".into(),
             rpc: "users.v1.Users/Get".into(),
             description: "Fetches **one** user.\n".into(),
             params: vec![KeyValue {
                 description: "1-based".into(),
                 ..KeyValue::new("page", "2")
+            }],
+            path_vars: vec![KeyValue {
+                description: "user ID".into(),
+                ..KeyValue::new("id", "{{uid}}")
             }],
             headers: vec![off],
             body: Body::Json {

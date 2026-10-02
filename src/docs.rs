@@ -92,6 +92,7 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
         };
         let _ = write!(out, "**Auth:** {kind}{from}\n\n");
     }
+    table(out, "Path variables", &req.path_vars);
     table(out, "Query parameters", &req.params);
     table(out, "Headers", &req.headers);
     match &req.body {
