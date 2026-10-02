@@ -71,6 +71,10 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 impl Wire {
     fn new(mut req: Request) -> Result<Self, String> {
+        // ponytail: no generator writes a file body yet; add per language when asked for.
+        if matches!(req.body, Body::File { .. }) {
+            return Err("Code snippets don't cover a binary (file) body yet".into());
+        }
         let parts = match std::mem::take(&mut req.body) {
             Body::Multipart { parts } => parts
                 .into_iter()

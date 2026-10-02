@@ -288,6 +288,10 @@ pub enum Body {
     Multipart {
         parts: Vec<KeyValue>,
     },
+    /// A file's bytes as they are, streamed from disk when sent.
+    File {
+        path: String,
+    },
     #[serde(rename = "graphql")]
     GraphQL {
         query: String,
@@ -613,6 +617,7 @@ impl Request {
                 Body::Multipart { parts } => Body::Multipart {
                     parts: kv(parts, &mut r),
                 },
+                Body::File { path } => Body::File { path: r(path) },
                 Body::GraphQL { query, variables } => Body::GraphQL {
                     query: r(query),
                     variables: r(variables),

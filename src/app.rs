@@ -4247,6 +4247,12 @@ fn body_editor(
             ("Form", Body::Form { fields: Vec::new() }),
             ("Multipart", Body::Multipart { parts: Vec::new() }),
             (
+                "Binary",
+                Body::File {
+                    path: String::new(),
+                },
+            ),
+            (
                 "GraphQL",
                 Body::GraphQL {
                     query: String::new(),
@@ -4292,21 +4298,12 @@ fn body_editor(
         }
         Body::Multipart { parts } => {
             ui.weak("A value starting with @ uploads that file, e.g. @files/photo.png (relative to the workspace). Or drop files here.");
-            // A file dropped while a dialog is up is the dialog's (Import from Postman).
-            let modal = ui.ctx().memory(|m| m.top_modal_layer().is_some());
-            let dropped: Vec<PathBuf> = ui.input(|i| {
-                let files = i.raw.dropped_files.iter().filter(|_| !modal);
-                files.map(|f| f.path().to_owned()).collect()
-            });
-            let workspace = std::env::current_dir().unwrap_or_default();
-            for path in dropped {
+            for path in dropped_files(ui) {
                 let key = path
                     .file_stem()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                // Inside the workspace, keep it relative so it still works after a git clone.
-                let path = path.strip_prefix(&workspace).unwrap_or(&path);
                 parts.push(KeyValue::new(key, format!("@{}", path.display())));
             }
             kv_table(ui, "multipart", parts, vars, true);
@@ -4319,11 +4316,61 @@ fn body_editor(
                 }
             }
         }
+        Body::File { path } => {
+            ui.weak("The file's bytes are the body, as they are. Content-Type comes from the extension unless set under Headers. Or drop a file here.");
+            if let Some(dropped) = dropped_files(ui).pop() {
+                *path = dropped.display().to_string();
+            }
+            var_edit(
+                ui,
+                egui::Id::new("body-file"),
+                path,
+                vars,
+                egui::TextStyle::Monospace,
+                false,
+                &[],
+                |e| {
+                    e.hint_text("path/to/file (relative to the workspace)")
+                        .desired_width(f32::INFINITY)
+                },
+            );
+            if !path.trim().is_empty() && !path.contains("{{") {
+                match std::fs::metadata(&*path) {
+                    Ok(m) if m.is_file() => {
+                        let mime = mime_guess::from_path(&*path).first_or_octet_stream();
+                        ui.weak(format!("{} · {mime}", human_size(m.len() as usize)));
+                    }
+                    _ => {
+                        ui.colored_label(ORANGE, format!("File not found: {path}"));
+                    }
+                }
+            }
+        }
         Body::GraphQL { query, variables } => {
             return graphql_editor(ui, query, variables, vars, explorer);
         }
     }
     false
+}
+
+/// Files dropped on the window this frame, relative to the workspace when inside it so they
+/// still work after a git clone. A file dropped while a dialog is up is the dialog's (Import
+/// from Postman).
+fn dropped_files(ui: &egui::Ui) -> Vec<PathBuf> {
+    if ui.ctx().memory(|m| m.top_modal_layer().is_some()) {
+        return Vec::new();
+    }
+    let workspace = std::env::current_dir().unwrap_or_default();
+    ui.input(|i| {
+        let files = i.raw.dropped_files.iter().map(|f| f.path().to_owned());
+        files
+            .map(|p| {
+                p.strip_prefix(&workspace)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(p)
+            })
+            .collect()
+    })
 }
 
 /// Query and variables on the left, schema explorer on the right. Returns true when
@@ -6392,8 +6439,8 @@ mod ui_tests {
         let file = h.state().ws.root.join("shop.postman_collection.json");
         let shop = r#"{ "info": { "name": "Shop" }, "item": [
             { "name": "list", "request": { "method": "GET", "url": "{{base}}/items" } },
-            { "name": "bin", "request": { "method": "POST", "url": "{{base}}/bin",
-                                          "body": { "mode": "file" } } } ] }"#;
+            { "name": "signed", "request": { "method": "GET", "url": "{{base}}/s",
+                                             "auth": { "type": "awsv4", "awsv4": [] } } } ] }"#;
         std::fs::write(&file, shop).unwrap();
         h.get_all_by_label("⋯").next().unwrap().click();
         h.run();
@@ -6409,7 +6456,7 @@ mod ui_tests {
         let Some(Dialog::Postman { note, .. }) = &app.dialog else {
             panic!("the dialog stays to say what didn't come over");
         };
-        assert!(note.contains("bin: a file body"), "{note}");
+        assert!(note.contains("signed: awsv4 auth"), "{note}");
         assert_eq!(draft(&h).body, parts);
 
         // A second import of the same environment never replaces the first, which may
@@ -6771,6 +6818,29 @@ mod ui_tests {
         h.run();
         type_into(&mut h, 1, "acc");
         assert!(h.query_by_label("Accept").is_none());
+    }
+
+    #[test]
+    fn a_file_dropped_on_a_binary_body_becomes_the_body() {
+        let mut h = with_request("binary-body");
+        h.state_mut().req_tab = ReqTab::Body;
+        h.run();
+        h.get_by_label("Binary").click();
+        h.run();
+        let file = h.state().ws.root.join("photo.png");
+        std::fs::write(&file, [0u8; 2048]).unwrap();
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(file.clone())));
+        h.run();
+        shot(&mut h, "51-binary-body");
+        let path = file.display().to_string();
+        assert_eq!(draft(&h).body, Body::File { path });
+        // What will go out, before Send.
+        assert!(h.query_by_label_contains("image/png").is_some());
+        std::fs::remove_file(&file).unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("File not found").is_some());
     }
 
     #[test]

@@ -10,7 +10,8 @@ such as Citrix VDI. No installer: unzip and run.
   connected, and publishes from the message panel with QoS and retain; Postman-style pre-request/test
   scripts (`pm.*`, chai, `jsonSchema`); collection runner with CSV/JSON data; load test
   pane; proxy/PAC/WPAD, custom CA and client certificates. JSON, text, form and multipart
-  bodies (a value `@path` uploads a file); a description per param, header and form
+  bodies (a value `@path` uploads a file), and a Binary body that sends a file as it is,
+  streamed from disk with its type guessed from the extension; a description per param, header and form
   field, and Bulk Edit (`key: value` lines) for those tables; path variables (`/users/:id`
   gets an `id` row under Params, filled in on Send, kept on Postman import and export); per-request settings (HTTP
   version, redirects, TLS check, cookies, timeout); paste a curl command into the URL bar

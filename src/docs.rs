@@ -105,6 +105,9 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
         Body::Text { text } => code(out, "Body", "", text),
         Body::Form { fields } => table(out, "Body (form)", fields),
         Body::Multipart { parts } => table(out, "Body (multipart; `@path` uploads a file)", parts),
+        Body::File { path } => {
+            let _ = write!(out, "**Body:** the file `{path}`\n\n");
+        }
         Body::GraphQL { query, variables } => {
             code(out, "Query", "graphql", query);
             if !variables.trim().is_empty() {

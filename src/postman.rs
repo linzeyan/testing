@@ -197,6 +197,9 @@ impl Reader {
                 query: str_of(&b["graphql"]["query"]).into(),
                 variables: str_of(&b["graphql"]["variables"]).into(),
             },
+            "file" => Body::File {
+                path: str_of(&b["file"]["src"]).into(),
+            },
             mode => {
                 self.warn(key, format!("a {mode} body isn't supported; left empty"));
                 Body::None
@@ -533,6 +536,7 @@ fn body_json(body: &Body) -> Option<Value> {
             }
             json!({ "mode": "formdata", "formdata": rows })
         }
+        Body::File { path } => json!({ "mode": "file", "file": { "src": path } }),
         Body::GraphQL { query, variables } => {
             json!({ "mode": "graphql", "graphql": { "query": query, "variables": variables } })
         }
@@ -807,12 +811,13 @@ mod tests {
         assert_eq!(r["me"].method, "GRAPHQL");
 
         // What couldn't come over is said, not dropped quietly.
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].starts_with("login: awsv4 auth"), "{warnings:?}");
-        assert!(
-            warnings[1].starts_with("binary: a file body"),
-            "{warnings:?}"
-        );
+        let file = Body::File {
+            path: "x.bin".into(),
+        };
+        assert_eq!(r["binary"].body, file);
+        assert_eq!(body_json(&file).unwrap()["file"]["src"], "x.bin");
         assert_eq!(r["login"].auth, Auth::None);
     }
 

@@ -179,6 +179,18 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
         Body::Text { text } => typed(b, "text/plain; charset=utf-8").body(text),
         Body::Form { fields } => b.form(&pairs(&fields)),
         Body::Multipart { parts } => b.multipart(multipart(parts)?),
+        // Streamed like multipart files, so a large upload never sits in memory.
+        Body::File { path } => {
+            if path.trim().is_empty() {
+                return Err("Pick a file to send as the body".into());
+            }
+            let file = std::fs::File::open(&path).map_err(|e| format!("{path}: {e}"))?;
+            let len = file.metadata().map_err(|e| format!("{path}: {e}"))?.len();
+            let mime = mime_guess::from_path(&path).first_or_octet_stream();
+            typed(b, mime.as_ref())
+                .header(reqwest::header::CONTENT_LENGTH, len)
+                .body(tokio::fs::File::from_std(file))
+        }
         Body::GraphQL { query, variables } => {
             let variables: serde_json::Value = if variables.trim().is_empty() {
                 serde_json::Value::Object(Default::default())
@@ -653,6 +665,31 @@ pub(crate) mod tests {
         // The Timeline lists exactly what arrived, the headers reqwest adds included.
         assert_eq!(shown(&resp), received(&resp));
         assert_eq!(resp.sent.body.as_deref(), Some("{\"n\":1}"));
+    }
+
+    #[test]
+    fn a_file_body_goes_out_as_its_bytes_typed_by_its_extension() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("apitool-body-{}.png", std::process::id()));
+        std::fs::write(&path, "not really a png").unwrap();
+        let req = Request {
+            method: "PUT".into(),
+            url: echo_server(),
+            body: Body::File {
+                path: path.display().to_string(),
+            },
+            ..Default::default()
+        };
+        let resp = rt.block_on(execute(client(&rt), req)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let wire = resp.body.to_lowercase();
+        assert!(wire.contains("content-type: image/png"), "{wire}");
+        assert!(wire.contains("content-length: 16"), "{wire}");
+        assert!(wire.ends_with("\r\n\r\nnot really a png"), "{wire}");
+        assert_eq!(shown(&resp), received(&resp));
     }
 
     /// The header lines an echo server got, as (lowercase name, value), sorted.
