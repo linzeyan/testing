@@ -115,6 +115,7 @@ pub struct State {
     pub network: crate::net::Network,
     /// The language the code panel shows.
     pub code_lang: String,
+    pub wrap_response: bool,
 }
 
 /// Clones share one connection: the GUI's mock server reads from its own thread.

@@ -274,9 +274,49 @@ struct ResponseView {
     head: http::Response,
     /// Body as displayed (pretty-printed when JSON); `head.body` is emptied to avoid a 2nd copy.
     text: String,
+    /// A JSON body's other form for the Pretty/Raw switch: as received while `text` is
+    /// pretty, and the other way round. None when the body isn't valid JSON.
+    other: Option<String>,
+    pretty: bool,
+    /// Colour JSON tokens (also when it's cut and no longer parses).
+    json: bool,
     raw_size: usize,
     line_starts: Vec<usize>,
+    /// Visual rows for word wrap at a given width in columns, see `wrap_rows`.
+    wrapped: Option<(usize, Vec<Row>)>,
     find: Find,
+}
+
+impl ResponseView {
+    fn set_pretty(&mut self, pretty: bool) {
+        if pretty == self.pretty {
+            return;
+        }
+        let Some(other) = &mut self.other else { return };
+        std::mem::swap(&mut self.text, other);
+        self.pretty = pretty;
+        self.line_starts = line_starts(&self.text);
+        self.wrapped = None;
+        self.find = Find::default();
+    }
+
+    /// The body as the server sent it.
+    fn raw(&self) -> &str {
+        match (&self.other, self.pretty) {
+            (Some(raw), true) => raw,
+            _ => &self.text,
+        }
+    }
+}
+
+/// One visual row of a wrapped body.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Row {
+    start: usize,
+    /// 1-based, on the first row of each line; 0 on the rows it wraps onto.
+    line: u32,
+    /// The row starts inside a JSON string, for colouring.
+    in_string: bool,
 }
 
 /// Find-in-body state. Lives in the view, so a new response starts a fresh search.
@@ -328,6 +368,11 @@ enum Dialog {
     Postman {
         text: String,
         note: String,
+    },
+    /// Where to save the response body.
+    SaveBody {
+        path: String,
+        error: String,
     },
 }
 
@@ -426,6 +471,8 @@ pub struct App {
     /// The code snippet panel, and its language (kept in the workspace state).
     code: bool,
     code_lang: String,
+    /// Word wrap in the response body, kept across restarts.
+    wrap_response: bool,
     mock: Option<MockServer>,
     active_env: Option<String>,
     vars: HashMap<String, String>,
@@ -479,6 +526,7 @@ impl App {
             code_lang: Some(state.code_lang)
                 .filter(|l| crate::codegen::TARGETS.iter().any(|(n, _)| l == n))
                 .unwrap_or_else(|| "cURL".into()),
+            wrap_response: state.wrap_response,
             mock: None,
             ws,
             active_env: None,
@@ -527,6 +575,61 @@ impl App {
         app
     }
 
+    /// Offers Downloads/<request name>.<extension from the content type>.
+    fn ask_save_body(&mut self) {
+        let Some(Ok(view)) = self.response.as_ref().map(|s| &s.result) else {
+            return;
+        };
+        let content_type = (view.head.headers.iter())
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map_or("", |(_, v)| v.as_str());
+        let ext = match content_type {
+            c if c.contains("json") => "json",
+            c if c.contains("xml") => "xml",
+            c if c.contains("html") => "html",
+            c if c.starts_with("text/") => "txt",
+            _ => "bin",
+        };
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+        let dir = (home.map(|h| PathBuf::from(h).join("Downloads")))
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(|| self.ws.root.clone());
+        let name = self.open.as_ref().map(Open::name).unwrap_or_default();
+        let file = format!("{}.{ext}", crate::store::safe_name(&name));
+        self.dialog = Some(Dialog::SaveBody {
+            path: dir.join(file).display().to_string(),
+            error: String::new(),
+        });
+    }
+
+    fn save_body(&mut self) {
+        let Some(Dialog::SaveBody { path, .. }) = &self.dialog else {
+            return;
+        };
+        let path = path.trim().to_owned();
+        let Some(Ok(view)) = self.response.as_ref().map(|s| &s.result) else {
+            self.dialog = None;
+            return;
+        };
+        let body = view.raw();
+        match std::fs::write(&path, body) {
+            Ok(()) => {
+                let cut = if view.head.truncated {
+                    " (cut at 16 MiB)"
+                } else {
+                    ""
+                };
+                self.status = format!("Saved {}{cut} to {path}", human_size(body.len()));
+                self.dialog = None;
+            }
+            Err(e) => {
+                if let Some(Dialog::SaveBody { error, .. }) = &mut self.dialog {
+                    *error = format!("{path}: {e}");
+                }
+            }
+        }
+    }
+
     fn save_state(&self) {
         self.ws.save_state(&State {
             active_env: self.active_env.clone(),
@@ -534,6 +637,7 @@ impl App {
             tabs: self.tabs.iter().map(|t| t.path.clone()).collect(),
             network: self.network.clone(),
             code_lang: self.code_lang.clone(),
+            wrap_response: self.wrap_response,
         });
     }
 
@@ -1242,21 +1346,152 @@ impl App {
 fn into_view(mut head: http::Response) -> ResponseView {
     let body = std::mem::take(&mut head.body);
     let raw_size = body.len();
-    let looks_json = head.is_json() || body.trim_start().starts_with(['{', '[']);
-    let text = looks_json
-        .then(|| http::pretty_json(&body))
-        .flatten()
-        .unwrap_or(body);
-    let line_starts = std::iter::once(0)
-        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
-        .filter(|&i| i < text.len())
-        .collect();
+    let json = head.is_json() || body.trim_start().starts_with(['{', '[']);
+    let (text, other) = match json.then(|| http::pretty_json(&body)).flatten() {
+        Some(pretty) => (pretty, Some(body)),
+        None => (body, None),
+    };
     ResponseView {
         head,
+        line_starts: line_starts(&text),
         text,
+        pretty: other.is_some(),
+        other,
+        json,
         raw_size,
-        line_starts,
+        wrapped: None,
         find: Find::default(),
+    }
+}
+
+fn line_starts(text: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .filter(|&i| i < text.len())
+        .collect()
+}
+
+/// Cuts each line into rows of `cols` columns, counting East Asian characters as two
+/// (they're drawn twice as wide). Monospace makes this exact enough to keep `show_rows`,
+/// which wrapped labels of varying height wouldn't allow. One pass over the text.
+// ponytail: "wide" is everything from U+1100 up; emoji and combining marks are off by one.
+fn wrap_rows(text: &str, line_starts: &[usize], cols: usize) -> Vec<Row> {
+    let mut rows = Vec::with_capacity(line_starts.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for (n, &start) in line_starts.iter().enumerate() {
+        let end = line_starts.get(n + 1).copied().unwrap_or(text.len());
+        let line = text[start..end].trim_end_matches(['\n', '\r']);
+        rows.push(Row {
+            start,
+            line: n as u32 + 1,
+            in_string,
+        });
+        let mut used = 0;
+        for (i, c) in line.char_indices() {
+            let w = if c as u32 >= 0x1100 { 2 } else { 1 };
+            if used + w > cols {
+                rows.push(Row {
+                    start: start + i,
+                    line: 0,
+                    in_string,
+                });
+                used = 0;
+            }
+            used += w;
+            match c {
+                _ if escaped => escaped = false,
+                '\\' if in_string => escaped = true,
+                '"' => in_string = !in_string,
+                _ => {}
+            }
+        }
+        // Valid JSON has no raw newline in a string; don't let a stray quote colour the rest.
+        in_string = false;
+    }
+    rows
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Token {
+    Key,
+    Str,
+    Num,
+    /// true, false, null
+    Lit,
+    Punct,
+}
+
+/// JSON tokens on one row as (end byte, kind), for colouring. Works a row at a time, so
+/// it never looks past what's on screen; a string that runs on past the row counts as a
+/// value, since the colon that would make it a key isn't in sight.
+fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Token)> {
+    let b = row.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let string_end = |mut i: usize| {
+        while i < b.len() && b[i] != b'"' {
+            i += if b[i] == b'\\' { 2 } else { 1 };
+        }
+        (i + 1).min(b.len())
+    };
+    if in_string {
+        i = string_end(0);
+        out.push((i, Token::Str));
+    }
+    while i < b.len() {
+        let (end, kind) = match b[i] {
+            b'"' => {
+                let end = string_end(i + 1);
+                let rest = row[end..].trim_start();
+                (
+                    end,
+                    if rest.starts_with(':') {
+                        Token::Key
+                    } else {
+                        Token::Str
+                    },
+                )
+            }
+            b'-' | b'0'..=b'9' => {
+                let n = b[i..]
+                    .iter()
+                    .position(|c| !matches!(c, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'));
+                (n.map_or(b.len(), |n| i + n), Token::Num)
+            }
+            b't' | b'f' | b'n' => {
+                let n = b[i..].iter().position(|c| !c.is_ascii_alphabetic());
+                (n.map_or(b.len(), |n| i + n), Token::Lit)
+            }
+            _ => {
+                let n = b[i..]
+                    .iter()
+                    .position(|c| matches!(c, b'"' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n'));
+                (n.map_or(b.len(), |n| i + n), Token::Punct)
+            }
+        };
+        // Never stall on a byte none of the arms consumed.
+        let end = end.max(i + 1).min(b.len());
+        match out.last_mut() {
+            Some((e, k)) if *k == kind => *e = end,
+            _ => out.push((end, kind)),
+        }
+        i = end;
+    }
+    out
+}
+
+fn token_color(ui: &egui::Ui, t: Token) -> Color32 {
+    let dark = ui.visuals().dark_mode;
+    match (t, dark) {
+        (Token::Key, true) => Color32::from_rgb(156, 210, 254),
+        (Token::Key, false) => Color32::from_rgb(4, 81, 165),
+        (Token::Str, true) => Color32::from_rgb(206, 145, 120),
+        (Token::Str, false) => Color32::from_rgb(163, 21, 21),
+        (Token::Num, true) => Color32::from_rgb(181, 206, 168),
+        (Token::Num, false) => Color32::from_rgb(9, 134, 88),
+        (Token::Lit, true) => Color32::from_rgb(86, 156, 214),
+        (Token::Lit, false) => Color32::from_rgb(0, 0, 255),
+        (Token::Punct, _) => ui.visuals().weak_text_color(),
     }
 }
 
@@ -1940,6 +2175,8 @@ impl App {
 
         // As in Postman: beside both the request and its response, so edits show live.
         let mut lang_changed = false;
+        let mut save_file = false;
+        let wrap_before = self.wrap_response;
         if self.code {
             egui::Panel::right("code")
                 .resizable(true)
@@ -2316,14 +2553,20 @@ impl App {
                 None => {
                     ui.weak(format!("Press Send or {} to see the response.", ui.ctx().format_shortcut(&SEND)));
                 }
-                Some(shown) => example = response_ui(ui, shown, &mut self.resp_tab),
+                Some(shown) => {
+                    let wrap = &mut self.wrap_response;
+                    example = response_ui(ui, shown, &mut self.resp_tab, wrap, &mut save_file);
+                }
             }
         });
         if let Some(example) = example {
             self.save_example(example);
         }
-        if lang_changed {
+        if lang_changed || wrap_before != self.wrap_response {
             self.save_state();
+        }
+        if save_file {
+            self.ask_save_body();
         }
 
         if save {
@@ -2556,6 +2799,27 @@ impl App {
                                 }
                             }));
                         }
+                    });
+                }
+                Dialog::SaveBody { path, error } => {
+                    ui.heading("Save response body");
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(path)
+                            .hint_text("File path")
+                            .desired_width(f32::INFINITY),
+                    );
+                    let enter = enter_pressed(ui);
+                    if !enter && ui.memory(|m| m.focused().is_none()) {
+                        edit.request_focus();
+                    }
+                    if !error.is_empty() {
+                        ui.colored_label(RED, error.as_str());
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.add(primary("Save")).clicked() || enter {
+                            then = Some(Box::new(|app, _| app.save_body()));
+                        }
+                        cancel = ui.button("Cancel").clicked();
                     });
                 }
                 Dialog::Import => {
@@ -4740,7 +5004,14 @@ fn stream_ui(
 }
 
 /// Returns an example to save when the user asked for one.
-fn response_ui(ui: &mut egui::Ui, shown: &mut Shown, tab: &mut RespTab) -> Option<Example> {
+/// `wrap` is the word-wrap switch; `save_file` is set when the user asks to save the body.
+fn response_ui(
+    ui: &mut egui::Ui,
+    shown: &mut Shown,
+    tab: &mut RespTab,
+    wrap: &mut bool,
+    save_file: &mut bool,
+) -> Option<Example> {
     let mut example = None;
     let passed = shown.tests.iter().filter(|t| t.passed).count();
     ui.horizontal(|ui| {
@@ -4796,6 +5067,12 @@ fn response_ui(ui: &mut egui::Ui, shown: &mut Shown, tab: &mut RespTab) -> Optio
                 if ui.small_button("Copy").on_hover_text("Copy body").clicked() {
                     ui.ctx().copy_text(view.text.clone());
                 }
+                if (ui.small_button("Save…"))
+                    .on_hover_text("Save the body to a file, as received")
+                    .clicked()
+                {
+                    *save_file = true;
+                }
                 if ui
                     .small_button("Save as example")
                     .on_hover_text("Keep this response with the request")
@@ -4816,6 +5093,25 @@ fn response_ui(ui: &mut egui::Ui, shown: &mut Shown, tab: &mut RespTab) -> Optio
                     });
                 }
                 if *tab == RespTab::Body {
+                    ui.separator();
+                    if (ui.selectable_label(*wrap, "Wrap"))
+                        .on_hover_text("Wrap long lines")
+                        .clicked()
+                    {
+                        *wrap = !*wrap;
+                    }
+                    // Right to left: Raw is added first to sit on the right.
+                    if view.other.is_some() {
+                        if (ui.selectable_label(!view.pretty, "Raw"))
+                            .on_hover_text("As received")
+                            .clicked()
+                        {
+                            view.set_pretty(false);
+                        }
+                        if ui.selectable_label(view.pretty, "Pretty").clicked() {
+                            view.set_pretty(true);
+                        }
+                    }
                     find_bar(ui, view);
                 }
             });
@@ -4888,32 +5184,80 @@ fn response_ui(ui: &mut egui::Ui, shown: &mut Shown, tab: &mut RespTab) -> Optio
         }
         (_, Ok(view)) => {
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-            let mut area = egui::ScrollArea::both()
-                .id_salt("response-body")
-                .auto_shrink(false);
+            let font = egui::TextStyle::Monospace.resolve(ui.style());
+            let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '0'));
+            let digits = view.line_starts.len().max(1).ilog10() as usize + 1;
+            let gutter = (digits + 1) as f32 * char_w + ui.spacing().item_spacing.x;
+            if *wrap {
+                let width = ui.available_width() - gutter - ui.spacing().scroll.bar_width;
+                let cols = (width / char_w).floor().max(20.0) as usize;
+                if view.wrapped.as_ref().is_none_or(|(c, _)| *c != cols) {
+                    view.wrapped = Some((cols, wrap_rows(&view.text, &view.line_starts, cols)));
+                }
+            }
+            let rows: &[Row] = match (&view.wrapped, *wrap) {
+                (Some((_, rows)), true) => rows,
+                _ => &[],
+            };
+            let count = if *wrap {
+                rows.len()
+            } else {
+                view.line_starts.len()
+            };
+            let mut area = match *wrap {
+                true => egui::ScrollArea::vertical(),
+                false => egui::ScrollArea::both(),
+            }
+            .id_salt("response-body")
+            .auto_shrink(false);
             if std::mem::take(&mut view.find.scroll)
                 && let Some(&at) = view.find.hits.get(view.find.current)
             {
-                let row = view.line_starts.partition_point(|&s| s <= at) - 1;
+                let row = match *wrap {
+                    true => rows.partition_point(|r| r.start <= at),
+                    false => view.line_starts.partition_point(|&s| s <= at),
+                } - 1;
                 // A few lines of context above the hit.
                 let pitch = row_height + ui.spacing().item_spacing.y;
                 area = area.vertical_scroll_offset(row.saturating_sub(3) as f32 * pitch);
             }
-            let view = &*view;
-            area.show_rows(ui, row_height, view.line_starts.len(), |ui, rows| {
-                for row in rows {
-                    let start = view.line_starts[row];
-                    let end = view
-                        .line_starts
-                        .get(row + 1)
-                        .copied()
-                        .unwrap_or(view.text.len());
+            let weak = ui.visuals().weak_text_color();
+            area.show_rows(ui, row_height, count, |ui, range| {
+                for i in range {
+                    let (start, end, line, in_string) = match *wrap {
+                        true => {
+                            let end = rows.get(i + 1).map_or(view.text.len(), |r| r.start);
+                            (rows[i].start, end, rows[i].line, rows[i].in_string)
+                        }
+                        false => {
+                            let end = view.line_starts.get(i + 1).copied();
+                            (
+                                view.line_starts[i],
+                                end.unwrap_or(view.text.len()),
+                                i as u32 + 1,
+                                false,
+                            )
+                        }
+                    };
                     let mut cut = end.min(start + MAX_LINE);
                     while !view.text.is_char_boundary(cut) {
                         cut -= 1;
                     }
                     let end = start + view.text[start..cut].trim_end().len();
-                    ui.add(egui::Label::new(highlighted(ui, view, start..end)).extend());
+                    ui.horizontal(|ui| {
+                        let number = match line {
+                            0 => String::new(),
+                            n => n.to_string(),
+                        };
+                        ui.label(
+                            RichText::new(format!("{number:>digits$}"))
+                                .monospace()
+                                .color(weak),
+                        );
+                        ui.add(
+                            egui::Label::new(highlighted(ui, view, start..end, in_string)).extend(),
+                        );
+                    });
                 }
             });
         }
@@ -5003,40 +5347,64 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     }
 }
 
-/// One body line, with find hits painted over it.
+/// One body row, JSON tokens coloured and find hits painted over it.
 fn highlighted(
     ui: &egui::Ui,
     view: &ResponseView,
     line: std::ops::Range<usize>,
+    in_string: bool,
 ) -> egui::WidgetText {
     let (text, find) = (&view.text, &view.find);
     let len = find.searched.len();
-    let first = find.hits.partition_point(|&h| h + len <= line.start);
-    if len == 0 || find.hits.get(first).is_none_or(|&h| h >= line.end) {
+    let mut hit = find.hits.partition_point(|&h| h + len <= line.start);
+    let no_hits = len == 0 || find.hits.get(hit).is_none_or(|&h| h >= line.end);
+    if !view.json && no_hits {
         return RichText::new(&text[line]).monospace().into();
     }
-    let font = egui::TextStyle::Monospace.resolve(ui.style());
-    let plain = egui::TextFormat::simple(font.clone(), ui.visuals().text_color());
-    let mark = |current| egui::TextFormat {
-        background: if current {
-            ORANGE
-        } else {
-            Color32::from_rgb(240, 220, 90)
-        },
-        ..egui::TextFormat::simple(font.clone(), Color32::BLACK)
+    let tokens: Vec<(usize, Option<Token>)> = match view.json {
+        true => (json_tokens(&text[line.clone()], in_string).into_iter())
+            .map(|(end, t)| (end, Some(t)))
+            .collect(),
+        false => vec![(line.len(), None)],
     };
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
     let mut job = egui::text::LayoutJob::default();
+    let mut append = |range: std::ops::Range<usize>, color, background| {
+        let format = egui::TextFormat {
+            background,
+            ..egui::TextFormat::simple(font.clone(), color)
+        };
+        job.append(&text[range], 0.0, format);
+    };
     let mut pos = line.start;
-    for (k, &h) in find.hits.iter().enumerate().skip(first) {
-        if h >= line.end {
-            break;
+    for (end, token) in tokens {
+        let end = line.start + end;
+        let color = token.map_or(ui.visuals().text_color(), |t| token_color(ui, t));
+        while pos < end {
+            match find.hits.get(hit).copied().filter(|_| len > 0) {
+                Some(h) if h < end && h + len > pos => {
+                    if h > pos {
+                        append(pos..h, color, Color32::TRANSPARENT);
+                        pos = h;
+                    }
+                    let to = (h + len).min(end);
+                    let mark = match hit == find.current {
+                        true => ORANGE,
+                        false => Color32::from_rgb(240, 220, 90),
+                    };
+                    append(pos..to, Color32::BLACK, mark);
+                    pos = to;
+                    if h + len <= to {
+                        hit += 1;
+                    }
+                }
+                _ => {
+                    append(pos..end, color, Color32::TRANSPARENT);
+                    pos = end;
+                }
+            }
         }
-        let (from, to) = (h.max(pos), (h + len).min(line.end));
-        job.append(&text[pos..from], 0.0, plain.clone());
-        job.append(&text[from..to], 0.0, mark(k == find.current));
-        pos = to;
     }
-    job.append(&text[pos..line.end], 0.0, plain);
     job.into()
 }
 
@@ -6074,6 +6442,118 @@ mod ui_tests {
     fn wait(h: &mut Harness<'_, App>, done: impl Fn(&App) -> bool) {
         wait_live(h, done);
         h.run();
+    }
+
+    /// Keys, strings, numbers and literals get their own colours, a quote inside a
+    /// string doesn't end it, and a row that starts inside a string continues it.
+    #[test]
+    fn json_rows_are_tokenized_for_colour() {
+        use Token::*;
+        let row = r#"  "k\"ey": "v,1", "n": -1.5e3, "t": [true, null]"#;
+        let kinds: Vec<(&str, Token)> = {
+            let mut at = 0;
+            (json_tokens(row, false).into_iter())
+                .map(|(end, t)| (std::mem::replace(&mut at, end), end, t))
+                .map(|(from, to, t)| (&row[from..to], t))
+                .collect()
+        };
+        assert_eq!(
+            kinds,
+            [
+                ("  ", Punct),
+                (r#""k\"ey""#, Key),
+                (": ", Punct),
+                (r#""v,1""#, Str),
+                (", ", Punct),
+                (r#""n""#, Key),
+                (": ", Punct),
+                ("-1.5e3", Num),
+                (", ", Punct),
+                (r#""t""#, Key),
+                (": [", Punct),
+                ("true", Lit),
+                (", ", Punct),
+                ("null", Lit),
+                ("]", Punct),
+            ]
+        );
+        assert_eq!(json_tokens(r#"ue", 1"#, true)[0], (3, Str));
+    }
+
+    /// Wrapped rows keep `show_rows` usable: each holds at most `cols` columns (CJK
+    /// counting two), only a line's first row is numbered, and a row cut inside a
+    /// string knows it.
+    #[test]
+    fn long_lines_wrap_into_numbered_rows() {
+        let text = "{\"a\": \"0123456789\"}\n中文中文中文\n";
+        let rows = wrap_rows(text, &line_starts(text), 8);
+        let shown: Vec<(&str, u32, bool)> = (0..rows.len())
+            .map(|i| {
+                let end = rows.get(i + 1).map_or(text.len(), |r| r.start);
+                (
+                    text[rows[i].start..end].trim_end(),
+                    rows[i].line,
+                    rows[i].in_string,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("{\"a\": \"0", 1, false),
+                ("12345678", 0, true),
+                ("9\"}", 0, true),
+                ("中文中文", 2, false),
+                ("中文", 0, false),
+            ]
+        );
+    }
+
+    /// The response toolbar: Raw shows the body as received and Pretty brings the
+    /// indented one back; Wrap is kept across restarts; Save… writes what the server
+    /// sent to the path given, Enter confirming.
+    #[test]
+    fn response_body_switches_wraps_and_saves() {
+        let mut h = with_request("resp-tools");
+        let raw = r#"{"a":[1,2],"b":"x"}"#;
+        show_response(&mut h, "application/json", raw.into());
+        let text = |h: &Harness<'_, App>| {
+            let shown = h.state().response.as_ref().unwrap();
+            shown.result.as_ref().unwrap().text.clone()
+        };
+        assert!(text(&h).starts_with("{\n  \"a\": ["), "{}", text(&h));
+        h.get_by_label("Raw").click();
+        h.run();
+        assert_eq!(text(&h), raw);
+        h.get_by_label("Pretty").click();
+        h.run();
+        assert!(text(&h).starts_with("{\n"));
+
+        let look = r#"{"id":42,"name":"中文名稱","tags":["a","b"],"ok":true,"none":null,"price":-1.5e3,"note":"a long value that runs well past the width of the pane so that wrapping has something to do, again and again and again and again and again and again and again"}"#;
+        show_response(&mut h, "application/json", look.into());
+        shot(&mut h, "40-response-pretty");
+        h.get_by_label("Wrap").click();
+        h.run();
+        assert!(h.state().wrap_response);
+        h.get_by_label("Raw").click();
+        h.run();
+        shot(&mut h, "41-response-raw-wrapped");
+        show_response(&mut h, "application/json", raw.into());
+        let ws = h.state().ws.clone();
+        assert!(ws.load_state().wrap_response, "kept for the next start");
+
+        h.get_by_label("Save…").click();
+        h.run();
+        let file = ws.root.join("body.json");
+        let Some(Dialog::SaveBody { path, .. }) = &mut h.state_mut().dialog else {
+            panic!("the save dialog should be open");
+        };
+        assert!(path.ends_with("r.json"), "named after the request: {path}");
+        *path = file.display().to_string();
+        h.key_press(Key::Enter);
+        h.run();
+        assert!(h.state().dialog.is_none());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), raw, "as received");
     }
 
     /// A chatty stream keeps a bounded log: big messages keep their start, and old
