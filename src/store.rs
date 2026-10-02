@@ -387,6 +387,45 @@ impl Workspace {
         Ok(new)
     }
 
+    /// Copies a request or a whole folder next to itself as "<name> copy" ("copy 2", …).
+    pub fn duplicate(&self, path: &Path) -> Result<PathBuf, String> {
+        let dir = path.is_dir();
+        // A dot in a folder name is not an extension.
+        let stem = match dir {
+            true => path.file_name(),
+            false => path.file_stem(),
+        };
+        let stem = stem.unwrap_or_default().to_string_lossy();
+        let new = (1..)
+            .map(|n| match n {
+                1 => format!("{stem} copy"),
+                n => format!("{stem} copy {n}"),
+            })
+            .map(|name| match dir {
+                true => path.with_file_name(name),
+                false => path.with_file_name(format!("{name}.toml")),
+            })
+            .find(|p| !p.exists())
+            .expect("some name is free");
+        fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+            fs::create_dir(to)?;
+            for entry in fs::read_dir(from)? {
+                let entry = entry?;
+                match entry.file_type()?.is_dir() {
+                    true => copy_dir(&entry.path(), &to.join(entry.file_name()))?,
+                    false => drop(fs::copy(entry.path(), to.join(entry.file_name()))?),
+                }
+            }
+            Ok(())
+        }
+        match dir {
+            true => copy_dir(path, &new),
+            false => fs::copy(path, &new).map(drop),
+        }
+        .map_err(|e| format!("duplicate: {e}"))?;
+        Ok(new)
+    }
+
     pub fn delete(&self, path: &Path) -> Result<(), String> {
         if path.is_dir() {
             fs::remove_dir_all(path)
@@ -615,6 +654,52 @@ mod tests {
         fs::write(root.join("environments/dev.toml"), "vars = [").unwrap();
         assert!(ws.env_vars(Some("dev")).unwrap_err().contains("dev.toml"));
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn duplicates_sit_next_to_the_original_and_never_overwrite() {
+        let root = std::env::temp_dir().join(format!("apitool-dup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let ws = Workspace::open(root.clone()).unwrap();
+        let api = ws.create_folder(&ws.collections(), "api.v2").unwrap();
+        let get = ws.create_request(&api, "get").unwrap();
+        let req = Request {
+            url: "{{base}}/x".into(),
+            ..Default::default()
+        };
+        ws.save_request(&get, &req).unwrap();
+        ws.save_folder(
+            &api,
+            &Folder {
+                description: "settings come along".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let copy = ws.duplicate(&get).unwrap();
+        assert_eq!(ws.display_name(&copy), "api.v2/get copy");
+        assert_eq!(ws.load_request(&copy).unwrap().url, "{{base}}/x");
+        let again = ws.duplicate(&get).unwrap();
+        assert_eq!(ws.display_name(&again), "api.v2/get copy 2");
+
+        let folder = ws.duplicate(&api).unwrap();
+        assert_eq!(folder.file_name().unwrap(), "api.v2 copy");
+        assert_eq!(
+            ws.load_folder(&folder).unwrap().description,
+            "settings come along"
+        );
+        let copied = ws.load_requests_in(&folder).unwrap();
+        let names: Vec<_> = copied.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "api.v2 copy/get",
+                "api.v2 copy/get copy",
+                "api.v2 copy/get copy 2"
+            ]
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

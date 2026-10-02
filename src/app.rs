@@ -21,6 +21,7 @@ const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S)
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
+const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
 /// Lines longer than this are clipped in the viewer; JSON is pretty-printed first so
 /// only non-JSON minified bodies hit it.
 const MAX_LINE: usize = 4096;
@@ -293,6 +294,7 @@ enum TreeAction {
     /// `true` (a double-click) opens a normal tab instead of a preview.
     Open(PathBuf, bool),
     Dialog(Dialog),
+    Duplicate(PathBuf),
     Run(PathBuf),
     FolderSettings(PathBuf),
     CopyDocs(PathBuf),
@@ -1171,6 +1173,14 @@ impl eframe::App for App {
         {
             self.close_tab(&path);
         }
+        if ui.input_mut(|i| i.consume_shortcut(&DUPLICATE))
+            && self.dialog.is_none()
+            && self.env_editor.is_none()
+            && self.folder_editor.is_none()
+            && let Some(path) = self.open.as_ref().map(|o| o.path.clone())
+        {
+            self.duplicate(&path);
+        }
         if ui.input(|i| i.viewport().close_requested())
             && !self.allow_close
             && !self.unsaved().is_empty()
@@ -1396,6 +1406,7 @@ impl App {
                     self.activate(path, pin);
                 }
                 TreeAction::Dialog(d) => self.dialog = Some(d),
+                TreeAction::Duplicate(path) => self.duplicate(&path),
                 TreeAction::Run(path) => self.open_runner(path),
                 TreeAction::FolderSettings(dir) => self.open_folder_editor(dir),
                 TreeAction::CopyDocs(dir) => self.copy_docs(&dir, ui.ctx()),
@@ -1405,6 +1416,22 @@ impl App {
     }
 
     /// From the saved files, so unsaved edits aren't documented.
+    /// Copies what's saved, like Postman: unsaved edits stay in the original's tab. A
+    /// duplicated request opens, ready to change.
+    fn duplicate(&mut self, path: &Path) {
+        match self.ws.duplicate(path) {
+            Ok(new) => {
+                self.reload();
+                self.status = format!("Duplicated as \"{}\"", self.ws.display_name(&new));
+                if new.is_file() && !self.runner_busy() {
+                    self.runner = None;
+                    self.activate(new, true);
+                }
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
     fn copy_docs(&mut self, dir: &Path, ctx: &egui::Context) {
         match crate::docs::markdown(&self.ws, dir) {
             Ok(md) => {
@@ -2902,25 +2929,24 @@ fn tree_ui(
                     .default_open(selected.is_some_and(|s| s.starts_with(path)))
                     .show(ui, |ui| tree_ui(ui, children, selected, actions));
                 resp.header_response.context_menu(|ui| {
-                    let mut item = |label: &str, d: Dialog| {
+                    let mut item = |label: &str, a: TreeAction| {
                         if ui.button(label).clicked() {
-                            actions.push(TreeAction::Dialog(d));
+                            actions.push(a);
                             ui.close();
                         }
                     };
-                    item(
-                        "New request",
-                        Dialog::name(NameKind::NewRequest(path.clone()), ""),
-                    );
-                    item(
-                        "New folder",
-                        Dialog::name(NameKind::NewFolder(path.clone()), ""),
-                    );
+                    let dialog = |kind| TreeAction::Dialog(Dialog::name(kind, ""));
+                    item("New request", dialog(NameKind::NewRequest(path.clone())));
+                    item("New folder", dialog(NameKind::NewFolder(path.clone())));
                     item(
                         "Rename",
-                        Dialog::name(NameKind::Rename(path.clone()), name.as_str()),
+                        TreeAction::Dialog(Dialog::name(
+                            NameKind::Rename(path.clone()),
+                            name.as_str(),
+                        )),
                     );
-                    item("Delete", Dialog::Delete(path.clone()));
+                    item("Duplicate", TreeAction::Duplicate(path.clone()));
+                    item("Delete", TreeAction::Dialog(Dialog::Delete(path.clone())));
                     ui.separator();
                     if ui.button("Folder settings…").clicked() {
                         actions.push(TreeAction::FolderSettings(path.clone()));
@@ -2964,6 +2990,12 @@ fn tree_ui(
                             NameKind::Rename(path.clone()),
                             name.as_str(),
                         )));
+                        ui.close();
+                    }
+                    let duplicate = egui::Button::new("Duplicate")
+                        .shortcut_text(ui.ctx().format_shortcut(&DUPLICATE));
+                    if ui.add(duplicate).clicked() {
+                        actions.push(TreeAction::Duplicate(path.clone()));
                         ui.close();
                     }
                     if ui.button("Delete").clicked() {
@@ -4476,6 +4508,25 @@ mod ui_tests {
 
     fn draft<'h>(h: &'h Harness<'_, App>) -> &'h Request {
         &h.state().open.as_ref().unwrap().draft
+    }
+
+    #[test]
+    fn duplicate_opens_a_copy_of_what_is_saved() {
+        let mut h = with_request("duplicate");
+        h.state_mut().open.as_mut().unwrap().draft.url = "http://unsaved.test".into();
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::D);
+        h.run();
+        let app = h.state();
+        let open = app.open.as_ref().unwrap();
+        assert_eq!(app.ws.display_name(&open.path), "r copy");
+        assert_eq!(open.draft.url, "", "unsaved edits stay with the original");
+        assert_eq!(app.tabs.len(), 2);
+        assert!(
+            app.tabs[0].parked.as_ref().is_some_and(|p| p.open.dirty()),
+            "the original keeps its edits"
+        );
+        assert!(app.status.contains("r copy"), "{}", app.status);
     }
 
     #[test]
