@@ -508,26 +508,29 @@ async fn read_body(mut resp: reqwest::Response) -> Result<ReadBody, String> {
     Ok((text, None, truncated))
 }
 
-/// Streams the body to `path`, whatever its size. A failed download removes the file
-/// rather than leave a cut one that looks whole. ponytail: Cancel drops this mid-write
-/// and leaves the partial file; clean up on abort if that confuses anyone.
+/// Streams the body to `path`, whatever its size. A download that fails or is cancelled
+/// (Cancel drops this mid-write) removes the file rather than leave a cut one that looks
+/// whole.
 async fn download(mut resp: reqwest::Response, path: &std::path::Path) -> Result<u64, String> {
     use tokio::io::AsyncWriteExt;
+    /// Armed once the file is ours: a file that couldn't be created may be someone else's.
+    struct Partial<'a>(&'a std::path::Path);
+    impl Drop for Partial<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
     let failed = |e: std::io::Error| format!("{}: {e}", path.display());
     let mut file = tokio::fs::File::create(path).await.map_err(failed)?;
+    let partial = Partial(path);
     let mut n = 0;
-    let written = async {
-        while let Some(chunk) = resp.chunk().await.map_err(|e| error_chain(&e))? {
-            file.write_all(&chunk).await.map_err(failed)?;
-            n += chunk.len() as u64;
-        }
-        file.flush().await.map_err(failed)
+    while let Some(chunk) = resp.chunk().await.map_err(|e| error_chain(&e))? {
+        file.write_all(&chunk).await.map_err(failed)?;
+        n += chunk.len() as u64;
     }
-    .await;
-    if written.is_err() {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-    written.map(|()| n)
+    file.flush().await.map_err(failed)?;
+    std::mem::forget(partial);
+    Ok(n)
 }
 
 pub fn header_list(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
@@ -1194,6 +1197,40 @@ pub(crate) mod tests {
         assert_eq!(resp.body, "no such thing");
         assert!(!missing.exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Cancel drops a download mid-write; the cut file left behind would look whole.
+    #[test]
+    fn a_cancelled_download_leaves_no_file() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let file = std::env::temp_dir().join(format!("apitool-cut-{}.bin", std::process::id()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_request(&mut s);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000000\r\n\r\n");
+            let _ = s.write_all(&[7; 1000]);
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let req = Request {
+            method: "GET".into(),
+            url: format!("http://{addr}/"),
+            ..Default::default()
+        };
+        let send = SINK.scope(Sink::File(file.clone()), execute(client(&rt), req));
+        let task = rt.spawn(send);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::fs::metadata(&file).map_or(true, |m| m.len() == 0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the download should start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        task.abort();
+        assert!(rt.block_on(task).is_err_and(|e| e.is_cancelled()));
+        assert!(!file.exists(), "a cut file looks whole");
     }
 
     /// 50 load-test VUs each holding a 4 MB body peaked at 502 MiB; they only need the

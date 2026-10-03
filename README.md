@@ -34,9 +34,9 @@ such as Citrix VDI. No installer: unzip and run.
   typing, and the Headers tab folds out what Send adds (Host, auth, Content-Type…) and
   where each comes from; a response body with JSON colours and line numbers, folding
   of pretty JSON objects and arrays (find opens a fold it lands in), Pretty/Raw (XML responses are indented too), a JSONPath filter (`$.items[*].id`, `..id`; Save… still writes the whole
-  body), a Tests tab filter (All/Passed/Failed with counts), word wrap and Save… to a file (bodies past 16 MiB keep their start, to
+  body), a Tests tab filter (All/Passed/Failed with counts), word wrap (between words) and Save… to a file (bodies past 16 MiB keep their start, to
   spare RAM; Send ⏷ "Send and download…" streams a successful response straight to a
-  file instead, however big); a PNG or JPEG response shows as a picture, other binary
+  file instead, however big, and a failed or cancelled one leaves no partial file); a PNG or JPEG response shows as a picture, other binary
   bodies by their size (Save… writes them byte for byte), and "Open in browser" shows an
   HTML one; a Timeline tab with the request as it went out (headers reqwest adds and jar
   cookies included), each redirect and the peer address; a History menu in the

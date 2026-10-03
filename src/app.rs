@@ -1720,17 +1720,27 @@ fn wrap_rows(text: &str, line_starts: &[usize], cols: usize) -> Vec<Row> {
             in_string,
         });
         let mut used = 0;
+        // Where the row can break between words instead: the start of its last word, the
+        // columns before it and the string state there. Never in the indentation.
+        let (mut word, mut text, mut prev) = (None, false, '\0');
         for (i, c) in line.char_indices() {
             let w = if c as u32 >= 0x1100 { 2 } else { 1 };
-            if used + w > cols {
+            if c != ' ' && prev == ' ' && text {
+                word = Some((i, used, in_string));
+            }
+            // A space may hang past the edge, as in a browser.
+            if used + w > cols && c != ' ' {
+                let (at, before, in_string) = word.take().unwrap_or((i, used, in_string));
                 rows.push(Row {
-                    start: start + i,
+                    start: start + at,
                     line: 0,
                     in_string,
                 });
-                used = 0;
+                used -= before;
             }
             used += w;
+            text |= c != ' ';
+            prev = c;
             match c {
                 _ if escaped => escaped = false,
                 '\\' if in_string => escaped = true,
@@ -6384,7 +6394,9 @@ fn response_ui(
             // Pretty JSON only: folding finds a block's end by its indentation.
             let foldable = view.json && (view.pretty || view.unfiltered.is_some());
             let arrow_w = if foldable { char_w * 1.5 } else { 0.0 };
-            let gutter = (digits + 1) as f32 * char_w + arrow_w + 2.0 * ui.spacing().item_spacing.x;
+            let spacing = ui.spacing().item_spacing.x;
+            let arrow = if foldable { arrow_w + spacing } else { 0.0 };
+            let gutter = (digits + 1) as f32 * char_w + spacing + arrow;
             if *wrap {
                 let width = ui.available_width() - gutter - ui.spacing().scroll.bar_width;
                 let cols = (width / char_w).floor().max(20.0) as usize;
@@ -8743,12 +8755,25 @@ mod ui_tests {
         assert_eq!(
             shown,
             [
-                ("{\"a\": \"0", 1, false),
-                ("12345678", 0, true),
-                ("9\"}", 0, true),
+                ("{\"a\":", 1, false),
+                ("\"0123456", 0, false),
+                ("789\"}", 0, true),
                 ("中文中文", 2, false),
                 ("中文", 0, false),
             ]
+        );
+        // Between words when there's room, not inside one; never after the indentation, and
+        // not before a space (it hangs instead).
+        let text = "aa bbbb cc\n    aaaaaaaa\naaaaaa bb\n";
+        let rows = wrap_rows(text, &line_starts(text), 6);
+        let starts: Vec<usize> = rows.iter().map(|r| r.start).collect();
+        assert_eq!(starts, [0, 3, 8, 11, 17, 24, 31]);
+        let text = "\"aa bbbbbb\"";
+        let rows = wrap_rows(text, &line_starts(text), 6);
+        assert_eq!(
+            (rows[1].start, rows[1].in_string),
+            (4, true),
+            "a word inside a string"
         );
     }
 
