@@ -475,7 +475,11 @@ pub async fn stream(
     if let Err(e) = http::with_token(&clients.http, &mut req, false).await {
         return emit(Event::Error(e));
     }
-    let method = match method_for(&clients.grpc, &req).await {
+    let grpc = match clients.grpc_for(&req.url) {
+        Ok(c) => c,
+        Err(e) => return emit(Event::Error(e)),
+    };
+    let method = match method_for(&grpc, &req).await {
         Ok(m) => m,
         Err(e) => return emit(Event::Error(e)),
     };
@@ -489,7 +493,7 @@ pub async fn stream(
         Some((Ok::<_, std::convert::Infallible>(frame), rx))
     });
     let opened = format!("calling {}", req.rpc.trim());
-    let send = match wire(&clients.grpc, req) {
+    let send = match wire(&grpc, req) {
         // A stream lasts until someone ends it, not until the network timeout.
         Ok(b) => b
             .timeout(Duration::MAX)

@@ -37,6 +37,8 @@ pub struct Network {
     pub ca_file: String,
     pub client_cert: String,
     pub client_cert_password: String,
+    /// Checked in order before `client_cert`; the first whose host matches wins.
+    pub host_certs: Vec<HostCert>,
     pub insecure: bool,
     pub timeout_secs: u64,
 }
@@ -51,9 +53,60 @@ impl Default for Network {
             ca_file: String::new(),
             client_cert: String::new(),
             client_cert_password: String::new(),
+            host_certs: Vec::new(),
             insecure: false,
             timeout_secs: 60,
         }
+    }
+}
+
+/// A client certificate for one host, as Postman and Insomnia do: an API gateway and an
+/// internal service rarely accept the same one.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct HostCert {
+    /// `api.example.com`, `*.example.com` (subdomains only), either with `:port`.
+    pub host: String,
+    /// Empty sends no certificate to this host, even when there is a default one.
+    pub cert: String,
+    pub password: String,
+}
+
+impl Network {
+    /// The certificate path and password for a connection to `url`.
+    pub fn cert_for(&self, url: &str) -> (&str, &str) {
+        match self.host_cert(url) {
+            Some(i) => (&self.host_certs[i].cert, &self.host_certs[i].password),
+            None => (&self.client_cert, &self.client_cert_password),
+        }
+    }
+
+    fn host_cert(&self, url: &str) -> Option<usize> {
+        let url = reqwest::Url::parse(url.trim()).ok()?;
+        let host = url.host_str()?.to_ascii_lowercase();
+        let port = url.port_or_known_default();
+        (self.host_certs.iter()).position(|c| host_matches(&c.host, &host, port))
+    }
+}
+
+fn host_matches(pattern: &str, host: &str, port: Option<u16>) -> bool {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    // `[::1]` ends in `]`, so its colons aren't a port.
+    let (name, want) = match pattern.rsplit_once(':').filter(|_| !pattern.ends_with(']')) {
+        Some((name, p)) => match p.parse::<u16>() {
+            Ok(p) => (name, Some(p)),
+            Err(_) => return false,
+        },
+        None => (pattern.as_str(), None),
+    };
+    if want.is_some_and(|w| Some(w) != port) {
+        return false;
+    }
+    match name.strip_prefix("*.") {
+        Some(base) => host
+            .strip_suffix(base)
+            .is_some_and(|sub| sub.ends_with('.')),
+        None => !name.is_empty() && name == host,
     }
 }
 
@@ -117,6 +170,8 @@ struct Variant {
     redirects: Option<u32>,
     insecure: bool,
     cookies: bool,
+    /// Which of `host_certs` to present; None is the default certificate.
+    cert: Option<usize>,
 }
 
 impl From<&Settings> for Variant {
@@ -126,6 +181,7 @@ impl From<&Settings> for Variant {
             redirects: s.follow_redirects.then_some(s.max_redirects),
             insecure: !s.verify_tls,
             cookies: s.cookies,
+            cert: None,
         }
     }
 }
@@ -133,15 +189,33 @@ impl From<&Settings> for Variant {
 struct Variants {
     build: Box<dyn Fn(Variant) -> Result<reqwest::Client, String> + Send + Sync>,
     built: Mutex<HashMap<Variant, reqwest::Client>>,
+    /// For picking the certificate by host.
+    net: Network,
 }
 
 impl Clients {
-    /// The client for a request's settings; the shared one unless they differ from the
-    /// defaults.
-    pub fn for_settings(&self, s: &Settings) -> Result<reqwest::Client, String> {
-        let v = Variant::from(s);
+    /// The client for a request's settings and host; the shared one unless they differ
+    /// from the defaults.
+    pub fn for_settings(&self, s: &Settings, url: &str) -> Result<reqwest::Client, String> {
+        let cert = self.variants.net.host_cert(url);
+        self.variant(Variant { cert, ..s.into() })
+    }
+
+    /// The HTTP/2 client for a gRPC call to `url`.
+    pub fn grpc_for(&self, url: &str) -> Result<reqwest::Client, String> {
+        let cert = self.variants.net.host_cert(url);
+        self.variant(Variant {
+            cert,
+            ..grpc_variant()
+        })
+    }
+
+    fn variant(&self, v: Variant) -> Result<reqwest::Client, String> {
         if v == Variant::from(&Settings::default()) {
             return Ok(self.http.clone());
+        }
+        if v == grpc_variant() {
+            return Ok(self.grpc.clone());
         }
         if let Some(c) = self.variants.built.lock().unwrap().get(&v) {
             return Ok(c.clone());
@@ -149,6 +223,13 @@ impl Clients {
         let c = (self.variants.build)(v)?;
         self.variants.built.lock().unwrap().insert(v, c.clone());
         Ok(c)
+    }
+}
+
+fn grpc_variant() -> Variant {
+    Variant {
+        version: HttpVersion::Http2,
+        ..Variant::from(&Settings::default())
     }
 }
 
@@ -211,12 +292,16 @@ pub async fn build_client_with_jar(
         }
     }
 
-    let cert = net.client_cert.trim();
-    let identity = if cert.is_empty() {
-        None
-    } else {
-        Some(load_identity(Path::new(cert), &net.client_cert_password)?)
+    let load = |cert: &str, password: &str| match cert.trim() {
+        "" => Ok(None),
+        cert => load_identity(Path::new(cert), password).map(Some),
     };
+    let identity = load(&net.client_cert, &net.client_cert_password)?;
+    // Loaded up front so a wrong path or password shows now, not on some later request.
+    let host_ids = (net.host_certs.iter())
+        .map(|c| load(&c.cert, &c.password).map_err(|e| format!("{}: {e}", c.host.trim())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let picking = net.clone();
 
     let build = move |v: Variant| {
         let mut b = reqwest::Client::builder()
@@ -248,7 +333,11 @@ pub async fn build_client_with_jar(
             // Merge keeps the OS trust store; the corporate root is added on top.
             b = b.tls_certs_merge(certs.clone());
         }
-        if let Some(id) = &identity {
+        let id = match v.cert {
+            Some(i) => &host_ids[i],
+            None => &identity,
+        };
+        if let Some(id) = id {
             b = b.identity(id.clone());
         }
         b = b.connector_layer(tower_layer::layer_fn(TimeConnect));
@@ -260,20 +349,16 @@ pub async fn build_client_with_jar(
         };
         b.build().map_err(|e| error_chain(&e))
     };
-    let default = Variant::from(&Settings::default());
-    let grpc = Variant {
-        version: HttpVersion::Http2,
-        ..default
-    };
     Ok(Clients {
-        http: build(default)?,
-        grpc: build(grpc)?,
+        http: build(Variant::from(&Settings::default()))?,
+        grpc: build(grpc_variant())?,
         note,
         route,
         jar: scripts_jar,
         variants: Arc::new(Variants {
             build: Box::new(build),
             built: Default::default(),
+            net: picking,
         }),
     })
 }
@@ -787,6 +872,37 @@ mod tests {
         assert!(err.contains("PAC script"), "{err}");
         let err = Pac::new("var x = 1;").err().unwrap();
         assert!(err.contains("FindProxyForURL is not defined"), "{err}");
+    }
+
+    #[test]
+    fn host_certificates_match_by_name_wildcard_and_port() {
+        let at = |pattern: &str, url: &str| {
+            let net = Network {
+                client_cert: "default.pem".into(),
+                host_certs: vec![HostCert {
+                    host: pattern.into(),
+                    cert: "host.pem".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            net.cert_for(url).0.to_owned()
+        };
+        assert_eq!(at("API.corp.com", "https://api.corp.com/v1"), "host.pem");
+        assert_eq!(at("api.corp.com", "https://corp.com/"), "default.pem");
+        // A wildcard covers subdomains, not the domain or look-alikes.
+        assert_eq!(at("*.corp.com", "https://a.b.corp.com/"), "host.pem");
+        assert_eq!(at("*.corp.com", "https://corp.com/"), "default.pem");
+        assert_eq!(at("*.corp.com", "https://evilcorp.com/"), "default.pem");
+        // The port, when given, is compared with the URL's, defaults included.
+        assert_eq!(at("api.corp.com:443", "https://api.corp.com/"), "host.pem");
+        assert_eq!(
+            at("api.corp.com:8443", "https://api.corp.com/"),
+            "default.pem"
+        );
+        assert_eq!(at("[::1]:8443", "https://[::1]:8443/"), "host.pem");
+        assert_eq!(at("[::1]", "https://[::1]:8443/"), "host.pem");
+        assert_eq!(at("", "https://api.corp.com/"), "default.pem");
     }
 
     #[test]

@@ -1385,19 +1385,17 @@ impl App {
                 Ok(client) if is_mqtt => {
                     crate::mqtt::session(req, tls, client.route.clone(), pub_rx, emit).await
                 }
-                Ok(client) if is_ws => {
-                    stream::websocket(client.http.clone(), req, out_rx, emit).await
-                }
-                Ok(client) if socketio => {
-                    stream::socketio(client.http.clone(), req, out_rx, emit).await
-                }
                 Ok(client) if req.method == "GRPC" => {
                     crate::grpc::stream(client, req, out_rx, emit).await
                 }
-                Ok(client) if subscribes(&req) => {
-                    stream::graphql(client.http.clone(), req, emit).await
-                }
-                Ok(client) => stream::sse(client.http.clone(), req, emit).await,
+                // Streams keep the default settings; only the host's certificate varies.
+                Ok(client) => match client.for_settings(&Default::default(), &req.url) {
+                    Ok(http) if is_ws => stream::websocket(http, req, out_rx, emit).await,
+                    Ok(http) if socketio => stream::socketio(http, req, out_rx, emit).await,
+                    Ok(http) if subscribes(&req) => stream::graphql(http, req, emit).await,
+                    Ok(http) => stream::sse(http, req, emit).await,
+                    Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
+                },
                 Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
             }
         });
@@ -3541,7 +3539,10 @@ impl App {
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
                 .await
             {
-                Ok(client) => crate::grpc::reflect(&client.grpc, &req).await,
+                Ok(client) => match client.grpc_for(&req.url) {
+                    Ok(grpc) => crate::grpc::reflect(&grpc, &req).await,
+                    Err(e) => Err(format!("Network settings: {e}")),
+                },
                 Err(e) => Err(format!("Network settings: {e}")),
             };
             let _ = tx.send(Msg::Reflected(result));
@@ -4597,14 +4598,35 @@ impl App {
             ui.label(RichText::new("Certificates").strong());
             ui.weak("The OS certificate store is always trusted; these are added on top.");
             field(ui, &mut net.ca_file, "Extra CA bundle (PEM file path)");
+            let pfx = |path: &str| path.to_lowercase().ends_with(".pfx") || path.to_lowercase().ends_with(".p12");
             field(ui, &mut net.client_cert, "Client certificate (.pem with key, or .pfx / .p12)");
-            if net.client_cert.to_lowercase().ends_with(".pfx") || net.client_cert.to_lowercase().ends_with(".p12") {
+            if pfx(&net.client_cert) {
                 ui.add(
                     egui::TextEdit::singleline(&mut net.client_cert_password)
                         .password(true)
                         .hint_text("PFX password")
                         .desired_width(f32::INFINITY),
                 );
+            }
+            let mut removed = None;
+            for (i, c) in net.host_certs.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut c.host).hint_text("*.corp.com or host:8443").desired_width(150.0));
+                    let width = if pfx(&c.cert) { 220.0 } else { 330.0 };
+                    ui.add(egui::TextEdit::singleline(&mut c.cert).hint_text("Certificate; empty sends none").desired_width(width));
+                    if pfx(&c.cert) {
+                        ui.add(egui::TextEdit::singleline(&mut c.password).password(true).hint_text("PFX password").desired_width(100.0));
+                    }
+                    if ui.small_button("🗑").on_hover_text("Remove").clicked() {
+                        removed = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = removed {
+                net.host_certs.remove(i);
+            }
+            if ui.button("+ Certificate for a host").on_hover_text("Checked in order before the one above").clicked() {
+                net.host_certs.push(Default::default());
             }
             ui.checkbox(&mut net.insecure, "Skip TLS certificate verification");
             if net.insecure {

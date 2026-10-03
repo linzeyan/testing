@@ -387,7 +387,7 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
         return Err("+ and # are for subscribing; a last will goes to one topic".into());
     }
     let insecure = net.insecure || !req.settings.verify_tls;
-    let tls = || tls_config(net, insecure).map(TlsConfiguration::Rustls);
+    let tls = || tls_config(net, &req.url, insecure).map(TlsConfiguration::Rustls);
     let transport = match wire {
         Wire::Tcp => Transport::Tcp,
         Wire::Tls => Transport::tls_with_config(tls()?),
@@ -476,7 +476,11 @@ fn proxy(route: &Route, wire: &Wire, address: &str, port: u16) -> Result<Option<
 
 /// As for https: the system's trust store plus the CA file, the client certificate, and
 /// `insecure` for "accept any certificate".
-fn tls_config(net: &Network, insecure: bool) -> Result<Arc<rustls::ClientConfig>, String> {
+fn tls_config(
+    net: &Network,
+    url: &str,
+    insecure: bool,
+) -> Result<Arc<rustls::ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -497,11 +501,12 @@ fn tls_config(net: &Network, insecure: bool) -> Result<Arc<rustls::ClientConfig>
             .map_err(|e| format!("system certificates: {e}"))?;
         builder.with_custom_certificate_verifier(Arc::new(verifier))
     };
-    let cert = net.client_cert.trim();
+    let (cert, password) = net.cert_for(url);
+    let cert = cert.trim();
     if cert.is_empty() {
         return Ok(Arc::new(builder.with_no_client_auth()));
     }
-    let pem = crate::net::identity_pem(std::path::Path::new(cert), &net.client_cert_password)?;
+    let pem = crate::net::identity_pem(std::path::Path::new(cert), password)?;
     let bad = |e: String| format!("client certificate {cert}: {e}");
     let chain = (CertificateDer::pem_slice_iter(&pem))
         .collect::<Result<Vec<_>, _>>()
@@ -993,6 +998,17 @@ pub mod tests {
             exchange(req, net.clone())
         };
         assert_eq!(unverified(&net), expected(false));
+        let for_host = |host: &str| Network {
+            host_certs: vec![crate::net::HostCert {
+                host: host.into(),
+                cert: path.display().to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(unverified(&for_host("127.0.0.1")), expected(false));
+        let events = unverified(&for_host("broker.corp.test"));
+        assert!(matches!(events.as_slice(), [Event::Error(_)]), "{events:?}");
         // The broker turns away a client without a certificate.
         let events = unverified(&Network::default());
         assert!(matches!(events.as_slice(), [Event::Error(_)]), "{events:?}");
@@ -1000,6 +1016,63 @@ pub mod tests {
         let url = format!("mqtts://127.0.0.1:{}", listen_tls(broker.clone(), serve_v3));
         let events = exchange(request(url, false), net);
         assert!(matches!(events.as_slice(), [Event::Error(_)]), "{events:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Here rather than in net.rs for the TLS server that checks client certificates.
+    #[test]
+    fn https_presents_the_certificate_chosen_for_its_host() {
+        let client = rcgen::generate_simple_self_signed(vec!["client.test".into()]).unwrap();
+        let path = std::env::temp_dir().join(format!("apitool-https-{}.pem", std::process::id()));
+        std::fs::write(
+            &path,
+            client.signing_key.serialize_pem() + &client.cert.pem(),
+        )
+        .unwrap();
+        let pem = path.display().to_string();
+        let server = tls_broker(client.cert.der());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let get = |net: Network| {
+            let serve: fn(&mut dyn Pipe) = |s| {
+                s.fill(&mut BytesMut::new());
+                s.put(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+            };
+            let url = format!("https://127.0.0.1:{}/", listen_tls(server.clone(), serve));
+            let settings = crate::model::Settings {
+                verify_tls: false,
+                ..Default::default()
+            };
+            rt.block_on(async {
+                let clients = crate::net::build_client(net).await?;
+                let resp = clients
+                    .for_settings(&settings, &url)?
+                    .get(&url)
+                    .send()
+                    .await;
+                resp.map(|r| r.status().as_u16()).map_err(|e| e.to_string())
+            })
+        };
+        let host = |host: &str, cert: &str| Network {
+            host_certs: vec![crate::net::HostCert {
+                host: host.into(),
+                cert: cert.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(get(host("127.0.0.1", &pem)), Ok(200));
+        assert_eq!(get(host("127.0.0.1:443", &pem)).ok(), None);
+        // Another host's certificate stays with that host.
+        assert_eq!(get(host("api.corp.test", &pem)).ok(), None);
+        // A matching entry without a certificate withholds the default one.
+        let withheld = Network {
+            client_cert: pem.clone(),
+            ..host("127.0.0.1", "")
+        };
+        assert_eq!(get(withheld).ok(), None);
         std::fs::remove_file(&path).unwrap();
     }
 

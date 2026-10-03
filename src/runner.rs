@@ -214,9 +214,9 @@ pub async fn send(client: &net::Clients, mut req: Request) -> Result<http::Respo
     if req.method.eq_ignore_ascii_case("GRPC") {
         // The gRPC client speaks only HTTP/2; the token endpoint gets the regular one.
         http::with_token(&client.http, &mut req, false).await?;
-        grpc::call(client.grpc.clone(), req).await
+        grpc::call(client.grpc_for(&req.url)?, req).await
     } else {
-        http::execute(client.for_settings(&req.settings)?, req).await
+        http::execute(client.for_settings(&req.settings, &req.url)?, req).await
     }
 }
 
