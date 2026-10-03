@@ -3230,6 +3230,7 @@ impl App {
                         ui.weak(format!("Press Send or {} to see the response.", ui.ctx().format_shortcut(&SEND)));
                         past_menu(ui, &mut past, None);
                     });
+                    shortcut_list(ui);
                 }
                 Some(shown) => {
                     let pretty_before = shown.result.as_ref().ok().map(|v| v.pretty);
@@ -5828,6 +5829,31 @@ fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_s
     }
 }
 
+/// The empty response pane is where every reference app teaches its keys: it is the
+/// biggest blank area, and it is in view exactly when nothing has been sent yet.
+fn shortcut_list(ui: &mut egui::Ui) {
+    ui.add_space(12.0);
+    egui::Grid::new("shortcuts")
+        .num_columns(2)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            for (what, key) in [
+                ("Send request", &SEND),
+                ("Save changes", &SAVE),
+                ("Go to a request, folder or action", &SWITCH),
+                ("New request", &NEW_REQUEST),
+                ("Duplicate", &DUPLICATE),
+                ("Select the URL", &FOCUS_URL),
+                ("Find in the response", &FIND),
+                ("Close tab", &CLOSE_TAB),
+            ] {
+                ui.weak(what);
+                ui.weak(RichText::new(ui.ctx().format_shortcut(key)).monospace());
+                ui.end_row();
+            }
+        });
+}
+
 const PRE_SNIPPETS: &[(&str, &str)] = &[
     (
         "Set a request header",
@@ -7605,6 +7631,11 @@ mod ui_tests {
     fn side_by_side_puts_the_response_beside_the_request_and_is_kept() {
         let mut h = with_request("sidebyside");
         let hint = "Press Send or Ctrl+Enter to see the response.";
+        // Until something is sent, the response pane teaches the keys.
+        assert!(
+            h.query_by_label("Go to a request, folder or action")
+                .is_some()
+        );
         let rects =
             |h: &Harness<'_, App>| (h.get_by_label("Params").rect(), h.get_by_label(hint).rect());
         let (p, r) = rects(&h);
