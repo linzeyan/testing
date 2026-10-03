@@ -635,6 +635,66 @@ fn send_request(spec: &str) -> Result<crate::model::Request, String> {
     })
 }
 
+/// A JSON Schema that `v` matches: types, every object key required, array items merged
+/// over all elements (a key only some elements have is optional).
+pub fn schema_of(v: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Value, json};
+    match v {
+        Value::Null => json!({ "type": "null" }),
+        Value::Bool(_) => json!({ "type": "boolean" }),
+        Value::Number(n) if n.is_i64() || n.is_u64() => json!({ "type": "integer" }),
+        Value::Number(_) => json!({ "type": "number" }),
+        Value::String(_) => json!({ "type": "string" }),
+        Value::Array(items) => {
+            let mut s = json!({ "type": "array" });
+            if let Some(merged) = items.iter().map(schema_of).reduce(merge_schemas) {
+                s["items"] = merged;
+            }
+            s
+        }
+        Value::Object(o) => json!({
+            "type": "object",
+            "properties": o.iter().map(|(k, v)| (k.clone(), schema_of(v))).collect::<serde_json::Map<_, _>>(),
+            "required": o.keys().collect::<Vec<_>>(),
+        }),
+    }
+}
+
+fn merge_schemas(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
+    use serde_json::{Value, json};
+    if a == b {
+        return a;
+    }
+    match (a["type"].as_str(), b["type"].as_str()) {
+        (Some("object"), Some("object")) => {
+            let (mut props, other) = (a["properties"].clone(), &b["properties"]);
+            for (k, v) in other.as_object().into_iter().flatten() {
+                props[k] = match props.get(k) {
+                    Some(p) => merge_schemas(p.clone(), v.clone()),
+                    None => v.clone(),
+                };
+            }
+            let required: Vec<&Value> = (a["required"].as_array().into_iter().flatten())
+                .filter(|k| b["required"].as_array().is_some_and(|r| r.contains(k)))
+                .collect();
+            json!({ "type": "object", "properties": props, "required": required })
+        }
+        (Some("array"), Some("array")) => match (a.get("items"), b.get("items")) {
+            (Some(x), Some(y)) => {
+                json!({ "type": "array", "items": merge_schemas(x.clone(), y.clone()) })
+            }
+            (Some(x), None) | (None, Some(x)) => json!({ "type": "array", "items": x }),
+            (None, None) => json!({ "type": "array" }),
+        },
+        (Some("integer"), Some("number")) | (Some("number"), Some("integer")) => {
+            json!({ "type": "number" })
+        }
+        // ponytail: mixed types (a value that is sometimes a string, sometimes null) allow
+        // anything; an anyOf of the two if that proves too loose.
+        _ => json!({}),
+    }
+}
+
 /// Native because JSON Schema validation in JS would mean vendoring Ajv (~120 KB) into
 /// every script run. Returns "" when valid, else one line per violation.
 fn schema_errors(schema: String, instance: String) -> String {
@@ -969,6 +1029,33 @@ mod tests {
             ]
         );
         assert!(out.error.unwrap().contains("no module 'left-pad'"));
+    }
+
+    /// The generated schema seeds a contract test: the response it came from must pass,
+    /// and one whose shape changed must not.
+    #[test]
+    fn a_schema_from_a_response_accepts_it_and_rejects_a_changed_shape() {
+        let body = serde_json::json!({"items": [{"id": 1, "tag": "a"}, {"id": 2.5}], "next": null});
+        let schema = schema_of(&body);
+        assert_eq!(
+            schema["properties"]["items"]["items"]["required"],
+            serde_json::json!(["id"])
+        );
+        assert_eq!(
+            schema["properties"]["items"]["items"]["properties"]["id"]["type"],
+            "number"
+        );
+        let check = |v: serde_json::Value| schema_errors(schema.to_string(), v.to_string());
+        assert_eq!(check(body.clone()), "");
+        assert_ne!(
+            check(serde_json::json!({"items": [{"id": "1"}], "next": null})),
+            ""
+        );
+        assert_ne!(
+            check(serde_json::json!({"items": []})),
+            "",
+            "next went missing"
+        );
     }
 
     #[test]

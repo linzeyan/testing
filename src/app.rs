@@ -3189,13 +3189,26 @@ impl App {
                         &all_vars,
                         open.draft.inherited.auth.as_ref(),
                     ),
-                    ReqTab::Scripts => scripts_editor(
-                        ui,
-                        &mut self.script_tab,
-                        &mut open.draft.pre_request,
-                        &mut open.draft.tests,
-                        &open.draft.inherited,
-                    ),
+                    ReqTab::Scripts => {
+                        let json_response = match self.response.as_ref().map(|s| &s.result) {
+                            Some(Ok(view))
+                                if (view.head.headers.iter()).any(|(k, v)| {
+                                    k.eq_ignore_ascii_case("content-type") && v.contains("json")
+                                }) =>
+                            {
+                                Some(view.raw())
+                            }
+                            _ => None,
+                        };
+                        scripts_editor(
+                            ui,
+                            &mut self.script_tab,
+                            &mut open.draft.pre_request,
+                            &mut open.draft.tests,
+                            &open.draft.inherited,
+                            json_response,
+                        )
+                    }
                     ReqTab::Asserts => {
                         kv_table(ui, "asserts", &mut open.draft.asserts, &all_vars, false);
                         ui.add_space(8.0);
@@ -3992,6 +4005,8 @@ impl App {
                         &mut ed.folder.pre_request,
                         &mut ed.folder.tests,
                         &ed.parent,
+                        // A folder's tests run on many responses, not the one shown.
+                        None,
                     ),
                     FolderTab::Docs => docs_editor(ui, &mut ed.folder.description),
                 });
@@ -5973,8 +5988,9 @@ fn scripts_editor(
     pre_request: &mut String,
     tests: &mut String,
     inherited: &Inherited,
+    json_response: Option<&str>,
 ) {
-    let mut insert = None;
+    let mut insert: Option<String> = None;
     ui.horizontal(|ui| {
         let label = |name: &str, s: &str| {
             if s.trim().is_empty() {
@@ -5994,7 +6010,18 @@ fn scripts_editor(
         ui.menu_button("Snippets", |ui| {
             for (name, code) in snippets {
                 if ui.button(*name).clicked() {
-                    insert = Some(*code);
+                    insert = Some((*code).to_owned());
+                    ui.close();
+                }
+            }
+            // Seeds a contract test from what came back: later sends fail when the shape
+            // changes.
+            if *tab == ScriptTab::Post
+                && let Some(body) = json_response
+            {
+                ui.separator();
+                if ui.button("Response matches its schema").clicked() {
+                    insert = Some(schema_snippet(body));
                     ui.close();
                 }
             }
@@ -6027,7 +6054,7 @@ fn scripts_editor(
             }
             text.push('\n');
         }
-        text.push_str(code);
+        text.push_str(&code);
     }
     // A pasted library (lodash, moment) can be past MAX_EDIT.
     let id = egui::Id::new(id);
@@ -6042,6 +6069,20 @@ fn scripts_editor(
             .desired_rows(12)
             .desired_width(f32::INFINITY),
     );
+}
+
+fn schema_snippet(body: &str) -> String {
+    match serde_json::from_str(body) {
+        Ok(v) => {
+            let schema = serde_json::to_string_pretty(&crate::script::schema_of(&v))
+                .unwrap_or_default()
+                .replace('\n', "\n    ");
+            format!(
+                "pm.test(\"Response matches its schema\", function () {{\n    pm.response.to.have.jsonSchema({schema});\n}});\n"
+            )
+        }
+        Err(e) => format!("// The response body isn't JSON: {e}\n"),
+    }
 }
 
 const GREEN: Color32 = Color32::from_rgb(80, 180, 100);
@@ -8668,6 +8709,79 @@ mod ui_tests {
         h.get_by_label("$.items[*].id").click();
         h.run();
         assert_eq!(view(&h).0, "[\n  1,\n  2\n]");
+    }
+
+    /// The schema snippet adds to what the user wrote, and what it adds passes on the
+    /// response it came from.
+    #[test]
+    fn a_schema_test_is_added_from_the_response() {
+        let mut h = with_request("schema-test");
+        let body = r#"{"items":[{"id":1},{"id":2}],"next":null}"#;
+        let headers = vec![("content-type".to_owned(), "application/json".to_owned())];
+        h.state_mut().response = Some(Shown {
+            result: Ok(into_view(http::Response {
+                status: 200,
+                reason: "OK".into(),
+                version: "HTTP/1.1".into(),
+                elapsed: Duration::ZERO,
+                headers: headers.clone(),
+                body: body.into(),
+                truncated: false,
+                sent: Default::default(),
+                bytes: None,
+            })),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            past: None,
+        });
+        h.state_mut().open.as_mut().unwrap().draft.tests = "// mine".into();
+        (h.state_mut().req_tab, h.state_mut().script_tab) = (ReqTab::Scripts, ScriptTab::Post);
+        h.run();
+        h.get_by_label("Snippets").click();
+        h.run();
+        h.get_by_label("Response matches its schema").click();
+        h.run();
+        let tests = draft(&h).tests.clone();
+        assert!(tests.starts_with("// mine\n\npm.test("), "{tests}");
+
+        let (empty, wire) = (
+            HashMap::new(),
+            crate::script::WireRequest {
+                method: "GET".into(),
+                url: String::new(),
+                headers: Vec::new(),
+            },
+        );
+        let out = crate::script::run(
+            &tests,
+            &crate::script::Input {
+                name: "t",
+                iteration: 0,
+                iteration_count: 1,
+                data: &empty,
+                env: &empty,
+                collection: &empty,
+                globals: &empty,
+                locals: &empty,
+                request: &wire,
+                response: Some(crate::script::ScriptResponse {
+                    code: 200,
+                    status: "OK",
+                    time: 1,
+                    headers: &headers,
+                    body,
+                }),
+                cookie_url: "",
+                jar: None,
+                client: None,
+            },
+        );
+        assert_eq!(out.error, None);
+        assert!(
+            out.tests.len() == 1 && out.tests[0].passed,
+            "{:?}",
+            out.tests
+        );
     }
 
     #[test]
