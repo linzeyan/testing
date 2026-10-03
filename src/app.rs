@@ -371,14 +371,17 @@ impl ResponseView {
         }
         let query = self.filter.trim();
         if !query.is_empty() {
-            let picked = serde_json::from_str(self.raw())
-                .map_err(|e| e.to_string())
-                .and_then(|json| crate::jsonpath::select(&json, query));
+            // The filter bar is only there for JSON and XML, the bodies with a Pretty form.
+            let picked = match self.json {
+                true => serde_json::from_str(self.raw())
+                    .map_err(|e| e.to_string())
+                    .and_then(|json| crate::jsonpath::select(&json, query))
+                    .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default()),
+                false => crate::xpath::select(self.raw(), query)
+                    .map(|xml| http::pretty_xml(&xml).unwrap_or(xml)),
+            };
             match picked {
-                Ok(v) => {
-                    let shown = serde_json::to_string_pretty(&v).unwrap_or_default();
-                    self.unfiltered = Some(std::mem::replace(&mut self.text, shown));
-                }
+                Ok(shown) => self.unfiltered = Some(std::mem::replace(&mut self.text, shown)),
                 Err(e) => self.filter_error = e,
             }
         }
@@ -1851,13 +1854,17 @@ fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView, recent: &mut Vec<Strin
             egui::TextEdit::singleline(&mut view.filter)
                 // Not an auto id: the × appearing would change it and drop focus.
                 .id(egui::Id::new("json-filter"))
-                .hint_text("Filter: $.items[*].id")
+                .hint_text(match view.json {
+                    true => "Filter: $.items[*].id",
+                    false => "Filter: //item/@id",
+                })
                 .font(egui::TextStyle::Monospace)
                 .desired_width(280.0),
         );
-        let edit = edit.on_hover_text(
-            "JSONPath: $, .key, ['key'], [0], [-1], [*], .*, ..key, [?(@.price < 10 && @.tag == 'x')]",
-        );
+        let edit = edit.on_hover_text(match view.json {
+            true => "JSONPath: $, .key, ['key'], [0], [-1], [*], .*, ..key, [?(@.price < 10 && @.tag == 'x')]",
+            false => "XPath: /a/b, //b, *, ., .., @attr, text(), [2], [last()], [@id], [@id='x'], [name='x'], [text()='x']; prefixes are ignored",
+        });
         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         let live = view.raw_size <= LIVE_FILTER_MAX;
         if view.filter != view.applied && (live || enter) {
@@ -10307,6 +10314,39 @@ mod ui_tests {
         h.run();
         assert!(h.state().dialog.is_none());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), raw, "as received");
+    }
+
+    #[test]
+    fn an_xml_body_is_filtered_by_xpath() {
+        let mut h = with_request("xpath");
+        let xml = r#"<list><item id="a"><n>1</n></item><item id="b"><n>2</n></item></list>"#;
+        show_response(&mut h, "application/xml", xml.into());
+        let hints: Vec<_> = (h.get_all_by_role(Role::TextInput))
+            .filter_map(|n| n.accesskit_node().placeholder().map(str::to_owned))
+            .collect();
+        assert!(
+            hints.contains(&"Filter: //item/@id".to_owned()),
+            "{hints:?}"
+        );
+        let view = h
+            .state_mut()
+            .response
+            .as_mut()
+            .unwrap()
+            .result
+            .as_mut()
+            .unwrap();
+        view.filter = "//item[@id='b']".into();
+        view.apply_filter();
+        assert_eq!(view.text, "<item id=\"b\">\n  <n>2</n>\n</item>");
+        assert_eq!(view.raw(), xml, "Save still writes the whole body");
+        view.filter = "//item[".into();
+        view.apply_filter();
+        assert!(
+            view.filter_error.contains("isn't closed"),
+            "{}",
+            view.filter_error
+        );
     }
 
     #[test]

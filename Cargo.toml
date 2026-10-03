@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.77.0"
+version = "0.78.0"
 edition = "2024"
 
 [dependencies]
@@ -25,6 +25,8 @@ protox = "0.9.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "charset", "gzip", "query", "form", "multipart", "stream", "cookies", "socks"] }
 reqwest-websocket = "0.6"
 rquickjs = { version = "0.14", features = ["parallel"] }
+# A read-only XML tree for the response filter's XPath; no dependencies of its own.
+roxmltree = "0.21"
 # Already in the tree as rustls's crypto provider: HMAC-SHA256 for AWS Signature v4.
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

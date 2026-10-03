@@ -31,3 +31,4 @@ mod sigv4;
 pub mod store;
 mod stream;
 mod varedit;
+mod xpath;
