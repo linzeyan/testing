@@ -29,8 +29,8 @@ pub enum Import {
     },
 }
 
-pub fn parse(text: &str) -> Result<Import, String> {
-    let v: Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+pub fn from_value(v: &Value) -> Result<Import, String> {
+    let v = v.clone();
     if let Some(values) = v["values"].as_array() {
         return Ok(environment(&v, values));
     }
@@ -738,7 +738,7 @@ mod tests {
             folders,
             requests,
             warnings,
-        } = parse(SHOP).unwrap()
+        } = crate::import::parse(SHOP).unwrap()
         else {
             panic!("not a collection");
         };
@@ -865,7 +865,7 @@ mod tests {
             name,
             shared,
             secret,
-        } = parse(env).unwrap()
+        } = crate::import::parse(env).unwrap()
         else {
             panic!("not an environment");
         };
@@ -876,7 +876,7 @@ mod tests {
         };
         assert_eq!(shared, [KeyValue::new("host", "h"), old]);
         assert_eq!(secret, [KeyValue::new("token", "s")]);
-        assert!(parse("{}").is_err() && parse("not json").is_err());
+        assert!(crate::import::parse("{}").is_err() && crate::import::parse("not json").is_err());
     }
 
     /// What goes to Postman must come back the same: a team may move both ways.
@@ -1084,7 +1084,7 @@ mod tests {
             folders,
             requests: back,
             warnings,
-        } = parse(&json).unwrap()
+        } = crate::import::parse(&json).unwrap()
         else {
             panic!("not a collection");
         };

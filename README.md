@@ -26,8 +26,10 @@ such as Citrix VDI. No installer: unzip and run.
   to import it, and "</> Code" for the request as curl, wget, HTTPie, PowerShell, raw
   HTTP, Python, fetch, axios, Go, Java, C#, PHP, Ruby, Rust, Swift or Kotlin (a Binary
   body reads its file, and `--data-binary @file` pastes back as one); import a
-  Postman v2.1 collection or environment (⋯ > "Import from Postman…": paste it, give its
-  path or drop the file) and copy a folder or the whole collection as a Postman
+  Postman v2.1 collection or environment, or an OpenAPI 3 / Swagger 2 spec in JSON or YAML
+  (a request per operation, a folder per tag, `{{baseUrl}}` from the server, auth from the
+  security schemes, bodies and saved examples from the schemas, so the mock server answers
+  right away) (⋯ > "Import…": paste it, give its path or drop the file) and copy a folder or the whole collection as a Postman
   collection; duplicate requests and folders (Ctrl+D); Save ⏷ "Save as…" saves the edits
   as a new request (`folder/name`; the original stays as saved); new request (Ctrl+N); Ctrl+L
   selects the URL; Ctrl+K jumps to any request (by folder and name, letters in order are

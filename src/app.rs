@@ -450,7 +450,7 @@ enum Dialog {
     /// Confirmed first: it replaces what was edited here since the last export.
     Import,
     /// Pasted JSON or a file path; `note` says what went wrong or didn't come over.
-    Postman {
+    Paste {
         text: String,
         note: String,
     },
@@ -2287,8 +2287,14 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("Import from Postman…").clicked() {
-                    self.dialog = Some(Dialog::Postman {
+                if ui
+                    .button("Import…")
+                    .on_hover_text(
+                        "A Postman collection or environment, or an OpenAPI/Swagger spec",
+                    )
+                    .clicked()
+                {
+                    self.dialog = Some(Dialog::Paste {
                         text: String::new(),
                         note: String::new(),
                     });
@@ -2422,9 +2428,9 @@ impl App {
     }
 
     /// Closes the dialog when everything came over; else it stays to say what didn't.
-    fn submit_postman(&mut self, input: &str) {
-        let result = self.import_postman(input);
-        let Some(Dialog::Postman { text, note }) = &mut self.dialog else {
+    fn submit_import(&mut self, input: &str) {
+        let result = self.import_text(input);
+        let Some(Dialog::Paste { text, note }) = &mut self.dialog else {
             return;
         };
         match result {
@@ -2467,16 +2473,17 @@ impl App {
 
     /// `input` is the JSON, or the path to its file (quoted, as Explorer's "Copy as path"
     /// gives it). What didn't come over as it was comes back to show the user.
-    fn import_postman(&mut self, input: &str) -> Result<Vec<String>, String> {
+    fn import_text(&mut self, input: &str) -> Result<Vec<String>, String> {
         let input = input.trim();
-        let text = match input.starts_with('{') {
+        // One line that isn't JSON is a path; YAML is never a single line worth importing.
+        let text = match input.starts_with('{') || input.contains('\n') {
             true => input.to_owned(),
             false => {
                 let path = input.trim_matches('"');
                 std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?
             }
         };
-        let warnings = match crate::postman::parse(&text)? {
+        let warnings = match crate::import::parse(&text)? {
             crate::postman::Import::Collection {
                 name,
                 folders,
@@ -3695,12 +3702,12 @@ impl App {
                         cancel = ui.button("Cancel").clicked();
                     });
                 }
-                Dialog::Postman { text, note } => {
-                    ui.heading("Import from Postman");
+                Dialog::Paste { text, note } => {
+                    ui.heading("Import a collection or spec");
                     ui.label(
-                        "A collection (v2.1) or an environment as Postman exports it: paste the \
-                         JSON or the file's path, or drop the file here. Nothing already here \
-                         is replaced.",
+                        "A Postman collection (v2.1) or environment, or an OpenAPI 3 / Swagger 2 \
+                         spec (JSON or YAML): paste it or the file's path, or drop the file \
+                         here. Nothing already here is replaced.",
                     );
                     // An exported collection is often past MAX_EDIT once pasted.
                     let id = egui::Id::new("postman-text");
@@ -3713,7 +3720,7 @@ impl App {
                                     ui.add(
                                         egui::TextEdit::multiline(text)
                                             .id(id)
-                                            .hint_text("JSON or path")
+                                            .hint_text("JSON, YAML or a path")
                                             .code_editor()
                                             .desired_rows(4)
                                             .desired_width(f32::INFINITY),
@@ -3737,7 +3744,7 @@ impl App {
                         let typed = !text.trim().is_empty();
                         let import = ui.add_enabled(typed, primary("Import")).clicked();
                         if let Some(input) = dropped.or(import.then(|| text.clone())) {
-                            then = Some(Box::new(move |app, _| app.submit_postman(&input)));
+                            then = Some(Box::new(move |app, _| app.submit_import(&input)));
                         }
                         cancel = ui.button("Close").clicked();
                     });
@@ -4521,7 +4528,7 @@ enum Action {
     NewEnv,
     Globals,
     RunCollection,
-    ImportPostman,
+    ImportAny,
     Network,
     Cookies,
     Sidebar,
@@ -4534,7 +4541,7 @@ const ACTIONS: [(&str, Action); 10] = [
     ("New environment", Action::NewEnv),
     ("Edit globals", Action::Globals),
     ("Run collection", Action::RunCollection),
-    ("Import from Postman", Action::ImportPostman),
+    ("Import (Postman, OpenAPI, Swagger)", Action::ImportAny),
     ("Network settings (proxy, certificates)", Action::Network),
     ("Cookies", Action::Cookies),
     ("Show or hide the sidebar", Action::Sidebar),
@@ -4552,8 +4559,8 @@ impl App {
             Action::NewEnv => self.dialog = Some(Dialog::name(NameKind::NewEnv, "")),
             Action::Globals => self.open_env_editor(None, &[]),
             Action::RunCollection => self.open_runner(root),
-            Action::ImportPostman => {
-                self.dialog = Some(Dialog::Postman {
+            Action::ImportAny => {
+                self.dialog = Some(Dialog::Paste {
                     text: String::new(),
                     note: String::new(),
                 });
@@ -7760,7 +7767,7 @@ mod ui_tests {
         std::fs::write(&file, shop).unwrap();
         h.get_all_by_label("⋯").next().unwrap().click();
         h.run();
-        h.get_by_label("Import from Postman…").click();
+        h.get_by_label("Import…").click();
         h.run();
         h.input_mut()
             .dropped_files
@@ -7769,7 +7776,7 @@ mod ui_tests {
         let app = h.state();
         let shop = app.ws.collections().join("Shop");
         assert_eq!(app.ws.load_requests_in(&shop).unwrap().len(), 2);
-        let Some(Dialog::Postman { note, .. }) = &app.dialog else {
+        let Some(Dialog::Paste { note, .. }) = &app.dialog else {
             panic!("the dialog stays to say what didn't come over");
         };
         assert!(note.contains("signed: ntlm auth"), "{note}");
@@ -7779,7 +7786,7 @@ mod ui_tests {
         // hold this machine's secrets by now.
         let env = r#"{ "name": "Prod", "values": [{ "key": "host", "value": "h" }] }"#;
         for _ in 0..2 {
-            h.state_mut().dialog = Some(Dialog::Postman {
+            h.state_mut().dialog = Some(Dialog::Paste {
                 text: env.into(),
                 note: String::new(),
             });
@@ -7789,7 +7796,7 @@ mod ui_tests {
             h.get_by_label("Import").click();
             h.run();
             let note = match &h.state().dialog {
-                Some(Dialog::Postman { note, .. }) => Some(note.as_str()),
+                Some(Dialog::Paste { note, .. }) => Some(note.as_str()),
                 _ => None,
             };
             assert_eq!(note, None, "nothing to report closes it");

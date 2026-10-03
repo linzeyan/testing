@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.57.0"
+version = "0.58.0"
 edition = "2024"
 
 [dependencies]
@@ -45,6 +45,9 @@ encoding_rs = "0.8"
 # reqwest's own cookie store; used directly to list, delete and persist cookies.
 cookie_store = "0.22"
 toml = "1"
+# OpenAPI specs are mostly YAML. The maintained fork of serde_yaml; parses into serde_json
+# values, so one reader serves JSON and YAML specs.
+serde_yaml_ng = "0.10"
 # The workspace store. Bundled: no system SQLite on Windows, and one version everywhere.
 rusqlite = { version = "0.40", features = ["bundled"] }
 # MQTT client. No provider of its own: TLS uses the ring one net.rs installs.
