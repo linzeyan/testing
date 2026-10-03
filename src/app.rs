@@ -4086,8 +4086,12 @@ impl App {
                         edit = Some(None);
                     }
                 });
-                let dynamic: Vec<_> = model::DYNAMIC.iter().map(|(n, _)| *n).collect();
-                ui.weak(format!("Always available: {}", dynamic.join(", ")));
+                // 120 names don't fit a line: name the common ones, autocomplete has the rest.
+                ui.weak(format!(
+                    "Always available: $guid, $timestamp, $randomInt, $randomEmail… \
+                     ({} in all; type {{{{$ for the list)",
+                    model::DYNAMIC.len()
+                ));
             });
         self.quick_look = open;
         if let Some(env) = edit {

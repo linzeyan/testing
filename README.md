@@ -12,7 +12,7 @@ such as Citrix VDI. No installer: unzip and run.
   connected, and publishes from the message panel with QoS and retain (and MQTT 5 user
   properties, which incoming messages show too); a last will
   (topic, message, QoS, retain) goes with the connection; Postman-style pre-request/test
-  scripts (`pm.*`, chai, `jsonSchema`); collection runner with CSV/JSON data (counts cover every row; the list keeps
+  scripts (`pm.*`, chai, `jsonSchema`; `pm.variables.replaceIn`); all of Postman's dynamic variables (`{{$guid}}`, `{{$timestamp}}`, `{{$randomEmail}}`, `{{$randomBankAccountIban}}`… 120 of them, a fresh value each use, `{{email` completes to `$randomEmail`); collection runner with CSV/JSON data (counts cover every row; the list keeps
   failures and the latest 1000 results); load test
   pane (response bodies are read and dropped, so many users cost no RAM); proxy/PAC/WPAD, custom CA and client certificates. JSON, text (Text/XML/HTML/JavaScript
   sets the Content-Type; XML has Beautify), form and multipart

@@ -278,7 +278,8 @@ fn completion_context(text: &str, cursor: usize) -> Option<(usize, usize, String
     valid.then(|| (open, byte, prefix.to_owned()))
 }
 
-/// Defined variables first, then dynamic ones; prefix matches rank above substring matches.
+/// Defined variables first, then dynamic ones; within each, prefix matches rank above
+/// substring matches.
 fn suggest(prefix: &str, vars: &HashMap<String, String>) -> Vec<(String, String)> {
     let prefix = prefix.to_lowercase();
     let mut out: Vec<(String, String)> = vars
@@ -289,7 +290,14 @@ fn suggest(prefix: &str, vars: &HashMap<String, String>) -> Vec<(String, String)
         .collect();
     out.sort_by_key(|(n, _)| {
         let lower = n.to_lowercase();
-        (!lower.starts_with(&prefix), n.starts_with('$'), lower)
+        // With ~120 dynamic names nearly any letter is a substring hit, so `{{email` has
+        // to reach `$randomEmail` as a prefix match or it falls past the cut.
+        let bare = lower.trim_start_matches('$');
+        let starts = [&lower[..], bare, bare.trim_start_matches("random")]
+            .iter()
+            .any(|w| w.starts_with(&prefix));
+        // The user's own names come first: one of them is what's meant far more often.
+        (n.starts_with('$'), !starts, lower)
     });
     out.truncate(MAX_SUGGESTIONS);
     out
@@ -370,6 +378,11 @@ mod tests {
         let names: Vec<_> = suggest("t", &vars).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names[..2], ["token".to_owned(), "authToken".to_owned()]);
         assert!(names.contains(&"$timestamp".to_owned()));
+        let names: Vec<_> = suggest("email", &vars)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names[0], "$randomEmail", "{names:?}");
     }
 
     #[test]

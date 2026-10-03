@@ -394,47 +394,10 @@ impl Auth {
 }
 
 /// Postman's dynamic variables: a fresh value on every use, no definition needed.
-pub const DYNAMIC: &[(&str, &str)] = &[
-    ("$guid", "random UUID v4"),
-    ("$randomUUID", "random UUID v4"),
-    ("$timestamp", "Unix time, seconds"),
-    ("$isoTimestamp", "current UTC time, ISO 8601"),
-    ("$randomInt", "random integer 0-1000"),
-];
-
-fn dynamic(name: &str) -> Option<String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let random = || {
-        let mut b = [0u8; 16];
-        getrandom::fill(&mut b).expect("OS random source");
-        b
-    };
-    Some(match name {
-        "$guid" | "$randomUUID" => {
-            let mut b = random();
-            b[6] = (b[6] & 0x0f) | 0x40; // version 4
-            b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
-            let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-            format!(
-                "{}-{}-{}-{}-{}",
-                &h[..8],
-                &h[8..12],
-                &h[12..16],
-                &h[16..20],
-                &h[20..]
-            )
-        }
-        "$timestamp" => now.as_secs().to_string(),
-        "$isoTimestamp" => iso8601(now),
-        "$randomInt" => (u32::from_le_bytes(random()[..4].try_into().unwrap()) % 1001).to_string(),
-        _ => return None,
-    })
-}
+pub use crate::fake::DYNAMIC;
 
 /// UTC "YYYY-MM-DDTHH:MM:SS.mmmZ" without a date library (days-to-civil, H. Hinnant).
-fn iso8601(since_epoch: std::time::Duration) -> String {
+pub(crate) fn iso8601(since_epoch: std::time::Duration) -> String {
     let secs = since_epoch.as_secs() as i64;
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     let z = days + 719_468;
@@ -468,7 +431,7 @@ pub fn resolve(s: &str, vars: &HashMap<String, String>, missing: &mut Vec<String
             return out;
         };
         let name = after[..end].trim();
-        match vars.get(name).cloned().or_else(|| dynamic(name)) {
+        match vars.get(name).cloned().or_else(|| crate::fake::value(name)) {
             Some(v) => out.push_str(&v),
             None => {
                 out.push_str(&rest[start..start + 2 + end + 2]);

@@ -7,6 +7,7 @@ mod codegen;
 mod cookies;
 mod curl;
 mod docs;
+mod fake;
 mod graphql;
 mod grpc;
 mod http;

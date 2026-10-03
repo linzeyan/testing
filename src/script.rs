@@ -143,7 +143,14 @@ pm.variables = {
   },
   set: function (k, v) { v = __str(v); __locals[k] = v; __out.locals[k] = v; },
   unset: function (k) { delete __locals[k]; __out.locals[k] = null; },
-  has: function (k) { return pm.variables.get(k) !== undefined; }
+  has: function (k) { return pm.variables.get(k) !== undefined; },
+  replaceIn: function (t) {
+    return String(t).replace(/\{\{([^{}]+)\}\}/g, function (m, k) {
+      var v = pm.variables.get(k);
+      if (v === undefined || v === null) v = __dynamic(k);
+      return v === undefined || v === null ? m : v;
+    });
+  }
 };
 if (__in.response) {
   var __res = __in.response;
@@ -228,6 +235,13 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
             .set(
                 "__schemaErrors",
                 rquickjs::Function::new(ctx.clone(), schema_errors).map_err(caught)?,
+            )
+            .map_err(caught)?;
+        ctx.globals()
+            .set(
+                "__dynamic",
+                rquickjs::Function::new(ctx.clone(), |n: String| crate::fake::value(&n))
+                    .map_err(caught)?,
             )
             .map_err(caught)?;
         ctx.eval::<(), _>(PRELUDE).map_err(caught)?;
@@ -431,6 +445,27 @@ mod tests {
         assert_eq!(r.url, "https://{{host}}/users?v=api.test");
         assert_eq!(r.headers, [("X-Ts".to_owned(), "42".to_owned())]);
         assert_eq!(out.locals["local"], Some("1".into()));
+    }
+
+    #[test]
+    fn replace_in_resolves_variables_and_dynamic_ones() {
+        // Postman scripts get a dynamic value into JS this way, e.g. to log or reuse it.
+        let (req, env) = (
+            request(),
+            HashMap::from([("host".to_owned(), "api.test".to_owned())]),
+        );
+        let out = run(
+            r#"console.log(pm.variables.replaceIn("{{host}}|{{$randomEmail}}|{{nope}}"));"#,
+            &input(&req, &env, None),
+        );
+        assert_eq!(out.error, None);
+        let parts: Vec<_> = out.logs[0].split('|').collect();
+        assert_eq!(parts[0], "api.test");
+        assert!(
+            parts[1].contains('@') && !parts[1].contains("{{"),
+            "{parts:?}"
+        );
+        assert_eq!(parts[2], "{{nope}}", "unknown names stay verbatim");
     }
 
     #[test]
