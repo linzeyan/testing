@@ -3189,6 +3189,7 @@ impl App {
         let mut past = Past {
             list: self.ws.responses(&open.path),
             pick: None,
+            delete: None,
             clear: false,
         };
         egui::CentralPanel::default().show(ui, |ui| {
@@ -3257,6 +3258,17 @@ impl App {
                 Ok(()) => {
                     self.statuses.remove(path);
                     self.status = "Cleared this request's response history".into();
+                }
+                Err(e) => self.status = e,
+            }
+        }
+        if let Some(id) = past.delete {
+            match self.ws.delete_response(id) {
+                Ok(()) => {
+                    // Still on screen, but no longer one History can bring back.
+                    if let Some(shown) = self.response.as_mut().filter(|s| s.past == Some(id)) {
+                        shown.past = None;
+                    }
                 }
                 Err(e) => self.status = e,
             }
@@ -6244,6 +6256,7 @@ fn stream_ui(
 struct Past {
     list: Vec<store::ResponseMeta>,
     pick: Option<i64>,
+    delete: Option<i64>,
     clear: bool,
 }
 
@@ -6260,12 +6273,26 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
         for m in &past.list {
             let text = RichText::new(format!("{}  ·  {} ms  ·  {}", m.status, m.ms, ago(m.at)))
                 .color(status_color(m.status));
-            if ui
-                .add(egui::Button::selectable(shown == Some(m.id), text))
-                .clicked()
-            {
-                past.pick = Some(m.id);
-            }
+            ui.horizontal(|ui| {
+                if ui
+                    // Room for "200 · 12345 ms · 59 min ago", so the ×s line up; the
+                    // grow atom keeps the text at the left of the wider button.
+                    .add(
+                        egui::Button::selectable(shown == Some(m.id), (text, egui::Atom::grow()))
+                            .min_size(egui::vec2(200.0, 0.0)),
+                    )
+                    .clicked()
+                {
+                    past.pick = Some(m.id);
+                }
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Delete this response")
+                    .clicked()
+                {
+                    past.delete = Some(m.id);
+                }
+            });
         }
         ui.separator();
         if ui.button("Clear history").clicked() {
@@ -8622,7 +8649,19 @@ mod ui_tests {
         // The tree row carries the last status, also after a restart.
         assert!(h.query_by_label("200").is_some());
         assert_eq!(h.state().ws.last_statuses().get(&path), Some(&200));
+        // × deletes one: the first send, the one on screen, which stays shown but is no
+        // longer one History can bring back.
         h.get_by_label("History: just now").click();
+        h.run();
+        // The last ×: the tab strip has its own, and the oldest row comes last.
+        h.get_all_by_label("×").last().unwrap().click();
+        h.run();
+        let left = h.state().ws.responses(&path);
+        assert_eq!(left.len(), 1);
+        assert!(body(h.state()).starts_with("get /users/first "));
+        assert_eq!(h.state().response.as_ref().unwrap().past, None);
+        // Now plain "History", after the sidebar tab of that name.
+        h.get_all_by_label("History").last().unwrap().click();
         h.run();
         h.get_by_label("Clear history").click();
         h.run();

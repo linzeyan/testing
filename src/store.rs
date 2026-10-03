@@ -444,6 +444,11 @@ impl Workspace {
         serde_json::from_str(&json).map_err(|e| e.to_string())
     }
 
+    pub fn delete_response(&self, id: i64) -> Result<(), String> {
+        let db = self.db();
+        sql(db.execute("DELETE FROM responses WHERE id = ?1", [id])).map(drop)
+    }
+
     pub fn clear_responses(&self, path: &Path) -> Result<(), String> {
         let db = self.db();
         sql(db.execute("DELETE FROM responses WHERE path = ?1", [self.key(path)])).map(drop)
