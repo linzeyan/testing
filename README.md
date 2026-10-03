@@ -48,8 +48,8 @@ such as Citrix VDI. No installer: unzip and run.
   response bar with the last 10 responses of each request (kept on disk, 1 MiB of body
   each); find in response (Ctrl+F; match case, whole word or regular expression; counts up to 10 000 hits); saved response
   examples; request history; Bearer, Basic, Digest, API key (header or query) and OAuth 2.0
-  (client credentials, password, and authorization code with PKCE: Send opens the browser
-  to sign in and catches the redirect on 127.0.0.1; an expired token is renewed with the
+  (client credentials, password, implicit, and authorization code with PKCE: Send opens the browser
+  to sign in and catches the redirect on 127.0.0.1, and implicit takes its token from that redirect; an expired token is renewed with the
   refresh token when the provider gives one, without signing in again, and tokens are kept
   in the workspace across restarts) auth; a Cookies tab with what a response sets; a cookie jar like a browser's, with a manager; folder settings
   (right-click a folder) with variables, auth and scripts shared by every request inside,

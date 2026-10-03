@@ -5524,9 +5524,15 @@ fn auth_editor(
                         Grant::AuthorizationCode,
                         "Authorization code",
                     );
+                    ui.selectable_value(&mut o.grant, Grant::Implicit, "Implicit");
                 });
                 ui.end_row();
-                if o.grant == model::Grant::AuthorizationCode {
+                let browser = matches!(
+                    o.grant,
+                    model::Grant::AuthorizationCode | model::Grant::Implicit
+                );
+                let implicit = o.grant == model::Grant::Implicit;
+                if browser {
                     text(
                         ui,
                         "Auth URL",
@@ -5534,20 +5540,25 @@ fn auth_editor(
                         "https://login.example.com/oauth2/authorize",
                     );
                 }
-                text(
-                    ui,
-                    "Token URL",
-                    &mut o.token_url,
-                    "https://login.example.com/oauth2/token",
-                );
+                // The implicit grant has no token request, so nothing to send these to.
+                if !implicit {
+                    text(
+                        ui,
+                        "Token URL",
+                        &mut o.token_url,
+                        "https://login.example.com/oauth2/token",
+                    );
+                }
                 text(ui, "Client ID", &mut o.client_id, "");
-                secret(ui, "Client secret", &mut o.client_secret);
+                if !implicit {
+                    secret(ui, "Client secret", &mut o.client_secret);
+                }
                 text(ui, "Scope", &mut o.scope, "optional, space separated");
                 if o.grant == model::Grant::Password {
                     text(ui, "Username", &mut o.username, "");
                     secret(ui, "Password", &mut o.password);
                 }
-                if o.grant == model::Grant::AuthorizationCode {
+                if browser {
                     text(
                         ui,
                         "Redirect URI",
@@ -5570,6 +5581,13 @@ fn auth_editor(
                 "Send opens your browser to sign in (with PKCE); the token is then reused until \
                  it expires or is rejected. Register the redirect URI with the provider; the \
                  client secret is only for confidential clients.",
+            );
+        }
+        Auth::OAuth2(o) if o.grant == model::Grant::Implicit => {
+            ui.weak(
+                "Send opens your browser to sign in; the provider hands the token straight back \
+                 to this machine. It is reused until it expires or is rejected, then you sign in \
+                 again (the implicit grant has no refresh tokens).",
             );
         }
         Auth::OAuth2(_) => {

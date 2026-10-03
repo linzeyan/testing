@@ -368,10 +368,10 @@ pub struct OAuth2 {
     pub username: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub password: String,
-    /// Authorization code only: where the browser signs in.
+    /// Authorization code and implicit: where the browser signs in.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth_url: String,
-    /// Authorization code only: a loopback URL the provider sends the browser back to.
+    /// Authorization code and implicit: a loopback URL the provider sends the browser back to.
     /// Empty: `http://127.0.0.1:<a free port>/callback`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub redirect_uri: String,
@@ -385,6 +385,9 @@ pub enum Grant {
     Password,
     /// Signs in through the system browser, with PKCE.
     AuthorizationCode,
+    /// Signs in through the browser too, but the token comes straight back in the redirect
+    /// (its fragment): older single-page-app providers that have no token endpoint for us.
+    Implicit,
 }
 
 impl Auth {

@@ -127,6 +127,22 @@ async fn token(
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
         .cloned();
+    if o.grant == Grant::Implicit {
+        // No token endpoint and no refresh token: the redirect brings the token itself.
+        let back = sign_in(o, open).await?;
+        let ttl = (back.get("expires_in").and_then(|s| s.parse().ok()))
+            .map_or(DEFAULT_TTL, Duration::from_secs);
+        let token = back["access_token"].clone();
+        return Ok(store(
+            key,
+            Granted {
+                token,
+                ttl,
+                refresh: None,
+            },
+            None,
+        ));
+    }
     // Expired or rejected: the refresh token saves a sign-in. If it's refused too (revoked,
     // expired), the grant runs again from the start.
     if let Some(refresh) = cached.and_then(|c| c.refresh) {
@@ -146,6 +162,7 @@ async fn token(
         Grant::ClientCredentials => "client_credentials",
         Grant::Password => "password",
         Grant::AuthorizationCode => "authorization_code",
+        Grant::Implicit => unreachable!("returned above"),
     };
     let (password, code) = (
         o.grant == Grant::Password,
@@ -168,10 +185,11 @@ async fn token(
         }
     }
     if code {
-        let signed = sign_in(o, open).await?;
-        form.push(("code", signed.code));
-        form.push(("redirect_uri", signed.redirect));
-        form.push(("code_verifier", signed.verifier));
+        let mut back = sign_in(o, open).await?;
+        let take = |k: &str, back: &mut HashMap<String, String>| back.remove(k).unwrap_or_default();
+        form.push(("code", take("code", &mut back)));
+        form.push(("redirect_uri", take(REDIRECT, &mut back)));
+        form.push(("code_verifier", take(VERIFIER, &mut back)));
     }
     let got = request_token(client, o, &form).await?;
     Ok(store(key, got, None))
@@ -321,12 +339,10 @@ fn challenge_params(s: &str) -> HashMap<String, String> {
     }
 }
 
-/// What the browser brought back, and what the token request must repeat.
-struct SignedIn {
-    code: String,
-    redirect: String,
-    verifier: String,
-}
+/// Keys `sign_in` adds to what the browser brought back: what the token request must
+/// repeat. Leading spaces: no provider parameter can be named like that.
+const REDIRECT: &str = " redirect_uri";
+const VERIFIER: &str = " code_verifier";
 
 /// Signing in may take a password and a second factor.
 const SIGN_IN_WAIT: Duration = Duration::from_secs(180);
@@ -334,10 +350,12 @@ const SIGN_IN_WAIT: Duration = Duration::from_secs(180);
 /// Authorization code with PKCE (RFC 7636) over a loopback redirect (RFC 8252): listen on
 /// this machine, send the browser to the provider, take the code it comes back with.
 /// PKCE is always sent: a provider that doesn't know it ignores the extra parameters.
+/// The implicit grant comes back the same way with `access_token` instead of `code`.
 async fn sign_in(
     o: &OAuth2,
     open: impl FnOnce(&str) -> Result<(), String>,
-) -> Result<SignedIn, String> {
+) -> Result<HashMap<String, String>, String> {
+    let implicit = o.grant == Grant::Implicit;
     let wanted = match o.redirect_uri.trim() {
         "" => "http://127.0.0.1:0/callback",
         uri => uri,
@@ -368,32 +386,41 @@ async fn sign_in(
     let mut url =
         reqwest::Url::parse(o.auth_url.trim()).map_err(|e| format!("OAuth 2.0 auth URL: {e}"))?;
     url.query_pairs_mut()
-        .append_pair("response_type", "code")
+        .append_pair("response_type", if implicit { "token" } else { "code" })
         .append_pair("client_id", &o.client_id)
         .append_pair("redirect_uri", redirect.as_str())
-        .append_pair("state", &state)
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256");
+        .append_pair("state", &state);
+    if !implicit {
+        url.query_pairs_mut()
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+    }
     if !o.scope.is_empty() {
         url.query_pairs_mut().append_pair("scope", &o.scope);
     }
     open(url.as_str())?;
-    let code = tokio::time::timeout(SIGN_IN_WAIT, callback(&listener, redirect.path(), &state))
+    let wanted = if implicit { "access_token" } else { "code" };
+    let came = callback(&listener, redirect.path(), &state, wanted);
+    let mut back = tokio::time::timeout(SIGN_IN_WAIT, came)
         .await
         .map_err(|_| "No OAuth 2.0 sign-in came back from the browser within 3 minutes")??;
-    Ok(SignedIn {
-        code,
-        redirect: redirect.to_string(),
-        verifier,
-    })
+    back.insert(REDIRECT.into(), redirect.to_string());
+    back.insert(VERIFIER.into(), verifier);
+    Ok(back)
 }
 
-/// Answers the browser until a request to `path` brings the code, or the provider's error.
+/// The implicit grant's token is in the URL fragment, which browsers never send: this page
+/// sends it again as a query string. Without a fragment the provider left nothing to read.
+const FRAGMENT_PAGE: &str = "<!doctype html><title>apitool</title><p style=\"font: 16px sans-serif\" id=m>Reading the sign-in…</p><script>if (location.hash.length > 1) location.replace(location.pathname + '?' + location.hash.slice(1)); else document.getElementById('m').textContent = 'Sign-in failed: the browser came back without a token.';</script>";
+
+/// Answers the browser until a request to `path` brings `wanted` (the code or the token),
+/// or the provider's error. Returns all of the redirect's parameters.
 async fn callback(
     listener: &tokio::net::TcpListener,
     path: &str,
     state: &str,
-) -> Result<String, String> {
+    wanted: &str,
+) -> Result<HashMap<String, String>, String> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     loop {
         let (mut stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
@@ -419,7 +446,16 @@ async fn callback(
             continue;
         };
         let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
-        let result = match (q.get("error"), q.get("code")) {
+        if q.is_empty() && wanted == "access_token" {
+            let page = FRAGMENT_PAGE;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
+                page.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+            continue;
+        }
+        let result = match (q.get("error"), q.get(wanted)) {
             (Some(error), _) => Err(match q.get("error_description") {
                 Some(d) => format!("{error}: {d}"),
                 None => error.clone(),
@@ -428,8 +464,15 @@ async fn callback(
             _ if q.get("state").map(String::as_str) != Some(state) => {
                 Err("the browser came back from a different sign-in; try again".to_owned())
             }
-            (None, Some(code)) => Ok(code.clone()),
-            (None, None) => Err("the browser came back without a code".to_owned()),
+            (None, Some(_)) => Ok(q.clone()),
+            (None, None) => Err(format!(
+                "the browser came back without {}",
+                if wanted == "code" {
+                    "a code"
+                } else {
+                    "a token"
+                }
+            )),
         };
         let (status, text) = match &result {
             Ok(_) => (
@@ -648,6 +691,67 @@ mod tests {
             panic!("signed in twice")
         }));
         assert_eq!(again.as_deref(), Ok("t1"));
+    }
+
+    /// The implicit grant's token arrives in the redirect's fragment, which a browser never
+    /// sends: the callback must hand out a page that resends it, and no token endpoint may
+    /// be called (there is none, and no client secret to give it).
+    #[test]
+    fn implicit_grant_takes_the_token_from_the_redirect_fragment() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        let addr = crate::http::tests::serve(move |_| {
+            count.fetch_add(1, SeqCst);
+            ("500 Nope".into(), String::new())
+        });
+        let o = OAuth2 {
+            grant: Grant::Implicit,
+            auth_url: "https://idp.test/authorize".into(),
+            token_url: format!("http://{addr}/token"),
+            client_id: "spa".into(),
+            client_secret: "never-sent".into(),
+            ..Default::default()
+        };
+        let seen = Arc::new(Mutex::new(String::new()));
+        let first_page = Arc::new(Mutex::new(String::new()));
+        let (url_seen, page_seen) = (seen.clone(), first_page.clone());
+        let browser = move |url: &str| -> Result<(), String> {
+            *url_seen.lock().unwrap() = url.to_owned();
+            let q = query(url);
+            let back = reqwest::Url::parse(&q["redirect_uri"]).unwrap();
+            let port = back.port().unwrap();
+            let state = q["state"].clone();
+            let path = back.path().to_owned();
+            std::thread::spawn(move || {
+                let get = |target: &str| {
+                    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                    write!(s, "GET {target} HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();
+                    let mut reply = String::new();
+                    let _ = s.read_to_string(&mut reply);
+                    reply
+                };
+                // What the browser asks for first: the fragment stays behind.
+                *page_seen.lock().unwrap() = get(&path);
+                get(&format!(
+                    "{path}?access_token=imp&token_type=bearer&expires_in=120&state={state}"
+                ));
+            });
+            Ok(())
+        };
+        let client = client(&rt);
+        let got = rt.block_on(token(&client, &o, true, browser));
+        assert_eq!(got.as_deref(), Ok("imp"));
+        let asked = query(&seen.lock().unwrap());
+        assert_eq!(asked["response_type"], "token");
+        assert!(!asked.contains_key("code_challenge"), "{asked:?}");
+        assert!(first_page.lock().unwrap().contains("location.hash"));
+        assert_eq!(hits.load(SeqCst), 0, "no token endpoint for this grant");
+        assert_eq!(cached_token(&o).as_deref(), Some("imp"));
+        TOKENS.lock().unwrap().remove(&cache_key(&o));
     }
 
     /// An expired token comes back through the refresh token, without the browser; once the

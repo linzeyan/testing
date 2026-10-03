@@ -83,11 +83,12 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
                 Grant::ClientCredentials => "client credentials",
                 Grant::Password => "password",
                 Grant::AuthorizationCode => "authorization code",
+                Grant::Implicit => "implicit",
             };
-            Some(format!(
-                "OAuth 2.0, {grant} grant, token URL `{}`",
-                o.token_url
-            ))
+            Some(match o.grant {
+                Grant::Implicit => format!("OAuth 2.0, implicit grant, auth URL `{}`", o.auth_url),
+                _ => format!("OAuth 2.0, {grant} grant, token URL `{}`", o.token_url),
+            })
         }
     };
     if let Some(kind) = kind {

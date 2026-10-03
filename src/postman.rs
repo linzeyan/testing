@@ -274,6 +274,7 @@ fn auth(v: &Value) -> Result<Auth, String> {
             let grant = match p("grant_type").as_str() {
                 "client_credentials" => Grant::ClientCredentials,
                 "password_credentials" => Grant::Password,
+                "implicit" => Grant::Implicit,
                 // "" is Postman's default.
                 "" | "authorization_code" | "authorization_code_with_pkce" => {
                     Grant::AuthorizationCode
@@ -590,6 +591,7 @@ fn auth_json(auth: &Auth) -> Option<Value> {
                 Grant::ClientCredentials => "client_credentials",
                 Grant::Password => "password_credentials",
                 Grant::AuthorizationCode => "authorization_code_with_pkce",
+                Grant::Implicit => "implicit",
             };
             typed(
                 "oauth2",
@@ -1005,6 +1007,20 @@ mod tests {
                 },
             ),
             (
+                "api/spa",
+                Request {
+                    method: "GET".into(),
+                    url: "{{base}}/me".into(),
+                    auth: Auth::OAuth2(OAuth2 {
+                        grant: Grant::Implicit,
+                        auth_url: "{{base}}/authorize".into(),
+                        client_id: "spa".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
                 "api/live",
                 Request {
                     method: "WS".into(),
@@ -1021,7 +1037,7 @@ mod tests {
         let (json, count, skipped) = collection(&ws, &api).unwrap();
         assert_eq!(
             (count, skipped),
-            (6, 1),
+            (7, 1),
             "WebSocket has no place in a collection"
         );
         let Import::Collection {
@@ -1039,7 +1055,7 @@ mod tests {
         assert_eq!(folders[""], folder);
         assert_eq!(folders["admin"], sub);
         let back: HashMap<_, _> = back.into_iter().collect();
-        assert_eq!(back.len(), 6);
+        assert_eq!(back.len(), 7);
         for (name, _) in requests.iter().filter(|(n, _)| *n != "api/live") {
             let mut saved = ws.load_request(&ws.request_path(name).unwrap()).unwrap();
             saved.inherited = Default::default();
