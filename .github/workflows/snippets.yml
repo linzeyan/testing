@@ -46,4 +46,5 @@ jobs:
         env:
           SNIP_TOOLS: powershell
           SNIP_PWSH: powershell
+          SNIP_BASH: C:\Program Files\Git\bin\bash.exe
         run: python .github/snippets.py snip

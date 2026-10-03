@@ -6,6 +6,7 @@ the cURL snippet (the reference, checked exactly by unit tests) sends.
 
 SNIP_TOOLS picks the snippets to run (curl is always run: it is the reference);
 SNIP_PWSH is the PowerShell to use (`powershell` for Windows PowerShell 5.1);
+SNIP_BASH the bash for the shell snippets (on Windows, not WSL's);
 SNIP_KOTLIN_CP is the classpath with the OkHttp and Okio jars.
 Exits non-zero if any picked snippet failed, differed, or couldn't run."""
 import http.server, os, queue, re, shutil, socket, subprocess, sys, threading
@@ -15,9 +16,10 @@ from email.policy import default
 SNIP = os.path.abspath(sys.argv[1])
 TOOLS = set(os.environ.get("SNIP_TOOLS", "").split(",")) - {""}
 PWSH = os.environ.get("SNIP_PWSH", "pwsh")
+BASH = os.environ.get("SNIP_BASH", "bash")
 KOTLIN_CP = os.environ.get("SNIP_KOTLIN_CP", "")
 # What a snippet admits it can't do, in a comment at its top: not a failure.
-ADMITTED = {"multipart.wget.sh"}
+ADMITTED = {"multipart.wget.sh", "multipart.java.java"}
 captured = queue.Queue()
 
 
@@ -140,7 +142,7 @@ def main():
             cmd = ["kotlin", "-cp", jar + jar_sep + KOTLIN_CP, case.capitalize() + "Kt"]
         else:
             cmd = {
-                "sh": ["bash", name],
+                "sh": [BASH, name],
                 "ps1": [PWSH, "-NoProfile", "-NonInteractive", "-File", name],
                 "php": ["php", name],
                 "java": ["java", name],
@@ -181,9 +183,15 @@ def main():
         got = norm(case, captured.get())
         if tool == "curl":
             reference[case] = got
+            if p.returncode != 0:
+                results[name] = f"FAIL reference exit {p.returncode}"
+                continue
             results[name] = f"reference (exit {p.returncode})"
             continue
         ref = reference.get(case)
+        if ref is None:
+            results[name] = "FAIL the cURL reference sent nothing"
+            continue
         diff = [k for k in sorted(set(ref) | set(got)) if ref.get(k) != got.get(k)]
         if case == "digest":  # only curl answers the challenge; the rest leave a comment
             diff = [k for k in diff if k != "authorization"]

@@ -449,6 +449,12 @@ fn powershell(w: &Wire) -> String {
             ps_str(pass),
             ps_str(user)
         );
+        // 7 won't send credentials over http:// without it, and 5.1 doesn't know it.
+        if !w.https() {
+            out.push_str(
+                "if ($PSVersionTable.PSVersion.Major -ge 6) { $params.AllowUnencryptedAuthentication = $true }\n",
+            );
+        }
     }
     out.push_str("$response = Invoke-WebRequest @params -UseBasicParsing\n$response.Content");
     if needs_7 {
@@ -1416,9 +1422,10 @@ fn kotlin(w: &Wire) -> String {
         None => "null".into(),
     };
     let body = if let Some(body) = &w.body {
+        // Bytes: a String body gets "; charset=utf-8" added to its content type.
         let _ = writeln!(
             out,
-            "    val body = {}.toRequestBody({media})",
+            "    val body = {}.toByteArray().toRequestBody({media})",
             kotlin_str(body)
         );
         "body"
