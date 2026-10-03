@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::model::Request;
 use crate::net::Clients;
-use crate::runner;
+use crate::{http, runner};
 
 /// Log-bucketed latency histogram: 1% resolution, fixed ~16 KB no matter how many requests.
 const GROWTH: f64 = 1.01;
@@ -91,7 +91,9 @@ pub async fn run(
         set.spawn(async move {
             while Instant::now() < deadline {
                 let t = Instant::now();
-                let result = runner::send(&client, req.clone()).await.map(|r| r.status);
+                let send = runner::send(&client, req.clone());
+                let result = http::SINK.scope(http::Sink::Discard, send).await;
+                let result = result.map(|r| r.status);
                 let us = t.elapsed().as_micros() as u64;
                 stats.lock().unwrap().record(us, result);
             }

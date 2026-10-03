@@ -1201,7 +1201,11 @@ impl App {
                     let info = runner::Info::single(name);
                     let run = runner::run(client.clone(), &info, req, vars);
                     match download {
-                        Some(file) => crate::http::DOWNLOAD.scope(file, run).await,
+                        Some(file) => {
+                            crate::http::SINK
+                                .scope(crate::http::Sink::File(file), run)
+                                .await
+                        }
                         None => run.await,
                     }
                 }
@@ -8488,6 +8492,51 @@ mod ui_tests {
         let kept = h.state().stream.as_ref().unwrap().events().len();
         println!(
             "1 GB of SSE events: peak {peak} MiB, then {} MiB ({kept} events kept)",
+            rss()
+        );
+
+        // Load test: 50 VUs for 3 s against a 4 MB body, each answer written as it goes.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let chunk = [b'x'; 64 * 1024];
+                    while s.read(&mut [0; 8192]).is_ok_and(|n| n > 0) {
+                        let head = "HTTP/1.1 200 OK\r\ncontent-length: 4194304\r\n\r\n";
+                        if s.write_all(head.as_bytes()).is_err() {
+                            return;
+                        }
+                        for _ in 0..64 {
+                            if s.write_all(&chunk).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let stats = Arc::new(std::sync::Mutex::new(crate::loadtest::Stats::default()));
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        let rt = &h.state().rt;
+        let client = rt.block_on(crate::net::build_client(net)).unwrap();
+        let req = Request {
+            url: format!("http://{addr}/"),
+            ..Default::default()
+        };
+        let run = crate::loadtest::run(client, req, 50, Duration::from_secs(3), stats.clone());
+        let task = rt.spawn(run);
+        let mut peak = rss();
+        while !task.is_finished() {
+            peak = peak.max(rss());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let count = stats.lock().unwrap().count;
+        println!(
+            "load test, 50 VUs × 4 MB: peak {peak} MiB, then {} MiB ({count} requests)",
             rss()
         );
     }

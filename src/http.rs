@@ -41,9 +41,17 @@ pub struct Trace {
 
 tokio::task_local! {
     static TRACE: std::cell::RefCell<Trace>;
-    /// "Send and download": a successful response's body goes to this file, not RAM.
-    /// A task-local like TRACE so the runner and its scripts don't carry it.
-    pub static DOWNLOAD: std::path::PathBuf;
+    /// Where bodies go instead of RAM for the sends inside `SINK.scope`. A task-local like
+    /// TRACE so the runner and its scripts don't carry it.
+    pub static SINK: Sink;
+}
+
+pub enum Sink {
+    /// "Send and download": a successful response's body goes to this file.
+    File(std::path::PathBuf),
+    /// The load test only counts statuses and times; each VU keeping a body would add up
+    /// to gigabytes.
+    Discard,
 }
 
 /// No-op outside a traced send (WebSocket, SSE, gRPC, the PAC fetch).
@@ -436,12 +444,22 @@ pub fn auto_headers(mut req: Request, own: &[KeyValue]) -> Vec<(String, String, 
 /// and friends included). `text()` itself takes whatever arrives: a 1 GB download, or a
 /// small gzip that inflates to one.
 async fn read_body(mut resp: reqwest::Response) -> Result<(String, bool), String> {
-    // Only a success: an error body (or Digest's first 401) is small and worth reading here.
-    if resp.status().is_success()
-        && let Ok(path) = DOWNLOAD.try_with(Clone::clone)
-    {
-        let n = download(resp, &path).await?;
-        return Ok((format!("Saved {n} bytes to {}", path.display()), false));
+    let sink = SINK.try_with(|s| match s {
+        Sink::File(path) => Some(path.clone()),
+        Sink::Discard => None,
+    });
+    match sink {
+        // Only a success: an error body (or Digest's first 401) is small and worth reading.
+        Ok(Some(path)) if resp.status().is_success() => {
+            let n = download(resp, &path).await?;
+            return Ok((format!("Saved {n} bytes to {}", path.display()), false));
+        }
+        // Still read to the end: that's part of the time, and frees the connection for reuse.
+        Ok(None) => {
+            while resp.chunk().await.map_err(|e| error_chain(&e))?.is_some() {}
+            return Ok((String::new(), false));
+        }
+        _ => {}
     }
     let charset = (resp.headers().get(CONTENT_TYPE))
         .and_then(|v| v.to_str().ok())
@@ -1109,7 +1127,7 @@ pub(crate) mod tests {
                 url,
                 ..Default::default()
             };
-            let send = DOWNLOAD.scope(to.to_owned(), execute(client.clone(), req));
+            let send = SINK.scope(Sink::File(to.to_owned()), execute(client.clone(), req));
             rt.block_on(send).unwrap()
         };
         let file = dir.join("big.bin");
@@ -1133,6 +1151,21 @@ pub(crate) mod tests {
         assert_eq!(resp.body, "no such thing");
         assert!(!missing.exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 50 load-test VUs each holding a 4 MB body peaked at 502 MiB; they only need the
+    /// status, so the body is read through and dropped.
+    #[test]
+    fn a_discarded_body_is_read_but_not_kept() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let req = Request {
+            method: "GET".into(),
+            url: serve_bytes("content-type: text/plain", vec![b'a'; 1 << 20]),
+            ..Default::default()
+        };
+        let send = SINK.scope(Sink::Discard, execute(client(&rt), req));
+        let resp = rt.block_on(send).unwrap();
+        assert_eq!((resp.status, resp.body.as_str()), (200, ""));
     }
 
     /// Reading in capped chunks must still decode like `text()` did: legacy Taiwanese
