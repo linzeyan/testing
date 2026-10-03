@@ -206,7 +206,6 @@ fn connect(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
-/// A request's path ends in `.toml`; a folder's never does.
 /// A child's entry in its folder's `order`.
 fn tag(path: &Path) -> String {
     match is_request(path) {
@@ -219,6 +218,7 @@ fn tag(path: &Path) -> String {
         + if is_request(path) { "" } else { "/" }
 }
 
+/// A request's path ends in `.toml`; a folder's never does.
 pub fn is_request(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "toml")
 }
@@ -299,7 +299,31 @@ impl Workspace {
             root,
         };
         ws.ignore()?;
+        ws.seal_secrets();
         Ok(ws)
+    }
+
+    /// Seals secrets stored plain: from before sealing, or from a system without it. A
+    /// keychain that fails is reported and tried again next time; the workspace opens.
+    fn seal_secrets(&self) {
+        let db = self.db();
+        let plain = (db.prepare("SELECT name, secret FROM envs WHERE secret NOT LIKE 'sealed:%'"))
+            .and_then(|mut q| {
+                let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<(String, String)>>>()
+            });
+        for (name, secret) in plain.unwrap_or_default() {
+            match crate::vault::seal(&secret) {
+                Ok(sealed) if sealed != secret => {
+                    let update = "UPDATE envs SET secret = ?2 WHERE name = ?1";
+                    if let Err(e) = db.execute(update, [&name, &sealed]) {
+                        eprintln!("sealing secrets: {e}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => return eprintln!("sealing secrets: {e}"),
+            }
+        }
     }
 
     /// Checked on every open, so rules added later reach existing workspaces too.
@@ -935,6 +959,8 @@ impl Workspace {
         let parse = |json: &str| {
             serde_json::from_str(json).map_err(|e| format!("environment \"{name}\": {e}"))
         };
+        let secret = crate::vault::open(&secret)
+            .map_err(|e| format!("environment \"{name}\": its secrets can't be opened: {e}"))?;
         Ok((parse(&shared)?, parse(&secret)?))
     }
 
@@ -951,9 +977,11 @@ impl Workspace {
             let vars: Vec<&KeyValue> = vars.iter().filter(|v| !v.key.is_empty()).collect();
             to_json(&vars)
         };
+        let secret = crate::vault::seal(&keep(secret)?)
+            .map_err(|e| format!("secrets aren't saved unencrypted, and sealing failed: {e}"))?;
         sql(self.db().execute(
             "INSERT OR REPLACE INTO envs (name, shared, secret) VALUES (?1, ?2, ?3)",
-            [env.unwrap_or(""), &keep(shared)?, &keep(secret)?],
+            [env.unwrap_or(""), &keep(shared)?, &secret],
         ))
         .map(drop)
     }
@@ -1670,6 +1698,46 @@ mod tests {
             panic!("api")
         };
         assert_eq!(names(children), ["x", "c"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn secrets_are_sealed_in_the_database_and_old_plain_ones_on_open() {
+        let root = fresh("sealed");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let column = |ws: &Workspace, env: &str| -> String {
+            let q = "SELECT secret FROM envs WHERE name = ?1";
+            ws.db().query_row(q, [env], |r| r.get(0)).unwrap()
+        };
+        let seals = cfg!(any(windows, target_os = "macos"));
+        ws.save_env(Some("dev"), &[], &[KeyValue::new("token", "s3cret")])
+            .unwrap();
+        assert_eq!(column(&ws, "dev").starts_with(crate::vault::PREFIX), seals);
+        if seals {
+            assert!(!column(&ws, "dev").contains("s3cret"));
+        }
+        assert_eq!(
+            ws.load_env(Some("dev")).unwrap().1,
+            [KeyValue::new("token", "s3cret")]
+        );
+
+        // A row from before sealing is read as it was, and sealed the next time it opens.
+        let old = r#"[{"key":"pw","value":"hunter2","enabled":true}]"#;
+        let insert = "INSERT INTO envs (name, shared, secret) VALUES ('old', '[]', ?1)";
+        ws.db().execute(insert, [old]).unwrap();
+        assert_eq!(ws.load_env(Some("old")).unwrap().1[0].value, "hunter2");
+        drop(ws);
+        let ws = Workspace::open(root.clone()).unwrap();
+        assert_eq!(column(&ws, "old").starts_with(crate::vault::PREFIX), seals);
+        assert_eq!(ws.load_env(Some("old")).unwrap().1[0].value, "hunter2");
+
+        // What can't be opened is an error, never an empty list a save would then keep.
+        let broken = format!("{}AAAA", crate::vault::PREFIX);
+        ws.db()
+            .execute("UPDATE envs SET secret = ?1 WHERE name = 'old'", [&broken])
+            .unwrap();
+        let err = ws.load_env(Some("old")).unwrap_err();
+        assert!(err.contains("can't be opened"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
 

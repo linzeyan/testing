@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.78.0"
+version = "0.79.0"
 edition = "2024"
 
 [dependencies]
@@ -64,7 +64,8 @@ rustls-platform-verifier = "0.7"
 
 [target."cfg(windows)".dependencies]
 # WinHTTP reads IE/Edge proxy settings and does WPAD discovery the way the OS does.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinHttp"] }
+# DPAPI seals environment secrets in apitool.db (see vault.rs).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Cryptography"] }
 
 [dev-dependencies]
 # A fake MQTT broker's buffers, for rumqttc's packet codec.

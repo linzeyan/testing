@@ -87,7 +87,7 @@ such as Citrix VDI. No installer: unzip and run.
 The workspace (`workspace/` next to the executable, or `$APITOOL_WORKSPACE`) keeps
 everything in one SQLite file, `apitool.db`. For git, ⋯ > "Export to files" writes the
 collection, environments and globals as TOML beside it (`collections/`, `environments/`,
-`globals.toml`; secret values, history, cookies and OAuth tokens stay in the database), and "Import from
+`globals.toml`; secret values, history, cookies and OAuth tokens stay in the database, secret values sealed by the OS: DPAPI on Windows, a login-keychain key on macOS, plain on Linux; a database copied to another user or machine can't open them), and "Import from
 files…" reads them back, e.g. after a pull. A workspace from an older version, which was
 those TOML files, is imported into `apitool.db` on first start, secrets and history
 included.
