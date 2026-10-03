@@ -21,6 +21,7 @@ mod net;
 mod postman;
 mod runner;
 mod script;
+mod sigv4;
 pub mod store;
 mod stream;
 mod varedit;

@@ -74,6 +74,10 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
         Auth::Bearer { .. } => Some("Bearer token".into()),
         Auth::Basic { .. } => Some("Basic".into()),
         Auth::Digest { .. } => Some("Digest".into()),
+        Auth::AwsV4(a) => Some(format!(
+            "AWS Signature v4, service `{}`, region `{}`",
+            a.service, a.region
+        )),
         Auth::ApiKey { key, in_query, .. } => Some(match in_query {
             true => format!("API key, query parameter `{key}`"),
             false => format!("API key, header `{key}`"),

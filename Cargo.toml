@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.52.0"
+version = "0.53.0"
 edition = "2024"
 
 [dependencies]
@@ -24,6 +24,8 @@ protox = "0.9.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "charset", "gzip", "query", "form", "multipart", "stream", "cookies"] }
 reqwest-websocket = "0.6"
 rquickjs = { version = "0.14", features = ["parallel"] }
+# Already in the tree as rustls's crypto provider: HMAC-SHA256 for AWS Signature v4.
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }

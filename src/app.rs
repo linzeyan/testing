@@ -5442,6 +5442,7 @@ fn auth_editor(
                 in_query: false,
             },
         ),
+        ("AWS Signature", Auth::AwsV4(model::AwsV4::default())),
     ];
     let label_of = |a: &Auth| {
         let d = std::mem::discriminant(a);
@@ -5494,6 +5495,18 @@ fn auth_editor(
             Auth::Basic { username, password } | Auth::Digest { username, password } => {
                 text(ui, "Username", username, "");
                 secret(ui, "Password", password);
+            }
+            Auth::AwsV4(a) => {
+                text(ui, "Access key", &mut a.access_key, "{{aws_access_key}}");
+                secret(ui, "Secret key", &mut a.secret_key);
+                text(ui, "Region", &mut a.region, "us-east-1");
+                text(ui, "Service", &mut a.service, "execute-api, s3, lambda…");
+                text(
+                    ui,
+                    "Session token",
+                    &mut a.session_token,
+                    "temporary credentials only",
+                );
             }
             Auth::ApiKey {
                 key,
@@ -5592,6 +5605,13 @@ fn auth_editor(
         }
         Auth::OAuth2(_) => {
             ui.weak("The token is fetched on Send and reused until it expires or is rejected.");
+        }
+        Auth::AwsV4(_) => {
+            ui.weak(
+                "Each Send is signed over its URL, headers and body. A signature lasts 15 \
+                 minutes, so a copied snippet stops working after that. A body streamed from a \
+                 file is sent as UNSIGNED-PAYLOAD, which S3 accepts.",
+            );
         }
         _ => {
             ui.weak(
@@ -7666,7 +7686,7 @@ mod ui_tests {
         let shop = r#"{ "info": { "name": "Shop" }, "item": [
             { "name": "list", "request": { "method": "GET", "url": "{{base}}/items" } },
             { "name": "signed", "request": { "method": "GET", "url": "{{base}}/s",
-                                             "auth": { "type": "awsv4", "awsv4": [] } } } ] }"#;
+                                             "auth": { "type": "ntlm", "ntlm": [] } } } ] }"#;
         std::fs::write(&file, shop).unwrap();
         h.get_all_by_label("⋯").next().unwrap().click();
         h.run();
@@ -7682,7 +7702,7 @@ mod ui_tests {
         let Some(Dialog::Postman { note, .. }) = &app.dialog else {
             panic!("the dialog stays to say what didn't come over");
         };
-        assert!(note.contains("signed: awsv4 auth"), "{note}");
+        assert!(note.contains("signed: ntlm auth"), "{note}");
         assert_eq!(draft(&h).body, parts);
 
         // A second import of the same environment never replaces the first, which may

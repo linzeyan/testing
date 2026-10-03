@@ -6,7 +6,9 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
-use crate::model::{self, Auth, Body, Example, Folder, Grant, KeyValue, OAuth2, Request, Settings};
+use crate::model::{
+    self, Auth, AwsV4, Body, Example, Folder, Grant, KeyValue, OAuth2, Request, Settings,
+};
 use crate::store::{Node, Workspace, folder_name, safe_name};
 
 const SCHEMA: &str = "https://schema.getpostman.com/json/collection/v2.1.0/collection.json";
@@ -298,6 +300,18 @@ fn auth(v: &Value) -> Result<Auth, String> {
             value: p("value"),
             in_query: p("in") == "query",
         },
+        // A presigned URL (auth data in the query) is a different signature: refused, so the
+        // import says so instead of sending headers the server doesn't expect.
+        "awsv4" if p("addAuthDataToQuery") == "true" => {
+            return Err("awsv4 (auth data in the query)".into());
+        }
+        "awsv4" => Auth::AwsV4(AwsV4 {
+            access_key: p("accessKey"),
+            secret_key: p("secretKey"),
+            region: p("region"),
+            service: p("service"),
+            session_token: p("sessionToken"),
+        }),
         other => return Err(other.into()),
     })
 }
@@ -586,6 +600,16 @@ fn auth_json(auth: &Auth) -> Option<Value> {
                 ("in", if *in_query { "query" } else { "header" }),
             ],
         ),
+        Auth::AwsV4(a) => typed(
+            "awsv4",
+            &[
+                ("accessKey", a.access_key.as_str()),
+                ("secretKey", a.secret_key.as_str()),
+                ("region", a.region.as_str()),
+                ("service", a.service.as_str()),
+                ("sessionToken", a.session_token.as_str()),
+            ],
+        ),
         Auth::OAuth2(o) => {
             let grant = match o.grant {
                 Grant::ClientCredentials => "client_credentials",
@@ -692,7 +716,7 @@ mod tests {
         { "name": "login",
           "request": { "method": "POST", "url": "{{base}}/login",
             "body": { "mode": "urlencoded", "urlencoded": [{ "key": "user", "value": "{{user}}" }] },
-            "auth": { "type": "awsv4", "awsv4": [] } } },
+            "auth": { "type": "ntlm", "ntlm": [] } } },
         { "name": "feed", "request": { "method": "GET", "url": "{{base}}/feed?x=1",
             "auth": { "type": "apikey", "apikey": [{ "key": "key", "value": "api_key" },
                       { "key": "value", "value": "k" }, { "key": "in", "value": "query" }] } } },
@@ -821,7 +845,7 @@ mod tests {
 
         // What couldn't come over is said, not dropped quietly.
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].starts_with("login: awsv4 auth"), "{warnings:?}");
+        assert!(warnings[0].starts_with("login: ntlm auth"), "{warnings:?}");
         let file = Body::File {
             path: "x.bin".into(),
         };
@@ -1007,6 +1031,21 @@ mod tests {
                 },
             ),
             (
+                "api/aws",
+                Request {
+                    method: "GET".into(),
+                    url: "https://abc.execute-api.us-east-1.amazonaws.com/prod".into(),
+                    auth: Auth::AwsV4(AwsV4 {
+                        access_key: "{{ak}}".into(),
+                        secret_key: "{{sk}}".into(),
+                        region: "us-east-1".into(),
+                        service: "execute-api".into(),
+                        session_token: String::new(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
                 "api/spa",
                 Request {
                     method: "GET".into(),
@@ -1037,7 +1076,7 @@ mod tests {
         let (json, count, skipped) = collection(&ws, &api).unwrap();
         assert_eq!(
             (count, skipped),
-            (7, 1),
+            (8, 1),
             "WebSocket has no place in a collection"
         );
         let Import::Collection {
@@ -1055,7 +1094,7 @@ mod tests {
         assert_eq!(folders[""], folder);
         assert_eq!(folders["admin"], sub);
         let back: HashMap<_, _> = back.into_iter().collect();
-        assert_eq!(back.len(), 7);
+        assert_eq!(back.len(), 8);
         for (name, _) in requests.iter().filter(|(n, _)| *n != "api/live") {
             let mut saved = ws.load_request(&ws.request_path(name).unwrap()).unwrap();
             saved.inherited = Default::default();

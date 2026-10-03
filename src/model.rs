@@ -350,6 +350,23 @@ pub enum Auth {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         in_query: bool,
     },
+    /// Signed per request with the secret key; the signature covers the body and expires
+    /// in 15 minutes.
+    #[serde(rename = "awsv4")]
+    AwsV4(AwsV4),
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct AwsV4 {
+    pub access_key: String,
+    pub secret_key: String,
+    pub region: String,
+    /// e.g. execute-api, s3, lambda.
+    pub service: String,
+    /// Temporary credentials (STS) only.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub session_token: String,
 }
 
 /// OAuth 2.0 grants that need no browser. ponytail: authorization code (browser + local
@@ -638,6 +655,13 @@ impl Request {
                 }),
                 // Becomes a header or a query parameter below.
                 Auth::ApiKey { .. } => Auth::None,
+                Auth::AwsV4(a) => Auth::AwsV4(AwsV4 {
+                    access_key: r(&a.access_key),
+                    secret_key: r(&a.secret_key),
+                    region: r(&a.region),
+                    service: r(&a.service),
+                    session_token: r(&a.session_token),
+                }),
             },
             // Scripts have already run by the time a request is resolved for the wire.
             pre_request: String::new(),

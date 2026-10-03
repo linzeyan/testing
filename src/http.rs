@@ -180,9 +180,15 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
     for h in &req.headers {
         b = b.header(h.key.as_str(), h.value.as_str());
     }
+    let mut aws = None;
     b = match req.auth {
         // `resolved` has already made an API key a header or query parameter.
         Auth::None | Auth::Inherit | Auth::ApiKey { .. } => b,
+        // Signed last, over the finished request.
+        Auth::AwsV4(a) => {
+            aws = Some(a);
+            b
+        }
         Auth::Bearer { token } => b.bearer_auth(token),
         Auth::Basic { username, password } => b.basic_auth(username, Some(password)),
         // Both need a round trip first; `execute` and `with_token` take care of it.
@@ -207,7 +213,7 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
             b.header(CONTENT_TYPE, mime)
         }
     };
-    Ok(match req.body {
+    let b = match req.body {
         Body::None => b,
         Body::Json { text } => typed(b, "application/json").body(text),
         Body::Text { text } => typed(b, "text/plain; charset=utf-8").body(text),
@@ -235,7 +241,13 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
             let payload = serde_json::json!({ "query": query, "variables": variables });
             typed(b, "application/json").body(payload.to_string())
         }
-    })
+    };
+    let Some(aws) = aws else {
+        return Ok(b);
+    };
+    let mut wire = b.build().map_err(|e| error_chain(&e))?;
+    crate::sigv4::sign(&mut wire, &aws, std::time::SystemTime::now())?;
+    Ok(reqwest::RequestBuilder::from_parts(client.clone(), wire))
 }
 
 /// Files are streamed from disk when the request is sent, not read into memory first.
