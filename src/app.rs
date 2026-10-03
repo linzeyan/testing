@@ -2992,6 +2992,7 @@ impl App {
                                 && !open.draft.mqtt.v5
                                 && open.draft.mqtt.keep_alive_secs == 60
                                 && open.draft.mqtt.clean_session
+                                && open.draft.mqtt.will_topic.trim().is_empty()
                         }
                         false => open.draft.settings.is_default(),
                     };
@@ -5490,9 +5491,32 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
             ui.checkbox(&mut m.clean_session, "");
             ui.weak("Off: the broker keeps subscriptions and queued messages for this client ID");
             ui.end_row();
+
+            ui.label("Last will");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut m.will_topic)
+                        .hint_text("devices/42/status")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(240.0),
+                );
+                qos_box(ui, "will-qos", &mut m.will_qos);
+                ui.checkbox(&mut m.will_retain, "Retain");
+            });
+            ui.weak("The broker publishes it if the connection drops without a goodbye");
+            ui.end_row();
+
+            ui.label("Will message");
+            ui.add_enabled(
+                !m.will_topic.trim().is_empty(),
+                egui::TextEdit::singleline(&mut m.will_payload)
+                    .hint_text("offline")
+                    .desired_width(240.0),
+            );
+            ui.end_row();
         });
     ui.add_space(8.0);
-    ui.weak("Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// trust the system's certificates and the CA file in Network settings.");
+    ui.weak("Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// use the certificate settings in Network settings, and the connection goes through its proxy.");
 }
 
 fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_secs: u64) {
@@ -8572,14 +8596,23 @@ mod ui_tests {
             username: "u".into(),
             password: "p".into(),
         };
-        d.mqtt.client_id = "tester".into();
+        d.mqtt.will_topic = "status/{{device}}".into();
+        d.mqtt.will_payload = "offline".into();
+        (d.mqtt.will_qos, d.mqtt.will_retain) = (1, true);
         let topic = |filter: &str| model::Topic {
             filter: filter.into(),
             ..Default::default()
         };
         d.mqtt.topics = vec![topic("a/#"), topic("denied")];
+        h.state_mut().vars.insert("device".into(), "tester".into());
         h.run();
         assert!(h.query_by_label("Params").is_none(), "MQTT has no query");
+        // Only the will is set, and the tab says so.
+        h.get_by_label("Settings ●").click();
+        h.run();
+        h.state_mut().open.as_mut().unwrap().draft.mqtt.client_id = "tester".into();
+        h.run();
+        shot(&mut h, "65-mqtt-settings");
         h.get_by_label("Topics (2)").click();
         h.run();
         h.get_by_label("Connect").click();

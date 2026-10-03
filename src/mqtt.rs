@@ -359,6 +359,10 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
         Auth::None | Auth::Inherit => None,
         _ => return Err("MQTT signs in with a username and password: use Basic auth".into()),
     };
+    let will = m.will_topic.as_str();
+    if will.contains(['+', '#']) {
+        return Err("+ and # are for subscribing; a last will goes to one topic".into());
+    }
     let insecure = net.insecure || !req.settings.verify_tls;
     let tls = || tls_config(net, insecure).map(TlsConfiguration::Rustls);
     let transport = match wire {
@@ -376,6 +380,10 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
             .set_transport(transport);
         if let Some(p) = proxy {
             o.set_proxy(p);
+        }
+        if !will.is_empty() {
+            let (payload, qos) = (m.will_payload.clone(), qos5(m.will_qos));
+            o.set_last_will(p5::LastWill::new(will, payload, qos, m.will_retain, None));
         }
         // In v5 a session ends with the connection unless it's given a lifetime; "keep
         // the session" means what it does in 3.1.1: until the broker forgets it.
@@ -395,6 +403,10 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
         .set_transport(transport);
     if let Some(p) = proxy {
         o.set_proxy(p);
+    }
+    if !will.is_empty() {
+        let (payload, qos) = (m.will_payload.clone(), qos3(m.will_qos));
+        o.set_last_will(rumqttc::LastWill::new(will, payload, qos, m.will_retain));
     }
     if let Some((user, password)) = login {
         o.set_credentials(user, password);
@@ -668,7 +680,8 @@ pub mod tests {
         port
     }
 
-    /// Just enough MQTT 3.1.1 broker for client "tester" signing in as u/p: answers
+    /// Just enough MQTT 3.1.1 broker for client "tester" signing in as u/p, with "offline"
+    /// as its retained QoS 1 will on status/tester: answers
     /// subscriptions (refusing "denied") and unsubscriptions, says hello on a/1 after the
     /// first subscription, echoes what's published on a/echo and stops at DISCONNECT.
     pub fn broker() -> u16 {
@@ -698,6 +711,8 @@ pub mod tests {
             ("u", "p")
         );
         assert_eq!(connect.client_id, "tester");
+        let will = rumqttc::LastWill::new("status/tester", "offline", QoS::AtLeastOnce, true);
+        assert_eq!(connect.last_will, Some(will));
         send(
             s,
             Packet::ConnAck(ConnAck::new(ConnectReturnCode::Success, false)),
@@ -746,7 +761,7 @@ pub mod tests {
             p.write(&mut out, max).unwrap();
             s.put(&out);
         };
-        let Packet::Connect(connect, _, login) = next(s) else {
+        let Packet::Connect(connect, will, login) = next(s) else {
             panic!("CONNECT first");
         };
         let login = login.expect("credentials from Basic auth");
@@ -755,6 +770,8 @@ pub mod tests {
             ("u", "p")
         );
         assert_eq!(connect.client_id, "tester");
+        let offline = p5::LastWill::new("status/tester", "offline", qos5(1), true, None);
+        assert_eq!(will, Some(offline));
         let ack = p5::ConnAck {
             session_present: false,
             code: p5::ConnectReturnCode::Success,
@@ -825,6 +842,10 @@ pub mod tests {
                         ..Default::default()
                     },
                 ],
+                will_topic: "status/tester".into(),
+                will_payload: "offline".into(),
+                will_qos: 1,
+                will_retain: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -985,6 +1006,16 @@ pub mod tests {
         assert!(bad("mqtt://x:port", Auth::None).contains("port"));
         let bearer = Auth::Bearer { token: "t".into() };
         assert!(bad("mqtt://x", bearer).contains("Basic"));
+        let will = Request {
+            url: "mqtt://x".into(),
+            mqtt: Mqtt {
+                will_topic: "status/#".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = connect(&will, &Network::default(), &Route::Direct).err();
+        assert!(err.unwrap().contains("last will"));
         // Without a scheme or port it's plain MQTT on 1883; WebSocket keeps the URL.
         assert_eq!(
             target("broker.test").unwrap(),

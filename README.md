@@ -9,7 +9,8 @@ such as Citrix VDI. No installer: unzip and run.
   `wss://`; TLS takes the network settings' CA file, client certificate and "accept any
   certificate", and the connection goes through the proxy https would use, tunnelled with
   CONNECT) subscribes to the request's topics on Connect, follows changes to them while
-  connected, and publishes from the message panel with QoS and retain; Postman-style pre-request/test
+  connected, and publishes from the message panel with QoS and retain; a last will
+  (topic, message, QoS, retain) goes with the connection; Postman-style pre-request/test
   scripts (`pm.*`, chai, `jsonSchema`); collection runner with CSV/JSON data (counts cover every row; the list keeps
   failures and the latest 1000 results); load test
   pane (response bodies are read and dropped, so many users cost no RAM); proxy/PAC/WPAD, custom CA and client certificates. JSON, text (Text/XML/HTML/JavaScript

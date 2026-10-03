@@ -118,6 +118,14 @@ pub struct Mqtt {
     pub qos: u8,
     /// The broker keeps the last retained message for whoever subscribes later.
     pub retain: bool,
+    /// What the broker publishes for this client when it drops without a goodbye. No
+    /// topic: no will.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub will_topic: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub will_payload: String,
+    pub will_qos: u8,
+    pub will_retain: bool,
 }
 
 impl Default for Mqtt {
@@ -131,6 +139,10 @@ impl Default for Mqtt {
             topic: String::new(),
             qos: 0,
             retain: false,
+            will_topic: String::new(),
+            will_payload: String::new(),
+            will_qos: 0,
+            will_retain: false,
         }
     }
 }
@@ -671,6 +683,8 @@ impl Request {
                     })
                     .collect(),
                 topic: r(&self.mqtt.topic),
+                will_topic: r(self.mqtt.will_topic.trim()),
+                will_payload: r(&self.mqtt.will_payload),
                 ..self.mqtt.clone()
             },
             examples: Vec::new(),
@@ -952,6 +966,10 @@ mod tests {
                 topic: "cmd".into(),
                 qos: 1,
                 retain: true,
+                will_topic: "status/{{device}}".into(),
+                will_payload: "offline".into(),
+                will_qos: 2,
+                will_retain: true,
             },
             examples: vec![Example {
                 name: "found".into(),
