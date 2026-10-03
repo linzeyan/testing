@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 use regex::{Captures, Regex};
 use serde_json::{Value, json};
 
-use crate::model::{Auth, AwsV4, Body, Folder, Grant, KeyValue, OAuth2, Request};
+use crate::model::{Auth, AwsV4, Body, Folder, Grant, KeyValue, OAuth1, OAuth2, Request};
 use crate::postman::Import;
 use crate::store::safe_name;
 
@@ -375,6 +375,17 @@ fn auth(a: &Value) -> Result<Auth, String> {
             service: s("service"),
             session_token: s("sessionToken"),
         }),
+        "oauth1" => Auth::OAuth1(OAuth1 {
+            consumer_secret: match str_of(&a["signatureMethod"]).starts_with("RSA") {
+                true => s("privateKey"),
+                false => s("consumerSecret"),
+            },
+            signature_method: s("signatureMethod"),
+            consumer_key: s("consumerKey"),
+            token: s("tokenKey"),
+            token_secret: s("tokenSecret"),
+            realm: s("realm"),
+        }),
         "apikey" => return Err("cookie API key".into()),
         kind => return Err(kind.to_owned()),
     })
@@ -658,5 +669,26 @@ environments:
             ("WS", "wss://echo.websocket.org")
         );
         assert_eq!(envs[0].0, "Staging");
+    }
+
+    #[test]
+    fn oauth1_takes_the_private_key_for_rsa() {
+        let a = serde_json::json!({
+            "type": "oauth1", "signatureMethod": "RSA-SHA256", "consumerKey": "ck",
+            "consumerSecret": "unused", "privateKey": "PEM", "tokenKey": "t", "tokenSecret": "ts",
+        });
+        let Auth::OAuth1(o) = auth(&a).unwrap() else {
+            panic!("oauth1")
+        };
+        assert_eq!(
+            (o.consumer_key, o.consumer_secret, o.token, o.token_secret),
+            ("ck".into(), "PEM".into(), "t".into(), "ts".into())
+        );
+        let mut hmac = a.clone();
+        hmac["signatureMethod"] = "HMAC-SHA1".into();
+        let Auth::OAuth1(o) = auth(&hmac).unwrap() else {
+            panic!("oauth1")
+        };
+        assert_eq!(o.consumer_secret, "unused");
     }
 }

@@ -359,9 +359,31 @@ pub enum Auth {
     /// in 15 minutes.
     #[serde(rename = "awsv4")]
     AwsV4(AwsV4),
+    /// Signed per request over the method, URL, query and form body.
+    #[serde(rename = "oauth1")]
+    OAuth1(OAuth1),
     /// A token signed per request and sent as a Bearer token.
     #[serde(rename = "jwt")]
     Jwt(Jwt),
+}
+
+/// ponytail: no callback/verifier fields, so the three-legged token dance is done
+/// elsewhere and its access token pasted here; add them when someone runs the dance here.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct OAuth1 {
+    /// One of `oauth1::METHODS`; empty is HMAC-SHA1.
+    pub signature_method: String,
+    pub consumer_key: String,
+    /// For RSA-*, the PEM private key.
+    pub consumer_secret: String,
+    /// Empty for two-legged requests.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub token: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub token_secret: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub realm: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -680,6 +702,14 @@ impl Request {
                     region: r(&a.region),
                     service: r(&a.service),
                     session_token: r(&a.session_token),
+                }),
+                Auth::OAuth1(o) => Auth::OAuth1(OAuth1 {
+                    signature_method: o.signature_method.clone(),
+                    consumer_key: r(&o.consumer_key),
+                    consumer_secret: r(&o.consumer_secret),
+                    token: r(&o.token),
+                    token_secret: r(&o.token_secret),
+                    realm: r(&o.realm),
                 }),
                 Auth::Jwt(j) => Auth::Jwt(Jwt {
                     algorithm: j.algorithm.clone(),

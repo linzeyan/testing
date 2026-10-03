@@ -22,7 +22,7 @@ fn mac(key: &[u8], data: &str) -> Vec<u8> {
 }
 
 /// RFC 3986 unreserved characters stay; everything else is %XX, upper case (AWS's rule).
-fn uri_encode(s: &str, keep_slash: bool) -> String {
+pub(crate) fn uri_encode(s: &str, keep_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

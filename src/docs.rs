@@ -72,6 +72,13 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
         Auth::Inherit => None,
         Auth::None => Some("none".to_owned()),
         Auth::Bearer { .. } => Some("Bearer token".into()),
+        Auth::OAuth1(o) => Some(format!(
+            "OAuth 1.0, {}",
+            match o.signature_method.as_str() {
+                "" => "HMAC-SHA1",
+                m => m,
+            }
+        )),
         Auth::Jwt(j) => Some(format!("JWT Bearer, signed with {}", j.algorithm)),
         Auth::Basic { .. } => Some("Basic".into()),
         Auth::Digest { .. } => Some("Digest".into()),

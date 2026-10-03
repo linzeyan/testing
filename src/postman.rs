@@ -7,7 +7,8 @@ use std::path::Path;
 use serde_json::{Map, Value, json};
 
 use crate::model::{
-    self, Auth, AwsV4, Body, Example, Folder, Grant, Jwt, KeyValue, OAuth2, Request, Settings,
+    self, Auth, AwsV4, Body, Example, Folder, Grant, Jwt, KeyValue, OAuth1, OAuth2, Request,
+    Settings,
 };
 use crate::store::{Node, Workspace, folder_name, safe_name};
 
@@ -311,6 +312,21 @@ fn auth(v: &Value) -> Result<Auth, String> {
         "awsv4" if p("addAuthDataToQuery") == "true" => {
             return Err("awsv4 (auth data in the query)".into());
         }
+        // Only the header form, which is all apitool sends.
+        "oauth1" if p("addParamsToHeader") == "false" => {
+            return Err("oauth1 (parameters in the body or query)".into());
+        }
+        "oauth1" => Auth::OAuth1(OAuth1 {
+            consumer_secret: match p("signatureMethod").starts_with("RSA") {
+                true => p("privateKey"),
+                false => p("consumerSecret"),
+            },
+            signature_method: p("signatureMethod"),
+            consumer_key: p("consumerKey"),
+            token: p("token"),
+            token_secret: p("tokenSecret"),
+            realm: p("realm"),
+        }),
         // Only the header form: a query-parameter token or base64 secret would go out wrong.
         "jwt" if p("addTokenTo") == "queryParam" => {
             return Err("jwt (token in the query)".into());
@@ -622,6 +638,22 @@ fn auth_json(auth: &Auth) -> Option<Value> {
                 ("key", key.as_str()),
                 ("value", value.as_str()),
                 ("in", if *in_query { "query" } else { "header" }),
+            ],
+        ),
+        Auth::OAuth1(o) => typed(
+            "oauth1",
+            &[
+                ("signatureMethod", o.signature_method.as_str()),
+                ("consumerKey", o.consumer_key.as_str()),
+                match o.signature_method.starts_with("RSA") {
+                    true => ("privateKey", o.consumer_secret.as_str()),
+                    false => ("consumerSecret", o.consumer_secret.as_str()),
+                },
+                ("token", o.token.as_str()),
+                ("tokenSecret", o.token_secret.as_str()),
+                ("realm", o.realm.as_str()),
+                ("version", "1.0"),
+                ("addParamsToHeader", "true"),
             ],
         ),
         Auth::Jwt(j) => typed(
@@ -1096,6 +1128,21 @@ mod tests {
                 },
             ),
             (
+                "api/oauth1",
+                Request {
+                    url: "{{base}}/me".into(),
+                    auth: Auth::OAuth1(OAuth1 {
+                        signature_method: "RSA-SHA256".into(),
+                        consumer_key: "ck".into(),
+                        consumer_secret: "{{private_key}}".into(),
+                        token: "t".into(),
+                        token_secret: "ts".into(),
+                        realm: "r".into(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
                 "api/jwt-rs",
                 Request {
                     url: "{{base}}/me".into(),
@@ -1138,7 +1185,7 @@ mod tests {
         let (json, count, skipped) = collection(&ws, &api).unwrap();
         assert_eq!(
             (count, skipped),
-            (10, 1),
+            (11, 1),
             "WebSocket has no place in a collection"
         );
         let Import::Collection {
@@ -1157,7 +1204,7 @@ mod tests {
         assert_eq!(folders[""], folder);
         assert_eq!(folders["admin"], sub);
         let back: HashMap<_, _> = back.into_iter().collect();
-        assert_eq!(back.len(), 10);
+        assert_eq!(back.len(), 11);
         for (name, _) in requests.iter().filter(|(n, _)| *n != "api/live") {
             let mut saved = ws.load_request(&ws.request_path(name).unwrap()).unwrap();
             saved.inherited = Default::default();

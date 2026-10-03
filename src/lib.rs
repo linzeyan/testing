@@ -22,6 +22,7 @@ mod mock;
 mod model;
 mod mqtt;
 mod net;
+mod oauth1;
 mod openapi;
 mod postman;
 mod runner;

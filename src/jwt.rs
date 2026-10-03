@@ -36,7 +36,7 @@ pub fn sign(j: &Jwt) -> Result<String, String> {
     Ok(format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig)))
 }
 
-fn signature_of(alg: &str, secret: &str, msg: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn signature_of(alg: &str, secret: &str, msg: &[u8]) -> Result<Vec<u8>, String> {
     let rng = SystemRandom::new();
     let hs = |a| {
         Ok(hmac::sign(&hmac::Key::new(a, secret.as_bytes()), msg)

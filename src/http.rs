@@ -185,13 +185,19 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
     for h in &req.headers {
         b = b.header(h.key.as_str(), h.value.as_str());
     }
-    let mut aws = None;
+    // What signs the finished request: what is signed is then exactly what goes out.
+    type Signer = Box<dyn FnOnce(&mut reqwest::Request) -> Result<(), String>>;
+    let mut sign_last: Option<Signer> = None;
+    let now = std::time::SystemTime::now();
     b = match req.auth {
         // `resolved` has already made an API key a header or query parameter.
         Auth::None | Auth::Inherit | Auth::ApiKey { .. } => b,
-        // Signed last, over the finished request.
         Auth::AwsV4(a) => {
-            aws = Some(a);
+            sign_last = Some(Box::new(move |w| crate::sigv4::sign(w, &a, now)));
+            b
+        }
+        Auth::OAuth1(o) => {
+            sign_last = Some(Box::new(move |w| crate::oauth1::sign(w, &o, now)));
             b
         }
         Auth::Bearer { token } => b.bearer_auth(token),
@@ -248,11 +254,11 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
             typed(b, "application/json").body(payload.to_string())
         }
     };
-    let Some(aws) = aws else {
+    let Some(sign) = sign_last else {
         return Ok(b);
     };
     let mut wire = b.build().map_err(|e| error_chain(&e))?;
-    crate::sigv4::sign(&mut wire, &aws, std::time::SystemTime::now())?;
+    sign(&mut wire)?;
     Ok(reqwest::RequestBuilder::from_parts(client.clone(), wire))
 }
 
@@ -917,6 +923,26 @@ pub(crate) mod tests {
     }
 
     /// The Headers tab's "added on Send" plus the user's own must be exactly what arrives.
+    #[test]
+    fn oauth1_signs_the_finished_request() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let req = Request {
+            url: "http://x.test/a?b=1".into(),
+            auth: Auth::OAuth1(crate::model::OAuth1 {
+                consumer_key: "ck".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let wire = build(&client(&rt), req).unwrap().build().unwrap();
+        let h = wire.headers()["authorization"].to_str().unwrap();
+        assert!(h.starts_with(r#"OAuth oauth_consumer_key="ck""#), "{h}");
+        assert!(h.contains(r#"oauth_signature_method="HMAC-SHA1""#), "{h}");
+    }
+
     #[test]
     fn a_jwt_is_signed_from_the_resolved_claims_and_sent_as_bearer() {
         use base64::Engine as _;

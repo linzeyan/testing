@@ -5656,6 +5656,15 @@ fn auth_editor(
         ),
         ("AWS Signature", Auth::AwsV4(model::AwsV4::default())),
         (
+            "OAuth 1.0",
+            Auth::OAuth1(model::OAuth1 {
+                signature_method: "HMAC-SHA1".into(),
+                consumer_key: user(),
+                consumer_secret: pass(),
+                ..Default::default()
+            }),
+        ),
+        (
             "JWT Bearer",
             Auth::Jwt(model::Jwt {
                 algorithm: "HS256".into(),
@@ -5727,6 +5736,31 @@ fn auth_editor(
                     &mut a.session_token,
                     "temporary credentials only",
                 );
+            }
+            Auth::OAuth1(o) => {
+                ui.label("Signature");
+                egui::ComboBox::from_id_salt("oauth1-method")
+                    .selected_text(o.signature_method.as_str())
+                    .show_ui(ui, |ui| {
+                        for m in crate::oauth1::METHODS {
+                            ui.selectable_value(&mut o.signature_method, m.to_owned(), m);
+                        }
+                    });
+                ui.end_row();
+                text(ui, "Consumer key", &mut o.consumer_key, "");
+                if o.signature_method.starts_with("RSA") {
+                    text(
+                        ui,
+                        "Private key",
+                        &mut o.consumer_secret,
+                        "{{private_key}} (PEM)",
+                    );
+                } else {
+                    secret(ui, "Consumer secret", &mut o.consumer_secret);
+                }
+                text(ui, "Access token", &mut o.token, "empty for two-legged");
+                secret(ui, "Token secret", &mut o.token_secret);
+                text(ui, "Realm", &mut o.realm, "optional");
             }
             Auth::Jwt(j) => {
                 ui.label("Algorithm");
@@ -5868,6 +5902,13 @@ fn auth_editor(
         }
         Auth::OAuth2(_) => {
             ui.weak("The token is fetched on Send and reused until it expires or is rejected.");
+        }
+        Auth::OAuth1(_) => {
+            ui.weak(
+                "Each Send is signed over its method, URL, query and form body with a fresh \
+                 nonce and timestamp. Get the access token from the provider's sign-in flow \
+                 first and paste it here.",
+            );
         }
         Auth::Jwt(_) => {
             ui.weak(
