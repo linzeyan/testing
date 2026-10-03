@@ -251,6 +251,77 @@ pm.sendRequest = function (req, cb) {
   return err ? Promise.reject(err) : Promise.resolve(res);
 };
 var __asyncError;
+// The Assert table's right-hand side: a number, true/false/null, a quoted string, or text;
+// `{{vars}}` resolved first.
+function __literal(s) {
+  s = pm.variables.replaceIn(String(s).trim());
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  if (s === 'null') return null;
+  if (s === 'undefined') return undefined;
+  if (s !== '' && !isNaN(Number(s))) return Number(s);
+  var q = s.charAt(0);
+  if (s.length > 1 && (q === '"' || q === "'") && s.charAt(s.length - 1) === q) return s.slice(1, -1);
+  return s;
+}
+function __list(s) {
+  s = String(s).trim();
+  if (s.charAt(0) === '[' && s.charAt(s.length - 1) === ']') s = s.slice(1, -1);
+  return s.split(',').map(__literal);
+}
+function __regex(s) {
+  s = pm.variables.replaceIn(String(s).trim());
+  if (s.length > 1 && s.charAt(0) === '/' && s.charAt(s.length - 1) === '/') s = s.slice(1, -1);
+  return new RegExp(s);
+}
+var __ops = (function (E) {
+  return {
+    eq: function (l, a) { E(l).to.eql(__literal(a)); },
+    neq: function (l, a) { E(l).to.not.eql(__literal(a)); },
+    gt: function (l, a) { E(l).to.be.above(__literal(a)); },
+    gte: function (l, a) { E(l).to.be.at.least(__literal(a)); },
+    lt: function (l, a) { E(l).to.be.below(__literal(a)); },
+    lte: function (l, a) { E(l).to.be.at.most(__literal(a)); },
+    in: function (l, a) { E(__list(a)).to.deep.include(l); },
+    notIn: function (l, a) { E(__list(a)).to.not.deep.include(l); },
+    contains: function (l, a) { E(l).to.include(__literal(a)); },
+    notContains: function (l, a) { E(l).to.not.include(__literal(a)); },
+    length: function (l, a) { E(l).to.have.lengthOf(__literal(a)); },
+    matches: function (l, a) { E(String(l)).to.match(__regex(a)); },
+    notMatches: function (l, a) { E(String(l)).to.not.match(__regex(a)); },
+    startsWith: function (l, a) { var x = String(__literal(a)); E(String(l).slice(0, x.length), 'start').to.equal(x); },
+    endsWith: function (l, a) { var x = String(__literal(a)); E(String(l).slice(-x.length), 'end').to.equal(x); },
+    between: function (l, a) { var b = __list(a); E(l).to.be.within(b[0], b[1]); },
+    isEmpty: function (l) { E(l).to.be.empty; },
+    isNotEmpty: function (l) { E(l).to.not.be.empty; },
+    isNull: function (l) { E(l).to.be.null; },
+    isUndefined: function (l) { E(l).to.be.undefined; },
+    isDefined: function (l) { E(l).to.not.be.undefined; },
+    isTruthy: function (l) { E(l).to.be.ok; },
+    isFalsy: function (l) { E(l).to.not.be.ok; },
+    isJson: function (l) { E(l !== null && typeof l === 'object', 'expected ' + __str(l) + ' to be JSON').to.equal(true); },
+    isNumber: function (l) { E(l).to.be.a('number'); },
+    isString: function (l) { E(l).to.be.a('string'); },
+    isBoolean: function (l) { E(l).to.be.a('boolean'); },
+    isArray: function (l) { E(l).to.be.an('array'); }
+  };
+})(chai.expect);
+// Rows of [left, "op value"]; the left side is a JS expression over `res`, as in Bruno.
+function __asserts(rows) {
+  var text = __in.response.body, body;
+  try { body = JSON.parse(text); } catch (e) { body = text; }
+  var headers = {};
+  __in.response.headers.forEach(function (h) { headers[String(h[0]).toLowerCase()] = h[1]; });
+  var res = { status: __in.response.code, statusText: __in.response.status, responseTime: __in.response.time, headers: headers, body: body };
+  rows.forEach(function (row) {
+    var spec = row[1], gap = spec.indexOf(' ');
+    var op = gap < 0 ? spec : spec.slice(0, gap), arg = gap < 0 ? '' : spec.slice(gap + 1);
+    if (!__has(__ops, op)) { op = 'eq'; arg = spec; }
+    pm.test(row[0] + ' ' + spec, function () {
+      __ops[op](new Function('res', 'return (' + row[0] + ');')(res), arg);
+    });
+  });
+}
 if (__in.response) {
   var __res = __in.response;
   var __resHeaders = {
@@ -706,6 +777,91 @@ mod tests {
             "{parts:?}"
         );
         assert_eq!(parts[2], "{{nope}}", "unknown names stay verbatim");
+    }
+
+    /// The Assert table: each operator Bruno offers must pass on what matches and fail on
+    /// what doesn't, or a green row would mean nothing.
+    #[test]
+    fn assert_rows_check_the_response_without_js() {
+        let (req, env) = (
+            request(),
+            HashMap::from([("want".to_owned(), "ann".to_owned())]),
+        );
+        let headers = vec![("Content-Type".to_owned(), "application/json".to_owned())];
+        let body = r#"{"name":"ann","items":[1,2,3],"none":null,"ok":true,"empty":[],"id":"a-17"}"#;
+        let resp = ScriptResponse {
+            code: 201,
+            status: "Created",
+            time: 40,
+            headers: &headers,
+            body,
+        };
+        let rows = serde_json::json!([
+            ["res.status", "eq 201"],
+            ["res.status", "201"],
+            ["res.status", "in 200,201"],
+            ["res.status", "notIn [400, 500]"],
+            ["res.status", "between 200,299"],
+            ["res.status", "neq 200"],
+            ["res.responseTime", "lt 1000"],
+            ["res.responseTime", "gte 40"],
+            ["res.headers['content-type']", "contains json"],
+            ["res.body.name", "eq {{want}}"],
+            ["res.body.name", "eq 'ann'"],
+            ["res.body.items", "length 3"],
+            ["res.body.items", "contains 2"],
+            ["res.body.items.length", "gt 2"],
+            ["res.body.id", "matches /^a-\\d+$/"],
+            ["res.body.id", "startsWith a-"],
+            ["res.body.id", "endsWith 17"],
+            ["res.body.none", "isNull"],
+            ["res.body.missing", "isUndefined"],
+            ["res.body.ok", "isBoolean"],
+            ["res.body.empty", "isEmpty"],
+            ["res.body", "isJson"],
+            ["res.body.items", "isArray"],
+            // These must fail.
+            ["res.status", "eq 200"],
+            ["res.body.items", "length 2"],
+            ["res.body.name", "isNumber"],
+            ["res.body.id", "notMatches ^a"],
+            ["res.body.nope.deeper", "isDefined"],
+            ["res.body.id", "startsWith 17"],
+            ["res.body.id", "endsWith a-"],
+        ]);
+        let out = run(
+            &format!("__asserts({rows});"),
+            &input(&req, &env, Some(resp)),
+        );
+        assert_eq!(out.error, None);
+        let failed: Vec<_> = out
+            .tests
+            .iter()
+            .filter(|t| !t.passed)
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(
+            failed,
+            [
+                "res.status eq 200",
+                "res.body.items length 2",
+                "res.body.name isNumber",
+                "res.body.id notMatches ^a",
+                "res.body.nope.deeper isDefined",
+                "res.body.id startsWith 17",
+                "res.body.id endsWith a-",
+            ],
+            "{:?}",
+            out.tests
+        );
+        assert_eq!(out.tests.len(), 30);
+        assert!(
+            out.tests[23]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("expected 201 to deeply equal 200")
+        );
     }
 
     #[test]

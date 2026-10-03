@@ -45,6 +45,10 @@ pub struct Request {
     /// JavaScript run on the response (`pm.test`, variable capture).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub tests: String,
+    /// Bruno-style checks without JS: key `res.status`, value `eq 200` (the operator
+    /// first; none means `eq`). Each row is a test result.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub asserts: Vec<KeyValue>,
     #[serde(skip_serializing_if = "Settings::is_default")]
     pub settings: Settings,
     #[serde(skip_serializing_if = "Mqtt::is_default")]
@@ -249,6 +253,7 @@ impl Default for Request {
             tests: String::new(),
             settings: Settings::default(),
             mqtt: Mqtt::default(),
+            asserts: Vec::new(),
             examples: Vec::new(),
             inherited: Inherited::default(),
         }
@@ -681,6 +686,7 @@ impl Request {
                 will_payload: r(&self.mqtt.will_payload),
                 ..self.mqtt.clone()
             },
+            asserts: Vec::new(),
             examples: Vec::new(),
             inherited: Inherited::default(),
         };
@@ -941,6 +947,7 @@ mod tests {
             pre_request: "pm.environment.set(\"ts\", Date.now());".into(),
             tests: "pm.test(\"ok\", function () {\n    pm.response.to.have.status(200);\n});\n"
                 .into(),
+            asserts: vec![KeyValue::new("res.body.items", "length 3")],
             settings: Settings {
                 http_version: HttpVersion::Http1,
                 follow_redirects: false,

@@ -139,7 +139,19 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
     let response = send(&client, wire).await;
 
     if let Ok(resp) = &response {
-        for (folder, code) in scripts(&req.inherited.tests, &req.tests) {
+        let mut tests = scripts(&req.inherited.tests, &req.tests);
+        let asserts: Vec<_> = (req.asserts.iter())
+            .filter(|a| a.enabled && !a.key.trim().is_empty())
+            .map(|a| (a.key.trim(), a.value.trim()))
+            .collect();
+        if !asserts.is_empty() {
+            // After the scripts, so a row can check what they computed into a variable.
+            tests.push((
+                String::new(),
+                format!("__asserts({});", serde_json::json!(asserts)),
+            ));
+        }
+        for (folder, code) in tests {
             let wire = WireRequest {
                 method: req.method.clone(),
                 url: req.url.clone(),
@@ -788,6 +800,38 @@ mod tests {
         }
         // The last write wins and is handed back for persisting.
         assert_eq!(env["session"], Some("bob".into()));
+    }
+
+    /// The request's Assert rows run after its tests script, with the variables it set.
+    #[test]
+    fn assert_rows_become_test_results() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt.block_on(build_client(Network::default())).unwrap();
+        let base = crate::http::tests::echo_server();
+        let mut off = KeyValue::new("res.status", "eq 404");
+        off.enabled = false;
+        let req = Request {
+            url: format!("{base}/x"),
+            tests: r#"pm.environment.set("code", pm.response.code);"#.into(),
+            asserts: vec![KeyValue::new("res.status", "eq {{code}}"), off],
+            ..Default::default()
+        };
+        let out = rt.block_on(super::run(
+            client,
+            &Info::single("t".into()),
+            req,
+            Vars::default(),
+        ));
+        let names: Vec<_> = out
+            .tests
+            .iter()
+            .map(|t| (t.name.as_str(), t.passed))
+            .collect();
+        assert_eq!(names, [("res.status eq {{code}}", true)]);
     }
 
     /// Postman's flow control: jump over a request, poll one until it's done, stop the

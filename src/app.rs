@@ -76,6 +76,7 @@ enum ReqTab {
     Body,
     Auth,
     Scripts,
+    Asserts,
     Settings,
     Examples,
     Docs,
@@ -3108,6 +3109,11 @@ impl App {
                     ReqTab::Scripts,
                     dot(no_scripts, "Scripts"),
                 );
+                ui.selectable_value(
+                    &mut self.req_tab,
+                    ReqTab::Asserts,
+                    tab(count(&open.draft.asserts), "Asserts"),
+                );
                 // How a single HTTP exchange goes out, or MQTT's connection; other
                 // streams and gRPC have none.
                 if !matches!(open.draft.method.as_str(), "WS" | "SSE" | "GRPC") {
@@ -3190,6 +3196,11 @@ impl App {
                         &mut open.draft.tests,
                         &open.draft.inherited,
                     ),
+                    ReqTab::Asserts => {
+                        kv_table(ui, "asserts", &mut open.draft.asserts, &all_vars, false);
+                        ui.add_space(8.0);
+                        ui.weak(ASSERTS_HINT);
+                    }
                     ReqTab::Settings if open.draft.method == "MQTT" => {
                         mqtt_settings(ui, &mut open.draft.mqtt)
                     }
@@ -5892,6 +5903,14 @@ fn shortcut_list(ui: &mut egui::Ui) {
             }
         });
 }
+
+const ASSERTS_HINT: &str = "Key: what to check, e.g. res.status, res.body.items.length, \
+    res.body[0].id, res.headers['content-type'], res.responseTime.\n\
+    Value: an operator and what to compare with, e.g. eq 200, neq, gt 0, gte, lt 500, lte, \
+    in 200,201, notIn, contains ok, notContains, length 3, matches ^ok, notMatches, \
+    startsWith, endsWith, between 1,10, isEmpty, isNotEmpty, isNull, isUndefined, isDefined, \
+    isTruthy, isFalsy, isJson, isNumber, isString, isBoolean, isArray; no operator is eq. \
+    {{variables}} work. Each row shows up under Tests.";
 
 const PRE_SNIPPETS: &[(&str, &str)] = &[
     (
