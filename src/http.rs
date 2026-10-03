@@ -195,6 +195,7 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
             b
         }
         Auth::Bearer { token } => b.bearer_auth(token),
+        Auth::Jwt(j) => b.bearer_auth(crate::jwt::sign(&j)?),
         Auth::Basic { username, password } => b.basic_auth(username, Some(password)),
         // Both need a round trip first; `execute` and `with_token` take care of it.
         Auth::Digest { .. } => {
@@ -916,6 +917,52 @@ pub(crate) mod tests {
     }
 
     /// The Headers tab's "added on Send" plus the user's own must be exactly what arrives.
+    #[test]
+    fn a_jwt_is_signed_from_the_resolved_claims_and_sent_as_bearer() {
+        use base64::Engine as _;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let req = Request {
+            url: echo_server(),
+            auth: Auth::Jwt(crate::model::Jwt {
+                algorithm: "HS256".into(),
+                secret: "{{key}}".into(),
+                payload: r#"{"sub": "{{user}}"}"#.into(),
+            }),
+            ..Default::default()
+        };
+        let vars = std::collections::HashMap::from([
+            ("key".into(), "k".into()),
+            ("user".into(), "ada".into()),
+        ]);
+        let (req, _) = req.resolved(&vars);
+        let resp = rt.block_on(execute(client(&rt), req)).unwrap();
+        let auth = (received(&resp).into_iter())
+            .find_map(|(k, v)| (k == "authorization").then_some(v))
+            .unwrap();
+        let token = auth.strip_prefix("Bearer ").unwrap();
+        let claims = token.split('.').nth(1).unwrap();
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(claims)
+            .unwrap();
+        assert_eq!(claims, br#"{"sub":"ada"}"#);
+        let signed_with = |secret: &str| {
+            crate::jwt::sign(&crate::model::Jwt {
+                algorithm: "HS256".into(),
+                secret: secret.into(),
+                payload: r#"{"sub":"ada"}"#.into(),
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            token,
+            signed_with("k"),
+            "the secret's variable is resolved too"
+        );
+    }
+
     #[test]
     fn the_headers_tab_predicts_every_header_that_arrives() {
         let rt = tokio::runtime::Builder::new_current_thread()

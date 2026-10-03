@@ -7,7 +7,7 @@ use std::path::Path;
 use serde_json::{Map, Value, json};
 
 use crate::model::{
-    self, Auth, AwsV4, Body, Example, Folder, Grant, KeyValue, OAuth2, Request, Settings,
+    self, Auth, AwsV4, Body, Example, Folder, Grant, Jwt, KeyValue, OAuth2, Request, Settings,
 };
 use crate::store::{Node, Workspace, folder_name, safe_name};
 
@@ -311,6 +311,24 @@ fn auth(v: &Value) -> Result<Auth, String> {
         "awsv4" if p("addAuthDataToQuery") == "true" => {
             return Err("awsv4 (auth data in the query)".into());
         }
+        // Only the header form: a query-parameter token or base64 secret would go out wrong.
+        "jwt" if p("addTokenTo") == "queryParam" => {
+            return Err("jwt (token in the query)".into());
+        }
+        "jwt" if p("isSecretBase64Encoded") == "true" => {
+            return Err("jwt (base64-encoded secret)".into());
+        }
+        "jwt" => {
+            let algorithm = p("algorithm");
+            Auth::Jwt(Jwt {
+                secret: match algorithm.starts_with("HS") {
+                    true => p("secret"),
+                    false => p("privateKey"),
+                },
+                algorithm,
+                payload: p("payload"),
+            })
+        }
         "awsv4" => Auth::AwsV4(AwsV4 {
             access_key: p("accessKey"),
             secret_key: p("secretKey"),
@@ -604,6 +622,19 @@ fn auth_json(auth: &Auth) -> Option<Value> {
                 ("key", key.as_str()),
                 ("value", value.as_str()),
                 ("in", if *in_query { "query" } else { "header" }),
+            ],
+        ),
+        Auth::Jwt(j) => typed(
+            "jwt",
+            &[
+                ("algorithm", j.algorithm.as_str()),
+                match j.algorithm.starts_with("HS") {
+                    true => ("secret", j.secret.as_str()),
+                    false => ("privateKey", j.secret.as_str()),
+                },
+                ("payload", j.payload.as_str()),
+                ("addTokenTo", "header"),
+                ("headerPrefix", "Bearer"),
             ],
         ),
         Auth::AwsV4(a) => typed(
@@ -1053,6 +1084,30 @@ mod tests {
                 },
             ),
             (
+                "api/jwt",
+                Request {
+                    url: "{{base}}/me".into(),
+                    auth: Auth::Jwt(Jwt {
+                        algorithm: "HS256".into(),
+                        secret: "{{jwt_secret}}".into(),
+                        payload: r#"{"sub": "ada"}"#.into(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                "api/jwt-rs",
+                Request {
+                    url: "{{base}}/me".into(),
+                    auth: Auth::Jwt(Jwt {
+                        algorithm: "RS256".into(),
+                        secret: "{{private_key}}".into(),
+                        payload: "{}".into(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
                 "api/spa",
                 Request {
                     method: "GET".into(),
@@ -1083,7 +1138,7 @@ mod tests {
         let (json, count, skipped) = collection(&ws, &api).unwrap();
         assert_eq!(
             (count, skipped),
-            (8, 1),
+            (10, 1),
             "WebSocket has no place in a collection"
         );
         let Import::Collection {
@@ -1102,7 +1157,7 @@ mod tests {
         assert_eq!(folders[""], folder);
         assert_eq!(folders["admin"], sub);
         let back: HashMap<_, _> = back.into_iter().collect();
-        assert_eq!(back.len(), 8);
+        assert_eq!(back.len(), 10);
         for (name, _) in requests.iter().filter(|(n, _)| *n != "api/live") {
             let mut saved = ws.load_request(&ws.request_path(name).unwrap()).unwrap();
             saved.inherited = Default::default();

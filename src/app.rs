@@ -5655,6 +5655,14 @@ fn auth_editor(
             },
         ),
         ("AWS Signature", Auth::AwsV4(model::AwsV4::default())),
+        (
+            "JWT Bearer",
+            Auth::Jwt(model::Jwt {
+                algorithm: "HS256".into(),
+                secret: pass(),
+                payload: "{\n  \"sub\": \"\",\n  \"iat\": {{$timestamp}}\n}".into(),
+            }),
+        ),
     ];
     let label_of = |a: &Auth| {
         let d = std::mem::discriminant(a);
@@ -5719,6 +5727,49 @@ fn auth_editor(
                     &mut a.session_token,
                     "temporary credentials only",
                 );
+            }
+            Auth::Jwt(j) => {
+                ui.label("Algorithm");
+                egui::ComboBox::from_id_salt("jwt-alg")
+                    .selected_text(j.algorithm.as_str())
+                    .show_ui(ui, |ui| {
+                        for alg in crate::jwt::ALGORITHMS {
+                            ui.selectable_value(&mut j.algorithm, alg.to_owned(), alg);
+                        }
+                    });
+                ui.end_row();
+                if j.algorithm.starts_with("HS") {
+                    secret(ui, "Secret", &mut j.secret);
+                } else {
+                    ui.label("Private key");
+                    var_edit(
+                        ui,
+                        egui::Id::new(("auth", "jwt-key")),
+                        &mut j.secret,
+                        vars,
+                        egui::TextStyle::Monospace,
+                        true,
+                        &[],
+                        |e| {
+                            e.hint_text("{{private_key}} or -----BEGIN PRIVATE KEY-----…")
+                                .desired_rows(3)
+                                .desired_width(420.0)
+                        },
+                    );
+                    ui.end_row();
+                }
+                ui.label("Payload");
+                var_edit(
+                    ui,
+                    egui::Id::new(("auth", "jwt-payload")),
+                    &mut j.payload,
+                    vars,
+                    egui::TextStyle::Monospace,
+                    true,
+                    &[],
+                    |e| e.desired_rows(4).desired_width(420.0),
+                );
+                ui.end_row();
             }
             Auth::ApiKey {
                 key,
@@ -5817,6 +5868,12 @@ fn auth_editor(
         }
         Auth::OAuth2(_) => {
             ui.weak("The token is fetched on Send and reused until it expires or is rejected.");
+        }
+        Auth::Jwt(_) => {
+            ui.weak(
+                "Signed on each Send and sent as Authorization: Bearer. Variables work in the \
+                 payload ({{$timestamp}} for iat); keep the secret in a secret environment.",
+            );
         }
         Auth::AwsV4(_) => {
             ui.weak(

@@ -15,6 +15,7 @@ mod http;
 mod import;
 mod insomnia;
 mod jsonpath;
+mod jwt;
 mod loadtest;
 mod mcp;
 mod mock;

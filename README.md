@@ -52,7 +52,7 @@ such as Citrix VDI. No installer: unzip and run.
   cookies included), each redirect and the peer address; a History menu in the
   response bar with the last 10 responses of each request (kept on disk, 1 MiB of body
   each); find in response (Ctrl+F; match case, whole word or regular expression; counts up to 10 000 hits); saved response
-  examples; request history; Bearer, Basic, Digest, API key (header or query), AWS Signature v4 (signed over the final URL, headers and body on every send; S3 and session tokens included; Postman's awsv4 both ways) and OAuth 2.0
+  examples; request history; Bearer, Basic, Digest, API key (header or query), AWS Signature v4 (signed over the final URL, headers and body on every send; S3 and session tokens included; Postman's awsv4 both ways), JWT Bearer (HS/RS/PS/ES 256–512 and EdDSA, signed per send from a JSON payload with variables; Postman's jwt both ways) and OAuth 2.0
   (client credentials, password, implicit, and authorization code with PKCE: Send opens the browser
   to sign in and catches the redirect on 127.0.0.1, and implicit takes its token from that redirect; an expired token is renewed with the
   refresh token when the provider gives one, without signing in again, and tokens are kept

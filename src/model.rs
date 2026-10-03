@@ -359,6 +359,20 @@ pub enum Auth {
     /// in 15 minutes.
     #[serde(rename = "awsv4")]
     AwsV4(AwsV4),
+    /// A token signed per request and sent as a Bearer token.
+    #[serde(rename = "jwt")]
+    Jwt(Jwt),
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Jwt {
+    /// One of `jwt::ALGORITHMS`.
+    pub algorithm: String,
+    /// The HMAC secret for HS*, a PEM private key for the rest.
+    pub secret: String,
+    /// The claims, as JSON.
+    pub payload: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -666,6 +680,11 @@ impl Request {
                     region: r(&a.region),
                     service: r(&a.service),
                     session_token: r(&a.session_token),
+                }),
+                Auth::Jwt(j) => Auth::Jwt(Jwt {
+                    algorithm: j.algorithm.clone(),
+                    secret: r(&j.secret),
+                    payload: r(&j.payload),
                 }),
             },
             // Scripts have already run by the time a request is resolved for the wire.
