@@ -395,6 +395,8 @@ enum NameKind {
     NewRequest(PathBuf),
     NewFolder(PathBuf),
     Rename(PathBuf),
+    /// The open request's draft, saved under a `folder/name`.
+    SaveAs(PathBuf),
     NewEnv,
     DuplicateEnv(String),
 }
@@ -1463,6 +1465,26 @@ impl App {
         }
     }
 
+    /// Like Postman: the original keeps what was saved, and this tab, response included,
+    /// becomes the new request.
+    fn save_as(&mut self, old: &Path, name: &str) -> Result<PathBuf, String> {
+        let new = self.ws.request_path(name)?;
+        if self.ws.exists(&new) {
+            return Err(format!("\"{}\" already exists", self.ws.display_name(&new)));
+        }
+        let Some(open) = self.open.as_mut().filter(|o| o.path == old) else {
+            return Err("The request isn't open any more".into());
+        };
+        self.ws.save_request(&new, &open.draft)?;
+        open.saved = open.draft.clone();
+        self.follow_move(old, &new);
+        // Another folder passes down other variables, auth and scripts.
+        self.refresh_inherited();
+        self.reveal = Some(new.clone());
+        self.status = format!("Saved as \"{}\"", self.ws.display_name(&new));
+        Ok(new)
+    }
+
     fn submit_name(&mut self) {
         let Some(Dialog::Name { kind, name, .. }) = &mut self.dialog else {
             return;
@@ -1487,6 +1509,10 @@ impl App {
                     self.follow_move(&old, &new);
                     None
                 })
+            }
+            NameKind::SaveAs(old) => {
+                let old = old.clone();
+                self.save_as(&old, &name).map(|_| None)
             }
         };
         let Some(Dialog::Name { kind, error, .. }) = &mut self.dialog else {
@@ -2503,7 +2529,7 @@ impl App {
         };
         let (mut send, mut save, mut cancel) = (false, false, false);
         let (mut toggle_load, mut start_load) = (false, false);
-        let mut download = false;
+        let (mut download, mut save_as) = (false, false);
         let mut define: Option<Vec<String>> = None;
         let mut fetch_schema = false;
         let mut example = None;
@@ -2614,6 +2640,18 @@ impl App {
                         .on_hover_text("Unsaved changes");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Right to left: this lands to the right of Save.
+                    let more = ui.button("⏷");
+                    egui::Popup::menu(&more)
+                        .id(egui::Id::new("save-more"))
+                        .show(|ui| {
+                            save_as = ui
+                                .button("Save as…")
+                                .on_hover_text(
+                                    "Save these edits as a new request; this one stays as saved",
+                                )
+                                .clicked();
+                        });
                     save = ui
                         .add_enabled(open.dirty(), egui::Button::new("Save"))
                         .on_hover_text(ui.ctx().format_shortcut(&SAVE))
@@ -3023,6 +3061,10 @@ impl App {
         if download {
             self.ask_download();
         }
+        if save_as && let Some(open) = &self.open {
+            let copy = format!("{} copy", self.ws.display_name(&open.path));
+            self.dialog = Some(Dialog::name(NameKind::SaveAs(open.path.clone()), copy));
+        }
         if fetch_schema {
             self.fetch_schema(ui.ctx());
         }
@@ -3157,9 +3199,13 @@ impl App {
                         NameKind::NewRequest(_) => "New request",
                         NameKind::NewFolder(_) => "New folder",
                         NameKind::Rename(_) => "Rename",
+                        NameKind::SaveAs(_) => "Save as",
                         NameKind::NewEnv => "New environment",
                         NameKind::DuplicateEnv(_) => "Duplicate environment",
                     });
+                    if let NameKind::SaveAs(_) = kind {
+                        ui.weak("A folder in front puts it there: users/get user");
+                    }
                     let edit = ui.add(
                         egui::TextEdit::singleline(name)
                             .hint_text("Name")
@@ -7389,7 +7435,8 @@ mod ui_tests {
         let url = format!("http://{addr}/files/report.csv?v=2");
         h.state_mut().open.as_mut().unwrap().draft.url = url;
         h.run();
-        h.get_by_label("⏷").click();
+        // Save's ⏷ comes first, on the row above.
+        h.get_all_by_label("⏷").last().unwrap().click();
         h.run();
         h.get_by_label("Send and download…").click();
         h.run();
@@ -7419,6 +7466,61 @@ mod ui_tests {
             .as_ref()
             .unwrap();
         assert!(view.text.contains("saved.csv"), "{}", view.text);
+    }
+
+    /// Save as forks a variant without touching the original, and the copy picks up what
+    /// its new folder passes down.
+    #[test]
+    fn save_as_forks_the_edits_and_leaves_the_original_as_saved() {
+        let mut h = with_request("save-as");
+        let ws = h.state().ws.clone();
+        let team = ws.collections().join("team");
+        let folder = crate::model::Folder {
+            vars: vec![KeyValue::new("tenant", "t1")],
+            ..Default::default()
+        };
+        ws.save_folder(&team, &folder).unwrap();
+        h.state_mut().open.as_mut().unwrap().draft.url = "http://api.test/v2".into();
+        h.run();
+        h.get_all_by_label("⏷").next().unwrap().click();
+        h.run();
+        h.get_by_label("Save as…").click();
+        h.run();
+        let Some(Dialog::Name { name, .. }) = &mut h.state_mut().dialog else {
+            panic!("the save-as dialog should be open");
+        };
+        assert_eq!(name, "r copy", "free by default, next to the original");
+        *name = "team/r v2".into();
+        h.key_press(Key::Enter);
+        h.run();
+        shot(&mut h, "61-saved-as");
+
+        assert!(h.state().dialog.is_none());
+        let copy = team.join("r v2.toml");
+        assert_eq!(ws.load_request(&copy).unwrap().url, "http://api.test/v2");
+        let original = ws.collections().join("r.toml");
+        assert_eq!(ws.load_request(&original).unwrap().url, "", "kept as saved");
+        let open = h.state().open.as_ref().unwrap();
+        assert_eq!(open.path, copy, "the tab follows the copy");
+        assert!(!open.dirty());
+        assert_eq!(open.draft.inherited.vars.get("tenant").unwrap(), "t1");
+        assert_eq!(h.state().tabs.len(), 1);
+
+        // Never over another request.
+        h.get_all_by_label("⏷").next().unwrap().click();
+        h.run();
+        h.get_by_label("Save as…").click();
+        h.run();
+        if let Some(Dialog::Name { name, .. }) = &mut h.state_mut().dialog {
+            *name = "r".into();
+        }
+        h.key_press(Key::Enter);
+        h.run();
+        let Some(Dialog::Name { error, .. }) = &h.state().dialog else {
+            panic!("the dialog should stay to say why");
+        };
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(ws.load_request(&original).unwrap().url, "");
     }
 
     #[test]
