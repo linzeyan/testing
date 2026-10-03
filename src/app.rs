@@ -154,6 +154,12 @@ impl Tab {
     }
 }
 
+struct Repeat {
+    path: PathBuf,
+    every: Duration,
+    next: Instant,
+}
+
 struct Parked {
     open: Open,
     response: Option<Shown>,
@@ -617,6 +623,10 @@ pub struct App {
     /// Closed tabs and where they were, newest last, for Reopen Closed Tab. This session
     /// only, like a browser's.
     closed: Vec<(PathBuf, usize)>,
+    /// Send ⏷ "Repeat every": the open request, sent again this long after each send
+    /// started, never two at once. Ends with Stop, Cancel or another tab.
+    repeat: Option<Repeat>,
+    repeat_secs: u64,
     /// Outlives client rebuilds; saved to the workspace after responses.
     cookies: Arc<Jar>,
     /// `auth::grants()` when OAuth tokens were last saved to the workspace.
@@ -690,6 +700,8 @@ impl App {
             tree_filter: String::new(),
             reveal: None,
             closed: Vec::new(),
+            repeat: None,
+            repeat_secs: 5,
             cookies: Arc::new(Jar::from_json(&ws.load_cookies())),
             saved_grants: crate::auth::grants(),
             cookie_manager: false,
@@ -1479,6 +1491,26 @@ impl App {
         s.live = false;
     }
 
+    /// Sends the repeated request when its time has come and the last send is back.
+    fn tick_repeat(&mut self, ctx: &egui::Context) {
+        let Some(r) = &mut self.repeat else { return };
+        if self.open.as_ref().map(|o| &o.path) != Some(&r.path) {
+            self.repeat = None;
+            return;
+        }
+        // The answer to the last one wakes this up again.
+        if self.dialog.is_some() || self.pending.iter().any(|p| p.path == r.path) {
+            return;
+        }
+        let now = Instant::now();
+        if now < r.next {
+            ctx.request_repaint_after(r.next - now);
+            return;
+        }
+        r.next = now + r.every;
+        self.send(ctx, None);
+    }
+
     fn cancel(&mut self) {
         let path = self.open.as_ref().map(|o| &o.path);
         if let Some(i) = self.pending.iter().position(|p| Some(&p.path) == path) {
@@ -2050,6 +2082,7 @@ fn token_color(ui: &egui::Ui, t: Token) -> Color32 {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive();
+        self.tick_repeat(ui.ctx());
         let regained = ui.input(|i| {
             i.events
                 .iter()
@@ -2899,6 +2932,10 @@ impl App {
         let (mut send, mut save, mut cancel) = (false, false, false);
         let (mut toggle_load, mut start_load) = (false, false);
         let (mut download, mut save_as) = (false, false);
+        let (mut start_repeat, mut stop_repeat) = (false, false);
+        let repeating = (self.repeat.as_ref())
+            .filter(|r| r.path == open.path)
+            .map(|r| r.every.as_secs());
         let mut define: Option<Vec<String>> = None;
         let mut fetch_schema = false;
         let mut reflect = false;
@@ -3129,6 +3166,10 @@ impl App {
                 } else if pending.is_some() || live {
                     let label = if live { "Disconnect" } else { "Cancel" };
                     cancel = ui.add_sized(button, egui::Button::new(label)).clicked();
+                } else if let Some(every) = repeating {
+                    stop_repeat = (ui.add_sized(button, egui::Button::new("Stop repeat")))
+                        .on_hover_text(format!("Sending every {every} s"))
+                        .clicked();
                 } else {
                     let label = RichText::new(if streaming { "Connect" } else { "Send" })
                         .strong()
@@ -3153,6 +3194,15 @@ impl App {
                                 .button("Send and download…")
                                 .on_hover_text("Save the response straight to a file, for big ones")
                                 .clicked();
+                            ui.horizontal(|ui| {
+                                start_repeat = (ui.button("Repeat every"))
+                                    .on_hover_text(
+                                        "Send now and again at this interval, until stopped",
+                                    )
+                                    .clicked();
+                                let secs = egui::DragValue::new(&mut self.repeat_secs);
+                                ui.add(secs.range(1..=3600).suffix(" s"));
+                            });
                         });
                 }
             });
@@ -3519,12 +3569,22 @@ impl App {
         if save {
             self.save();
         }
+        if cancel || stop_repeat {
+            self.repeat = None;
+        }
         if cancel {
             if live {
                 self.disconnect()
             } else {
                 self.cancel()
             }
+        }
+        if start_repeat && let Some(open) = &self.open {
+            self.repeat = Some(Repeat {
+                path: open.path.clone(),
+                every: Duration::from_secs(self.repeat_secs),
+                next: Instant::now(),
+            });
         }
         if send {
             self.send(ui.ctx(), None);
@@ -8815,6 +8875,35 @@ mod ui_tests {
         assert!(kept.contains("gui-1"), "{kept}");
     }
 
+    #[test]
+    fn repeat_sends_again_on_its_interval_until_stopped() {
+        let mut h = with_request("repeat");
+        h.state_mut().open.as_mut().unwrap().draft.url = crate::http::tests::echo_server();
+        h.run();
+        let before = h.state().history.len();
+        let send = h.get_by_label("Send").rect();
+        // Send's own ⏷, on its row (Save has one too).
+        let more = (h.get_all_by_label("⏷"))
+            .find(|n| (n.rect().center().y - send.center().y).abs() < 4.0)
+            .unwrap();
+        more.click();
+        h.run();
+        h.get_by_label("Repeat every").click();
+        // Steps, not `run`: a repeat keeps asking to be woken, and `run` waits for quiet.
+        let back = |n: usize| move |app: &App| app.pending.is_empty() && app.history.len() == n;
+        wait_live(&mut h, back(before + 1));
+        assert!(h.query_by_label("Stop repeat").is_some());
+        // Nothing more until the interval is up; then the same request again.
+        h.step();
+        assert_eq!(h.state().history.len(), before + 1);
+        h.state_mut().repeat.as_mut().unwrap().next = Instant::now();
+        wait_live(&mut h, back(before + 2));
+        h.get_by_label("Stop repeat").click();
+        h.run();
+        assert!(h.state().repeat.is_none());
+        h.get_by_label("Send");
+    }
+
     /// Save as forks a variant without touching the original, and the copy picks up what
     /// its new folder passes down.
     #[test]
@@ -9921,7 +10010,12 @@ mod ui_tests {
         });
 
         h.get_by_label("Disconnect").click();
-        wait(&mut h, |app| !app.stream.as_ref().unwrap().live);
+        // Not `!live`: that flips on the click, before the session has said how it ended,
+        // and a slow runner (CI's macOS) then sees the events without the close.
+        wait(&mut h, |app| {
+            let events = app.stream.as_ref().unwrap().events();
+            matches!(events.last(), Some((_, Event::Closed(_))))
+        });
         let events = h.state().stream.as_ref().unwrap().events();
         let (_, last) = events.last().unwrap();
         assert_eq!(*last, Event::Closed("disconnected".into()), "{events:?}");
