@@ -9,6 +9,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 const CHAI: &str = include_str!("../vendor/chai.js");
+/// What Postman's sandbox lets `require` load; evaluated only when a script asks, so the
+/// other runs pay nothing for them.
+const LIBS: &[(&str, &str)] = &[
+    ("crypto-js", include_str!("../vendor/crypto-js.js")),
+    ("lodash", include_str!("../vendor/lodash.min.js")),
+    ("moment", include_str!("../vendor/moment.min.js")),
+];
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -251,6 +258,60 @@ pm.sendRequest = function (req, cb) {
   return err ? Promise.reject(err) : Promise.resolve(res);
 };
 var __asyncError;
+// Postman's sandbox modules. uuid and tv4 stand on what's native here already.
+var __modules = {
+  chai: chai,
+  uuid: { v4: function () { return __dynamic('$guid'); } },
+  tv4: {
+    error: null,
+    validate: function (data, schema) {
+      var e = __schemaErrors(JSON.stringify(schema), JSON.stringify(data));
+      this.error = e ? { message: e } : null;
+      return !e;
+    },
+    validateResult: function (data, schema) {
+      var valid = this.validate(data, schema);
+      return { valid: valid, error: this.error };
+    }
+  }
+};
+function require(name) {
+  name = String(name);
+  if (__has(__modules, name)) return __modules[name];
+  var src = __lib(name);
+  if (src === undefined || src === null) throw new Error("require: no module '" + name + "' here (crypto-js, lodash, moment, uuid, tv4, chai, atob, btoa)");
+  var module = { exports: {} };
+  new Function('module', 'exports', 'require', src)(module, module.exports, require);
+  return __modules[name] = module.exports;
+}
+if (typeof btoa !== 'function') {
+  var __b64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  // Latin-1 in and out, as in browsers: a byte per character.
+  var btoa = function (s) {
+    s = String(s);
+    var out = '';
+    for (var i = 0; i < s.length; i += 3) {
+      var a = s.charCodeAt(i), b = s.charCodeAt(i + 1), c = s.charCodeAt(i + 2);
+      if (a > 255 || b > 255 || c > 255) throw new Error('btoa: characters outside Latin-1');
+      var n = (a << 16) | ((b || 0) << 8) | (c || 0);
+      out += __b64[n >> 18 & 63] + __b64[n >> 12 & 63] + (i + 1 < s.length ? __b64[n >> 6 & 63] : '=') + (i + 2 < s.length ? __b64[n & 63] : '=');
+    }
+    return out;
+  };
+  var atob = function (s) {
+    s = String(s).replace(/[\s=]+/g, '');
+    var out = '', bits = 0, n = 0;
+    for (var i = 0; i < s.length; i++) {
+      var v = __b64.indexOf(s[i]);
+      if (v < 0) throw new Error('atob: not base64');
+      n = (n << 6) | v; bits += 6;
+      if (bits >= 8) { bits -= 8; out += String.fromCharCode(n >> bits & 255); }
+    }
+    return out;
+  };
+}
+__modules.atob = atob;
+__modules.btoa = btoa;
 // The Assert table's right-hand side: a number, true/false/null, a quoted string, or text;
 // `{{vars}}` resolved first.
 function __literal(s) {
@@ -405,6 +466,15 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
             .set(
                 "__schemaErrors",
                 rquickjs::Function::new(ctx.clone(), schema_errors).map_err(caught)?,
+            )
+            .map_err(caught)?;
+        ctx.globals()
+            .set(
+                "__lib",
+                rquickjs::Function::new(ctx.clone(), |name: String| {
+                    LIBS.iter().find(|(n, _)| *n == name).map(|(_, src)| *src)
+                })
+                .map_err(caught)?,
             )
             .map_err(caught)?;
         ctx.globals()
@@ -862,6 +932,43 @@ mod tests {
                 .unwrap()
                 .contains("expected 201 to deeply equal 200")
         );
+    }
+
+    /// Postman scripts sign requests with crypto-js and shape data with lodash and moment;
+    /// copied in, they must run as they did there.
+    #[test]
+    fn scripts_require_postmans_libraries() {
+        let (req, env) = (request(), HashMap::new());
+        let out = run(
+            r#"
+            var CryptoJS = require("crypto-js");
+            console.log(CryptoJS.HmacSHA256("data", "key").toString());
+            console.log(CryptoJS.enc.Base64.stringify(CryptoJS.SHA256("abc")));
+            console.log(require("lodash").chunk([1, 2, 3], 2));
+            console.log(require("moment").utc(0).add(1, "day").format("YYYY-MM-DD"));
+            console.log(/^[0-9a-f-]{36}$/.test(require("uuid").v4()));
+            var tv4 = require("tv4");
+            console.log(tv4.validate({ a: 1 }, { required: ["b"] }), !!tv4.error);
+            console.log(btoa("hi:there"), atob("aGk6dGhlcmU="));
+            console.log(require("lodash") === require("lodash"));
+            require("left-pad");
+            "#,
+            &input(&req, &env, None),
+        );
+        assert_eq!(
+            out.logs,
+            [
+                "5031fe3d989c6d1537a013fa6e739da23463fdaec3b70137d828e36ace221bd0",
+                "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+                "[[1,2],[3]]",
+                "1970-01-02",
+                "true",
+                "false true",
+                "aGk6dGhlcmU= hi:there",
+                "true",
+            ]
+        );
+        assert!(out.error.unwrap().contains("no module 'left-pad'"));
     }
 
     #[test]
