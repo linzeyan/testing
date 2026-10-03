@@ -41,11 +41,17 @@ jobs:
         shell: bash
         # Failures go into an annotation too: those can be read through the API with a
         # plain token, job logs can't.
+        # `shell: bash` runs with -e and pipefail: a failing test would end the script at
+        # the pipe, before the annotation.
         run: |
+          set +e +o pipefail
           cargo test --locked 2>&1 | tee test.log
           code=${PIPESTATUS[0]}
           if [ "$code" -ne 0 ]; then
-            msg=$(grep -E -A 6 'panicked at|^---- |^error' test.log | head -80 | awk '{printf "%s%%0A", $0}')
+            msg=$(grep -E -A 6 'panicked at|^---- |^error' test.log | head -80)
+            # A crash (a signal) prints no panic: the end of the log says what happened.
+            [ -n "$msg" ] || msg=$(tail -40 test.log)
+            msg=$(printf '%s\n' "$msg" | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
             echo "::error title=cargo test failed::$msg"
           fi
           exit "$code"

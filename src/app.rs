@@ -560,6 +560,8 @@ pub struct App {
     reveal: Option<PathBuf>,
     /// Outlives client rebuilds; saved to the workspace after responses.
     cookies: Arc<Jar>,
+    /// `auth::grants()` when OAuth tokens were last saved to the workspace.
+    saved_grants: u64,
     cookie_manager: bool,
     /// The code snippet panel, and its language (kept in the workspace state).
     code: bool,
@@ -611,6 +613,7 @@ impl App {
     pub fn new(ws: Workspace, renderer: String) -> Self {
         let (tx, rx) = mpsc::channel();
         let state = ws.load_state();
+        crate::auth::import(&ws.load_tokens());
         let mut app = Self {
             tree: ws.tree(),
             statuses: ws.last_statuses(),
@@ -620,6 +623,7 @@ impl App {
             tree_filter: String::new(),
             reveal: None,
             cookies: Arc::new(Jar::from_json(&ws.load_cookies())),
+            saved_grants: crate::auth::grants(),
             cookie_manager: false,
             code: false,
             code_lang: Some(state.code_lang)
@@ -1140,6 +1144,17 @@ impl App {
         }
     }
 
+    fn save_tokens(&mut self) {
+        let grants = crate::auth::grants();
+        if grants == self.saved_grants {
+            return;
+        }
+        self.saved_grants = grants;
+        if let Err(e) = self.ws.save_tokens(&crate::auth::export()) {
+            self.status = e;
+        }
+    }
+
     fn record_history(&mut self, sent: Pending, outcome: &Outcome) {
         let (status, elapsed) = match &outcome.response {
             Ok(r) => (r.status, r.elapsed),
@@ -1382,6 +1397,7 @@ impl App {
                     // Persist chained variables even if the runner pane was closed meanwhile.
                     self.apply_changes(env, globals);
                     self.save_cookies();
+                    self.save_tokens();
                     if let Some(run) = self
                         .runner
                         .as_mut()
@@ -1408,6 +1424,7 @@ impl App {
             // Variable writes apply even if the user switched away meanwhile.
             self.apply_changes(outcome.env, outcome.globals);
             self.save_cookies();
+            self.save_tokens();
             if !outcome.tests.is_empty() {
                 let passed = outcome.tests.iter().filter(|t| t.passed).count();
                 self.status = format!("Tests: {passed}/{} passed", outcome.tests.len());
@@ -7765,6 +7782,36 @@ mod ui_tests {
             .as_ref()
             .unwrap();
         assert!(view.text.contains("saved.csv"), "{}", view.text);
+    }
+
+    /// An OAuth token outlives the window: saved to the workspace once granted, so the
+    /// next start doesn't sign in again.
+    #[test]
+    fn a_granted_oauth_token_is_saved_to_the_workspace() {
+        let mut h = with_request("oauth-keep");
+        let provider = crate::http::tests::serve(|_| {
+            let json = "200 OK\r\ncontent-type: application/json";
+            (
+                json.into(),
+                r#"{"access_token":"gui-1","expires_in":3600}"#.into(),
+            )
+        });
+        {
+            let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+            d.url = crate::http::tests::echo_server();
+            d.auth = Auth::OAuth2(crate::model::OAuth2 {
+                grant: crate::model::Grant::ClientCredentials,
+                token_url: format!("http://{provider}/token"),
+                client_id: "gui".into(),
+                ..Default::default()
+            });
+        }
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| {
+            app.pending.is_empty() && app.response.is_some()
+        });
+        let kept = h.state().ws.load_tokens();
+        assert!(kept.contains("gui-1"), "{kept}");
     }
 
     /// Save as forks a variant without touching the original, and the copy picks up what

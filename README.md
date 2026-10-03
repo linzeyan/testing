@@ -45,7 +45,8 @@ such as Citrix VDI. No installer: unzip and run.
   examples; request history; Bearer, Basic, Digest, API key (header or query) and OAuth 2.0
   (client credentials, password, and authorization code with PKCE: Send opens the browser
   to sign in and catches the redirect on 127.0.0.1; an expired token is renewed with the
-  refresh token when the provider gives one, without signing in again) auth; a Cookies tab with what a response sets; a cookie jar like a browser's, with a manager; folder settings
+  refresh token when the provider gives one, without signing in again, and tokens are kept
+  in the workspace across restarts) auth; a Cookies tab with what a response sets; a cookie jar like a browser's, with a manager; folder settings
   (right-click a folder) with variables, auth and scripts shared by every request inside,
   like Postman collection/folder settings; tabs (a click in the tree previews,
   double-click or editing keeps the tab, Ctrl+W closes; right-click a tab to duplicate it or
@@ -76,7 +77,7 @@ such as Citrix VDI. No installer: unzip and run.
 The workspace (`workspace/` next to the executable, or `$APITOOL_WORKSPACE`) keeps
 everything in one SQLite file, `apitool.db`. For git, ⋯ > "Export to files" writes the
 collection, environments and globals as TOML beside it (`collections/`, `environments/`,
-`globals.toml`; secret values, history and cookies stay in the database), and "Import from
+`globals.toml`; secret values, history, cookies and OAuth tokens stay in the database), and "Import from
 files…" reads them back, e.g. after a pull. A workspace from an older version, which was
 those TOML files, is imported into `apitool.db` on first start, secrets and history
 included.

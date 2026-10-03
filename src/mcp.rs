@@ -25,6 +25,8 @@ pm.response.json(), pm.response.to.have.jsonSchema). Changes show up in the apit
 when it regains focus.";
 
 pub fn serve(ws: Workspace, input: impl BufRead, mut out: impl Write) -> Result<(), String> {
+    crate::auth::import(&ws.load_tokens());
+    let mut saved = crate::auth::grants();
     let mut server = Server::new(ws)?;
     for line in input.lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -38,6 +40,13 @@ pub fn serve(ws: Workspace, input: impl BufRead, mut out: impl Write) -> Result<
         if let Some(reply) = reply {
             writeln!(out, "{reply}").map_err(|e| e.to_string())?;
             out.flush().map_err(|e| e.to_string())?;
+        }
+        // stdout is for JSON-RPC only.
+        if crate::auth::grants() != saved {
+            saved = crate::auth::grants();
+            if let Err(e) = server.ws.save_tokens(&crate::auth::export()) {
+                eprintln!("OAuth tokens not kept: {e}");
+            }
         }
     }
     Ok(())

@@ -92,6 +92,8 @@ fn run(args: Vec<String>) -> Result<bool, String> {
     let junit = junit.as_deref().map(absolute).transpose()?;
 
     let ws = store::open_workspace(workspace)?;
+    crate::auth::import(&ws.load_tokens());
+    let grants = crate::auth::grants();
     let requests = ws.load_requests_in(&scope(&ws, &target))?;
     let env = match env {
         Some(name) if !ws.env_names().contains(&name) => {
@@ -153,6 +155,9 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         }
     }));
     println!("\n{total} requests, {failed} failed; {tests} tests, {tests_failed} failed");
+    if crate::auth::grants() != grants {
+        ws.save_tokens(&crate::auth::export())?;
+    }
     if let Some(path) = junit {
         let xml = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites name=\"apitool\">\n{suites}</testsuites>\n"
@@ -346,5 +351,39 @@ mod tests {
         assert_eq!(xml.matches("<failure message=").count(), 1, "{xml}");
         assert!(xml.contains("name=\"smoke/b #1\""), "{xml}");
         assert!(run(args("missing")).unwrap_err().contains("no requests"));
+    }
+
+    /// A CI job signing in with client credentials keeps the token in the workspace, so
+    /// the next run, a new process, uses it rather than asking the provider again.
+    #[test]
+    fn an_oauth_token_is_kept_in_the_workspace() {
+        use crate::model::{Auth, Grant, OAuth2};
+        let ws = std::env::temp_dir().join(format!("apitool-cli-oauth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let provider = crate::http::tests::serve(|_| {
+            let json = "200 OK\r\ncontent-type: application/json";
+            (
+                json.into(),
+                r#"{"access_token":"kept-1","expires_in":3600}"#.into(),
+            )
+        });
+        let workspace = store::Workspace::open(ws.clone()).unwrap();
+        let request = crate::model::Request {
+            url: crate::http::tests::echo_server(),
+            auth: Auth::OAuth2(OAuth2 {
+                grant: Grant::ClientCredentials,
+                token_url: format!("http://{provider}/token"),
+                client_id: "ci".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let path = workspace.request_path("r").unwrap();
+        workspace.save_request(&path, &request).unwrap();
+        let args = vec!["r".into(), "--workspace".into(), ws.display().to_string()];
+        assert_eq!(run(args), Ok(true));
+        let kept = workspace.load_tokens();
+        assert!(kept.contains("kept-1"), "{kept}");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

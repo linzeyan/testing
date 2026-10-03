@@ -454,6 +454,15 @@ impl Workspace {
         self.put("cookies", json)
     }
 
+    /// OAuth tokens as `auth::export` wrote them; empty when there are none yet.
+    pub fn load_tokens(&self) -> String {
+        self.get("oauth-tokens").unwrap_or_default()
+    }
+
+    pub fn save_tokens(&self, json: &str) -> Result<(), String> {
+        self.put("oauth-tokens", json)
+    }
+
     /// Where requests and folders live, as paths (see the module docs).
     pub fn collections(&self) -> PathBuf {
         self.root.join("collections")

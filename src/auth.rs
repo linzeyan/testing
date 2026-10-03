@@ -3,14 +3,17 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::http::error_chain;
 use crate::model::{Grant, OAuth2};
 
-/// Tokens by grant parameters, for the life of the process (GUI session, CLI run, MCP server).
+/// Tokens by grant parameters. The workspace keeps them across runs (see `export`).
 static TOKENS: LazyLock<Mutex<HashMap<String, Cached>>> = LazyLock::new(Default::default);
+/// Tokens granted so far: a saver compares it with the count it last saved.
+static GRANTS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct Cached {
@@ -29,6 +32,64 @@ fn cache_key(o: &OAuth2) -> String {
         "{:?}\n{}\n{}\n{}\n{}",
         o.grant, o.token_url, o.client_id, o.scope, o.username
     )
+}
+
+/// A token as the workspace keeps it: expiry in Unix seconds, as an `Instant` means
+/// nothing to the next process.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Kept {
+    token: String,
+    expires: u64,
+    refresh: Option<String>,
+}
+
+fn unix_now() -> u64 {
+    (SystemTime::now().duration_since(UNIX_EPOCH)).map_or(0, |d| d.as_secs())
+}
+
+/// The tokens worth keeping as JSON, so the next start doesn't sign in again: those still
+/// valid, and expired ones with a refresh token.
+pub fn export() -> String {
+    let tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    let (now, unix) = (Instant::now(), unix_now());
+    let kept: HashMap<&String, Kept> = (tokens.iter())
+        .filter(|(_, c)| now < c.until || c.refresh.is_some())
+        .map(|(k, c)| {
+            let left = c.until.saturating_duration_since(now).as_secs();
+            let (token, refresh) = (c.token.clone(), c.refresh.clone());
+            let expires = unix + left;
+            (
+                k,
+                Kept {
+                    token,
+                    expires,
+                    refresh,
+                },
+            )
+        })
+        .collect();
+    serde_json::to_string(&kept).unwrap_or_default()
+}
+
+/// Takes in what `export` wrote; tokens this process already has are fresher and stay.
+pub fn import(json: &str) {
+    let Ok(kept) = serde_json::from_str::<HashMap<String, Kept>>(json) else {
+        return;
+    };
+    let (now, unix) = (Instant::now(), unix_now());
+    let mut tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    for (key, k) in kept {
+        tokens.entry(key).or_insert(Cached {
+            token: k.token,
+            until: now + Duration::from_secs(k.expires.saturating_sub(unix)),
+            refresh: k.refresh,
+        });
+    }
+}
+
+/// Goes up with each token granted; unchanged since the last save means nothing new.
+pub fn grants() -> u64 {
+    GRANTS.load(Ordering::Relaxed)
 }
 
 /// A still-valid cached token, without any network traffic (for "Copy as curl").
@@ -135,6 +196,7 @@ fn store(key: String, got: Granted, refresh: Option<String>) -> String {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, cached);
+    GRANTS.fetch_add(1, Ordering::Relaxed);
     got.token
 }
 
@@ -484,6 +546,58 @@ mod tests {
             scope: "read".into(),
             ..Default::default()
         }
+    }
+
+    /// Signing in after every restart is what keeping tokens in the workspace saves: a
+    /// valid token comes back as it was, an expired one only for its refresh token.
+    #[test]
+    fn tokens_come_back_in_the_next_process() {
+        let grant = |url: &str| cache_key(&code_grant(format!("http://{url}/token")));
+        let (valid, dead, stale) = (grant("valid.test"), grant("dead.test"), grant("stale.test"));
+        let granted = |token: &str, secs: u64, refresh: Option<&str>| Granted {
+            token: token.into(),
+            ttl: Duration::from_secs(secs),
+            refresh: refresh.map(Into::into),
+        };
+        store(valid.clone(), granted("t1", 3600, Some("r1")), None);
+        store(dead.clone(), granted("old", 0, None), None);
+        store(stale.clone(), granted("old", 0, Some("r2")), None);
+        let json = export();
+        // The next process: nothing in memory but what the workspace kept.
+        let forget = || {
+            let mut tokens = TOKENS.lock().unwrap();
+            for key in [&valid, &dead, &stale] {
+                tokens.remove(key);
+            }
+        };
+        forget();
+        import(&json);
+        let tokens = TOKENS.lock().unwrap();
+        let t1 = &tokens[&valid];
+        assert_eq!(
+            (t1.token.as_str(), t1.refresh.as_deref()),
+            ("t1", Some("r1"))
+        );
+        let left = t1.until.saturating_duration_since(Instant::now());
+        assert!(
+            left > Duration::from_secs(3000) && left <= Duration::from_secs(3600),
+            "{left:?}"
+        );
+        assert!(
+            !tokens.contains_key(&dead),
+            "expired, nothing to renew it with"
+        );
+        assert_eq!(tokens[&stale].refresh.as_deref(), Some("r2"), "renewable");
+        assert!(tokens[&stale].until <= Instant::now(), "but expired");
+        drop(tokens);
+        // A token this process got meanwhile is newer than what was kept.
+        store(valid.clone(), granted("t2", 3600, None), None);
+        import(&json);
+        assert_eq!(
+            cached_token(&code_grant("http://valid.test/token".into())).as_deref(),
+            Some("t2")
+        );
+        forget();
     }
 
     /// The provider gets a PKCE challenge; the token request must prove it with the
