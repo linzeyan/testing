@@ -220,6 +220,178 @@ pub async fn graphql(client: reqwest::Client, req: Request, emit: impl Fn(Event)
     emit(Event::Closed("connection closed".into()))
 }
 
+/// Socket.IO 4 (Engine.IO 4) over its WebSocket transport. The URL's path is the
+/// namespace, a JSON body the CONNECT auth payload. Each outgoing message is an event:
+/// `name {"json": "arg"}`, or the wire's own `["name", arg, …]` array.
+// ponytail: the handshake path is always /socket.io/ and long-polling isn't spoken; add a
+// path setting when a server mounts it elsewhere.
+pub async fn socketio(
+    client: reqwest::Client,
+    req: Request,
+    mut outgoing: mpsc::UnboundedReceiver<String>,
+    emit: impl Fn(Event),
+) {
+    let mut url = match reqwest::Url::parse(&http::wire_url(&req.url)) {
+        Ok(u) => u,
+        Err(e) => return emit(Event::Error(format!("URL: {e}"))),
+    };
+    let ns = match url.path().trim_end_matches('/') {
+        "" => String::new(),
+        p => p.to_owned(),
+    };
+    url.set_path("/socket.io/");
+    url.query_pairs_mut()
+        .append_pair("EIO", "4")
+        .append_pair("transport", "websocket");
+    let auth = match &req.body {
+        Body::Json { text } if !text.trim().is_empty() => text.trim().to_owned(),
+        _ => String::new(),
+    };
+    let mut upgrade = Request {
+        method: "WS".into(),
+        url: url.to_string(),
+        body: Body::None,
+        ..req
+    };
+    if let Err(e) = http::with_token(&client, &mut upgrade, false).await {
+        return emit(Event::Error(e));
+    }
+    let b = match http::build(&client, upgrade) {
+        Ok(b) => b,
+        Err(e) => return emit(Event::Error(e)),
+    };
+    let socket = match b.upgrade().send().await {
+        Ok(resp) => resp.into_websocket().await,
+        Err(e) => Err(e),
+    };
+    let socket = match socket {
+        Ok(s) => s,
+        Err(e) => return emit(Event::Error(error_chain(&e))),
+    };
+    let (mut sink, mut stream) = socket.split();
+    // A namespace other than "/" is named in every packet, followed by a comma.
+    let prefix = match ns.is_empty() {
+        true => String::new(),
+        false => format!("{ns},"),
+    };
+    loop {
+        tokio::select! {
+            out = outgoing.recv() => match out {
+                Some(text) => {
+                    let args = match event_args(&text) {
+                        Ok(a) => a,
+                        Err(e) => { emit(Event::Error(e)); continue; }
+                    };
+                    if let Err(e) = sink.send(Message::Text(format!("42{prefix}{args}"))).await {
+                        return emit(Event::Error(error_chain(&e)));
+                    }
+                    emit(Event::Out(args));
+                }
+                None => {
+                    let _ = sink.send(Message::Text(format!("41{prefix}"))).await;
+                    let _ = sink.send(Message::Close { code: CloseCode::Normal, reason: String::new() }).await;
+                    return emit(Event::Closed("disconnected".into()));
+                }
+            },
+            incoming = stream.next() => {
+                let text = match incoming {
+                    Some(Ok(Message::Text(t))) => t,
+                    Some(Ok(Message::Close { code, reason })) => {
+                        return emit(Event::Closed(format!("closed by server ({code:?}) {reason}")));
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => return emit(Event::Error(error_chain(&e))),
+                    None => return emit(Event::Closed("connection closed".into())),
+                };
+                // Engine.IO: 0 open, 2 ping, 4 a Socket.IO packet.
+                match text.as_bytes().first() {
+                    Some(b'0') => {
+                        let connect = format!("40{prefix}{auth}");
+                        if let Err(e) = sink.send(Message::Text(connect)).await {
+                            return emit(Event::Error(error_chain(&e)));
+                        }
+                    }
+                    Some(b'2') => {
+                        if let Err(e) = sink.send(Message::Text("3".into())).await {
+                            return emit(Event::Error(error_chain(&e)));
+                        }
+                    }
+                    Some(b'4') => match socketio_packet(&text[1..]) {
+                        Packet::Connected => {
+                            let at = if ns.is_empty() { "/" } else { &ns };
+                            emit(Event::Open(format!("connected to {at}")));
+                        }
+                        Packet::Event(e) => emit(Event::In(e)),
+                        Packet::Refused(why) => return emit(Event::Error(format!("connection refused: {why}"))),
+                        Packet::Disconnected => return emit(Event::Closed("disconnected by server".into())),
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+enum Packet {
+    Connected,
+    Event(String),
+    Refused(String),
+    Disconnected,
+}
+
+/// A Socket.IO packet past its Engine.IO `4`: type, `/namespace,`, ack id, JSON.
+fn socketio_packet(p: &str) -> Packet {
+    let (kind, rest) = p.split_at(p.len().min(1));
+    let rest = match rest.strip_prefix('/') {
+        Some(r) => r.split_once(',').map_or("", |(_, data)| data),
+        None => rest,
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (id, data) = rest.split_at(digits);
+    match kind {
+        "0" => Packet::Connected,
+        "1" => Packet::Disconnected,
+        "4" => Packet::Refused(data.to_owned()),
+        // `["name", args…]`: shown as the name, then the arguments.
+        "2" => match serde_json::from_str::<Vec<serde_json::Value>>(data) {
+            Ok(v) if !v.is_empty() => {
+                let name = v[0]
+                    .as_str()
+                    .map_or_else(|| v[0].to_string(), str::to_owned);
+                let args: Vec<String> = v[1..].iter().map(|a| a.to_string()).collect();
+                Packet::Event(format!("{name} {}", args.join(" ")).trim_end().to_owned())
+            }
+            _ => Packet::Event(data.to_owned()),
+        },
+        "3" => Packet::Event(format!("ack {id} {data}")),
+        _ => Packet::Event(p.to_owned()),
+    }
+}
+
+/// What the compose box holds, as the JSON array an event packet carries.
+fn event_args(text: &str) -> Result<String, String> {
+    let text = text.trim();
+    if text.starts_with('[') {
+        let v: Vec<serde_json::Value> =
+            serde_json::from_str(text).map_err(|e| format!("not a JSON array: {e}"))?;
+        if !v.first().is_some_and(serde_json::Value::is_string) {
+            return Err("the array starts with the event name".into());
+        }
+        return Ok(serde_json::to_string(&v).unwrap_or_default());
+    }
+    let (name, arg) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    if name.is_empty() {
+        return Err("type an event name, then its argument: chat {\"text\": \"hi\"}".into());
+    }
+    let mut args = vec![serde_json::Value::String(name.to_owned())];
+    let arg = arg.trim();
+    if !arg.is_empty() {
+        // Text that isn't JSON goes as a string, as `socket.emit("chat", "hi")` would.
+        args.push(serde_json::from_str(arg).unwrap_or_else(|_| arg.into()));
+    }
+    Ok(serde_json::to_string(&args).unwrap_or_default())
+}
+
 /// Incremental `text/event-stream` parser. Works on bytes so multi-byte characters
 /// split across network chunks decode correctly.
 #[derive(Default)]
@@ -535,6 +707,112 @@ mod tests {
         assert!(!is_subscription("query { subscriptionCount }"));
         assert!(!is_subscription("subscriptions { x }"));
         assert!(!is_subscription("{ m }"));
+    }
+
+    /// The Engine.IO/Socket.IO exchange a socket.io 4 server has: open, CONNECT to the
+    /// namespace with the auth payload, answer pings, events both ways, DISCONNECT when the
+    /// user hangs up.
+    // tungstenite's handshake callback type fixes the error type the lint objects to.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn socketio_connects_to_a_namespace_and_trades_events() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let check = |req: &tungstenite::handshake::server::Request, resp| {
+                let uri = req.uri().to_string();
+                assert!(
+                    uri.starts_with("/socket.io/?") && uri.contains("EIO=4"),
+                    "{uri}"
+                );
+                assert!(
+                    uri.contains("transport=websocket") && uri.contains("v=1"),
+                    "{uri}"
+                );
+                Ok(resp)
+            };
+            let mut ws = tungstenite::accept_hdr(s, check).unwrap();
+            let mut got = Vec::new();
+            let send = |ws: &mut tungstenite::WebSocket<_>, t: &str| {
+                ws.send(tungstenite::Message::text(t)).unwrap()
+            };
+            send(
+                &mut ws,
+                r#"0{"sid":"e1","pingInterval":25000,"pingTimeout":20000}"#,
+            );
+            while let Ok(msg) = ws.read() {
+                let t = msg.to_text().unwrap_or_default().to_owned();
+                got.push(t.clone());
+                match t.as_str() {
+                    t if t.starts_with("40/chat,") => {
+                        send(&mut ws, r#"40/chat,{"sid":"s1"}"#);
+                        send(&mut ws, "2");
+                    }
+                    "3" => send(&mut ws, r#"42/chat,["welcome",{"n":1},"x"]"#),
+                    t if t.starts_with("42/chat,") => send(&mut ws, r#"43/chat,7["ok"]"#),
+                    _ => {}
+                }
+            }
+            got
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt
+            .block_on(crate::net::build_client(crate::net::Network::default()))
+            .unwrap()
+            .http;
+        let req = Request {
+            method: "SOCKETIO".into(),
+            url: format!("http://{addr}/chat?v=1"),
+            body: Body::Json {
+                text: r#"{"token": "t"}"#.into(),
+            },
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let events = std::sync::Mutex::new(Vec::new());
+        rt.block_on(socketio(client, req, rx, |e| {
+            match &e {
+                Event::In(t) if t.starts_with("welcome") => {
+                    let tx = tx.lock().unwrap();
+                    tx.as_ref()
+                        .unwrap()
+                        .send(r#"say {"text": "hi"}"#.into())
+                        .unwrap();
+                }
+                Event::In(t) if t.starts_with("ack") => drop(tx.lock().unwrap().take()),
+                _ => {}
+            }
+            events.lock().unwrap().push(e);
+        }));
+        let got = server.join().unwrap();
+        assert_eq!(
+            got,
+            [
+                r#"40/chat,{"token": "t"}"#,
+                "3",
+                r#"42/chat,["say",{"text":"hi"}]"#,
+                "41/chat,",
+                ""
+            ]
+        );
+        assert_eq!(
+            events.into_inner().unwrap(),
+            [
+                Event::Open("connected to /chat".into()),
+                Event::In(r#"welcome {"n":1} "x""#.into()),
+                Event::Out(r#"["say",{"text":"hi"}]"#.into()),
+                Event::In(r#"ack 7 ["ok"]"#.into()),
+                Event::Closed("disconnected".into()),
+            ]
+        );
+        assert_eq!(event_args("ping").unwrap(), r#"["ping"]"#);
+        assert_eq!(event_args("say hi there").unwrap(), r#"["say","hi there"]"#);
+        assert!(event_args("[1, 2]").is_err() && event_args("  ").is_err());
     }
 
     /// A server that never ends a line can't fill RAM: the line keeps its first MiB and

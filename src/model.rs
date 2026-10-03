@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 
 pub const METHODS: &[&str] = &[
     "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "GRAPHQL", "WS", "SSE", "GRPC",
-    "MQTT",
+    "MQTT", "SOCKETIO",
 ];
 
 /// Methods whose response is a stream of messages rather than one body.
 pub fn is_streaming(method: &str) -> bool {
-    matches!(method, "WS" | "SSE" | "MQTT")
+    matches!(method, "WS" | "SSE" | "MQTT" | "SOCKETIO")
 }
 
 /// One request per file on disk, so field order and `skip_serializing_if` matter:

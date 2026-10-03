@@ -198,6 +198,8 @@ struct StreamSession {
     outgoing: Option<Outgoing>,
     /// gRPC: (proto, method), to check messages before they are sent.
     grpc: Option<(String, String)>,
+    /// What the compose box takes, shown while it's empty.
+    hint: &'static str,
     live: bool,
     compose: String,
     abort: tokio::task::AbortHandle,
@@ -1345,10 +1347,12 @@ impl App {
         let Some(open) = &self.open else { return };
         let (req, _) = open.draft.resolved(&self.all_vars());
         let is_ws = req.method.eq_ignore_ascii_case("WS");
+        let socketio = req.method == "SOCKETIO";
         let is_mqtt = req.method == "MQTT";
         let grpc = (req.method == "GRPC").then(|| (req.proto.clone(), req.rpc.clone()));
-        let sends =
-            is_ws || rpc_of(&open.draft, &self.grpc_methods).is_some_and(|r| r.client_streaming);
+        let sends = is_ws
+            || socketio
+            || rpc_of(&open.draft, &self.grpc_methods).is_some_and(|r| r.client_streaming);
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
         let (pub_tx, pub_rx) = tokio::sync::mpsc::unbounded_channel();
         let outgoing = match (is_mqtt, sends) {
@@ -1381,6 +1385,9 @@ impl App {
                 Ok(client) if is_ws => {
                     stream::websocket(client.http.clone(), req, out_rx, emit).await
                 }
+                Ok(client) if socketio => {
+                    stream::socketio(client.http.clone(), req, out_rx, emit).await
+                }
                 Ok(client) if req.method == "GRPC" => {
                     crate::grpc::stream(client, req, out_rx, emit).await
                 }
@@ -1397,6 +1404,11 @@ impl App {
             log,
             selected: None,
             outgoing,
+            hint: match (&grpc, socketio) {
+                (Some(_), _) => "Message (JSON)",
+                (None, true) => "An event and its argument: chat {\"text\": \"hi\"}",
+                (None, false) => "Message",
+            },
             grpc,
             live: true,
             compose: self
@@ -2975,6 +2987,7 @@ impl App {
                 let width = ui.available_width() - button[0] - 8.0 - more;
                 let hint = match open.draft.method.as_str() {
                     "MQTT" => "mqtt://{{broker}}:1883",
+                    "SOCKETIO" => "http://{{host}}:3000/namespace",
                     _ => "https://{{host}}/path",
                 };
                 let url = var_edit(
@@ -3146,7 +3159,10 @@ impl App {
                 );
                 // How a single HTTP exchange goes out, or MQTT's connection; other
                 // streams and gRPC have none.
-                if !matches!(open.draft.method.as_str(), "WS" | "SSE" | "GRPC") {
+                if !matches!(
+                    open.draft.method.as_str(),
+                    "WS" | "SSE" | "GRPC" | "SOCKETIO"
+                ) {
                     let default = match mqtt {
                         true => {
                             open.draft.mqtt.client_id.is_empty()
@@ -6459,11 +6475,7 @@ fn stream_ui(
                         .id(id)
                         .desired_rows(2)
                         .font(egui::TextStyle::Monospace)
-                        .hint_text(if s.grpc.is_some() {
-                            "Message (JSON)"
-                        } else {
-                            "Message"
-                        })
+                        .hint_text(s.hint)
                         .desired_width(ui.available_width() - send_w - 8.0),
                 );
             }

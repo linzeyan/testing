@@ -432,7 +432,7 @@ fn group(
                 items.push(Value::Object(g));
             }
             Node::Request { method, .. }
-                if matches!(method.as_str(), "WS" | "SSE" | "GRPC" | "MQTT") =>
+                if matches!(method.as_str(), "WS" | "SSE" | "GRPC" | "MQTT" | "SOCKETIO") =>
             {
                 counts.1 += 1
             }

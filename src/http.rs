@@ -137,7 +137,7 @@ impl Response {
 /// HTTP verb for a request; the pseudo-methods map to what goes on the wire.
 pub fn wire_method(method: &str) -> Result<reqwest::Method, String> {
     match method.trim().to_uppercase().as_str() {
-        "WS" | "SSE" => Ok(reqwest::Method::GET),
+        "WS" | "SSE" | "SOCKETIO" => Ok(reqwest::Method::GET),
         "GRPC" | "GRAPHQL" => Ok(reqwest::Method::POST),
         // Else it would go out as an HTTP request with an "MQTT" verb.
         "MQTT" => Err("MQTT connects instead of sending: open it in the app and Connect".into()),
