@@ -118,6 +118,9 @@ pub struct Mqtt {
     pub qos: u8,
     /// The broker keeps the last retained message for whoever subscribes later.
     pub retain: bool,
+    /// MQTT 5 user properties sent with every publish, like headers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub user_properties: Vec<KeyValue>,
     /// What the broker publishes for this client when it drops without a goodbye. No
     /// topic: no will.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -139,6 +142,7 @@ impl Default for Mqtt {
             topic: String::new(),
             qos: 0,
             retain: false,
+            user_properties: Vec::new(),
             will_topic: String::new(),
             will_payload: String::new(),
             will_qos: 0,
@@ -966,6 +970,7 @@ mod tests {
                 topic: "cmd".into(),
                 qos: 1,
                 retain: true,
+                user_properties: vec![KeyValue::new("trace", "{{id}}")],
                 will_topic: "status/{{device}}".into(),
                 will_payload: "offline".into(),
                 will_qos: 2,

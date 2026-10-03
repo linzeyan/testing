@@ -78,6 +78,8 @@ enum ReqTab {
     Docs,
     /// MQTT only.
     Topics,
+    /// MQTT only: user properties.
+    Properties,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -3013,15 +3015,21 @@ impl App {
                 // MQTT has no query, headers or body: topics take their place.
                 let mqtt = open.draft.method == "MQTT";
                 let http_only = [ReqTab::Params, ReqTab::Headers, ReqTab::Body];
+                let mqtt_only = [ReqTab::Topics, ReqTab::Properties];
                 if mqtt && http_only.contains(&self.req_tab) {
                     self.req_tab = ReqTab::Topics;
-                } else if !mqtt && self.req_tab == ReqTab::Topics {
+                } else if !mqtt && mqtt_only.contains(&self.req_tab) {
                     self.req_tab = ReqTab::Params;
                 }
                 if mqtt {
                     let topics = open.draft.mqtt.topics.iter();
                     let on = topics.filter(|t| t.enabled && !t.filter.is_empty()).count();
                     ui.selectable_value(&mut self.req_tab, ReqTab::Topics, tab(on, "Topics"));
+                    ui.selectable_value(
+                        &mut self.req_tab,
+                        ReqTab::Properties,
+                        tab(count(&open.draft.mqtt.user_properties), "Properties"),
+                    );
                 } else {
                     ui.selectable_value(
                         &mut self.req_tab,
@@ -3155,6 +3163,21 @@ impl App {
                         {
                             s.resubscribe(&open.draft, &all_vars);
                         }
+                    }
+                    ReqTab::Properties => {
+                        let m = &mut open.draft.mqtt;
+                        kv_table(
+                            ui,
+                            "mqtt-properties",
+                            &mut m.user_properties,
+                            &all_vars,
+                            true,
+                        );
+                        ui.add_space(8.0);
+                        ui.weak(match m.v5 {
+                            true => "Sent with every message you publish.",
+                            false => "User properties need MQTT 5.0 (Settings).",
+                        });
                     }
                     ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
                     ReqTab::Docs => docs_editor(ui, &mut open.draft.description),
@@ -5560,7 +5583,7 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
                     ui.selectable_value(&mut m.v5, false, "3.1.1");
                     ui.selectable_value(&mut m.v5, true, "5.0");
                 });
-            ui.weak("5.0 says why a broker refuses or hangs up");
+            ui.weak("5.0 says why a broker refuses or hangs up, and has user properties");
             ui.end_row();
 
             ui.label("Client ID");
@@ -6025,11 +6048,24 @@ impl StreamSession {
                 if topic.contains(['+', '#']) {
                     return Err("+ and # are for subscribing; publish to one topic".into());
                 }
+                let properties: Vec<_> = (m.user_properties.iter())
+                    .filter(|p| p.enabled && !p.key.trim().is_empty())
+                    .map(|p| {
+                        let r = |s: &str| model::resolve(s, vars, &mut Vec::new());
+                        (r(p.key.trim()), r(&p.value))
+                    })
+                    .collect();
+                // ponytail: goes by the request's version now, not the connection's; they
+                // differ only if it's switched while connected.
+                if !m.v5 && !properties.is_empty() {
+                    return Err("User properties need MQTT 5.0 (Settings)".into());
+                }
                 let _ = tx.send(crate::mqtt::Command::Publish(crate::mqtt::Publish {
                     topic,
                     qos: m.qos,
                     retain: m.retain,
                     payload: self.compose.clone(),
+                    properties,
                 }));
             }
         }
@@ -8862,14 +8898,13 @@ mod ui_tests {
         );
     }
 
-    /// Topics subscribe on Connect, Send publishes where the request says, and a topic
-    /// that can't be published to is refused before it reaches the broker.
-    #[test]
-    fn mqtt_subscribes_publishes_and_disconnects() {
-        let mut h = with_request("mqtt");
+    /// The request the test brokers in `mqtt::tests` expect, with its will through a
+    /// variable.
+    fn mqtt_request(name: &str, port: u16) -> Harness<'static, App> {
+        let mut h = with_request(name);
         let d = &mut h.state_mut().open.as_mut().unwrap().draft;
         d.method = "MQTT".into();
-        d.url = format!("mqtt://127.0.0.1:{}", crate::mqtt::tests::broker());
+        d.url = format!("mqtt://127.0.0.1:{port}");
         d.auth = Auth::Basic {
             username: "u".into(),
             password: "p".into(),
@@ -8883,6 +8918,19 @@ mod ui_tests {
         };
         d.mqtt.topics = vec![topic("a/#"), topic("denied")];
         h.state_mut().vars.insert("device".into(), "tester".into());
+        h
+    }
+
+    fn got(app: &App, text: &str) -> bool {
+        let events = app.stream.as_ref().unwrap().events();
+        (events.iter()).any(|(_, e)| matches!(e, Event::In(t) if t == text))
+    }
+
+    /// Topics subscribe on Connect, Send publishes where the request says, and a topic
+    /// that can't be published to is refused before it reaches the broker.
+    #[test]
+    fn mqtt_subscribes_publishes_and_disconnects() {
+        let mut h = mqtt_request("mqtt", crate::mqtt::tests::broker());
         h.run();
         assert!(h.query_by_label("Params").is_none(), "MQTT has no query");
         // Only the will is set, and the tab says so.
@@ -8894,12 +8942,6 @@ mod ui_tests {
         h.get_by_label("Topics (2)").click();
         h.run();
         h.get_by_label("Connect").click();
-        let got = |app: &App, text: &str| {
-            let events = app.stream.as_ref().unwrap().events();
-            events
-                .iter()
-                .any(|(_, e)| matches!(e, Event::In(t) if t == text))
-        };
         wait_live(&mut h, |app| got(app, "[a/1] hello"));
 
         h.state_mut().stream.as_mut().unwrap().compose = "ping".into();
@@ -8909,7 +8951,20 @@ mod ui_tests {
             h.run_steps(2);
             assert!(h.state().status.contains(why), "{}", h.state().status);
         }
-        h.state_mut().open.as_mut().unwrap().draft.mqtt.topic = "cmd".into();
+        // 3.1.1 has nowhere to put them; dropping them silently would mislead.
+        let m = &mut h.state_mut().open.as_mut().unwrap().draft.mqtt;
+        (m.topic, m.user_properties) = ("cmd".into(), vec![KeyValue::new("unit", "C")]);
+        h.get_by_label("Send").click();
+        h.run_steps(2);
+        assert!(h.state().status.contains("MQTT 5"), "{}", h.state().status);
+        h.state_mut()
+            .open
+            .as_mut()
+            .unwrap()
+            .draft
+            .mqtt
+            .user_properties[0]
+            .enabled = false;
         h.get_by_label("Send").click();
         wait_live(&mut h, |app| got(app, "[a/echo] echo cmd ping"));
         shot(&mut h, "33-mqtt");
@@ -8931,6 +8986,31 @@ mod ui_tests {
         let events = h.state().stream.as_ref().unwrap().events();
         let (_, last) = events.last().unwrap();
         assert_eq!(*last, Event::Closed("disconnected".into()), "{events:?}");
+    }
+
+    /// MQTT 5 user properties go out with each publish, variables filled in; the broker
+    /// echoes them back.
+    #[test]
+    fn mqtt_5_publishes_user_properties() {
+        let mut h = mqtt_request("mqtt5", crate::mqtt::tests::broker_v5());
+        let m = &mut h.state_mut().open.as_mut().unwrap().draft.mqtt;
+        (m.client_id, m.v5, m.topic) = ("tester".into(), true, "cmd".into());
+        let mut off = KeyValue::new("off", "x");
+        off.enabled = false;
+        m.user_properties = vec![KeyValue::new("from", "{{device}}"), off];
+        h.run();
+        h.get_by_label("Properties (1)").click();
+        h.run();
+        h.get_by_label("Connect").click();
+        wait_live(&mut h, |app| got(app, "[a/1] hello"));
+        h.state_mut().stream.as_mut().unwrap().compose = "ping".into();
+        h.get_by_label("Send").click();
+        wait_live(&mut h, |app| {
+            got(app, "[a/echo · from=tester] echo cmd ping")
+        });
+        shot(&mut h, "67-mqtt-properties");
+        h.get_by_label("Disconnect").click();
+        wait(&mut h, |app| !app.stream.as_ref().unwrap().live);
     }
 
     #[test]

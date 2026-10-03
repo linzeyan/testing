@@ -31,6 +31,8 @@ pub struct Publish {
     pub qos: u8,
     pub retain: bool,
     pub payload: String,
+    /// MQTT 5 user properties; the app refuses them for a 3.1.1 connection.
+    pub properties: Vec<(String, String)>,
 }
 
 /// What the app asks of a live session.
@@ -68,7 +70,7 @@ pub async fn session(
         while let Some(command) = commands.recv().await {
             let sent = match command {
                 Command::Publish(p) => {
-                    let shown = format!("[{}] {}", p.topic, p.payload);
+                    let shown = shown(&p.topic, &p.properties, p.payload.as_bytes());
                     client.publish(p).await.map(|()| emit(Event::Out(shown)))
                 }
                 Command::Topics(want) => update(&client, &acks, &mut have, want).await,
@@ -175,7 +177,7 @@ enum Events {
 
 enum Got {
     Connected,
-    /// "[topic] payload"
+    /// "[topic · key=value] payload"
     Message(String),
     /// Per filter: "(QoS 1)" or why it was refused.
     SubAck(Vec<String>),
@@ -209,8 +211,20 @@ impl Client {
         match self {
             Client::V3(c) => (c.publish(p.topic, qos3(p.qos), p.retain, p.payload).await)
                 .map_err(|e| e.to_string()),
-            Client::V5(c) => (c.publish(p.topic, qos5(p.qos), p.retain, p.payload).await)
-                .map_err(|e| e.to_string()),
+            Client::V5(c) if p.properties.is_empty() => {
+                (c.publish(p.topic, qos5(p.qos), p.retain, p.payload).await)
+                    .map_err(|e| e.to_string())
+            }
+            Client::V5(c) => {
+                let properties = p5::PublishProperties {
+                    user_properties: p.properties,
+                    ..Default::default()
+                };
+                let (topic, qos, payload) = (p.topic, qos5(p.qos), p.payload);
+                (c.publish_with_properties(topic, qos, p.retain, payload, properties)
+                    .await)
+                    .map_err(|e| e.to_string())
+            }
         }
     }
 
@@ -229,7 +243,7 @@ impl Events {
         let got = match self {
             Events::V3(e) => match e.poll().await {
                 Ok(In3(Incoming::ConnAck(_))) => Got::Connected,
-                Ok(In3(Incoming::Publish(p))) => Got::Message(shown(&p.topic, &p.payload)),
+                Ok(In3(Incoming::Publish(p))) => Got::Message(shown(&p.topic, &[], &p.payload)),
                 Ok(In3(Incoming::SubAck(ack))) => Got::SubAck(
                     (ack.return_codes.iter())
                         .map(|c| match c {
@@ -249,7 +263,12 @@ impl Events {
             Events::V5(e) => match e.poll().await {
                 Ok(In5(p5::Packet::ConnAck(_))) => Got::Connected,
                 Ok(In5(p5::Packet::Publish(p))) => {
-                    Got::Message(shown(&String::from_utf8_lossy(&p.topic), &p.payload))
+                    let properties = p.properties.map(|p| p.user_properties);
+                    Got::Message(shown(
+                        &String::from_utf8_lossy(&p.topic),
+                        &properties.unwrap_or_default(),
+                        &p.payload,
+                    ))
                 }
                 Ok(In5(p5::Packet::SubAck(ack))) => Got::SubAck(
                     (ack.return_codes.iter())
@@ -279,8 +298,12 @@ impl Events {
     }
 }
 
-fn shown(topic: &str, payload: &[u8]) -> String {
-    format!("[{topic}] {}", String::from_utf8_lossy(payload))
+/// User properties go in the brackets, so the one-line list shows them too.
+fn shown(topic: &str, properties: &[(String, String)], payload: &[u8]) -> String {
+    let properties: String = (properties.iter())
+        .map(|(k, v)| format!(" · {k}={v}"))
+        .collect();
+    format!("[{topic}{properties}] {}", String::from_utf8_lossy(payload))
 }
 
 fn qos3(n: u8) -> rumqttc::QoS {
@@ -688,6 +711,11 @@ pub mod tests {
         listen(false, serve_v3)
     }
 
+    /// `broker` in MQTT 5, echoing user properties back.
+    pub fn broker_v5() -> u16 {
+        listen(false, serve_v5)
+    }
+
     fn serve_v3(s: &mut dyn Pipe) {
         let mut buf = BytesMut::new();
         let mut next = |s: &mut dyn Pipe| loop {
@@ -809,10 +837,8 @@ pub mod tests {
                     let topic = String::from_utf8_lossy(&p.topic);
                     let text = String::from_utf8_lossy(&p.payload);
                     let echo = format!("echo {topic} {text}");
-                    send(
-                        s,
-                        Packet::Publish(p5::Publish::new("a/echo", qos5(0), echo, None)),
-                    );
+                    let echo = p5::Publish::new("a/echo", qos5(0), echo, p.properties);
+                    send(s, Packet::Publish(echo));
                 }
                 Packet::Disconnect(_) => break,
                 _ => {}
@@ -852,8 +878,9 @@ pub mod tests {
         }
     }
 
-    /// Subscribes to a/# and "denied"; answers the hello with a publish; once the echo is
-    /// back, swaps "denied" for b/# while connected; hangs up once b/# is subscribed.
+    /// Subscribes to a/# and "denied"; answers the hello with a publish (with a user
+    /// property in MQTT 5); once the echo is back, swaps "denied" for b/# while
+    /// connected; hangs up once b/# is subscribed.
     fn exchange(req: Request, net: Network) -> Vec<Event> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -863,6 +890,10 @@ pub mod tests {
             .block_on(crate::net::build_client(net.clone()))
             .unwrap()
             .route;
+        let properties = match req.mqtt.v5 {
+            true => vec![("unit".to_owned(), "°C".to_owned())],
+            false => Vec::new(),
+        };
         let (tx, rx) = mpsc::unbounded_channel();
         let tx = std::sync::Mutex::new(Some(tx));
         let events = std::sync::Mutex::new(Vec::new());
@@ -877,8 +908,9 @@ pub mod tests {
                     qos: 0,
                     retain: false,
                     payload: "ping".into(),
+                    properties: properties.clone(),
                 })),
-                Event::In(t) if t.starts_with("[a/echo]") => {
+                Event::In(t) if t.starts_with("[a/echo") => {
                     command(Command::Topics(vec![("a/#".into(), 1), ("b/#".into(), 0)]))
                 }
                 Event::Info(t) if t.contains("b/#") => drop(tx.lock().unwrap().take()),
@@ -889,13 +921,18 @@ pub mod tests {
         events.into_inner().unwrap()
     }
 
-    fn expected(refused: &str) -> Vec<Event> {
+    /// MQTT 5's refusal says why, and its messages carry the user property both ways.
+    fn expected(v5: bool) -> Vec<Event> {
+        let (refused, unit) = match v5 {
+            true => ("refused (NotAuthorized)", " · unit=°C"),
+            false => ("refused", ""),
+        };
         vec![
             Event::Open("connected".into()),
             Event::Info(format!("subscribed: a/# (QoS 1), denied {refused}")),
             Event::In("[a/1] hello".into()),
-            Event::Out("[cmd] ping".into()),
-            Event::In("[a/echo] echo cmd ping".into()),
+            Event::Out(format!("[cmd{unit}] ping")),
+            Event::In(format!("[a/echo{unit}] echo cmd ping")),
             // a/# is unchanged, so it's left alone.
             Event::Info("unsubscribed: denied".into()),
             Event::Info("subscribed: b/# (QoS 0)".into()),
@@ -908,16 +945,16 @@ pub mod tests {
         let url = format!("mqtt://127.0.0.1:{}", broker());
         assert_eq!(
             exchange(request(url, false), Network::default()),
-            expected("refused")
+            expected(false)
         );
     }
 
     #[test]
-    fn mqtt_5_says_why_a_subscription_is_refused() {
+    fn mqtt_5_says_why_a_subscription_is_refused_and_carries_user_properties() {
         let url = format!("mqtt://127.0.0.1:{}", listen(false, serve_v5));
         assert_eq!(
             exchange(request(url, true), Network::default()),
-            expected("refused (NotAuthorized)")
+            expected(true)
         );
     }
 
@@ -926,12 +963,12 @@ pub mod tests {
         let url = format!("ws://127.0.0.1:{}/mqtt", listen(true, serve_v3));
         assert_eq!(
             exchange(request(url, false), Network::default()),
-            expected("refused")
+            expected(false)
         );
         let url = format!("ws://127.0.0.1:{}/mqtt", listen(true, serve_v5));
         assert_eq!(
             exchange(request(url, true), Network::default()),
-            expected("refused (NotAuthorized)")
+            expected(true)
         );
     }
 
@@ -955,7 +992,7 @@ pub mod tests {
             req.settings.verify_tls = false;
             exchange(req, net.clone())
         };
-        assert_eq!(unverified(&net), expected("refused"));
+        assert_eq!(unverified(&net), expected(false));
         // The broker turns away a client without a certificate.
         let events = unverified(&Network::default());
         assert!(matches!(events.as_slice(), [Event::Error(_)]), "{events:?}");
@@ -977,8 +1014,8 @@ pub mod tests {
             };
             exchange(request("mqtt://broker.test:1883".into(), v5), net)
         };
-        assert_eq!(via(serve_v3, false), expected("refused"));
-        assert_eq!(via(serve_v5, true), expected("refused (NotAuthorized)"));
+        assert_eq!(via(serve_v3, false), expected(false));
+        assert_eq!(via(serve_v5, true), expected(true));
     }
 
     #[test]
