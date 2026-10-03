@@ -8254,6 +8254,17 @@ mod ui_tests {
         send(&mut h);
         assert_eq!(pretty(h.state()), Some(true));
         assert!(h.state().ws.load_state().raw_types.is_empty());
+        // A past response picked from History opens the same way as a new one.
+        h.get_by_label("Raw").click();
+        h.run();
+        h.get_by_label_contains("History: ").click();
+        h.run();
+        let by = egui_kittest::kittest::By::new().label_contains("200  ·");
+        h.query_all(by).next().unwrap().click();
+        h.run();
+        let shown = h.state().response.as_ref().unwrap();
+        assert!(shown.past.is_some(), "a past response is shown");
+        assert_eq!(pretty(h.state()), Some(false));
         // The type, not its parameters: a charset doesn't make another kind of body.
         let head = http::Response {
             status: 200,
@@ -9638,6 +9649,10 @@ mod ui_tests {
         for _ in 0..200 {
             h.step();
             if done(h.state()) {
+                // Sessions write their events from another thread: what's awaited may
+                // have arrived after this frame was drawn (e.g. in the frame that
+                // connected, before the panel showed Send), so draw one that sees it.
+                h.step();
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
