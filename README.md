@@ -27,13 +27,13 @@ such as Citrix VDI. No installer: unzip and run.
   collection; duplicate requests and folders (Ctrl+D); Save ⏷ "Save as…" saves the edits
   as a new request (`folder/name`; the original stays as saved); new request (Ctrl+N); Ctrl+L
   selects the URL; Ctrl+K jumps to any request (by folder and name, letters in order are
-  enough) or environment; filter the tree by name; drag a request or folder onto a folder (or the
+  enough), folder (its settings) or environment; filter the tree by name; drag a request or folder onto a folder (or the
   empty space under the tree) to move it, open tabs following; a ⋯ on the hovered tree row
   opens the same menu as right-click; each request's last status code on its tree row; a
   `folder › request` breadcrumb whose folders open their settings; header names and Content-Type values complete while
   typing, and the Headers tab folds out what Send adds (Host, auth, Content-Type…) and
   where each comes from; a response body with JSON colours and line numbers, folding
-  of pretty JSON objects and arrays (find opens a fold it lands in), Pretty/Raw (XML responses are indented too), a JSONPath filter (`$.items[*].id`, `..id`; Save… still writes the whole
+  of pretty JSON objects and arrays (find opens a fold it lands in), Pretty/Raw (XML responses are indented too), a JSONPath filter (`$.items[*].id`, `..id`, `$.items[?(@.price < 10 && @.tag == 'x')]`; Save… still writes the whole
   body), a Tests tab filter (All/Passed/Failed with counts), word wrap (between words) and Save… to a file (bodies past 16 MiB keep their start, to
   spare RAM; Send ⏷ "Send and download…" streams a successful response straight to a
   file instead, however big, and a failed or cancelled one leaves no partial file); a PNG or JPEG response shows as a picture, other binary

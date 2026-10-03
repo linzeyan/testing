@@ -265,6 +265,8 @@ fn apply_one(map: &mut HashMap<String, String>, k: &str, v: &Option<String>) {
 
 /// Reads a runner data file: CSV with a header row, or a JSON array of objects.
 /// Non-string JSON values are passed on as their JSON text, like Postman.
+// ponytail: every row is kept as a map, about 16 times the file (100 000 rows: 65 MiB from
+// CSV, 105 MiB from JSON). Read rows as the run reaches them if files with millions come.
 pub fn load_data(path: &Path) -> Result<Vec<HashMap<String, String>>, String> {
     let shown = path.display();
     let text = std::fs::read_to_string(path).map_err(|e| format!("{shown}: {e}"))?;

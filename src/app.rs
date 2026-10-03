@@ -1649,7 +1649,7 @@ fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
                 .desired_width(280.0),
         );
         let edit = edit.on_hover_text(
-            "JSONPath: $, .key, ['key'], [0], [-1], [*], .*, ..key (filters [?()] aren't supported)",
+            "JSONPath: $, .key, ['key'], [0], [-1], [*], .*, ..key, [?(@.price < 10 && @.tag == 'x')]",
         );
         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         let live = view.raw_size <= LIVE_FILTER_MAX;
@@ -3476,7 +3476,7 @@ impl App {
                     });
                     let edit = ui.add(
                         egui::TextEdit::singleline(query)
-                            .hint_text("Go to a request or environment")
+                            .hint_text("Go to a request, folder or environment")
                             .desired_width(f32::INFINITY),
                     );
                     let enter = enter_pressed(ui);
@@ -3494,7 +3494,7 @@ impl App {
                         let row = ui.horizontal(|ui| {
                             let color = match target {
                                 Go::Request(_) => method_color(badge),
-                                Go::Env(_) => ui.visuals().weak_text_color(),
+                                Go::Folder(_) | Go::Env(_) => ui.visuals().weak_text_color(),
                             };
                             ui.add_sized(
                                 [44.0, 18.0],
@@ -3521,6 +3521,10 @@ impl App {
                                 Go::Request(path) => {
                                     app.reveal = Some(path.clone());
                                     app.activate(path, true);
+                                }
+                                Go::Folder(dir) => {
+                                    app.reveal = Some(dir.clone());
+                                    app.open_folder_editor(dir);
                                 }
                                 Go::Env(name) => app.set_env(Some(name)),
                             }
@@ -4352,23 +4356,28 @@ fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
 #[derive(Clone)]
 enum Go {
     Request(PathBuf),
+    /// Opens its settings.
+    Folder(PathBuf),
     Env(String),
 }
 
-/// What Ctrl+K can jump to: (label, badge, target). Requests are labelled by their place in
-/// the tree, so two "get user"s in different folders can be told apart.
+/// What Ctrl+K can jump to: (label, badge, target). Requests and folders are labelled by
+/// their place in the tree, so two "get user"s in different folders can be told apart.
 fn switch_targets(nodes: &[Node], root: &Path, envs: &[String]) -> Vec<(String, String, Go)> {
     fn walk(nodes: &[Node], root: &Path, out: &mut Vec<(String, String, Go)>) {
+        let label = |path: &Path| {
+            let rel = path.strip_prefix(root).unwrap_or(path).with_extension("");
+            rel.to_string_lossy().replace('\\', "/")
+        };
         for node in nodes {
             match node {
-                Node::Folder { children, .. } => walk(children, root, out),
+                Node::Folder { path, children, .. } => {
+                    out.push((label(path), "DIR".to_owned(), Go::Folder(path.clone())));
+                    walk(children, root, out);
+                }
                 Node::Request { path, method, .. } => {
-                    let label = path.strip_prefix(root).unwrap_or(path).with_extension("");
-                    out.push((
-                        label.to_string_lossy().replace('\\', "/"),
-                        short_method(method).to_owned(),
-                        Go::Request(path.clone()),
-                    ));
+                    let badge = short_method(method).to_owned();
+                    out.push((label(path), badge, Go::Request(path.clone())));
                 }
             }
         }
@@ -6639,16 +6648,17 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
         edit.request_focus(); // keep typing / pressing Enter for the next hit
     }
     if find.query != find.searched {
-        // ASCII-only case folding keeps byte offsets identical to `text`.
-        let needle = find.query.to_ascii_lowercase();
-        find.hits = if needle.is_empty() {
-            Vec::new()
-        } else {
-            let hay = text.to_ascii_lowercase();
-            hay.match_indices(&needle)
-                .map(|(i, _)| i)
+        // ASCII-only case folding, in place: lowercasing a copy of a 16 MiB body per
+        // keystroke was a 16 MiB allocation each time.
+        let finder = aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build([&find.query]);
+        find.hits = match finder {
+            Ok(f) if !find.query.is_empty() => (f.find_iter(text.as_str()))
+                .map(|m| m.start())
                 .take(MAX_HITS)
-                .collect()
+                .collect(),
+            _ => Vec::new(),
         };
         find.searched = find.query.clone();
         find.current = 0;
@@ -6667,7 +6677,6 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     }
 }
 
-/// One body row, JSON tokens coloured and find hits painted over it.
 /// A body that isn't text: shown when it's an image, else only its size.
 fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
     let bytes = view.head.bytes.as_deref().unwrap_or_default();
@@ -6721,6 +6730,7 @@ fn decode_image(
     ))
 }
 
+/// One body row, JSON tokens coloured and find hits painted over it.
 fn highlighted(
     ui: &egui::Ui,
     view: &ResponseView,
@@ -7965,7 +7975,7 @@ mod ui_tests {
     }
 
     #[test]
-    fn ctrl_k_jumps_to_a_request_or_environment_from_the_keyboard() {
+    fn ctrl_k_jumps_to_a_request_folder_or_environment_from_the_keyboard() {
         let ws = workspace("switch");
         let top = ws.collections();
         for folder in ["admin", "users"] {
@@ -7978,7 +7988,7 @@ mod ui_tests {
         let switch = |h: &mut Harness<'_, App>, text: &str, downs: usize| {
             h.key_press_modifiers(Modifiers::COMMAND, Key::K);
             h.run();
-            let hint = Some("Go to a request or environment");
+            let hint = Some("Go to a request, folder or environment");
             (h.get_all_by_role(Role::TextInput))
                 .find(|n| n.accesskit_node().placeholder() == hint)
                 .unwrap()
@@ -8002,6 +8012,10 @@ mod ui_tests {
         assert_eq!(open(&h), Some(top.join("users/get user.toml")));
         switch(&mut h, "prod", 0);
         assert_eq!(h.state().active_env.as_deref(), Some("prod"));
+        // A folder opens its settings; it ranks above the longer "users/get user".
+        switch(&mut h, "users", 0);
+        let editing = h.state().folder_editor.as_ref().map(|f| f.dir.clone());
+        assert_eq!(editing, Some(top.join("users")));
     }
 
     #[test]
