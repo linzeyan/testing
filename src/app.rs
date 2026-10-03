@@ -508,13 +508,35 @@ struct RunState {
     started: Instant,
     finished: Option<Duration>,
     total: usize,
-    items: Vec<RunItem>,
+    /// At most MAX_RUN_ROWS, oldest first; the counters below cover the whole run.
+    items: VecDeque<RunItem>,
+    done: usize,
+    failed: usize,
+    /// Passed, run.
+    tests: (usize, usize),
     abort: tokio::task::AbortHandle,
 }
+
+/// Results the runner pane keeps: a data file of 100 000 rows would otherwise hold every
+/// row in RAM and lay all of them out each frame.
+const MAX_RUN_ROWS: usize = 1000;
 
 impl RunState {
     fn running(&self) -> bool {
         self.finished.is_none()
+    }
+
+    /// Past MAX_RUN_ROWS the oldest passing row goes: failures are what's looked for.
+    fn push(&mut self, item: RunItem) {
+        self.done += 1;
+        self.failed += usize::from(item.failed());
+        self.tests.0 += item.tests.iter().filter(|t| t.passed).count();
+        self.tests.1 += item.tests.len();
+        self.items.push_back(item);
+        if self.items.len() > MAX_RUN_ROWS {
+            let oldest = self.items.iter().position(|i| !i.failed()).unwrap_or(0);
+            self.items.remove(oldest);
+        }
     }
 }
 
@@ -1332,7 +1354,7 @@ impl App {
                         .and_then(|r| r.run.as_mut())
                         .filter(|r| r.id == id)
                     {
-                        run.items.push(item);
+                        run.push(item);
                     }
                     continue;
                 }
@@ -3953,7 +3975,10 @@ impl App {
             started: Instant::now(),
             finished: None,
             total,
-            items: Vec::new(),
+            items: VecDeque::new(),
+            done: 0,
+            failed: 0,
+            tests: (0, 0),
             abort: task.abort_handle(),
         });
     }
@@ -4010,14 +4035,7 @@ impl App {
         ui.separator();
 
         if let Some(run) = &view.run {
-            let done = run.items.len();
-            let failed = run.items.iter().filter(|i| i.failed()).count();
-            let (tests_passed, tests_total) = run.items.iter().fold((0, 0), |(p, t), i| {
-                (
-                    p + i.tests.iter().filter(|x| x.passed).count(),
-                    t + i.tests.len(),
-                )
-            });
+            let (done, failed, (tests_passed, tests_total)) = (run.done, run.failed, run.tests);
             let elapsed = run.finished.unwrap_or_else(|| run.started.elapsed());
             ui.add(
                 egui::ProgressBar::new(done as f32 / run.total.max(1) as f32)
@@ -4046,7 +4064,12 @@ impl App {
                 ui.ctx().request_repaint_after(Duration::from_millis(250));
             }
             ui.separator();
-            // ponytail: plain ScrollArea renders every row; switch to show_rows if runs reach tens of thousands.
+            if done > run.items.len() {
+                ui.weak(format!(
+                    "Showing {} of {done}: failures and the latest passes.",
+                    run.items.len()
+                ));
+            }
             egui::ScrollArea::vertical()
                 .id_salt("runner-results")
                 .auto_shrink(false)
@@ -7525,6 +7548,46 @@ mod ui_tests {
         };
         assert!(error.contains("already exists"), "{error}");
         assert_eq!(ws.load_request(&original).unwrap().url, "");
+    }
+
+    /// A long data-driven run keeps a bounded list, but the counts cover every row and
+    /// no failure is pushed out by passes.
+    #[test]
+    fn a_long_run_keeps_its_failures_and_counts_everything() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut run = RunState {
+            id: 0,
+            started: Instant::now(),
+            finished: None,
+            total: 0,
+            items: VecDeque::new(),
+            done: 0,
+            failed: 0,
+            tests: (0, 0),
+            abort: rt.spawn(async {}).abort_handle(),
+        };
+        for i in 0..3 * MAX_RUN_ROWS {
+            run.push(RunItem {
+                iteration: i,
+                name: "r".into(),
+                method: "GET".into(),
+                status: Ok((200, 1)),
+                tests: vec![crate::script::TestResult {
+                    name: "ok".into(),
+                    passed: i % 100 != 0,
+                    error: None,
+                }],
+            });
+        }
+        assert_eq!(run.items.len(), MAX_RUN_ROWS);
+        assert_eq!((run.done, run.failed), (3 * MAX_RUN_ROWS, 30));
+        assert_eq!(run.tests, (3 * MAX_RUN_ROWS - 30, 3 * MAX_RUN_ROWS));
+        let failures = run.items.iter().filter(|i| i.failed()).count();
+        assert_eq!(
+            failures, 30,
+            "the first failure, from row 0, is still there"
+        );
+        assert_eq!(run.items.back().unwrap().iteration, 3 * MAX_RUN_ROWS - 1);
     }
 
     #[test]

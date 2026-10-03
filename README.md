@@ -8,7 +8,8 @@ such as Citrix VDI. No installer: unzip and run.
   messages); MQTT 3.1.1 or 5 over TCP, TLS or WebSocket (`mqtt://`, `mqtts://`, `ws://`,
   `wss://`) subscribes to the request's topics on Connect, follows changes to them while
   connected, and publishes from the message panel with QoS and retain; Postman-style pre-request/test
-  scripts (`pm.*`, chai, `jsonSchema`); collection runner with CSV/JSON data; load test
+  scripts (`pm.*`, chai, `jsonSchema`); collection runner with CSV/JSON data (counts cover every row; the list keeps
+  failures and the latest 1000 results); load test
   pane (response bodies are read and dropped, so many users cost no RAM); proxy/PAC/WPAD, custom CA and client certificates. JSON, text (Text/XML/HTML/JavaScript
   sets the Content-Type; XML has Beautify), form and multipart
   bodies (a value `@path` uploads a file), and a Binary body that sends a file as it is,
