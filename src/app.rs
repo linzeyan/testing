@@ -6307,7 +6307,19 @@ fn response_ui(
                         .color(status_color(h.status)),
                 )
                 .on_hover_text(status_meaning(h.status));
-                ui.weak(format!("{} ms", h.elapsed.as_millis()));
+                let ms = ui.weak(format!("{} ms", h.elapsed.as_millis()));
+                if let Some(waited) = h.sent.waited {
+                    let hops = match h.sent.hops.len() {
+                        0 => String::new(),
+                        1 => ", the redirect included".into(),
+                        n => format!(", {n} redirects included"),
+                    };
+                    ms.on_hover_text(format!(
+                        "Waiting (TTFB) {} ms{hops}\nDownload {} ms",
+                        waited.as_millis(),
+                        h.elapsed.saturating_sub(waited).as_millis()
+                    ));
+                }
                 // As received, before any re-indenting for display.
                 let headers: usize = (h.headers.iter()).map(|(k, v)| k.len() + v.len() + 4).sum();
                 let sizes = format!(

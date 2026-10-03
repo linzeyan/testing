@@ -55,7 +55,7 @@ such as Citrix VDI. No installer: unzip and run.
   like Postman collection/folder settings; tabs (a click in the tree previews,
   double-click or editing keeps the tab, Ctrl+W closes; right-click a tab to duplicate it or
   close others, those to the right or all, which leaves tabs with unsaved edits open);
-  hover the status code for what it means and the size for headers vs body; "Side by side"
+  hover the status code for what it means, the time for waiting (TTFB) vs download, and the size for headers vs body; "Side by side"
   in the status bar puts the response beside the request and "Sidebar" folds the tree away
   (both kept across restarts); an environment can have a colour (prod in red) shown on its
   selector and as a strip across the top; Markdown API docs from

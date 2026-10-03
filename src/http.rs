@@ -18,6 +18,11 @@ pub struct Sent {
     pub hops: Vec<(u16, String)>,
     /// The peer the response came from; the proxy's address when going through one.
     pub remote: Option<String>,
+    /// Until the response headers were in, redirects included; the rest of the time went
+    /// on the body. None from before it was kept, and for gRPC.
+    /// ponytail: DNS, connect and TLS aren't split out; a timing connector layer would.
+    #[serde(default)]
+    pub waited: Option<Duration>,
 }
 
 /// Only used to build requests, never to send: the code panel and the Headers tab rebuild
@@ -339,6 +344,7 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
     };
     let (resp, trace) = TRACE.scope(Default::default(), send).await;
     let resp = resp.map_err(|e| error_chain(&e))?;
+    sent.waited = Some(started.elapsed());
     sent.added(trace.cookie, body_len);
     sent.hops = trace.hops;
     sent.remote = resp.remote_addr().map(|a| a.to_string());
@@ -1110,6 +1116,33 @@ pub(crate) mod tests {
             let _ = s.write_all(&body);
         });
         format!("http://{addr}/")
+    }
+
+    /// What Postman's time hover splits: a server slow to start answering, and one slow
+    /// to send the body, are told apart.
+    #[test]
+    fn the_wait_for_headers_is_told_from_the_body_download() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_request(&mut s);
+            std::thread::sleep(Duration::from_millis(200));
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\n");
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = s.write_all(b"ok");
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // A process's first connection can take a second here (measured with a bare
+        // std connect), which would land in the wait.
+        get(&rt, serve_bytes("content-type: text/plain", b"x".to_vec()));
+        let resp = get(&rt, format!("http://{addr}/"));
+        let waited = resp.sent.waited.unwrap();
+        let ms = Duration::from_millis;
+        assert!(ms(200) <= waited && waited < ms(450), "{waited:?}");
+        let download = resp.elapsed - waited;
+        assert!(download >= ms(250), "{download:?}");
     }
 
     fn get(rt: &tokio::runtime::Runtime, url: String) -> Response {
