@@ -31,7 +31,8 @@ such as Citrix VDI. No installer: unzip and run.
   collection; duplicate requests and folders (Ctrl+D); Save ⏷ "Save as…" saves the edits
   as a new request (`folder/name`; the original stays as saved); new request (Ctrl+N); Ctrl+L
   selects the URL; Ctrl+K jumps to any request (by folder and name, letters in order are
-  enough), folder (its settings) or environment; filter the tree by name; drag a request or folder onto a folder (or the
+  enough), folder (its settings) or environment, or does what a button does (new request,
+  network settings, cookies, side by side…); filter the tree by name; drag a request or folder onto a folder (or the
   empty space under the tree) to move it, open tabs following; a ⋯ on the hovered tree row
   opens the same menu as right-click; each request's last status code on its tree row; a
   `folder › request` breadcrumb whose folders open their settings; header names and Content-Type values complete while

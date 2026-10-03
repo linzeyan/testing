@@ -3606,7 +3606,7 @@ impl App {
                     });
                     let edit = ui.add(
                         egui::TextEdit::singleline(query)
-                            .hint_text("Go to a request, folder or environment")
+                            .hint_text("Go to a request, folder, environment or action")
                             .desired_width(f32::INFINITY),
                     );
                     let enter = enter_pressed(ui);
@@ -3624,7 +3624,9 @@ impl App {
                         let row = ui.horizontal(|ui| {
                             let color = match target {
                                 Go::Request(_) => method_color(badge),
-                                Go::Folder(_) | Go::Env(_) => ui.visuals().weak_text_color(),
+                                Go::Folder(_) | Go::Env(_) | Go::Action(_) => {
+                                    ui.visuals().weak_text_color()
+                                }
                             };
                             ui.add_sized(
                                 [44.0, 18.0],
@@ -3657,6 +3659,7 @@ impl App {
                                     app.open_folder_editor(dir);
                                 }
                                 Go::Env(name) => app.set_env(Some(name)),
+                                Go::Action(action) => app.act(action),
                             }
                         }));
                     }
@@ -4489,9 +4492,69 @@ enum Go {
     /// Opens its settings.
     Folder(PathBuf),
     Env(String),
+    Action(Action),
 }
 
-/// What Ctrl+K can jump to: (label, badge, target). Requests and folders are labelled by
+/// What a button somewhere already does, for whoever's hands are on the keyboard.
+#[derive(Clone, Copy)]
+enum Action {
+    NewRequest,
+    NewFolder,
+    NewEnv,
+    Globals,
+    RunCollection,
+    ImportPostman,
+    Network,
+    Cookies,
+    Sidebar,
+    SideBySide,
+}
+
+const ACTIONS: [(&str, Action); 10] = [
+    ("New request", Action::NewRequest),
+    ("New folder", Action::NewFolder),
+    ("New environment", Action::NewEnv),
+    ("Edit globals", Action::Globals),
+    ("Run collection", Action::RunCollection),
+    ("Import from Postman", Action::ImportPostman),
+    ("Network settings (proxy, certificates)", Action::Network),
+    ("Cookies", Action::Cookies),
+    ("Show or hide the sidebar", Action::Sidebar),
+    ("Side by side or stacked", Action::SideBySide),
+];
+
+impl App {
+    fn act(&mut self, action: Action) {
+        let root = self.ws.collections();
+        match action {
+            Action::NewRequest => {
+                self.dialog = Some(Dialog::name(NameKind::NewRequest(root), ""));
+            }
+            Action::NewFolder => self.dialog = Some(Dialog::name(NameKind::NewFolder(root), "")),
+            Action::NewEnv => self.dialog = Some(Dialog::name(NameKind::NewEnv, "")),
+            Action::Globals => self.open_env_editor(None, &[]),
+            Action::RunCollection => self.open_runner(root),
+            Action::ImportPostman => {
+                self.dialog = Some(Dialog::Postman {
+                    text: String::new(),
+                    note: String::new(),
+                });
+            }
+            Action::Network => self.network_editor = Some(self.network.clone()),
+            Action::Cookies => self.cookie_manager = true,
+            Action::Sidebar => {
+                self.hide_sidebar = !self.hide_sidebar;
+                self.save_state();
+            }
+            Action::SideBySide => {
+                self.side_by_side = !self.side_by_side;
+                self.save_state();
+            }
+        }
+    }
+}
+
+/// What Ctrl+K can jump to or do: (label, badge, target). Requests and folders are labelled by
 /// their place in the tree, so two "get user"s in different folders can be told apart.
 fn switch_targets(nodes: &[Node], root: &Path, envs: &[String]) -> Vec<(String, String, Go)> {
     fn walk(nodes: &[Node], root: &Path, out: &mut Vec<(String, String, Go)>) {
@@ -4515,6 +4578,9 @@ fn switch_targets(nodes: &[Node], root: &Path, envs: &[String]) -> Vec<(String, 
     let mut out = Vec::new();
     walk(nodes, root, &mut out);
     out.extend((envs.iter()).map(|e| (e.clone(), "ENV".to_owned(), Go::Env(e.clone()))));
+    out.extend(
+        (ACTIONS.iter()).map(|(label, a)| ((*label).to_owned(), "CMD".to_owned(), Go::Action(*a))),
+    );
     out
 }
 
@@ -8232,7 +8298,7 @@ mod ui_tests {
         let switch = |h: &mut Harness<'_, App>, text: &str, downs: usize| {
             h.key_press_modifiers(Modifiers::COMMAND, Key::K);
             h.run();
-            let hint = Some("Go to a request, folder or environment");
+            let hint = Some("Go to a request, folder, environment or action");
             (h.get_all_by_role(Role::TextInput))
                 .find(|n| n.accesskit_node().placeholder() == hint)
                 .unwrap()
@@ -8256,6 +8322,21 @@ mod ui_tests {
         assert_eq!(open(&h), Some(top.join("users/get user.toml")));
         switch(&mut h, "prod", 0);
         assert_eq!(h.state().active_env.as_deref(), Some("prod"));
+        // Actions do what their buttons do, saved state included.
+        switch(&mut h, "network", 0);
+        assert!(h.state().network_editor.is_some());
+        h.state_mut().network_editor = None;
+        switch(&mut h, "side by", 0);
+        assert!(h.state().side_by_side && h.state().ws.load_state().side_by_side);
+        switch(&mut h, "new req", 0);
+        assert!(matches!(
+            h.state().dialog,
+            Some(Dialog::Name {
+                kind: NameKind::NewRequest(_),
+                ..
+            })
+        ));
+        h.state_mut().dialog = None;
         // A folder opens its settings; it ranks above the longer "users/get user".
         switch(&mut h, "users", 0);
         let editing = h.state().folder_editor.as_ref().map(|f| f.dir.clone());
