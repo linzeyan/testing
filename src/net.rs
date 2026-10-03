@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use hyper_util::client::proxy::matcher::Matcher;
@@ -248,6 +248,7 @@ pub async fn build_client_with_jar(
         if let Some(id) = &identity {
             b = b.identity(id.clone());
         }
+        b = b.connector_layer(tower_layer::layer_fn(TimeConnect));
         b = match v.version {
             HttpVersion::Auto => b,
             HttpVersion::Http1 => b.http1_only(),
@@ -566,6 +567,40 @@ fn first_proxy(result: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Times each new connection for the response's time hover. It runs inside the send
+/// (unless hyper finishes it in the background for a later request), where TRACE is.
+#[derive(Clone)]
+struct TimeConnect<S>(S);
+
+impl<R, S> tower_service::Service<R> for TimeConnect<S>
+where
+    S: tower_service::Service<R>,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), S::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: R) -> Self::Future {
+        let started = Instant::now();
+        let connecting = self.0.call(req);
+        Box::pin(async move {
+            let conn = connecting.await;
+            let took = started.elapsed();
+            crate::http::trace(|t| *t.connect.get_or_insert_default() += took);
+            conn
+        })
+    }
 }
 
 fn dns_resolve(host: String) -> Option<String> {

@@ -6407,9 +6407,14 @@ fn response_ui(
                         1 => ", the redirect included".into(),
                         n => format!(", {n} redirects included"),
                     };
+                    let connect = match h.sent.connect {
+                        Some(c) => format!("Connect {} ms (DNS, TCP, TLS)\n", c.as_millis()),
+                        None => "Reused an open connection\n".into(),
+                    };
+                    let connected = waited.saturating_sub(h.sent.connect.unwrap_or_default());
                     ms.on_hover_text(format!(
-                        "Waiting (TTFB) {} ms{hops}\nDownload {} ms",
-                        waited.as_millis(),
+                        "{connect}Waiting (TTFB) {} ms{hops}\nDownload {} ms",
+                        connected.as_millis(),
                         h.elapsed.saturating_sub(waited).as_millis()
                     ));
                 }

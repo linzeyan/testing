@@ -20,9 +20,13 @@ pub struct Sent {
     pub remote: Option<String>,
     /// Until the response headers were in, redirects included; the rest of the time went
     /// on the body. None from before it was kept, and for gRPC.
-    /// ponytail: DNS, connect and TLS aren't split out; a timing connector layer would.
     #[serde(default)]
     pub waited: Option<Duration>,
+    /// Part of `waited`: opening new connections, DNS, TCP, TLS and a proxy's CONNECT
+    /// together. None when an open one was reused.
+    /// ponytail: not split further; DNS alone would need a resolver of our own.
+    #[serde(default)]
+    pub connect: Option<Duration>,
 }
 
 /// Only used to build requests, never to send: the code panel and the Headers tab rebuild
@@ -42,6 +46,8 @@ const MAX_SENT_BODY: usize = 64 << 10;
 pub struct Trace {
     pub cookie: Option<String>,
     pub hops: Vec<(u16, String)>,
+    /// Filled in by the connector, see `net::TimeConnect`.
+    pub connect: Option<Duration>,
 }
 
 tokio::task_local! {
@@ -347,6 +353,7 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
     sent.waited = Some(started.elapsed());
     sent.added(trace.cookie, body_len);
     sent.hops = trace.hops;
+    sent.connect = trace.connect;
     sent.remote = resp.remote_addr().map(|a| a.to_string());
     let status = resp.status();
     let version = format!("{:?}", resp.version());
@@ -1139,10 +1146,41 @@ pub(crate) mod tests {
         get(&rt, serve_bytes("content-type: text/plain", b"x".to_vec()));
         let resp = get(&rt, format!("http://{addr}/"));
         let waited = resp.sent.waited.unwrap();
+        // A new connection each time ("connection: close"), timed as part of the wait.
+        assert!(
+            resp.sent.connect.is_some_and(|c| c <= waited),
+            "{resp:?}",
+            resp = resp.sent
+        );
         let ms = Duration::from_millis;
         assert!(ms(200) <= waited && waited < ms(450), "{waited:?}");
         let download = resp.elapsed - waited;
         assert!(download >= ms(250), "{download:?}");
+    }
+
+    /// A reused connection costs nothing to open; it must not show the last one's time.
+    #[test]
+    fn a_reused_connection_has_no_connect_time() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            for _ in 0..2 {
+                read_request(&mut s);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+            }
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let c = client(&rt);
+        let req = Request {
+            method: "GET".into(),
+            url: format!("http://{addr}/"),
+            ..Default::default()
+        };
+        let first = rt.block_on(execute(c.clone(), req.clone())).unwrap();
+        let second = rt.block_on(execute(c, req)).unwrap();
+        assert!(first.sent.connect.is_some());
+        assert_eq!(second.sent.connect, None);
     }
 
     fn get(rt: &tokio::runtime::Runtime, url: String) -> Response {
