@@ -63,6 +63,12 @@ pub struct TestResult {
 /// `None` values mean "unset".
 pub type Changes = HashMap<String, Option<String>>;
 
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct Next {
+    /// None: stop the run (`setNextRequest(null)`).
+    pub name: Option<String>,
+}
+
 #[derive(Deserialize, Default, Debug)]
 pub struct Output {
     pub tests: Vec<TestResult>,
@@ -71,6 +77,11 @@ pub struct Output {
     pub globals: Changes,
     pub locals: Changes,
     pub request: Option<WireRequest>,
+    /// `pm.execution.setNextRequest`: where the collection runner goes after this request.
+    pub next: Option<Next>,
+    /// `pm.execution.skipRequest()` in a pre-request script: don't send it.
+    #[serde(default)]
+    pub skip: bool,
     /// Uncaught exception or syntax error; everything above is still what ran before it.
     #[serde(skip)]
     pub error: Option<String>,
@@ -82,7 +93,7 @@ chai.Assertion.addMethod('jsonSchema', function (schema) {
   this.assert(!errors, 'expected value to match JSON schema:\n' + errors, 'expected value not to match JSON schema');
 });
 var __in = JSON.parse(__input);
-var __out = { tests: [], logs: [], env: {}, globals: {}, locals: {}, request: null };
+var __out = { tests: [], logs: [], env: {}, globals: {}, locals: {}, request: null, next: null, skip: false };
 function __str(v) {
   if (typeof v === 'string') return v;
   try { var s = JSON.stringify(v); return s === undefined ? String(v) : s; } catch (e) { return String(v); }
@@ -141,6 +152,12 @@ var pm = {
     }
   }
 };
+// Only the collection runner follows these; a single Send has no next request.
+pm.execution = {
+  setNextRequest: function (n) { __out.next = { name: n === null || n === undefined ? null : String(n) }; },
+  skipRequest: function () { __out.skip = true; }
+};
+var postman = { setNextRequest: pm.execution.setNextRequest };
 var __locals = __in.locals;
 pm.variables = {
   get: function (k) {

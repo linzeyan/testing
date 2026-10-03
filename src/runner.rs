@@ -41,6 +41,10 @@ pub struct Outcome {
     /// Variable writes made by the scripts, to be applied (and persisted) by the caller.
     pub env: Changes,
     pub globals: Changes,
+    /// A script's `setNextRequest`: Some(None) stops the run.
+    pub next: Option<Option<String>>,
+    /// A pre-request script's `skipRequest()`: nothing was sent.
+    pub skipped: bool,
 }
 
 impl Outcome {
@@ -51,19 +55,15 @@ impl Outcome {
             logs: Vec::new(),
             env: Changes::new(),
             globals: Changes::new(),
+            next: None,
+            skipped: false,
         }
     }
 }
 
 /// Must run on a multi-threaded tokio runtime: scripts are CPU-bound and use `block_in_place`.
 pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: Vars) -> Outcome {
-    let mut out = Outcome {
-        response: Err(String::new()),
-        tests: Vec::new(),
-        logs: Vec::new(),
-        env: Changes::new(),
-        globals: Changes::new(),
-    };
+    let mut out = Outcome::failed(String::new());
     let mut locals = HashMap::new();
     let collection = req.inherited.vars.clone();
     // Postman's order: outermost folder first, the request's own script last.
@@ -113,6 +113,13 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
             let whose = whose(&folder);
             out.response = Err(format!(
                 "Pre-request script{whose} failed, request not sent:\n{e}"
+            ));
+            return out;
+        }
+        if out.skipped {
+            let whose = whose(&folder);
+            out.response = Err(format!(
+                "Skipped by pm.execution.skipRequest() in the pre-request script{whose}"
             ));
             return out;
         }
@@ -243,7 +250,9 @@ pub async fn run_collection(
     let mut first = true;
     for iteration in 0..count {
         vars.data = plan.data.get(iteration).cloned().unwrap_or_default();
-        for (name, req) in &plan.requests {
+        let mut at = 0;
+        while let Some((name, req)) = plan.requests.get(at) {
+            at += 1;
             if !first && !plan.delay.is_zero() {
                 tokio::time::sleep(plan.delay).await;
             }
@@ -262,13 +271,38 @@ pub async fn run_collection(
             }
             env.extend(out.env);
             globals.extend(out.globals);
-            on_item(RunItem {
-                iteration,
-                name: name.clone(),
-                method: req.method.clone(),
-                status: out.response.map(|r| (r.status, r.elapsed.as_millis())),
-                tests: out.tests,
-            });
+            let mut tests = out.tests;
+            // Postman matches the request's name; a folder path works too, for names that
+            // repeat across folders.
+            match out.next {
+                None => {}
+                Some(None) => at = plan.requests.len(),
+                Some(Some(next)) => {
+                    let found = plan.requests.iter().position(|(key, _)| {
+                        key == &next || key.rsplit('/').next() == Some(next.as_str())
+                    });
+                    at = found.unwrap_or_else(|| {
+                        tests.push(TestResult {
+                            name: "setNextRequest".into(),
+                            passed: false,
+                            error: Some(format!(
+                                "no request named \"{next}\" in this run; it stops here"
+                            )),
+                        });
+                        plan.requests.len()
+                    });
+                }
+            }
+            // Postman leaves skipped requests out of the results too.
+            if !out.skipped || tests.iter().any(|t| !t.passed) {
+                on_item(RunItem {
+                    iteration,
+                    name: name.clone(),
+                    method: req.method.clone(),
+                    status: out.response.map(|r| (r.status, r.elapsed.as_millis())),
+                    tests,
+                });
+            }
         }
     }
     (env, globals)
@@ -350,6 +384,10 @@ fn absorb(
     apply(&mut vars.env, &r.env);
     apply(&mut vars.globals, &r.globals);
     apply(locals, &r.locals);
+    if let Some(next) = r.next {
+        out.next = Some(next.name);
+    }
+    out.skipped |= r.skip;
     out.env.extend(r.env);
     out.globals.extend(r.globals);
     // Tests from the pre-request script are unusual but legal; keep them in order.
@@ -750,6 +788,85 @@ mod tests {
         }
         // The last write wins and is handed back for persisting.
         assert_eq!(env["session"], Some("bob".into()));
+    }
+
+    /// Postman's flow control: jump over a request, poll one until it's done, stop the
+    /// run, and leave out a request a pre-request script skips (it never goes out).
+    #[test]
+    fn scripts_choose_the_next_request_or_skip_their_own() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt.block_on(build_client(Network::default())).unwrap();
+        let base = crate::http::tests::echo_server();
+        let req = |pre: &str, tests: &str| Request {
+            url: format!("{base}/x"),
+            pre_request: pre.into(),
+            tests: tests.into(),
+            ..Default::default()
+        };
+        let poll = r#"var n = Number(pm.environment.get("n") || 0) + 1;
+            pm.environment.set("n", n);
+            pm.execution.setNextRequest(n < 3 ? "poll" : null);"#;
+        let plan = RunPlan {
+            requests: vec![
+                (
+                    "skipped".into(),
+                    req(
+                        "pm.execution.skipRequest();",
+                        "pm.environment.set('sent', 1);",
+                    ),
+                ),
+                (
+                    "start".into(),
+                    req("", r#"postman.setNextRequest("poll");"#),
+                ),
+                ("jumped over".into(), req("", "")),
+                ("jobs/poll".into(), req("", poll)),
+                ("after the stop".into(), req("", "")),
+            ],
+            data: vec![],
+            iterations: 1,
+            delay: Duration::ZERO,
+        };
+        let mut items = Vec::new();
+        let (env, _) = rt.block_on(run_collection(
+            client.clone(),
+            plan,
+            Vars::default(),
+            |item| items.push(item),
+        ));
+        let order: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(order, ["start", "jobs/poll", "jobs/poll", "jobs/poll"]);
+        assert!(items.iter().all(|i| !i.failed()));
+        assert_eq!(env.get("sent"), None, "a skipped request's tests don't run");
+
+        let plan = RunPlan {
+            requests: vec![
+                (
+                    "a".into(),
+                    req("", r#"pm.execution.setNextRequest("nope");"#),
+                ),
+                ("b".into(), req("", "")),
+            ],
+            data: vec![],
+            iterations: 1,
+            delay: Duration::ZERO,
+        };
+        let mut items = Vec::new();
+        rt.block_on(run_collection(client, plan, Vars::default(), |item| {
+            items.push(item)
+        }));
+        assert_eq!(items.len(), 1, "an unknown name stops the run");
+        assert!(
+            items[0].tests[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("\"nope\"")
+        );
     }
 
     #[test]
