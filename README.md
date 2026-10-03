@@ -29,7 +29,9 @@ such as Citrix VDI. No installer: unzip and run.
   Postman v2.1 collection or environment, or an OpenAPI 3 / Swagger 2 spec in JSON or YAML
   (a request per operation, a folder per tag, `{{baseUrl}}` from the server, auth from the
   security schemes, bodies and saved examples from the schemas, so the mock server answers
-  right away), or a HAR from browser devtools (a folder per host, each response kept as
+  right away), an Insomnia export (v4 JSON or v5 YAML: folders, auth, scripts, `{{ _.x }}`
+  as `{{x}}`, the base environment as collection variables and each sub-environment as an
+  environment), or a HAR from browser devtools (a folder per host, each response kept as
   the request's example) (⋯ > "Import…": paste it, give its path or drop the file) and copy a folder or the whole collection as a Postman
   collection; duplicate requests and folders (Ctrl+D); Save ⏷ "Save as…" saves the edits
   as a new request (`folder/name`; the original stays as saved); new request (Ctrl+N); Ctrl+L

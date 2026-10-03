@@ -13,6 +13,7 @@ mod grpc;
 mod har;
 mod http;
 mod import;
+mod insomnia;
 mod jsonpath;
 mod loadtest;
 mod mcp;

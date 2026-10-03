@@ -2489,10 +2489,19 @@ impl App {
                 folders,
                 requests,
                 warnings,
+                environments,
             } => {
                 let dir = self.ws.add_tree(&name, &folders, &requests)?;
                 let name = self.ws.display_name(&dir);
+                for (env, shared, secret) in &environments {
+                    self.add_env(env, shared, secret)?;
+                }
                 self.status = format!("Imported {} requests into \"{name}\"", requests.len());
+                match environments.len() {
+                    0 => {}
+                    1 => self.status += " and 1 environment",
+                    n => self.status += &format!(" and {n} environments"),
+                }
                 warnings
             }
             crate::postman::Import::Environment {
@@ -2500,19 +2509,29 @@ impl App {
                 shared,
                 secret,
             } => {
-                // Never replaces one: a same-named environment may hold this machine's secrets.
-                let names = self.ws.env_names();
-                let name = std::iter::once(name.clone())
-                    .chain((1..).map(|n| crate::store::copy_name(&name, n)))
-                    .find(|n| !names.contains(n))
-                    .expect("some name is free");
-                self.ws.save_env(Some(&name), &shared, &secret)?;
+                let name = self.add_env(&name, &shared, &secret)?;
                 self.status = format!("Imported environment \"{name}\"");
                 Vec::new()
             }
         };
         self.reload();
         Ok(warnings)
+    }
+
+    /// Never replaces one: a same-named environment may hold this machine's secrets.
+    fn add_env(
+        &mut self,
+        name: &str,
+        shared: &[crate::model::KeyValue],
+        secret: &[crate::model::KeyValue],
+    ) -> Result<String, String> {
+        let names = self.ws.env_names();
+        let name = std::iter::once(name.to_owned())
+            .chain((1..).map(|n| crate::store::copy_name(name, n)))
+            .find(|n| !names.contains(n))
+            .expect("some name is free");
+        self.ws.save_env(Some(&name), shared, secret)?;
+        Ok(name)
     }
 
     fn copy_docs(&mut self, dir: &Path, ctx: &egui::Context) {
@@ -7802,6 +7821,24 @@ mod ui_tests {
             assert_eq!(note, None, "nothing to report closes it");
         }
         assert_eq!(h.state().envs, ["dev", "Prod", "Prod copy"]);
+
+        // Insomnia keeps its environments in the collection's export; they arrive with it,
+        // under the same never-replace rule.
+        let insomnia = "type: collection.insomnia.rest/5.0\nname: Ins\ncollection: []\n\
+                        environments:\n  subEnvironments:\n    - name: Prod\n      data: {a: b}\n";
+        h.state_mut().dialog = Some(Dialog::Paste {
+            text: insomnia.into(),
+            note: String::new(),
+        });
+        h.run_steps(2);
+        h.get_by_label("Import").click();
+        h.run();
+        assert_eq!(h.state().envs, ["dev", "Prod", "Prod copy", "Prod copy 2"]);
+        assert!(
+            h.state().status.ends_with("and 1 environment"),
+            "{}",
+            h.state().status
+        );
     }
 
     #[test]

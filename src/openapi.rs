@@ -101,6 +101,7 @@ pub fn import(root: &Value) -> Import {
         folders,
         requests,
         warnings: s.warnings,
+        environments: Vec::new(),
     }
 }
 
@@ -674,6 +675,7 @@ mod tests {
                 folders,
                 requests,
                 warnings,
+                ..
             } => (name, folders, requests, warnings),
             Import::Environment { .. } => panic!("a collection"),
         }

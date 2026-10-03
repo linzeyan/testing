@@ -85,6 +85,7 @@ pub fn import(root: &Value) -> Import {
         folders,
         requests,
         warnings,
+        environments: Vec::new(),
     }
 }
 
@@ -188,6 +189,7 @@ mod tests {
             folders,
             requests,
             warnings,
+            ..
         } = import(&har)
         else {
             panic!("a collection")

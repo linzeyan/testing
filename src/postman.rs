@@ -13,6 +13,9 @@ use crate::store::{Node, Workspace, folder_name, safe_name};
 
 const SCHEMA: &str = "https://schema.getpostman.com/json/collection/v2.1.0/collection.json";
 
+/// An environment's name, shared and secret variables.
+pub type Env = (String, Vec<KeyValue>, Vec<KeyValue>);
+
 pub enum Import {
     /// Keys are below the collection's own folder, which is "".
     Collection {
@@ -21,6 +24,8 @@ pub enum Import {
         requests: Vec<(String, Request)>,
         /// What didn't come over as it was, one line each.
         warnings: Vec<String>,
+        /// Saved next to the collection.
+        environments: Vec<Env>,
     },
     Environment {
         name: String,
@@ -44,6 +49,7 @@ pub fn from_value(v: &Value) -> Result<Import, String> {
         folders: c.folders,
         requests: c.requests,
         warnings: c.warnings,
+        environments: Vec::new(),
     })
 }
 
@@ -738,6 +744,7 @@ mod tests {
             folders,
             requests,
             warnings,
+            ..
         } = crate::import::parse(SHOP).unwrap()
         else {
             panic!("not a collection");
@@ -1084,6 +1091,7 @@ mod tests {
             folders,
             requests: back,
             warnings,
+            ..
         } = crate::import::parse(&json).unwrap()
         else {
             panic!("not a collection");
