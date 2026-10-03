@@ -135,7 +135,9 @@ pub struct State {
     /// The language the code panel shows.
     pub code_lang: String,
     pub wrap_response: bool,
-    pub side_by_side: bool,
+    /// Response under the request. Off (side by side) unless chosen, as in bruno, insomnia
+    /// and yaak: wide screens have the room, and long JSON reads better tall.
+    pub stacked: bool,
     pub hide_sidebar: bool,
     /// By environment name. ponytail: a renamed or deleted environment leaves its entry
     /// behind; harmless, prune it if the list ever matters.

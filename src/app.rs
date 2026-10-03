@@ -18,6 +18,9 @@ use crate::stream::{self, Event};
 use crate::varedit::{clip, var_edit};
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+/// Below this workbench width (logical px) the response goes under the request: each half
+/// needs ~500 for the URL bar's buttons and the status line not to be cut off.
+const NARROW: f32 = 1000.0;
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
@@ -593,6 +596,8 @@ pub struct App {
     wrap_response: bool,
     /// The response beside the request instead of under it (Postman's two-pane view).
     side_by_side: bool,
+    /// Set each frame: the workbench is too narrow for side by side.
+    narrow: bool,
     hide_sidebar: bool,
     env_colors: HashMap<String, [u8; 3]>,
     recent_filters: Vec<String>,
@@ -655,7 +660,8 @@ impl App {
                 .filter(|l| crate::codegen::TARGETS.iter().any(|(n, _)| l == n))
                 .unwrap_or_else(|| "cURL".into()),
             wrap_response: state.wrap_response,
-            side_by_side: state.side_by_side,
+            side_by_side: !state.stacked,
+            narrow: false,
             hide_sidebar: state.hide_sidebar,
             env_colors: state.env_colors.clone(),
             recent_filters: state.recent_filters.clone(),
@@ -811,7 +817,7 @@ impl App {
             network: self.network.clone(),
             code_lang: self.code_lang.clone(),
             wrap_response: self.wrap_response,
-            side_by_side: self.side_by_side,
+            stacked: !self.side_by_side,
             hide_sidebar: self.hide_sidebar,
             env_colors: self.env_colors.clone(),
             recent_filters: self.recent_filters.clone(),
@@ -2097,9 +2103,13 @@ impl App {
                     self.save_state();
                 }
                 ui.separator();
+                let hint = match self.narrow {
+                    true => "The window is too narrow: the response is under the request until it is wider",
+                    false => "The response beside the request instead of under it",
+                };
                 if ui
                     .toggle_value(&mut self.side_by_side, "Side by side")
-                    .on_hover_text("The response beside the request instead of under it")
+                    .on_hover_text(hint)
                     .changed()
                 {
                     self.save_state();
@@ -2825,8 +2835,11 @@ impl App {
                 });
         }
 
+        // Too narrow for two columns of URL bar and JSON: stacked whatever the toggle says,
+        // like yaak and insomnia; widening the window puts it back.
+        self.narrow = ui.available_width() < NARROW;
         // Separate ids, so each layout keeps its own dragged size.
-        let panel = match self.side_by_side {
+        let panel = match self.side_by_side && !self.narrow {
             true => egui::Panel::left("request-side").default_size(ui.available_width() / 2.0),
             false => egui::Panel::top("request").default_size(320.0),
         };
@@ -7630,6 +7643,9 @@ mod ui_tests {
     #[test]
     fn side_by_side_puts_the_response_beside_the_request_and_is_kept() {
         let mut h = with_request("sidebyside");
+        h.set_size(egui::vec2(1600.0, 900.0));
+        h.run();
+        h.run();
         let hint = "Press Send or Ctrl+Enter to see the response.";
         // Until something is sent, the response pane teaches the keys.
         assert!(
@@ -7638,20 +7654,35 @@ mod ui_tests {
         );
         let rects =
             |h: &Harness<'_, App>| (h.get_by_label("Params").rect(), h.get_by_label(hint).rect());
+        shot(&mut h, "44-side-by-side");
+        let (p, r) = rects(&h);
+        assert!(
+            r.top() < p.top() && r.left() > p.right(),
+            "side by side by default: {p:?} {r:?}"
+        );
+        h.get_by_label("Side by side").click();
+        h.run();
         let (p, r) = rects(&h);
         assert!(
             r.top() > p.bottom(),
             "stacked: the response is under the request"
         );
+        assert!(h.state().ws.load_state().stacked, "kept for the next start");
+
+        // A narrow window stacks them whatever the toggle says.
         h.get_by_label("Side by side").click();
         h.run();
-        shot(&mut h, "44-side-by-side");
+        h.set_size(egui::vec2(1200.0, 800.0));
+        h.run();
+        h.run();
         let (p, r) = rects(&h);
-        assert!(r.top() < p.top() && r.left() > p.right(), "{p:?} {r:?}");
-        assert!(
-            h.state().ws.load_state().side_by_side,
-            "kept for the next start"
-        );
+        assert!(h.state().side_by_side);
+        assert!(r.top() > p.bottom(), "narrow: stacked {p:?} {r:?}");
+        h.set_size(egui::vec2(1600.0, 900.0));
+        h.run();
+        h.run();
+        let (p, r) = rects(&h);
+        assert!(r.left() > p.right(), "wide again: side by side {p:?} {r:?}");
     }
 
     /// A workspace with one request `r` (and env `dev` with `host`), opened in the app.
@@ -8413,7 +8444,7 @@ mod ui_tests {
         assert!(h.state().network_editor.is_some());
         h.state_mut().network_editor = None;
         switch(&mut h, "side by", 0);
-        assert!(h.state().side_by_side && h.state().ws.load_state().side_by_side);
+        assert!(!h.state().side_by_side && h.state().ws.load_state().stacked);
         switch(&mut h, "new req", 0);
         assert!(matches!(
             h.state().dialog,
