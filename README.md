@@ -32,8 +32,8 @@ such as Citrix VDI. No installer: unzip and run.
   opens the same menu as right-click; each request's last status code on its tree row; a
   `folder › request` breadcrumb whose folders open their settings; header names and Content-Type values complete while
   typing, and the Headers tab folds out what Send adds (Host, auth, Content-Type…) and
-  where each comes from; a response body with JSON colours and line numbers,
-  Pretty/Raw (XML responses are indented too), a JSONPath filter (`$.items[*].id`, `..id`; Save… still writes the whole
+  where each comes from; a response body with JSON colours and line numbers, folding
+  of pretty JSON objects and arrays (find opens a fold it lands in), Pretty/Raw (XML responses are indented too), a JSONPath filter (`$.items[*].id`, `..id`; Save… still writes the whole
   body), a Tests tab filter (All/Passed/Failed with counts), word wrap and Save… to a file (bodies past 16 MiB keep their start, to
   spare RAM; Send ⏷ "Send and download…" streams a successful response straight to a
   file instead, however big); a Timeline tab with the request as it went out (headers reqwest adds and jar

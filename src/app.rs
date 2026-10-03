@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -301,6 +301,8 @@ struct ResponseView {
     line_starts: Vec<usize>,
     /// Visual rows for word wrap at a given width in columns, see `wrap_rows`.
     wrapped: Option<(usize, Vec<Row>)>,
+    /// Folded JSON blocks, opening line → closing line (0-based).
+    folds: BTreeMap<usize, usize>,
     find: Find,
     /// The JSON filter as typed, the one `text` shows the result of, and why it can't apply.
     filter: String,
@@ -347,6 +349,7 @@ impl ResponseView {
         }
         self.line_starts = line_starts(&self.text);
         self.wrapped = None;
+        self.folds.clear();
         self.find = Find::default();
     }
 
@@ -1587,6 +1590,7 @@ fn into_view(mut head: http::Response) -> ResponseView {
         json,
         raw_size,
         wrapped: None,
+        folds: BTreeMap::new(),
         find: Find::default(),
         filter: String::new(),
         applied: String::new(),
@@ -1629,6 +1633,50 @@ fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
             ui.weak("Enter to apply");
         }
     });
+}
+
+/// The line that closes the `{`/`[` ending line `open`, found by indentation: pretty JSON
+/// puts the closing bracket at the opening line's indent. None if `open` opens nothing.
+fn fold_end(text: &str, line_starts: &[usize], open: usize) -> Option<usize> {
+    let line = |i: usize| {
+        let end = line_starts.get(i + 1).copied().unwrap_or(text.len());
+        text[line_starts[i]..end].trim_end()
+    };
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let head = line(open);
+    if !head.ends_with(['{', '[']) {
+        return None;
+    }
+    let depth = indent(head);
+    (open + 1..line_starts.len())
+        .take_while(|&i| indent(line(i)) >= depth)
+        .find(|&i| indent(line(i)) == depth && line(i).trim_start().starts_with(['}', ']']))
+}
+
+/// Folded `(open, close)` lines as hidden ranges `(first, count)`: each fold hides the
+/// lines after its opening one, its closing line included. Folds inside a folded one add
+/// nothing.
+fn hidden_ranges(folds: &BTreeMap<usize, usize>) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (&open, &close) in folds {
+        if out.last().is_some_and(|&(first, n)| open < first + n) {
+            continue;
+        }
+        out.push((open + 1, close - open));
+    }
+    out
+}
+
+/// The `shown`th visible line (or row), counting past hidden ranges.
+fn unhide(hidden: &[(usize, usize)], shown: usize) -> usize {
+    let mut i = shown;
+    for &(first, n) in hidden {
+        if i < first {
+            break;
+        }
+        i += n;
+    }
+    i
 }
 
 fn line_starts(text: &str) -> Vec<usize> {
@@ -6296,7 +6344,10 @@ fn response_ui(
             let font = egui::TextStyle::Monospace.resolve(ui.style());
             let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '0'));
             let digits = view.line_starts.len().max(1).ilog10() as usize + 1;
-            let gutter = (digits + 1) as f32 * char_w + ui.spacing().item_spacing.x;
+            // Pretty JSON only: folding finds a block's end by its indentation.
+            let foldable = view.json && (view.pretty || view.unfiltered.is_some());
+            let arrow_w = if foldable { char_w * 1.5 } else { 0.0 };
+            let gutter = (digits + 1) as f32 * char_w + arrow_w + 2.0 * ui.spacing().item_spacing.x;
             if *wrap {
                 let width = ui.available_width() - gutter - ui.spacing().scroll.bar_width;
                 let cols = (width / char_w).floor().max(20.0) as usize;
@@ -6308,31 +6359,58 @@ fn response_ui(
                 (Some((_, rows)), true) => rows,
                 _ => &[],
             };
-            let count = if *wrap {
-                rows.len()
-            } else {
-                view.line_starts.len()
-            };
             let mut area = match *wrap {
                 true => egui::ScrollArea::vertical(),
                 false => egui::ScrollArea::both(),
             }
             .id_salt("response-body")
             .auto_shrink(false);
+            let mut scroll_to = None;
             if std::mem::take(&mut view.find.scroll)
                 && let Some(&at) = view.find.hits.get(view.find.current)
             {
-                let row = match *wrap {
-                    true => rows.partition_point(|r| r.start <= at),
-                    false => view.line_starts.partition_point(|&s| s <= at),
-                } - 1;
+                let line = view.line_starts.partition_point(|&s| s <= at) - 1;
+                // A hit inside a folded block opens it.
+                view.folds
+                    .retain(|&open, &mut close| !(open < line && line <= close));
+                scroll_to = Some(
+                    match *wrap {
+                        true => rows.partition_point(|r| r.start <= at),
+                        false => line + 1,
+                    } - 1,
+                );
+            }
+            // Folds as hidden lines, then as hidden rows when wrapped.
+            let mut hidden = hidden_ranges(&view.folds);
+            if *wrap {
+                let row_of = |line: usize| match view.line_starts.get(line) {
+                    Some(&s) => rows.partition_point(|r| r.start < s),
+                    None => rows.len(),
+                };
+                for (first, n) in &mut hidden {
+                    let row = row_of(*first);
+                    (*first, *n) = (row, row_of(*first + *n) - row);
+                }
+            }
+            let total = if *wrap {
+                rows.len()
+            } else {
+                view.line_starts.len()
+            };
+            let count = total - hidden.iter().map(|&(_, n)| n).sum::<usize>();
+            if let Some(row) = scroll_to {
+                let before: usize = (hidden.iter())
+                    .filter(|&&(first, n)| first + n <= row)
+                    .map(|&(_, n)| n)
+                    .sum();
                 // A few lines of context above the hit.
                 let pitch = row_height + ui.spacing().item_spacing.y;
-                area = area.vertical_scroll_offset(row.saturating_sub(3) as f32 * pitch);
+                area = area.vertical_scroll_offset((row - before).saturating_sub(3) as f32 * pitch);
             }
             let weak = ui.visuals().weak_text_color();
+            let mut toggle = None;
             area.show_rows(ui, row_height, count, |ui, range| {
-                for i in range {
+                for i in range.map(|v| unhide(&hidden, v)) {
                     let (start, end, line, in_string) = match *wrap {
                         true => {
                             let end = rows.get(i + 1).map_or(view.text.len(), |r| r.start);
@@ -6353,6 +6431,9 @@ fn response_ui(
                         cut -= 1;
                     }
                     let end = start + view.text[start..cut].trim_end().len();
+                    let folded = hidden
+                        .binary_search_by_key(&(i + 1), |&(first, _)| first)
+                        .is_ok();
                     ui.horizontal(|ui| {
                         let number = match line {
                             0 => String::new(),
@@ -6363,12 +6444,60 @@ fn response_ui(
                                 .monospace()
                                 .color(weak),
                         );
+                        if foldable {
+                            let size = egui::vec2(arrow_w, row_height);
+                            let (rect, click) = ui.allocate_exact_size(size, egui::Sense::click());
+                            let at = line as usize;
+                            let opens = at > 0 && {
+                                let end = view.line_starts.get(at).copied();
+                                let text = &view.text
+                                    [view.line_starts[at - 1]..end.unwrap_or(view.text.len())];
+                                text.trim_end().ends_with(['{', '['])
+                            };
+                            if opens {
+                                let (arrow, what) = match view.folds.contains_key(&(at - 1)) {
+                                    true => ("⏵", "Unfold"),
+                                    false => ("⏷", "Fold"),
+                                };
+                                click.widget_info(|| {
+                                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, what)
+                                });
+                                let color = if click.hovered() {
+                                    ui.visuals().text_color()
+                                } else {
+                                    weak
+                                };
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    arrow,
+                                    font.clone(),
+                                    color,
+                                );
+                                if click.clicked() {
+                                    toggle = Some(at - 1);
+                                }
+                            }
+                        }
                         ui.add(
                             egui::Label::new(highlighted(ui, view, start..end, in_string)).extend(),
                         );
+                        if folded {
+                            let close = match view.text[start..end].ends_with('{') {
+                                true => "… }",
+                                false => "… ]",
+                            };
+                            ui.label(RichText::new(close).monospace().color(weak));
+                        }
                     });
                 }
             });
+            if let Some(open) = toggle
+                && view.folds.remove(&open).is_none()
+                && let Some(close) = fold_end(&view.text, &view.line_starts, open)
+            {
+                view.folds.insert(open, close);
+            }
         }
     }
     example
@@ -8089,6 +8218,64 @@ mod ui_tests {
         h.event(egui::Event::Text("a".into()));
         h.run();
         h.get_by_label(&format!("1/{MAX_HITS}+"));
+    }
+
+    #[test]
+    fn a_folded_json_block_hides_its_lines_until_find_needs_them() {
+        let mut h = with_request("fold");
+        let long = "z".repeat(400);
+        let body =
+            format!(r#"{{"a":{{"x":"NEEDLE","y":2}},"w":"{long}","list":[1,2],"b":"tail"}}"#);
+        show_response(&mut h, "application/json", body);
+        let visible = |h: &Harness<'_, App>, line: &str| h.query_by_label(line).is_some();
+        // Lines that open a block get an arrow: the body, "a" and "list".
+        assert_eq!(h.get_all_by_label("Fold").count(), 3);
+        h.get_all_by_label("Fold").nth(1).unwrap().click();
+        h.run();
+        shot(&mut h, "63-json-fold");
+        assert!(!visible(&h, r#"    "x": "NEEDLE","#));
+        assert!(!visible(&h, "  },"), "the closing line folds away too");
+        assert!(visible(&h, "… }") && visible(&h, r#"  "list": ["#));
+        h.get_by_label("Unfold").click();
+        h.run();
+        assert!(visible(&h, r#"    "x": "NEEDLE","#));
+
+        // Wrapped, a fold hides rows rather than lines: "w" takes several rows, so the
+        // rows of "list" aren't at its line numbers.
+        h.get_by_label("Wrap").click();
+        h.run();
+        h.get_all_by_label("Fold").nth(2).unwrap().click();
+        h.run();
+        assert!(!visible(&h, "    1,"));
+        assert!(visible(&h, r#"  "list": ["#) && visible(&h, r#"  "b": "tail""#));
+        h.get_all_by_label("Fold").next().unwrap().click();
+        h.run();
+        assert!(!visible(&h, r#"  "b": "tail""#));
+        // Find jumps to a hit inside a fold and opens just the folds around it.
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run();
+        h.event(egui::Event::Text("needle".into()));
+        h.run();
+        assert!(visible(&h, r#"    "x": "NEEDLE","#));
+        assert_eq!(h.get_all_by_label("Unfold").count(), 1, "list stays folded");
+    }
+
+    #[test]
+    fn folds_map_visible_rows_past_hidden_ones() {
+        let text = "{\n  \"a\": [\n    1\n  ],\n  \"b\": {}\n}";
+        let starts = line_starts(text);
+        assert_eq!(fold_end(text, &starts, 0), Some(5));
+        assert_eq!(fold_end(text, &starts, 1), Some(3));
+        // `{}` closes on its own line: nothing to fold.
+        assert_eq!(fold_end(text, &starts, 4), None);
+        let folds = BTreeMap::from([(0, 5), (1, 3)]);
+        // The inner fold is inside the outer one and adds nothing.
+        assert_eq!(hidden_ranges(&folds), [(1, 5)]);
+        let folds = BTreeMap::from([(1, 3)]);
+        let hidden = hidden_ranges(&folds);
+        assert_eq!(hidden, [(2, 2)]);
+        let shown: Vec<_> = (0..4).map(|v| unhide(&hidden, v)).collect();
+        assert_eq!(shown, [0, 1, 4, 5]);
     }
 
     #[test]
