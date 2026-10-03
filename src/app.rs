@@ -9219,6 +9219,27 @@ mod ui_tests {
             mb(size),
             rss()
         );
+
+        // A script that kept a 50 MB response in a variable: what does each frame cost?
+        h.state_mut().response = None;
+        let frames = |h: &mut Harness<'_, App>| {
+            let (start, mut peak) = (Instant::now(), rss());
+            for _ in 0..30 {
+                h.step();
+                peak = peak.max(rss());
+            }
+            (start.elapsed() / 30, peak)
+        };
+        let (without, _) = frames(&mut h);
+        h.state_mut()
+            .vars
+            .insert("big".into(), "x".repeat(50 << 20));
+        let before = rss();
+        let (with, peak) = frames(&mut h);
+        println!(
+            "50 MB variable: {:?} per frame (was {without:?}), from {before} MiB, peak {peak} MiB",
+            with
+        );
     }
 
     /// Without settling: a live stream's spinner keeps repainting, which `run` rejects.
