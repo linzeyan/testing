@@ -207,7 +207,7 @@ HVbhlnvmhVqnjypOaSnrvscI
             ("EdDSA", &rcgen::PKCS_ED25519, &signature::ED25519),
         ] {
             let key = rcgen::KeyPair::generate_for(kind).unwrap();
-            verify(alg, &key.serialize_pem(), &key.public_key_raw(), v);
+            verify(alg, &key.serialize_pem(), key.public_key_raw(), v);
         }
     }
 
