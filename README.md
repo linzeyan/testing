@@ -36,7 +36,7 @@ such as Citrix VDI. No installer: unzip and run.
   `folder › request` breadcrumb whose folders open their settings; header names and Content-Type values complete while
   typing, and the Headers tab folds out what Send adds (Host, auth, Content-Type…) and
   where each comes from; a response body with JSON colours and line numbers, folding
-  of pretty JSON objects and arrays (find opens a fold it lands in), Pretty/Raw (XML responses are indented too), a JSONPath filter (`$.items[*].id`, `..id`, `$.items[?(@.price < 10 && @.tag == 'x')]`; the last 10 used come back from Recent; Save… still writes the whole
+  of pretty JSON objects and arrays (find opens a fold it lands in), Pretty/Raw (XML responses are indented too; Raw, once chosen, sticks to that content type), a JSONPath filter (`$.items[*].id`, `..id`, `$.items[?(@.price < 10 && @.tag == 'x')]`; the last 10 used come back from Recent; Save… still writes the whole
   body), a Tests tab filter (All/Passed/Failed with counts), word wrap (between words) and Save… to a file (bodies past 16 MiB keep their start, to
   spare RAM; Send ⏷ "Send and download…" streams a successful response straight to a
   file instead, however big, and a failed or cancelled one leaves no partial file); a PNG or JPEG response shows as a picture, other binary

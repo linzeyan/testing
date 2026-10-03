@@ -594,6 +594,7 @@ pub struct App {
     hide_sidebar: bool,
     env_colors: HashMap<String, [u8; 3]>,
     recent_filters: Vec<String>,
+    raw_types: Vec<String>,
     mock: Option<MockServer>,
     active_env: Option<String>,
     vars: HashMap<String, String>,
@@ -656,6 +657,7 @@ impl App {
             hide_sidebar: state.hide_sidebar,
             env_colors: state.env_colors.clone(),
             recent_filters: state.recent_filters.clone(),
+            raw_types: state.raw_types.clone(),
             mock: None,
             ws,
             active_env: None,
@@ -811,6 +813,7 @@ impl App {
             hide_sidebar: self.hide_sidebar,
             env_colors: self.env_colors.clone(),
             recent_filters: self.recent_filters.clone(),
+            raw_types: self.raw_types.clone(),
         });
     }
 
@@ -1465,7 +1468,7 @@ impl App {
                 Err(_) => None,
             };
             let shown = || Shown {
-                result: outcome.response.map(into_view),
+                result: outcome.response.map(|r| shown_view(r, &self.raw_types)),
                 tests: outcome.tests,
                 logs: outcome.logs,
                 past,
@@ -1623,6 +1626,24 @@ impl App {
             }
         }
     }
+}
+
+/// "application/json" from "application/json; charset=utf-8".
+fn media_type(head: &http::Response) -> String {
+    let value = (head.headers.iter())
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map_or("", |(_, v)| v.as_str());
+    let media = value.split(';').next().unwrap_or_default();
+    media.trim().to_ascii_lowercase()
+}
+
+/// As the user last chose for its content type: Raw if they switched to it.
+fn shown_view(head: http::Response, raw_types: &[String]) -> ResponseView {
+    let mut view = into_view(head);
+    if raw_types.contains(&media_type(&view.head)) {
+        view.set_pretty(false);
+    }
+    view
 }
 
 fn into_view(mut head: http::Response) -> ResponseView {
@@ -2746,6 +2767,7 @@ impl App {
         let mut open_html = false;
         let wrap_before = self.wrap_response;
         let filters_before = self.recent_filters.first().cloned();
+        let mut raw_changed = false;
         if self.code {
             egui::Panel::right("code")
                 .resizable(true)
@@ -3186,10 +3208,21 @@ impl App {
                     });
                 }
                 Some(shown) => {
+                    let pretty_before = shown.result.as_ref().ok().map(|v| v.pretty);
                     let wrap = &mut self.wrap_response;
                     let tab = &mut self.resp_tab;
                     let recent = &mut self.recent_filters;
                     example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_html, &mut past, recent);
+                    if let Ok(view) = &shown.result
+                        && pretty_before != Some(view.pretty)
+                    {
+                        let media = media_type(&view.head);
+                        self.raw_types.retain(|t| *t != media);
+                        if !view.pretty {
+                            self.raw_types.push(media);
+                        }
+                        raw_changed = true;
+                    }
                 }
             }
         });
@@ -3210,7 +3243,7 @@ impl App {
                 // Tests and console output aren't kept: the response is what's looked back at.
                 Ok(r) => {
                     self.response = Some(Shown {
-                        result: Ok(into_view(r)),
+                        result: Ok(shown_view(r, &self.raw_types)),
                         tests: Vec::new(),
                         logs: Vec::new(),
                         past: Some(id),
@@ -3225,6 +3258,7 @@ impl App {
         if lang_changed
             || wrap_before != self.wrap_response
             || filters_before != self.recent_filters.first().cloned()
+            || raw_changed
         {
             self.save_state();
         }
@@ -8151,6 +8185,55 @@ mod ui_tests {
         switch(&mut h, "users", 0);
         let editing = h.state().folder_editor.as_ref().map(|f| f.dir.clone());
         assert_eq!(editing, Some(top.join("users")));
+    }
+
+    #[test]
+    fn raw_sticks_to_the_content_type_it_was_chosen_for() {
+        let mut h = with_request("raw-pref");
+        let url = crate::http::tests::json_server(r#"{"a":1}"#.into());
+        h.state_mut().open.as_mut().unwrap().draft.url = url;
+        let pretty = |app: &App| match app.response.as_ref().map(|s| &s.result) {
+            Some(Ok(view)) => Some(view.pretty),
+            _ => None,
+        };
+        let send = |h: &mut Harness<'_, App>| {
+            h.state_mut().response = None;
+            h.get_by_label("Send").click();
+            wait(h, |app| pretty(app).is_some());
+        };
+        send(&mut h);
+        assert_eq!(pretty(h.state()), Some(true), "JSON opens pretty at first");
+        h.get_by_label("Raw").click();
+        h.run();
+        let kept = vec!["application/json".to_owned()];
+        assert_eq!(h.state().ws.load_state().raw_types, kept);
+        send(&mut h);
+        assert_eq!(
+            pretty(h.state()),
+            Some(false),
+            "the next JSON response opens raw"
+        );
+        h.get_by_label("Pretty").click();
+        h.run();
+        send(&mut h);
+        assert_eq!(pretty(h.state()), Some(true));
+        assert!(h.state().ws.load_state().raw_types.is_empty());
+        // The type, not its parameters: a charset doesn't make another kind of body.
+        let head = http::Response {
+            status: 200,
+            reason: "OK".into(),
+            version: "HTTP/1.1".into(),
+            elapsed: Duration::ZERO,
+            headers: vec![(
+                "Content-Type".into(),
+                "Application/JSON; charset=utf-8".into(),
+            )],
+            body: String::new(),
+            truncated: false,
+            sent: Default::default(),
+            bytes: None,
+        };
+        assert_eq!(media_type(&head), "application/json");
     }
 
     #[test]
