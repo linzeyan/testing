@@ -423,6 +423,12 @@ fn template(s: &str, unknown: &mut HashSet<String>) -> String {
                 _ => None,
             },
             "faker" => Some(format!("${args}")).filter(|n| crate::fake::value(n).is_some()),
+            // Asked at send time here too.
+            "prompt" => {
+                let title = args.split(',').next().unwrap_or_default();
+                let title = title.trim().trim_matches(['\'', '"']).trim();
+                (!title.is_empty()).then(|| format!("?{title}"))
+            }
             _ => None,
         };
         dynamic.map_or_else(
@@ -477,7 +483,8 @@ mod tests {
            "url": "{{ _.BASE_URL }}/foo/:id",
            "parameters": [{"name": "query", "value": "qqq"}, {"name": "off", "value": "1", "disabled": true}],
            "pathParameters": [{"name": "id", "value": "iii"}],
-           "headers": [{"name": "X-Key", "value": "{{ _['api key'] }}"}, {"name": "", "value": ""}],
+           "headers": [{"name": "X-Key", "value": "{{ _['api key'] }}"}, {"name": "", "value": ""},
+                       {"name": "X-Otp", "value": "{% prompt 'One-time code', 'Code', '', '', true %}"}],
            "authentication": {"type": "bearer", "token": "{% uuid 'v4' %}"},
            "body": {"mimeType": "application/xml", "text": "<a>{% response 'body', 'req_2', '$.id' %}</a>"},
            "preRequestScript": "insomnia.environment.set('a', 1);"},
@@ -539,6 +546,7 @@ mod tests {
             req.headers,
             [
                 KeyValue::new("X-Key", "{{api key}}"),
+                KeyValue::new("X-Otp", "{{?One-time code}}"),
                 KeyValue::new("Content-Type", "application/xml")
             ]
         );

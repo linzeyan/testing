@@ -466,6 +466,11 @@ enum Dialog {
         query: String,
         selected: usize,
     },
+    /// Send asks for the request's `{{?name}}` values first, as Bruno does.
+    Prompt {
+        values: Vec<(String, String)>,
+        download: Option<PathBuf>,
+    },
 }
 
 impl Dialog {
@@ -619,6 +624,10 @@ pub struct App {
     response: Option<Shown>,
     /// At most one per request; tabs send independently.
     pending: Vec<Pending>,
+    /// `{{?name}}` answers: last ones offered again, kept only while the app runs (they're
+    /// often secrets). `answers` is what the next Send uses, taken by it.
+    prompted: HashMap<String, String>,
+    answers: Option<HashMap<String, String>>,
     stream: Option<StreamSession>,
     /// Methods of the last `.proto` the gRPC picker looked at; recompiled only on change.
     grpc_methods: Rpcs,
@@ -681,6 +690,8 @@ impl App {
             resp_tab: RespTab::Body,
             response: None,
             pending: Vec::new(),
+            prompted: HashMap::new(),
+            answers: None,
             stream: None,
             grpc_methods: None,
             explorer: Explorer::default(),
@@ -1272,10 +1283,24 @@ impl App {
             self.client.clone(),
             (self.network.clone(), self.cookies.clone()),
         );
+        let answers = self.answers.take();
+        let (_, missing) = open.draft.resolved(&self.all_vars());
+        let asked: Vec<String> = missing.into_iter().filter(|n| n.starts_with('?')).collect();
+        if !asked.is_empty() && answers.is_none() {
+            let values = (asked.into_iter())
+                .map(|n| {
+                    let last = self.prompted.get(&n).cloned().unwrap_or_default();
+                    (n, last)
+                })
+                .collect();
+            self.dialog = Some(Dialog::Prompt { values, download });
+            return;
+        }
         let vars = Vars {
             env: self.vars.clone(),
             globals: self.globals.clone(),
-            data: HashMap::new(),
+            // This Send's own values, like a data row: never written to an environment.
+            data: answers.unwrap_or_default(),
         };
         self.status.clear();
         let (path, name, req, tx, ctx) = (
@@ -3020,7 +3045,9 @@ impl App {
             {
                 self.status = e;
             }
-            let (_, missing) = open.draft.resolved(&all_vars);
+            let (_, mut missing) = open.draft.resolved(&all_vars);
+            // `{{?name}}` is asked for on Send, not missing.
+            missing.retain(|n| !n.starts_with('?'));
             // A pre-request script may define them; only warn when nothing could.
             let scripted = !open.draft.pre_request.trim().is_empty()
                 || !open.draft.inherited.pre_request.is_empty();
@@ -3654,6 +3681,37 @@ impl App {
                         let label = if *download { "Send" } else { "Save" };
                         if ui.add(primary(label)).clicked() || enter {
                             then = Some(Box::new(|app, ctx| app.save_body(ctx)));
+                        }
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                }
+                Dialog::Prompt { values, .. } => {
+                    ui.heading("Values for this request");
+                    let mut enter = false;
+                    egui::Grid::new("prompts").num_columns(2).show(ui, |ui| {
+                        for (i, (name, value)) in values.iter_mut().enumerate() {
+                            ui.label(name.trim_start_matches('?'));
+                            let edit =
+                                ui.add(egui::TextEdit::singleline(value).desired_width(240.0));
+                            enter |= enter_pressed(ui);
+                            if i == 0 && !enter && ui.memory(|m| m.focused().is_none()) {
+                                edit.request_focus();
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    ui.weak("Asked by {{?name}}; kept until apitool closes, never saved.");
+                    ui.horizontal(|ui| {
+                        if ui.add(primary("Send")).clicked() || enter {
+                            then = Some(Box::new(|app, ctx| {
+                                let Some(Dialog::Prompt { values, download }) = app.dialog.take()
+                                else {
+                                    return;
+                                };
+                                app.prompted.extend(values.iter().cloned());
+                                app.answers = Some(values.into_iter().collect());
+                                app.send(ctx, download);
+                            }));
                         }
                         cancel = ui.button("Cancel").clicked();
                     });
@@ -8709,6 +8767,48 @@ mod ui_tests {
         h.get_by_label("$.items[*].id").click();
         h.run();
         assert_eq!(view(&h).0, "[\n  1,\n  2\n]");
+    }
+
+    /// `{{?name}}` is asked for on Send, goes into that request only, and is offered again
+    /// next time, without ever landing in an environment.
+    #[test]
+    fn prompt_variables_are_asked_for_on_send() {
+        let mut h = with_request("prompt");
+        let addr = crate::http::tests::echo_server();
+        let draft = &mut h.state_mut().open.as_mut().unwrap().draft;
+        draft.url = format!("{addr}/{{{{?id}}}}");
+        draft.headers = vec![KeyValue::new("X-Key", "{{ ?api key }}")];
+        h.run();
+        assert!(h.query_by_label_contains("Undefined").is_none());
+        h.get_by_label("Send").click();
+        h.run();
+        let Some(Dialog::Prompt { values, .. }) = &mut h.state_mut().dialog else {
+            panic!("Send asks first");
+        };
+        let names: Vec<_> = values.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, ["?id", "?api key"]);
+        values[0].1 = "7".into();
+        values[1].1 = "k".into();
+        h.run_steps(2);
+        // The dialog's Send, drawn after the request's.
+        h.get_all_by_label("Send").last().unwrap().click();
+        wait(&mut h, |app| {
+            app.pending.is_empty() && app.response.is_some()
+        });
+        let shown = h.state().response.as_ref().unwrap();
+        let text = shown.result.as_ref().unwrap().text.to_lowercase();
+        assert!(
+            text.contains("/7 http/1.1") && text.contains("x-key: k"),
+            "{text}"
+        );
+        assert!(!h.state().vars.contains_key("?id"));
+
+        h.get_by_label("Send").click();
+        h.run();
+        let Some(Dialog::Prompt { values, .. }) = &h.state().dialog else {
+            panic!("asked again: a new value may be wanted");
+        };
+        assert_eq!(values[0].1, "7", "the last answer is offered");
     }
 
     /// The schema snippet adds to what the user wrote, and what it adds passes on the

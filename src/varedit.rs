@@ -226,6 +226,7 @@ pub fn var_edit(
         response = response.on_hover_ui(|ui| {
             let mut missing = Vec::new();
             let resolved = model::resolve(text, vars, &mut missing);
+            missing.retain(|n| !n.starts_with('?'));
             ui.label(RichText::new(clip(&resolved, 400)).monospace());
             if !missing.is_empty() {
                 ui.colored_label(UNDEFINED, format!("Undefined: {}", missing.join(", ")));
