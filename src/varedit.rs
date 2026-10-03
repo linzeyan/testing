@@ -22,6 +22,66 @@ struct Popup {
     dismissed: bool,
 }
 
+/// Text past this gets no editor: egui lays out every character at about 300 bytes each
+/// (a 10 MB body took 3.6 GB), which a machine with under 1 GB free can't hold.
+pub const MAX_EDIT: usize = 128 * 1024;
+
+/// For text too big to edit: a note with its start and a Clear button, in place of the
+/// editor. A paste that would make it too big is taken here, before the editor lays it
+/// out. `None` when the text can be edited as usual.
+pub fn too_big(ui: &mut egui::Ui, id: Id, text: &mut String) -> Option<egui::Response> {
+    let mut pasted = false;
+    if ui.memory(|m| m.has_focus(id)) {
+        let paste = ui.input_mut(|i| {
+            let big = |e: &egui::Event| matches!(e, egui::Event::Paste(s) if text.len() + s.len() > MAX_EDIT);
+            let at = i.events.iter().position(big)?;
+            match i.events.remove(at) {
+                egui::Event::Paste(s) => Some(s),
+                _ => None,
+            }
+        });
+        if let Some(s) = paste {
+            let chars = egui::TextEdit::load_state(ui.ctx(), id)
+                .and_then(|s| s.cursor.char_range())
+                .map(|r| r.as_sorted_char_range());
+            let byte = |c: usize| text.char_indices().nth(c).map_or(text.len(), |(b, _)| b);
+            let range = chars.map_or(text.len()..text.len(), |r| byte(r.start.0)..byte(r.end.0));
+            text.replace_range(range, &s);
+            pasted = true;
+        }
+    }
+    if text.len() <= MAX_EDIT {
+        return None;
+    }
+    let size = match text.len() {
+        n if n < 1 << 20 => format!("{} KB", n >> 10),
+        n => format!("{:.1} MB", n as f64 / 1_048_576.0),
+    };
+    let start: String = text.chars().take(300).collect();
+    let mut response = ui
+        .group(|ui| {
+            ui.label(format!(
+                "{size}: too big to edit here, laying it out would take more memory than \
+                 this machine may have. It's kept and sent as it is."
+            ));
+            ui.label(
+                RichText::new(format!("{}…", start.trim_end()))
+                    .monospace()
+                    .weak(),
+            );
+            ui.button("Clear")
+        })
+        .inner;
+    if response.clicked() {
+        text.clear();
+        response.mark_changed();
+    }
+    if pasted {
+        response.mark_changed();
+    }
+    Some(response)
+}
+
 pub fn is_known(name: &str, vars: &HashMap<String, String>) -> bool {
     vars.contains_key(name) || DYNAMIC.iter().any(|(n, _)| *n == name)
 }
@@ -41,6 +101,9 @@ pub fn var_edit(
     words: &[(&str, &str)],
     configure: impl FnOnce(egui::TextEdit<'_>) -> egui::TextEdit<'_>,
 ) -> egui::Response {
+    if let Some(response) = too_big(ui, id, text) {
+        return response;
+    }
     let popup_id = id.with("vars-popup");
     let focused_before = ui.memory(|m| m.has_focus(id));
     let mut popup: Popup = ui.data(|d| d.get_temp(popup_id)).unwrap_or_default();

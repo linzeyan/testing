@@ -13,7 +13,9 @@ such as Citrix VDI. No installer: unzip and run.
   pane (response bodies are read and dropped, so many users cost no RAM); proxy/PAC/WPAD, custom CA and client certificates. JSON, text (Text/XML/HTML/JavaScript
   sets the Content-Type; XML has Beautify), form and multipart
   bodies (a value `@path` uploads a file), and a Binary body that sends a file as it is,
-  streamed from disk with its type guessed from the extension; a description per param, header and form
+  streamed from disk with its type guessed from the extension (text past 128 KB, in a body,
+  script, example or the Postman import box, is kept and sent but not laid out for
+  editing: a 10 MB body took 3.6 GB to show); a description per param, header and form
   field, and Bulk Edit (`key: value` lines) for those tables; path variables (`/users/:id`
   gets an `id` row under Params, filled in on Send, kept on Postman import and export); per-request settings (HTTP
   version, redirects, TLS check, cookies, timeout); paste a curl command into the URL bar

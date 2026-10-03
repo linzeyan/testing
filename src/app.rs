@@ -2629,6 +2629,12 @@ impl App {
                     ui.weak("Variables are filled in; scripts don't run.");
                     ui.separator();
                     match code {
+                        Ok(code) if code.len() > crate::varedit::MAX_EDIT => {
+                            ui.weak(format!(
+                                "This snippet is {}: too big to show here. Copy still copies all of it.",
+                                human_size(code.len())
+                            ));
+                        }
                         Ok(code) => {
                             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
                                 ui.add(
@@ -3448,18 +3454,26 @@ impl App {
                          JSON or the file's path, or drop the file here. Nothing already here \
                          is replaced.",
                     );
-                    let edit = egui::ScrollArea::vertical()
-                        .max_height(160.0)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(text)
-                                    .hint_text("JSON or path")
-                                    .code_editor()
-                                    .desired_rows(4)
-                                    .desired_width(f32::INFINITY),
-                            )
-                        })
-                        .inner;
+                    // An exported collection is often past MAX_EDIT once pasted.
+                    let id = egui::Id::new("postman-text");
+                    let edit = match crate::varedit::too_big(ui, id, text) {
+                        Some(note) => note,
+                        None => {
+                            egui::ScrollArea::vertical()
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(text)
+                                            .id(id)
+                                            .hint_text("JSON or path")
+                                            .code_editor()
+                                            .desired_rows(4)
+                                            .desired_width(f32::INFINITY),
+                                    )
+                                })
+                                .inner
+                        }
+                    };
                     // Ready for Ctrl+V.
                     if ui.memory(|m| m.focused().is_none()) {
                         edit.request_focus();
@@ -4750,40 +4764,36 @@ fn body_editor(
     ui.horizontal(|ui| {
         // ponytail: switching to None/Form drops the text; keep a per-mode stash if that bites.
         // JSON <-> Text keeps the text, since that switch is usually a content-type correction.
-        let kind = std::mem::discriminant(&*body);
-        let text = match &*body {
-            Body::Json { text } | Body::Text { text } => text.clone(),
-            _ => String::new(),
-        };
-        let options = [
-            ("None", Body::None),
-            ("JSON", Body::Json { text: text.clone() }),
-            ("Text", Body::Text { text }),
-            ("Form", Body::Form { fields: Vec::new() }),
-            ("Multipart", Body::Multipart { parts: Vec::new() }),
-            (
-                "Binary",
-                Body::File {
-                    path: String::new(),
-                },
-            ),
-            (
-                "GraphQL",
-                Body::GraphQL {
-                    query: String::new(),
-                    variables: String::new(),
-                },
-            ),
+        // Built on a click only: the text moves over instead of being cloned every frame.
+        type Make = fn(String) -> Body;
+        let options: [(&str, Make); 7] = [
+            ("None", |_| Body::None),
+            ("JSON", |text| Body::Json { text }),
+            ("Text", |text| Body::Text { text }),
+            ("Form", |_| Body::Form { fields: Vec::new() }),
+            ("Multipart", |_| Body::Multipart { parts: Vec::new() }),
+            ("Binary", |_| Body::File {
+                path: String::new(),
+            }),
+            ("GraphQL", |_| Body::GraphQL {
+                query: String::new(),
+                variables: String::new(),
+            }),
         ];
+        let kind = std::mem::discriminant(&*body);
         let mut chosen = None;
-        for (label, option) in options {
-            let current = std::mem::discriminant(&option) == kind;
+        for (label, make) in options {
+            let current = std::mem::discriminant(&make(String::new())) == kind;
             if ui.selectable_label(current, label).clicked() && !current {
-                chosen = Some(option);
+                chosen = Some(make);
             }
         }
-        if let Some(option) = chosen {
-            *body = option;
+        if let Some(make) = chosen {
+            let text = match body {
+                Body::Json { text } | Body::Text { text } => std::mem::take(text),
+                _ => String::new(),
+            };
+            *body = make(text);
         }
     });
     ui.add_space(4.0);
@@ -4798,7 +4808,9 @@ fn body_editor(
                 {
                     *text = pretty;
                 }
+                // Parsing it each frame is what an uneditable body can do without.
                 if !text.trim().is_empty()
+                    && text.len() <= crate::varedit::MAX_EDIT
                     && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(text)
                 {
                     // Only a hint: `{{var}}` placeholders legitimately make the raw text invalid.
@@ -5533,14 +5545,16 @@ fn scripts_editor(
         let folders: Vec<&str> = above.iter().map(|(f, _)| f.as_str()).collect();
         ui.weak(format!("Folder scripts run first: {}", folders.join(", ")));
     }
-    let (text, hint) = match tab {
+    let (text, hint, id) = match tab {
         ScriptTab::Pre => (
             pre_request,
             "// Runs before the request is sent.\n// pm.request, pm.environment, pm.variables, console.log",
+            "pre-request-script",
         ),
         ScriptTab::Post => (
             tests,
             "// Runs after the response arrives.\n// pm.test(name, fn), pm.expect(...), pm.response.json()",
+            "tests-script",
         ),
     };
     if let Some(code) = insert {
@@ -5552,8 +5566,14 @@ fn scripts_editor(
         }
         text.push_str(code);
     }
+    // A pasted library (lodash, moment) can be past MAX_EDIT.
+    let id = egui::Id::new(id);
+    if crate::varedit::too_big(ui, id, text).is_some() {
+        return;
+    }
     ui.add(
         egui::TextEdit::multiline(text)
+            .id(id)
             .code_editor()
             .hint_text(hint)
             .desired_rows(12)
@@ -5848,17 +5868,21 @@ fn stream_ui(
     if s.outgoing.is_some() {
         ui.horizontal(|ui| {
             let send_w = 70.0;
-            ui.add(
-                egui::TextEdit::multiline(&mut s.compose)
-                    .desired_rows(2)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text(if s.grpc.is_some() {
-                        "Message (JSON)"
-                    } else {
-                        "Message"
-                    })
-                    .desired_width(ui.available_width() - send_w - 8.0),
-            );
+            let id = egui::Id::new("compose");
+            if crate::varedit::too_big(ui, id, &mut s.compose).is_none() {
+                ui.add(
+                    egui::TextEdit::multiline(&mut s.compose)
+                        .id(id)
+                        .desired_rows(2)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text(if s.grpc.is_some() {
+                            "Message (JSON)"
+                        } else {
+                            "Message"
+                        })
+                        .desired_width(ui.available_width() - send_w - 8.0),
+                );
+            }
             if ui
                 .add_sized([send_w, 22.0], egui::Button::new("Send"))
                 .on_hover_text(ui.ctx().format_shortcut(&SEND))
@@ -6371,12 +6395,17 @@ fn examples_editor(ui: &mut egui::Ui, examples: &mut Vec<Example>) {
                         remove = Some(i);
                     }
                 });
-                ui.add(
-                    egui::TextEdit::multiline(&mut ex.body)
-                        .code_editor()
-                        .desired_rows(8)
-                        .desired_width(f32::INFINITY),
-                );
+                // Saved from a response, so up to 16 MiB.
+                let id = egui::Id::new(("example-body", i));
+                if crate::varedit::too_big(ui, id, &mut ex.body).is_none() {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut ex.body)
+                            .id(id)
+                            .code_editor()
+                            .desired_rows(8)
+                            .desired_width(f32::INFINITY),
+                    );
+                }
             });
     }
     if let Some(i) = remove {
@@ -7561,6 +7590,49 @@ mod ui_tests {
         assert_eq!(ws.load_request(&original).unwrap().url, "");
     }
 
+    /// A 10 MB body took 3.6 GB to lay out for editing. Past MAX_EDIT it gets a note
+    /// instead, and a paste that big goes in at the cursor without reaching the editor.
+    #[test]
+    fn a_body_too_big_to_edit_gets_a_note_and_a_big_paste_still_lands() {
+        let mut h = with_request("big-body");
+        h.state_mut().open.as_mut().unwrap().draft.body = Body::Json { text: "ab".into() };
+        h.state_mut().req_tab = ReqTab::Body;
+        h.run();
+        let id = egui::Id::new("body");
+        h.ctx.memory_mut(|m| m.request_focus(id));
+        h.run();
+        let mut state = egui::TextEdit::load_state(&h.ctx, id).expect("the editor has focus");
+        let between = egui::text::CCursorRange::one(egui::text::CCursor::new(1));
+        state.cursor.set_char_range(Some(between));
+        state.store(&h.ctx, id);
+        let big = "x".repeat(crate::varedit::MAX_EDIT);
+        h.event(egui::Event::Paste(big.clone()));
+        h.run();
+        let Body::Json { text } = &draft(&h).body else {
+            panic!("still a JSON body");
+        };
+        assert!(*text == format!("a{big}b"), "pasted at the cursor");
+        assert!(h.query_by_label_contains("too big to edit").is_some());
+        shot(&mut h, "62-too-big-to-edit");
+        // The editor would have moved its cursor past what it inserted (and laid it all out).
+        let state = egui::TextEdit::load_state(&h.ctx, id).unwrap();
+        assert_eq!(
+            state.cursor.char_range(),
+            Some(between),
+            "the editor never saw it"
+        );
+
+        h.get_all_by_label("Clear").last().unwrap().click();
+        h.run();
+        assert_eq!(
+            draft(&h).body,
+            Body::Json {
+                text: String::new()
+            }
+        );
+        assert!(h.query_by_label_contains("too big to edit").is_none());
+    }
+
     /// A long data-driven run keeps a bounded list, but the counts cover every row and
     /// no failure is pushed out by passes.
     #[test]
@@ -8638,6 +8710,25 @@ mod ui_tests {
         }
         println!(
             "10 MB JSON body in the editor: peak {peak} MiB, then {} MiB",
+            rss()
+        );
+
+        // The same 10 MB pasted into an empty body editor.
+        let pasted = match &mut h.state_mut().open.as_mut().unwrap().draft.body {
+            Body::Json { text } => std::mem::take(text),
+            _ => unreachable!(),
+        };
+        h.step();
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::new("body")));
+        h.step();
+        h.event(egui::Event::Paste(pasted));
+        let mut peak = rss();
+        for _ in 0..10 {
+            h.step();
+            peak = peak.max(rss());
+        }
+        println!(
+            "10 MB pasted into the body editor: peak {peak} MiB, then {} MiB",
             rss()
         );
     }
