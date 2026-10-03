@@ -2,11 +2,13 @@ name: snippets
 
 # Runs the code snippets for the languages no developer machine here has (PowerShell,
 # PHP, Java, Kotlin, HTTPie, raw HTTP) against a local server; see .github/snippets.py.
+# Six runs in October 2026 found three bugs, then stayed green. Off on push since then;
+# run it from the Actions tab after changing src/codegen.rs.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths: [src/codegen.rs, .github/snippets.py, .github/workflows/snippets.yml]
+  # push:
+  #   branches: [main]
+  #   paths: [src/codegen.rs, .github/snippets.py, .github/workflows/snippets.yml]
 
 permissions:
   contents: read
