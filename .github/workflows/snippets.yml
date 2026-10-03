@@ -1,0 +1,49 @@
+name: snippets
+
+# Runs the code snippets for the languages no developer machine here has (PowerShell,
+# PHP, Java, Kotlin, HTTPie, raw HTTP) against a local server; see .github/snippets.py.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [src/codegen.rs, .github/snippets.py, .github/workflows/snippets.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate
+        run: APITOOL_SNIPPETS=snip/in cargo test --locked --lib -- every_target
+      - name: Tools
+        run: |
+          pipx install httpie
+          curl -fsSLO https://repo1.maven.org/maven2/com/squareup/okhttp3/okhttp/4.12.0/okhttp-4.12.0.jar
+          curl -fsSLO https://repo1.maven.org/maven2/com/squareup/okio/okio-jvm/3.6.0/okio-jvm-3.6.0.jar
+          pwsh -Version; php -v; java -version; kotlinc -version; http --version
+      - name: Run
+        env:
+          SNIP_TOOLS: powershell,php,java,kotlin,httpie,http
+        run: SNIP_KOTLIN_CP="$PWD/okhttp-4.12.0.jar:$PWD/okio-jvm-3.6.0.jar" python3 .github/snippets.py snip
+
+  # The snippets say they work in Windows PowerShell 5.1 unless they need 7.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate
+        shell: bash
+        run: APITOOL_SNIPPETS=snip/in cargo test --locked --lib -- every_target
+      - name: Run
+        shell: bash
+        env:
+          SNIP_TOOLS: powershell
+          SNIP_PWSH: powershell
+        run: python .github/snippets.py snip
