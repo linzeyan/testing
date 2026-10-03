@@ -24,6 +24,8 @@ const NARROW: f32 = 1000.0;
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
+const REOPEN_TAB: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::T);
 const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
 const NEW_REQUEST: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
 const FOCUS_URL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::L);
@@ -596,6 +598,9 @@ pub struct App {
     tree_filter: String,
     /// Set by a drop: the folders above it open on the next frame, so it stays in sight.
     reveal: Option<PathBuf>,
+    /// Closed tabs and where they were, newest last, for Reopen Closed Tab. This session
+    /// only, like a browser's.
+    closed: Vec<(PathBuf, usize)>,
     /// Outlives client rebuilds; saved to the workspace after responses.
     cookies: Arc<Jar>,
     /// `auth::grants()` when OAuth tokens were last saved to the workspace.
@@ -668,6 +673,7 @@ impl App {
             show_history: false,
             tree_filter: String::new(),
             reveal: None,
+            closed: Vec::new(),
             cookies: Arc::new(Jar::from_json(&ws.load_cookies())),
             saved_grants: crate::auth::grants(),
             cookie_manager: false,
@@ -1076,6 +1082,19 @@ impl App {
         }
     }
 
+    /// The newest closed tab that still exists and isn't open again, back where it was.
+    fn reopen_tab(&mut self) {
+        while let Some((path, at)) = self.closed.pop() {
+            if self.tab_index(&path).is_some() || !self.ws.exists(&path) {
+                continue;
+            }
+            self.tabs
+                .insert(at.min(self.tabs.len()), Tab::new(path.clone(), false));
+            self.activate(path, true);
+            return;
+        }
+    }
+
     /// Asks first if the tab has unsaved edits, with it brought to the front.
     fn close_tab(&mut self, path: &Path) {
         let Some(i) = self.tab_index(path) else {
@@ -1117,6 +1136,10 @@ impl App {
     /// Without asking. The tab to its right (else left) takes over if it was active.
     fn drop_tab(&mut self, i: usize) {
         let tab = self.tabs.remove(i);
+        self.closed.push((tab.path.clone(), i));
+        if self.closed.len() > 20 {
+            self.closed.remove(0);
+        }
         if self.stream.as_ref().is_some_and(|s| s.path == tab.path) {
             self.stream = None;
         }
@@ -1599,6 +1622,7 @@ impl App {
         let opens = self.open.iter_mut().chain(parked.map(|p| &mut p.open));
         opens.for_each(|o| moved(&mut o.path));
         self.tabs.iter_mut().for_each(|t| moved(&mut t.path));
+        self.closed.iter_mut().for_each(|(p, _)| moved(p));
     }
 
     /// After a drag and drop in the tree; a reorder in place keeps the path.
@@ -2038,6 +2062,13 @@ impl eframe::App for App {
             && let Some(path) = self.open.as_ref().map(|o| o.path.clone())
         {
             self.close_tab(&path);
+        }
+        if ui.input_mut(|i| i.consume_shortcut(&REOPEN_TAB))
+            && self.dialog.is_none()
+            && self.env_editor.is_none()
+            && self.folder_editor.is_none()
+        {
+            self.reopen_tab();
         }
         if ui.input_mut(|i| i.consume_shortcut(&DUPLICATE))
             && self.dialog.is_none()
@@ -2718,6 +2749,7 @@ impl App {
             Others,
             Right,
             All,
+            Reopen,
         }
         let active = self.open.as_ref().map(|o| o.path.clone());
         let (mut show, mut close, mut menu) = (None, None, None);
@@ -2772,6 +2804,12 @@ impl App {
                                 menu = Some((i, action));
                             }
                         }
+                        ui.separator();
+                        let item = egui::Button::new("Reopen Closed Tab")
+                            .shortcut_text(shortcut(&REOPEN_TAB));
+                        if ui.add_enabled(!self.closed.is_empty(), item).clicked() {
+                            menu = Some((i, Menu::Reopen));
+                        }
                     });
                     let x = ui
                         .small_button("×")
@@ -2787,6 +2825,7 @@ impl App {
             let paths = self.tabs.iter().map(|t| t.path.clone());
             let paths: Vec<PathBuf> = match action {
                 Menu::Duplicate => return self.duplicate(&self.tabs[i].path.clone()),
+                Menu::Reopen => return self.reopen_tab(),
                 Menu::Others => paths
                     .enumerate()
                     .filter(|(j, _)| *j != i)
@@ -6185,6 +6224,7 @@ fn shortcut_list(ui: &mut egui::Ui) {
                 ("Select the URL", &FOCUS_URL),
                 ("Find in the response", &FIND),
                 ("Close tab", &CLOSE_TAB),
+                ("Reopen closed tab", &REOPEN_TAB),
             ] {
                 ui.weak(what);
                 ui.weak(RichText::new(ui.ctx().format_shortcut(key)).monospace());
@@ -7998,6 +8038,27 @@ mod ui_tests {
         menu(&mut h, "c copy", "Close All Tabs");
         assert_eq!(tabs(&h), ["b"]);
         assert_eq!(draft(&h).url, "http://edited");
+
+        // Closed tabs come back newest first, each where it was.
+        let reopen = |h: &mut Harness<'_, App>| {
+            h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::T);
+            h.run();
+        };
+        reopen(&mut h);
+        assert_eq!(tabs(&h), ["b", "c"]);
+        menu(&mut h, "c", "Reopen Closed Tab");
+        assert_eq!(tabs(&h), ["b", "c copy", "c"]);
+        reopen(&mut h);
+        assert_eq!(tabs(&h), ["a", "b", "c copy", "c"]);
+        assert_eq!(h.state().open.as_ref().unwrap().path, dir.join("a.toml"));
+        // A request deleted since is passed over for the tab closed before it.
+        h.state_mut().activate(dir.join("c.toml"), false);
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::W);
+        h.run();
+        h.state().ws.delete(&dir.join("c.toml")).unwrap();
+        reopen(&mut h);
+        assert_eq!(tabs(&h), ["a", "b", "c copy", "d"]);
     }
 
     #[test]

@@ -59,7 +59,7 @@ such as Citrix VDI. No installer: unzip and run.
   in the workspace across restarts) auth; a Cookies tab with what a response sets; a cookie jar like a browser's, with a manager; folder settings
   (right-click a folder) with variables, auth and scripts shared by every request inside,
   like Postman collection/folder settings; tabs (a click in the tree previews,
-  double-click or editing keeps the tab, Ctrl+W closes; right-click a tab to duplicate it or
+  double-click or editing keeps the tab, Ctrl+W (or a middle click) closes, Ctrl+Shift+T reopens the last closed tab where it was; right-click a tab to duplicate it or
   close others, those to the right or all, which leaves tabs with unsaved edits open);
   until something is sent, the response pane lists the keyboard shortcuts; hover the status code for what it means, the time for opening the connection (DNS, TCP and TLS together), waiting (TTFB) and download, and the size for headers vs body; the response sits beside the request (a window too narrow for two columns stacks them
   until it is wider; "Side by side" in the status bar turns it off) and "Sidebar" folds the tree away
