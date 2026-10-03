@@ -38,7 +38,17 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         if: matrix.check
-        run: cargo test --locked
+        shell: bash
+        # Failures go into an annotation too: those can be read through the API with a
+        # plain token, job logs can't.
+        run: |
+          cargo test --locked 2>&1 | tee test.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            msg=$(grep -E -A 6 'panicked at|^---- |^error' test.log | head -80 | awk '{printf "%s%%0A", $0}')
+            echo "::error title=cargo test failed::$msg"
+          fi
+          exit "$code"
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package

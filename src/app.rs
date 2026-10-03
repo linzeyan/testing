@@ -6384,6 +6384,10 @@ fn examples_editor(ui: &mut egui::Ui, examples: &mut Vec<Example>) {
     }
 }
 
+/// Enough to step through: one letter in a 16 MiB body would otherwise keep millions of
+/// 8-byte offsets.
+const MAX_HITS: usize = 10_000;
+
 /// The find bar, laid out right to left next to Copy.
 fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     let ResponseView { text, find, .. } = view;
@@ -6394,7 +6398,11 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
         .clicked();
     if !find.searched.is_empty() {
         let n = find.hits.len();
-        ui.weak(format!("{}/{n}", if n == 0 { 0 } else { find.current + 1 }));
+        let more = if n == MAX_HITS { "+" } else { "" };
+        ui.weak(format!(
+            "{}/{n}{more}",
+            if n == 0 { 0 } else { find.current + 1 }
+        ));
     }
     let edit = ui.add(
         egui::TextEdit::singleline(&mut find.query)
@@ -6413,7 +6421,10 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
             Vec::new()
         } else {
             let hay = text.to_ascii_lowercase();
-            hay.match_indices(&needle).map(|(i, _)| i).collect()
+            hay.match_indices(&needle)
+                .map(|(i, _)| i)
+                .take(MAX_HITS)
+                .collect()
         };
         find.searched = find.query.clone();
         find.current = 0;
@@ -7998,6 +8009,14 @@ mod ui_tests {
         h.run();
         h.get_by_label("1/3");
         assert!(h.query_by_label("NEEDLE 7").is_some());
+
+        // One letter in a big body: enough hits to step through, not millions of offsets.
+        show_response(&mut h, "text/plain", "ab\n".repeat(2 * MAX_HITS));
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run();
+        h.event(egui::Event::Text("a".into()));
+        h.run();
+        h.get_by_label(&format!("1/{MAX_HITS}+"));
     }
 
     #[test]
@@ -8600,6 +8619,25 @@ mod ui_tests {
         let count = stats.lock().unwrap().count;
         println!(
             "load test, 50 VUs × 4 MB: peak {peak} MiB, then {} MiB ({count} requests)",
+            rss()
+        );
+
+        // A 10 MB JSON request body (pasted, imported) shown in the body editor.
+        {
+            let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+            d.method = "POST".into();
+            d.body = Body::Json {
+                text: object.repeat(10 * 1024 * 1024 / object.len()),
+            };
+        }
+        h.state_mut().req_tab = ReqTab::Body;
+        let mut peak = rss();
+        for _ in 0..10 {
+            h.step();
+            peak = peak.max(rss());
+        }
+        println!(
+            "10 MB JSON body in the editor: peak {peak} MiB, then {} MiB",
             rss()
         );
     }
