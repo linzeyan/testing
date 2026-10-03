@@ -1295,7 +1295,6 @@ impl App {
             (false, true) => Some(Outgoing::Text(out_tx)),
             (false, false) => None,
         };
-        let ca_file = self.network.ca_file.clone();
         let started = Instant::now();
         let log = Arc::new(std::sync::Mutex::new(Log::default()));
         let (cell, net, task_log, ctx) = (
@@ -1311,7 +1310,7 @@ impl App {
             };
             // Not over HTTP: no proxy, so no client (and no PAC download) to wait for.
             if is_mqtt {
-                return crate::mqtt::session(req, ca_file, pub_rx, emit).await;
+                return crate::mqtt::session(req, net.0, pub_rx, emit).await;
             }
             match cell
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))

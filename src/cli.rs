@@ -311,6 +311,8 @@ mod tests {
     #[test]
     fn exit_status_reflects_test_results() {
         let ws = std::env::temp_dir().join(format!("apitool-cli-{}", std::process::id()));
+        // A leftover from an earlier run with the same process id would add its requests.
+        let _ = std::fs::remove_dir_all(&ws);
         let dir = ws.join("collections/smoke");
         std::fs::create_dir_all(&dir).unwrap();
         let url = crate::http::tests::echo_server();

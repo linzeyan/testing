@@ -11,11 +11,14 @@ use rumqttc::v5::mqttbytes::v5 as p5;
 use rumqttc::{
     Incoming, Outgoing, SubscribeFilter, SubscribeReasonCode, TlsConfiguration, Transport, v5,
 };
-use rustls::pki_types::CertificateDer;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::sync::mpsc;
 
 use crate::model::{Auth, Request};
+use crate::net::Network;
 use crate::stream::Event;
 
 /// ponytail: incoming and outgoing messages are capped at 1 MiB; raise it when a broker's
@@ -36,15 +39,15 @@ pub enum Command {
     Topics(Vec<(String, u8)>),
 }
 
-/// `req` is resolved. `ca_file` is the network settings' CA, trusted on top of the
-/// system's for mqtts:// and wss://. Dropping the sender of `commands` disconnects.
+/// `req` is resolved. `net` gives mqtts:// and wss:// their TLS settings, as for https.
+/// Dropping the sender of `commands` disconnects.
 pub async fn session(
     req: Request,
-    ca_file: String,
+    net: Network,
     mut commands: mpsc::UnboundedReceiver<Command>,
     emit: impl Fn(Event),
 ) {
-    let (client, mut events) = match connect(&req, &ca_file) {
+    let (client, mut events) = match connect(&req, &net) {
         Ok(c) => c,
         Err(e) => return emit(Event::Error(e)),
     };
@@ -337,7 +340,7 @@ fn target(url: &str) -> Result<(Wire, String, u16), String> {
     Ok((wire, address, port))
 }
 
-fn connect(req: &Request, ca_file: &str) -> Result<(Client, Events), String> {
+fn connect(req: &Request, net: &Network) -> Result<(Client, Events), String> {
     let (wire, address, port) = target(&req.url)?;
     let m = &req.mqtt;
     let id = match m.client_id.trim() {
@@ -353,11 +356,13 @@ fn connect(req: &Request, ca_file: &str) -> Result<(Client, Events), String> {
         Auth::None | Auth::Inherit => None,
         _ => return Err("MQTT signs in with a username and password: use Basic auth".into()),
     };
+    let insecure = net.insecure || !req.settings.verify_tls;
+    let tls = || tls_config(net, insecure).map(TlsConfiguration::Rustls);
     let transport = match wire {
         Wire::Tcp => Transport::Tcp,
-        Wire::Tls => Transport::tls_with_config(tls_config(ca_file)?),
+        Wire::Tls => Transport::tls_with_config(tls()?),
         Wire::Ws => Transport::Ws,
-        Wire::Wss => Transport::wss_with_config(tls_config(ca_file)?),
+        Wire::Wss => Transport::wss_with_config(tls()?),
     };
     let keep_alive = Duration::from_secs(m.keep_alive_secs.into());
     if m.v5 {
@@ -389,28 +394,86 @@ fn connect(req: &Request, ca_file: &str) -> Result<(Client, Events), String> {
     Ok((Client::V3(c), Events::V3(e)))
 }
 
-/// The system's trust store plus the CA file, as for https. ponytail: the network
-/// settings' client certificate and "accept any certificate" aren't applied to MQTT yet.
-fn tls_config(ca_file: &str) -> Result<TlsConfiguration, String> {
+/// As for https: the system's trust store plus the CA file, the client certificate, and
+/// `insecure` for "accept any certificate".
+fn tls_config(net: &Network, insecure: bool) -> Result<Arc<rustls::ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let ca_file = ca_file.trim();
-    let mut extra = Vec::new();
-    if !ca_file.is_empty() {
-        let pem = std::fs::read(ca_file).map_err(|e| format!("CA file {ca_file}: {e}"))?;
-        for cert in CertificateDer::pem_slice_iter(&pem) {
-            extra.push(cert.map_err(|e| format!("CA file {ca_file}: {e}"))?);
-        }
-    }
-    let verifier =
-        rustls_platform_verifier::Verifier::new_with_extra_roots(extra, provider.clone())
-            .map_err(|e| format!("system certificates: {e}"))?;
-    let config = rustls::ClientConfig::builder_with_provider(provider)
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| e.to_string())?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-    Ok(config.into())
+        .dangerous();
+    let builder = if insecure {
+        builder.with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
+    } else {
+        let ca_file = net.ca_file.trim();
+        let mut extra = Vec::new();
+        if !ca_file.is_empty() {
+            let pem = std::fs::read(ca_file).map_err(|e| format!("CA file {ca_file}: {e}"))?;
+            for cert in CertificateDer::pem_slice_iter(&pem) {
+                extra.push(cert.map_err(|e| format!("CA file {ca_file}: {e}"))?);
+            }
+        }
+        let verifier = rustls_platform_verifier::Verifier::new_with_extra_roots(extra, provider)
+            .map_err(|e| format!("system certificates: {e}"))?;
+        builder.with_custom_certificate_verifier(Arc::new(verifier))
+    };
+    let cert = net.client_cert.trim();
+    if cert.is_empty() {
+        return Ok(Arc::new(builder.with_no_client_auth()));
+    }
+    let pem = crate::net::identity_pem(std::path::Path::new(cert), &net.client_cert_password)?;
+    let bad = |e: String| format!("client certificate {cert}: {e}");
+    let chain = (CertificateDer::pem_slice_iter(&pem))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| bad(e.to_string()))?;
+    if chain.is_empty() {
+        return Err(bad("no certificate in it".into()));
+    }
+    let key = PrivateKeyDer::from_pem_slice(&pem).map_err(|e| bad(e.to_string()))?;
+    let config = (builder.with_client_auth_cert(chain, key)).map_err(|e| bad(e.to_string()))?;
+    Ok(Arc::new(config))
+}
+
+/// "Accept any certificate", as reqwest has it: the certificate isn't checked, the
+/// handshake's signatures still are.
+#[derive(Debug)]
+struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let algorithms = &self.0.signature_verification_algorithms;
+        rustls::crypto::verify_tls12_signature(message, cert, dss, algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let algorithms = &self.0.signature_verification_algorithms;
+        rustls::crypto::verify_tls13_signature(message, cert, dss, algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 #[cfg(test)]
@@ -480,6 +543,58 @@ pub mod tests {
             serve(&mut ws)
         });
         port
+    }
+
+    impl Pipe for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+        fn fill(&mut self, buf: &mut BytesMut) {
+            let mut chunk = [0; 4096];
+            let n = self.read(&mut chunk).unwrap();
+            assert!(n > 0, "the client hung up without DISCONNECT");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        fn put(&mut self, bytes: &[u8]) {
+            self.write_all(bytes).unwrap();
+        }
+    }
+
+    /// Serves one connection over TLS. A failed handshake is the client's to report.
+    fn listen_tls(config: Arc<rustls::ServerConfig>, serve: fn(&mut dyn Pipe)) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut conn = rustls::ServerConnection::new(config).unwrap();
+            while conn.is_handshaking() {
+                if conn.complete_io(&mut s).is_err() {
+                    return;
+                }
+            }
+            serve(&mut rustls::StreamOwned::new(conn, s))
+        });
+        port
+    }
+
+    /// A broker with a self-signed certificate that wants a client certificate signed by
+    /// `client_ca`.
+    fn tls_broker(client_ca: &CertificateDer<'static>) -> Arc<rustls::ServerConfig> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(client_ca.clone()).unwrap();
+        let clients = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            roots.into(),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = PrivateKeyDer::try_from(own.signing_key.serialize_der()).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(clients)
+            .with_single_cert(vec![own.cert.der().clone()], key)
+            .unwrap();
+        Arc::new(config)
     }
 
     /// Just enough MQTT 3.1.1 broker for client "tester" signing in as u/p: answers
@@ -617,10 +732,8 @@ pub mod tests {
         }
     }
 
-    /// Subscribes to a/# and "denied"; answers the hello with a publish; once the echo is
-    /// back, swaps "denied" for b/# while connected; hangs up once b/# is subscribed.
-    fn exchange(url: String, v5: bool) -> Vec<Event> {
-        let req = Request {
+    fn request(url: String, v5: bool) -> Request {
+        Request {
             method: "MQTT".into(),
             url,
             auth: Auth::Basic {
@@ -644,7 +757,12 @@ pub mod tests {
                 ..Default::default()
             },
             ..Default::default()
-        };
+        }
+    }
+
+    /// Subscribes to a/# and "denied"; answers the hello with a publish; once the echo is
+    /// back, swaps "denied" for b/# while connected; hangs up once b/# is subscribed.
+    fn exchange(req: Request, net: Network) -> Vec<Event> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -656,7 +774,7 @@ pub mod tests {
             let tx = tx.lock().unwrap();
             tx.as_ref().unwrap().send(c).ok().unwrap();
         };
-        rt.block_on(session(req, String::new(), rx, |e| {
+        rt.block_on(session(req, net, rx, |e| {
             match &e {
                 Event::In(t) if t == "[a/1] hello" => command(Command::Publish(Publish {
                     topic: "cmd".into(),
@@ -692,21 +810,64 @@ pub mod tests {
     #[test]
     fn subscribes_publishes_follows_topic_changes_and_says_goodbye() {
         let url = format!("mqtt://127.0.0.1:{}", broker());
-        assert_eq!(exchange(url, false), expected("refused"));
+        assert_eq!(
+            exchange(request(url, false), Network::default()),
+            expected("refused")
+        );
     }
 
     #[test]
     fn mqtt_5_says_why_a_subscription_is_refused() {
         let url = format!("mqtt://127.0.0.1:{}", listen(false, serve_v5));
-        assert_eq!(exchange(url, true), expected("refused (NotAuthorized)"));
+        assert_eq!(
+            exchange(request(url, true), Network::default()),
+            expected("refused (NotAuthorized)")
+        );
     }
 
     #[test]
     fn both_versions_ride_websockets() {
         let url = format!("ws://127.0.0.1:{}/mqtt", listen(true, serve_v3));
-        assert_eq!(exchange(url, false), expected("refused"));
+        assert_eq!(
+            exchange(request(url, false), Network::default()),
+            expected("refused")
+        );
         let url = format!("ws://127.0.0.1:{}/mqtt", listen(true, serve_v5));
-        assert_eq!(exchange(url, true), expected("refused (NotAuthorized)"));
+        assert_eq!(
+            exchange(request(url, true), Network::default()),
+            expected("refused (NotAuthorized)")
+        );
+    }
+
+    #[test]
+    fn mqtts_presents_the_client_certificate_and_can_skip_verifying_the_broker() {
+        let client = rcgen::generate_simple_self_signed(vec!["client.test".into()]).unwrap();
+        let path = std::env::temp_dir().join(format!("apitool-mqtt-{}.pem", std::process::id()));
+        std::fs::write(
+            &path,
+            client.signing_key.serialize_pem() + &client.cert.pem(),
+        )
+        .unwrap();
+        let net = Network {
+            client_cert: path.display().to_string(),
+            ..Default::default()
+        };
+        let broker = tls_broker(client.cert.der());
+        let unverified = |net: &Network| {
+            let url = format!("mqtts://127.0.0.1:{}", listen_tls(broker.clone(), serve_v3));
+            let mut req = request(url, false);
+            req.settings.verify_tls = false;
+            exchange(req, net.clone())
+        };
+        assert_eq!(unverified(&net), expected("refused"));
+        // The broker turns away a client without a certificate.
+        let events = unverified(&Network::default());
+        assert!(matches!(events.as_slice(), [Event::Error(_)]), "{events:?}");
+        // Verified, the self-signed broker is refused.
+        let url = format!("mqtts://127.0.0.1:{}", listen_tls(broker.clone(), serve_v3));
+        let events = exchange(request(url, false), net);
+        assert!(matches!(events.as_slice(), [Event::Error(_)]), "{events:?}");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -726,7 +887,7 @@ pub mod tests {
                 auth,
                 ..Default::default()
             };
-            connect(&req, "").err().unwrap()
+            connect(&req, &Network::default()).err().unwrap()
         };
         assert!(bad("http://x", Auth::None).contains("mqtt://"));
         assert!(bad("mqtt://x:port", Auth::None).contains("port"));

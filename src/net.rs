@@ -239,19 +239,24 @@ async fn system_proxy(pac: Option<String>) -> (Option<reqwest::Proxy>, Option<St
 
 /// Accepts a PEM file (key + certificate chain) or a PFX/P12 bundle.
 fn load_identity(path: &Path, password: &str) -> Result<reqwest::Identity, String> {
+    let pem = identity_pem(path, password)?;
+    reqwest::Identity::from_pem(&pem)
+        .map_err(|e| format!("client certificate {}: {}", path.display(), error_chain(&e)))
+}
+
+/// The client certificate file as PEM (key and chain), a PFX/P12 converted: for reqwest
+/// and for MQTT's own TLS.
+pub fn identity_pem(path: &Path, password: &str) -> Result<Vec<u8>, String> {
     let shown = path.display();
     let data = std::fs::read(path).map_err(|e| format!("client certificate {shown}: {e}"))?;
     let is_pkcs12 = path
         .extension()
         .and_then(|x| x.to_str())
         .is_some_and(|x| x.eq_ignore_ascii_case("pfx") || x.eq_ignore_ascii_case("p12"));
-    let pem = if is_pkcs12 {
-        pkcs12_to_pem(&data, password)?
-    } else {
-        data
-    };
-    reqwest::Identity::from_pem(&pem)
-        .map_err(|e| format!("client certificate {shown}: {}", error_chain(&e)))
+    match is_pkcs12 {
+        true => pkcs12_to_pem(&data, password),
+        false => Ok(data),
+    }
 }
 
 /// reqwest+rustls only takes PEM identities, while corporate client certs usually ship as PFX.
