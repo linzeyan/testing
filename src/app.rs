@@ -530,6 +530,8 @@ enum TreeAction {
     Mock(PathBuf),
     /// Drag and drop: this request or folder into that folder.
     Move(PathBuf, PathBuf),
+    /// What, next to which, after it (else before).
+    Place(PathBuf, PathBuf, bool),
 }
 
 /// Collection runner pane. Settings persist while the pane is open; results are summaries only.
@@ -1599,16 +1601,17 @@ impl App {
         self.tabs.iter_mut().for_each(|t| moved(&mut t.path));
     }
 
-    /// Drag and drop in the tree.
-    fn move_into(&mut self, path: &Path, folder: &Path) {
-        match self.ws.move_into(path, folder) {
-            Ok(new) if new == path => {}
+    /// After a drag and drop in the tree; a reorder in place keeps the path.
+    fn moved(&mut self, path: &Path, result: Result<PathBuf, String>) {
+        match result {
             Ok(new) => {
-                self.follow_move(path, &new);
+                if new != path {
+                    self.follow_move(path, &new);
+                    self.status = format!("Moved to \"{}\"", self.ws.display_name(&new));
+                }
                 self.reload();
                 self.save_state();
-                self.reveal = Some(new.clone());
-                self.status = format!("Moved to \"{}\"", self.ws.display_name(&new));
+                self.reveal = Some(new);
             }
             Err(e) => self.status = e,
         }
@@ -2456,7 +2459,14 @@ impl App {
                 TreeAction::CopyDocs(dir) => self.copy_docs(&dir, ui.ctx()),
                 TreeAction::CopyPostman(dir) => self.copy_postman(&dir, ui.ctx()),
                 TreeAction::Mock(dir) => self.start_mock(dir, ui.ctx()),
-                TreeAction::Move(path, folder) => self.move_into(&path, &folder),
+                TreeAction::Move(path, folder) => {
+                    let moved = self.ws.move_into(&path, &folder);
+                    self.moved(&path, moved);
+                }
+                TreeAction::Place(path, target, after) => {
+                    let moved = self.ws.place(&path, &target, after);
+                    self.moved(&path, moved);
+                }
             }
         }
     }
@@ -4869,7 +4879,12 @@ fn tree_ui(
                 header
                     .interact(egui::Sense::drag())
                     .dnd_set_drag_payload(path.clone());
-                drop_into(ui, header, path, actions);
+                // The header's top edge is "before this folder"; the rest is "into it".
+                let edge = header.rect.top() + header.rect.height() / 3.0;
+                match ui.ctx().pointer_latest_pos().is_some_and(|p| p.y < edge) {
+                    true => drop_beside(ui, header, path, actions),
+                    false => drop_into(ui, header, path, actions),
+                }
                 header.context_menu(|ui| folder_menu(ui, path, name, actions));
                 more_button(ui, header, path, |ui| folder_menu(ui, path, name, actions));
             }
@@ -4901,10 +4916,7 @@ fn tree_ui(
                 }
                 resp.interact(egui::Sense::drag())
                     .dnd_set_drag_payload(path.clone());
-                // Dropped on a request: next to it, in its folder.
-                if let Some(folder) = path.parent() {
-                    drop_into(ui, &resp, folder, actions);
-                }
+                drop_beside(ui, &resp, path, actions);
                 resp.context_menu(|ui| request_menu(ui, path, name, actions));
                 more_button(ui, &resp, path, |ui| request_menu(ui, path, name, actions));
             }
@@ -5002,6 +5014,24 @@ fn drop_into(ui: &egui::Ui, resp: &egui::Response, folder: &Path, actions: &mut 
     }
     if let Some(path) = resp.dnd_release_payload::<PathBuf>() {
         actions.push(TreeAction::Move((*path).clone(), folder.to_owned()));
+    }
+}
+
+/// A tree drop target for arranging: a release over the row's upper half puts what is held
+/// before `target` (in target's folder), over the lower half after it; a line shows where.
+fn drop_beside(ui: &egui::Ui, resp: &egui::Response, target: &Path, actions: &mut Vec<TreeAction>) {
+    let after = (ui.ctx().pointer_latest_pos()).is_some_and(|p| p.y > resp.rect.center().y);
+    if resp.dnd_hover_payload::<PathBuf>().is_some() {
+        let y = if after {
+            resp.rect.bottom()
+        } else {
+            resp.rect.top()
+        };
+        let stroke = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
+        ui.painter().hline(ui.max_rect().x_range(), y, stroke);
+    }
+    if let Some(path) = resp.dnd_release_payload::<PathBuf>() {
+        actions.push(TreeAction::Place((*path).clone(), target.to_owned(), after));
     }
 }
 
@@ -8443,6 +8473,52 @@ mod ui_tests {
         drag(&mut h, r, egui::pos2(r.x, 600.0));
         assert!(h.state().ws.load_request(&top.join("r.toml")).is_ok());
         assert_eq!(h.state().open.as_ref().unwrap().path, top.join("r.toml"));
+    }
+
+    #[test]
+    fn dragging_onto_a_row_edge_arranges_the_tree() {
+        let ws = workspace("arrange");
+        let top = ws.collections();
+        ws.create_folder(&top, "api").unwrap();
+        ws.create_request(&top, "a").unwrap();
+        ws.create_request(&top, "b").unwrap();
+        let mut h = harness(ws);
+        h.run();
+        let drag = |h: &mut Harness<'_, App>, from: egui::Pos2, to: egui::Pos2| {
+            h.drag_at(from);
+            h.run();
+            h.hover_at(from + egui::vec2(0.0, 12.0));
+            h.run();
+            h.hover_at(to);
+            h.run();
+            h.drop_at(to);
+            h.run();
+        };
+        let order = |h: &Harness<'_, App>| -> Vec<String> {
+            (h.state().ws.tree().iter())
+                .map(|n| n.path().file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        let row =
+            |h: &Harness<'_, App>, name: &str| h.get_all_by_label(name).next().unwrap().rect();
+        // b onto a's upper half: before a.
+        let (b, a) = (row(&h, "b"), row(&h, "a"));
+        drag(&mut h, b.center(), egui::pos2(a.center().x, a.top() + 2.0));
+        assert_eq!(
+            order(&h),
+            ["api", "b.toml", "a.toml"],
+            "{}",
+            h.state().status
+        );
+        // a onto the folder header's top edge: before the folder, not into it.
+        let (a, folder) = (row(&h, "a"), h.get_by_label("api").rect());
+        drag(
+            &mut h,
+            a.center(),
+            egui::pos2(folder.center().x, folder.top() + 1.0),
+        );
+        assert_eq!(order(&h), ["a.toml", "api", "b.toml"]);
+        assert!(h.state().ws.exists(&top.join("a.toml")));
     }
 
     #[test]

@@ -38,7 +38,7 @@ such as Citrix VDI. No installer: unzip and run.
   selects the URL; Ctrl+K jumps to any request (by folder and name, letters in order are
   enough), folder (its settings) or environment, or does what a button does (new request,
   network settings, cookies, side by side…); filter the tree by name; drag a request or folder onto a folder (or the
-  empty space under the tree) to move it, open tabs following; a ⋯ on the hovered tree row
+  empty space under the tree) to move it, open tabs following, or onto a row's top/bottom edge to put it before/after that row (the order is kept in `.folder.toml`; Postman and Insomnia imports keep theirs); a ⋯ on the hovered tree row
   opens the same menu as right-click; each request's last status code on its tree row; a
   `folder › request` breadcrumb whose folders open their settings; header names and Content-Type values complete while
   typing, and the Headers tab folds out what Send adds (Host, auth, Content-Type…) and

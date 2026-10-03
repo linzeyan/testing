@@ -83,8 +83,11 @@ impl Reader {
             auth: self.auth(key, &v["auth"]),
             pre_request: script(&v["event"], "prerequest"),
             tests: script(&v["event"], "test"),
+            order: Vec::new(),
         };
+        let at = self.folders.len();
         self.folders.push((key.to_owned(), folder));
+        let mut order = Vec::new();
         // Postman allows the same name twice; files (in an export) don't, nor do they
         // tell case apart on macOS and Windows.
         let mut taken = HashSet::new();
@@ -98,14 +101,22 @@ impl Reader {
                 .find(|n| taken.insert(n.to_lowercase()))
                 .expect("some name is free");
             let child = match key.is_empty() {
-                true => name,
+                true => name.clone(),
                 false => format!("{key}/{name}"),
             };
             match item["item"].is_array() {
-                true => self.group(&child, item, &item["description"]),
-                false => self.request(&child, item),
+                true => {
+                    order.push(format!("{name}/"));
+                    self.group(&child, item, &item["description"]);
+                }
+                false => {
+                    order.push(name);
+                    self.request(&child, item);
+                }
             }
         }
+        // Postman's order is the author's; the tree would otherwise sort by name.
+        self.folders[at].1.order = Folder::order_of(order);
     }
 
     fn request(&mut self, key: &str, item: &Value) {
@@ -817,6 +828,12 @@ mod tests {
             "a name that can't be a file name is cleaned up"
         );
         let folders: HashMap<_, _> = folders.into_iter().collect();
+        // The author's order, not the tree's alphabetical one.
+        let order = &folders[""].order;
+        assert_eq!(
+            (&order[..2], order.last().unwrap().as_str()),
+            (&["users/".to_owned(), "create".to_owned()][..], "binary")
+        );
         let top = &folders[""];
         assert_eq!(top.description, "The shop.");
         let retries = KeyValue::new("retries", "3");
@@ -972,6 +989,7 @@ mod tests {
             }),
             pre_request: "console.log(1);\n".into(),
             tests: "pm.test('x', () => {});".into(),
+            order: Vec::new(),
         };
         ws.save_folder(&api, &folder).unwrap();
         let sub = Folder {

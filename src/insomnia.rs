@@ -138,6 +138,7 @@ impl Reader {
             auth: self.auth(key, &v["authentication"]),
             pre_request: script(v, "preRequestScript", "preRequest"),
             tests: script(v, "afterResponseScript", "afterResponse"),
+            order: Vec::new(),
         };
         // Insomnia folders can carry headers for their requests; apitool's don't.
         if headers(&v["headers"]).iter().any(|h| h.enabled) {
@@ -147,7 +148,9 @@ impl Reader {
             );
         }
         folder.vars.retain(|v| !v.key.is_empty());
+        let at = self.folders.len();
         self.folders.push((key.to_owned(), folder));
+        let mut order = Vec::new();
         let mut taken = HashSet::new();
         for child in v["children"].as_array().into_iter().flatten() {
             let base = safe_name(str_of(&child["name"]));
@@ -159,11 +162,12 @@ impl Reader {
                 .find(|n| taken.insert(n.to_lowercase()))
                 .expect("some name is free");
             let child_key = match key.is_empty() {
-                true => name,
+                true => name.clone(),
                 false => format!("{key}/{name}"),
             };
             let kind = str_of(&child["_type"]);
             if child["children"].is_array() {
+                order.push(format!("{name}/"));
                 self.group(&child_key, child);
             } else if kind == "grpc_request" || child["protoMethodName"].is_string() {
                 // The proto files live outside the export.
@@ -179,11 +183,15 @@ impl Reader {
                     description: description_of(child),
                     ..Default::default()
                 };
+                order.push(name);
                 self.requests.push((child_key, req));
             } else if kind == "request" || kind.is_empty() {
+                order.push(name);
                 self.request(&child_key, child);
             }
         }
+        // Children come sorted by Insomnia's own order (metaSortKey); keep it.
+        self.folders[at].1.order = Folder::order_of(order);
     }
 
     fn request(&mut self, key: &str, v: &Value) {

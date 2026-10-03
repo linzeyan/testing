@@ -117,6 +117,14 @@ pub enum Node {
     },
 }
 
+impl Node {
+    pub fn path(&self) -> &Path {
+        match self {
+            Node::Folder { path, .. } | Node::Request { path, .. } => path,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct EnvFile {
     #[serde(default)]
@@ -199,6 +207,18 @@ fn connect(path: &Path) -> Result<Connection, String> {
 }
 
 /// A request's path ends in `.toml`; a folder's never does.
+/// A child's entry in its folder's `order`.
+fn tag(path: &Path) -> String {
+    match is_request(path) {
+        true => path.file_stem(),
+        false => path.file_name(),
+    }
+    .unwrap_or_default()
+    .to_string_lossy()
+    .into_owned()
+        + if is_request(path) { "" } else { "/" }
+}
+
 pub fn is_request(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "toml")
 }
@@ -535,11 +555,20 @@ impl Workspace {
             let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect()
         };
-        let folders = rows("SELECT path, '' FROM folders WHERE path != ''");
+        let folders = rows("SELECT path, settings FROM folders");
         let requests = rows("SELECT path, method FROM requests");
         drop(db);
         match (folders, requests) {
-            (Ok(folders), Ok(requests)) => self.nodes("", &folders, &requests),
+            (Ok(mut folders), Ok(requests)) => {
+                let orders = (folders.iter_mut())
+                    .filter_map(|(key, settings)| {
+                        let f = serde_json::from_str::<Folder>(settings).ok();
+                        Some((key.clone(), f?.order)).filter(|(_, o)| !o.is_empty())
+                    })
+                    .collect();
+                folders.retain(|(key, _)| !key.is_empty());
+                self.nodes("", &folders, &requests, &orders)
+            }
             (Err(e), _) | (_, Err(e)) => {
                 eprintln!("workspace database: {e}");
                 Vec::new()
@@ -547,12 +576,14 @@ impl Workspace {
         }
     }
 
-    /// Folders first, then requests, each by name ignoring case.
+    /// The folder's own order if it has one; else (and for what it doesn't list) folders
+    /// first, then requests, each by name ignoring case.
     fn nodes(
         &self,
         parent: &str,
         folders: &[(String, String)],
         requests: &[(String, String)],
+        orders: &HashMap<String, Vec<String>>,
     ) -> Vec<Node> {
         let leaf = |key: &str| key.rsplit('/').next().unwrap_or(key).to_owned();
         let mut subfolders: Vec<Node> = folders
@@ -561,7 +592,7 @@ impl Workspace {
             .map(|(key, _)| Node::Folder {
                 name: leaf(key),
                 path: self.folder_at(key),
-                children: self.nodes(key, folders, requests),
+                children: self.nodes(key, folders, requests, orders),
             })
             .collect();
         let mut here: Vec<Node> = requests
@@ -579,7 +610,35 @@ impl Workspace {
         subfolders.sort_by_key(name);
         here.sort_by_key(name);
         subfolders.extend(here);
+        if let Some(order) = orders.get(parent) {
+            // Stable, so the unlisted follow in the default order.
+            let at = |n: &Node| order.iter().position(|t| *t == tag(n.path()));
+            subfolders.sort_by_key(|n| at(n).unwrap_or(usize::MAX));
+        }
         subfolders
+    }
+
+    /// Puts `path` just before (or after) `target`, first moving it into target's folder;
+    /// returns its new path.
+    pub fn place(&self, path: &Path, target: &Path, after: bool) -> Result<PathBuf, String> {
+        let dir = target.parent().ok_or("nothing to place it next to")?;
+        let new = self.move_into(path, dir)?;
+        if new == target {
+            return Ok(new);
+        }
+        let tree = self.tree();
+        let siblings = match dir == self.collections() {
+            true => &tree[..],
+            false => crate::docs::find(&tree, dir).ok_or("the folder is gone")?,
+        };
+        let mut order: Vec<String> = siblings.iter().map(|n| tag(n.path())).collect();
+        order.retain(|t| *t != tag(&new));
+        let at = (order.iter().position(|t| *t == tag(target))).ok_or("the target is gone")?;
+        order.insert(at + after as usize, tag(&new));
+        let mut folder = self.load_folder(dir)?;
+        folder.order = Folder::order_of(order);
+        self.save_folder(dir, &folder)?;
+        Ok(new)
     }
 
     pub fn load_request(&self, path: &Path) -> Result<Request, String> {
@@ -735,6 +794,13 @@ impl Workspace {
             return Err(format!("\"{}\" already exists", name.trim()));
         }
         self.relocate(path, &new)?;
+        // Keep its place among its siblings.
+        let dir = path.parent().unwrap_or(path);
+        let mut folder = self.load_folder(dir)?;
+        if let Some(t) = folder.order.iter_mut().find(|t| **t == tag(path)) {
+            *t = tag(&new);
+            self.save_folder(dir, &folder)?;
+        }
         Ok(new)
     }
 
@@ -1555,6 +1621,55 @@ mod tests {
         let err = ws.move_into(&other, &v1).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
         assert_eq!(ws.load_request(&v1.join("r.toml")).unwrap().url, "http://x");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dragged_order_sticks_through_renames_moves_and_export() {
+        let root = fresh("order");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let top = ws.collections();
+        let names =
+            |nodes: &[Node]| -> Vec<String> { nodes.iter().map(|n| tag(n.path())).collect() };
+        let api = ws.create_folder(&top, "api").unwrap();
+        let a = ws.create_request(&top, "a").unwrap();
+        let b = ws.create_request(&top, "b").unwrap();
+        // A request named like a folder is a different entry.
+        ws.create_request(&top, "api").unwrap();
+        assert_eq!(names(&ws.tree()), ["api/", "a", "api", "b"]);
+
+        ws.place(&b, &a, false).unwrap();
+        ws.place(&api, &b, true).unwrap();
+        assert_eq!(names(&ws.tree()), ["b", "api/", "a", "api"]);
+        // A rename keeps the place; a new request goes after what was arranged.
+        let c = ws.rename(&a, "c").unwrap();
+        ws.create_request(&top, "0 new").unwrap();
+        assert_eq!(names(&ws.tree()), ["b", "api/", "c", "api", "0 new"]);
+
+        // Into another folder, at a spot among what is there.
+        let inner = ws.create_request(&api, "x").unwrap();
+        let moved = ws.place(&c, &inner, false).unwrap();
+        assert_eq!(moved, api.join("c.toml"));
+        let Node::Folder { children, .. } = &ws.tree()[1] else {
+            panic!("api")
+        };
+        assert_eq!(names(children), ["c", "x"]);
+        // That is the default order, so nothing is stored.
+        assert!(ws.load_folder(&api).unwrap().order.is_empty());
+        ws.place(&moved, &inner, true).unwrap();
+        let Node::Folder { children, .. } = &ws.tree()[1] else {
+            panic!("api")
+        };
+        assert_eq!(names(children), ["x", "c"]);
+
+        let out = root.join("export");
+        ws.export(&out).unwrap();
+        let clone = Workspace::open(out).unwrap();
+        assert_eq!(names(&clone.tree()), ["b", "api/", "api", "0 new"]);
+        let Node::Folder { children, .. } = &clone.tree()[1] else {
+            panic!("api")
+        };
+        assert_eq!(names(children), ["x", "c"]);
         let _ = fs::remove_dir_all(&root);
     }
 

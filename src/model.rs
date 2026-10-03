@@ -210,6 +210,25 @@ pub struct Folder {
     /// Runs before the request's own tests.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub tests: String,
+    /// The children as arranged by dragging: request names, and folder names ending in
+    /// `/` (a folder and a request may share a name). Unlisted children follow in the
+    /// default order, so a new or renamed-elsewhere item never vanishes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+}
+
+impl Folder {
+    /// `children` (entries as in `order`) as an `order`: empty when it is the default one,
+    /// so a folder never rearranged keeps a clean .folder.toml.
+    pub fn order_of(children: Vec<String>) -> Vec<String> {
+        let mut default = children.clone();
+        default.sort_by_key(|t| (!t.ends_with('/'), t.trim_end_matches('/').to_lowercase()));
+        if default == children {
+            Vec::new()
+        } else {
+            children
+        }
+    }
 }
 
 /// A request's folders folded together, outermost first. Scripts carry their folder's
