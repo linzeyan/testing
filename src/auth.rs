@@ -10,8 +10,15 @@ use crate::http::error_chain;
 use crate::model::{Grant, OAuth2};
 
 /// Tokens by grant parameters, for the life of the process (GUI session, CLI run, MCP server).
-static TOKENS: LazyLock<Mutex<HashMap<String, (String, Instant)>>> =
-    LazyLock::new(Default::default);
+static TOKENS: LazyLock<Mutex<HashMap<String, Cached>>> = LazyLock::new(Default::default);
+
+#[derive(Clone)]
+struct Cached {
+    token: String,
+    until: Instant,
+    /// Gets the next token without signing in again, when the provider gave one.
+    refresh: Option<String>,
+}
 /// Without `expires_in`, a token is reused this long; a 401 refetches it anyway.
 const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 /// Refetch a bit early so a token doesn't expire in flight.
@@ -29,8 +36,8 @@ pub fn cached_token(o: &OAuth2) -> Option<String> {
     let tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
     tokens
         .get(&cache_key(o))
-        .filter(|(_, until)| Instant::now() < *until)
-        .map(|(t, _)| t.clone())
+        .filter(|c| Instant::now() < c.until)
+        .map(|c| c.token.clone())
 }
 
 /// `fresh` skips the cache, after the API rejected the cached token.
@@ -52,6 +59,27 @@ async fn token(
 ) -> Result<String, String> {
     if !fresh && let Some(token) = cached_token(o) {
         return Ok(token);
+    }
+    let key = cache_key(o);
+    let cached = TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned();
+    // Expired or rejected: the refresh token saves a sign-in. If it's refused too (revoked,
+    // expired), the grant runs again from the start.
+    if let Some(refresh) = cached.and_then(|c| c.refresh) {
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_owned()),
+            ("refresh_token", refresh.clone()),
+            ("client_id", o.client_id.clone()),
+        ];
+        if !o.client_secret.is_empty() {
+            form.push(("client_secret", o.client_secret.clone()));
+        }
+        if let Ok(got) = request_token(client, o, &form).await {
+            return Ok(store(key, got, Some(refresh)));
+        }
     }
     let grant = match o.grant {
         Grant::ClientCredentials => "client_credentials",
@@ -84,10 +112,41 @@ async fn token(
         form.push(("redirect_uri", signed.redirect));
         form.push(("code_verifier", signed.verifier));
     }
+    let got = request_token(client, o, &form).await?;
+    Ok(store(key, got, None))
+}
+
+/// A token response: the access token, how long it lasts, and a refresh token if any.
+struct Granted {
+    token: String,
+    ttl: Duration,
+    refresh: Option<String>,
+}
+
+/// Caches what was granted; a provider that doesn't rotate refresh tokens leaves `refresh`
+/// as it was. Returns the access token.
+fn store(key: String, got: Granted, refresh: Option<String>) -> String {
+    let cached = Cached {
+        token: got.token.clone(),
+        until: Instant::now() + got.ttl.saturating_sub(MARGIN),
+        refresh: got.refresh.or(refresh),
+    };
+    TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, cached);
+    got.token
+}
+
+async fn request_token(
+    client: &reqwest::Client,
+    o: &OAuth2,
+    form: &[(&str, String)],
+) -> Result<Granted, String> {
     let resp = client
         .post(o.token_url.trim())
         .header(reqwest::header::ACCEPT, "application/json")
-        .form(&form)
+        .form(form)
         .send()
         .await
         .map_err(|e| format!("OAuth 2.0 token request: {}", error_chain(&e)))?;
@@ -106,12 +165,12 @@ async fn token(
     let ttl = json["expires_in"]
         .as_u64()
         .map_or(DEFAULT_TTL, Duration::from_secs);
-    let until = Instant::now() + ttl.saturating_sub(MARGIN);
-    TOKENS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(cache_key(o), (token.clone(), until));
-    Ok(token)
+    let refresh = json["refresh_token"].as_str().map(str::to_owned);
+    Ok(Granted {
+        token,
+        ttl,
+        refresh,
+    })
 }
 
 /// The `Authorization` value answering a `WWW-Authenticate: Digest …` challenge (RFC 7616).
@@ -475,6 +534,59 @@ mod tests {
             panic!("signed in twice")
         }));
         assert_eq!(again.as_deref(), Ok("t1"));
+    }
+
+    /// An expired token comes back through the refresh token, without the browser; once the
+    /// provider refuses the refresh token, signing in again is the way back.
+    #[test]
+    fn an_expired_token_is_refreshed_without_signing_in_again() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let count = refreshes.clone();
+        let addr = crate::http::tests::serve(move |req| {
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or_default();
+            let form = query(&format!("http://x/?{body}"));
+            let json = "200 OK\r\ncontent-type: application/json".to_owned();
+            // Each token is born expired (expires_in 0), so every call needs a new one.
+            match form["grant_type"].as_str() {
+                "authorization_code" => (
+                    json,
+                    r#"{"access_token":"signed","expires_in":0,"refresh_token":"r1"}"#.into(),
+                ),
+                "refresh_token" if form["refresh_token"] == "r1" && form["client_id"] == "app" => {
+                    match count.fetch_add(1, SeqCst) {
+                        // No refresh_token in the answer: r1 stays in use.
+                        0 | 1 => (
+                            json,
+                            r#"{"access_token":"refreshed","expires_in":0}"#.into(),
+                        ),
+                        _ => (
+                            "400 Bad Request".into(),
+                            r#"{"error":"invalid_grant"}"#.into(),
+                        ),
+                    }
+                }
+                _ => ("400 Bad Request".into(), format!("{form:?}")),
+            }
+        });
+        let o = code_grant(format!("http://{addr}/token"));
+        let client = client(&rt);
+        let seen = Arc::new(Mutex::new(String::new()));
+        let answer = |state: &str| format!("code=c0de&state={state}");
+        let no_browser = |_: &str| -> Result<(), String> { panic!("signed in again") };
+
+        let first = rt.block_on(token(&client, &o, false, browser(seen.clone(), answer)));
+        assert_eq!(first.as_deref(), Ok("signed"));
+        for _ in 0..2 {
+            let next = rt.block_on(token(&client, &o, false, no_browser));
+            assert_eq!(next.as_deref(), Ok("refreshed"));
+        }
+        let again = rt.block_on(token(&client, &o, false, browser(seen, answer)));
+        assert_eq!(again.as_deref(), Ok("signed"), "refused refresh: sign in");
+        assert_eq!(refreshes.load(SeqCst), 3);
     }
 
     #[test]

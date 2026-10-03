@@ -42,7 +42,8 @@ such as Citrix VDI. No installer: unzip and run.
   each); find in response (Ctrl+F; counts up to 10 000 hits); saved response
   examples; request history; Bearer, Basic, Digest, API key (header or query) and OAuth 2.0
   (client credentials, password, and authorization code with PKCE: Send opens the browser
-  to sign in and catches the redirect on 127.0.0.1) auth; a Cookies tab with what a response sets; a cookie jar like a browser's, with a manager; folder settings
+  to sign in and catches the redirect on 127.0.0.1; an expired token is renewed with the
+  refresh token when the provider gives one, without signing in again) auth; a Cookies tab with what a response sets; a cookie jar like a browser's, with a manager; folder settings
   (right-click a folder) with variables, auth and scripts shared by every request inside,
   like Postman collection/folder settings; tabs (a click in the tree previews,
   double-click or editing keeps the tab, Ctrl+W closes; right-click a tab to duplicate it or
