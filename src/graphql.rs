@@ -25,6 +25,22 @@ fragment TypeRef on __Type {
   kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
 }";
 
+/// Whether the document's (first) operation is a subscription: it then streams over a
+/// WebSocket instead of a POST.
+pub fn is_subscription(query: &str) -> bool {
+    let code = query
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or_default());
+    let code: String = code.collect::<Vec<_>>().join(" ");
+    code.trim_start()
+        .strip_prefix("subscription")
+        .is_some_and(|rest| {
+            rest.chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Field {
     pub name: String,

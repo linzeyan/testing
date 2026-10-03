@@ -1384,6 +1384,9 @@ impl App {
                 Ok(client) if req.method == "GRPC" => {
                     crate::grpc::stream(client, req, out_rx, emit).await
                 }
+                Ok(client) if subscribes(&req) => {
+                    stream::graphql(client.http.clone(), req, emit).await
+                }
                 Ok(client) => stream::sse(client.http.clone(), req, emit).await,
                 Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
             }
@@ -6180,6 +6183,12 @@ fn rpc_of<'a>(req: &Request, rpcs: &'a Rpcs) -> Option<&'a crate::grpc::Rpc> {
 fn streams(req: &Request, rpcs: &Rpcs) -> bool {
     model::is_streaming(&req.method)
         || rpc_of(req, rpcs).is_some_and(|r| r.client_streaming || r.server_streaming)
+        || subscribes(req)
+}
+
+fn subscribes(req: &Request) -> bool {
+    req.method == "GRAPHQL"
+        && matches!(&req.body, Body::GraphQL { query, .. } if crate::graphql::is_subscription(query))
 }
 
 fn grpc_bar(ui: &mut egui::Ui, req: &mut Request, methods: &mut Rpcs) -> Option<String> {

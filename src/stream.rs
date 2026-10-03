@@ -8,7 +8,7 @@ use reqwest_websocket::{CloseCode, Message, Upgrade};
 use tokio::sync::mpsc;
 
 use crate::http::{self, error_chain};
-use crate::model::Request;
+use crate::model::{Body, Request};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
@@ -119,6 +119,105 @@ pub async fn websocket(
             },
         }
     }
+}
+
+/// A GraphQL subscription: graphql-transport-ws (the graphql-ws library, what servers
+/// speak today), or subscriptions-transport-ws when the server only picks that one. Each
+/// result arrives as a message; the server's `complete` ends the session.
+pub async fn graphql(client: reqwest::Client, req: Request, emit: impl Fn(Event)) {
+    use serde_json::{Value, json};
+    let Body::GraphQL { query, variables } = &req.body else {
+        return emit(Event::Error("not a GraphQL request".into()));
+    };
+    let variables: Value = match variables.trim() {
+        "" => Value::Null,
+        v => match serde_json::from_str(v) {
+            Ok(v) => v,
+            Err(e) => return emit(Event::Error(format!("Variables aren't JSON: {e}"))),
+        },
+    };
+    let payload = json!({ "query": query, "variables": variables });
+    // The handshake is a GET carrying the request's headers and auth, not its body.
+    let mut upgrade = Request {
+        method: "WS".into(),
+        body: Body::None,
+        ..req.clone()
+    };
+    if let Err(e) = http::with_token(&client, &mut upgrade, false).await {
+        return emit(Event::Error(e));
+    }
+    let b = match http::build(&client, upgrade) {
+        Ok(b) => b,
+        Err(e) => return emit(Event::Error(e)),
+    };
+    let sent = b
+        .upgrade()
+        .protocols(["graphql-transport-ws", "graphql-ws"])
+        .send()
+        .await;
+    let socket = match sent {
+        Ok(resp) => resp.into_websocket().await,
+        Err(e) => Err(e),
+    };
+    let socket = match socket {
+        Ok(s) => s,
+        Err(e) => return emit(Event::Error(error_chain(&e))),
+    };
+    let legacy = socket.protocol() == Some("graphql-ws");
+    let protocol = if legacy {
+        "graphql-ws"
+    } else {
+        "graphql-transport-ws"
+    };
+    emit(Event::Open(format!("connected ({protocol})")));
+    let (mut sink, mut stream) = socket.split();
+    macro_rules! send {
+        ($v:expr) => {{
+            let text = $v.to_string();
+            if let Err(e) = sink.send(Message::Text(text.clone())).await {
+                return emit(Event::Error(error_chain(&e)));
+            }
+            emit(Event::Out(text));
+        }};
+    }
+    send!(json!({ "type": "connection_init", "payload": {} }));
+    while let Some(incoming) = stream.next().await {
+        let text = match incoming {
+            Ok(Message::Text(t)) => t,
+            Ok(Message::Close { code, reason }) => {
+                return emit(Event::Closed(format!(
+                    "closed by server ({code:?}) {reason}"
+                )));
+            }
+            Ok(_) => continue,
+            Err(e) => return emit(Event::Error(error_chain(&e))),
+        };
+        let msg: Value = serde_json::from_str(&text).unwrap_or_default();
+        let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
+        match msg["type"].as_str().unwrap_or_default() {
+            "connection_ack" => {
+                let kind = if legacy { "start" } else { "subscribe" };
+                send!(json!({ "id": "1", "type": kind, "payload": payload }));
+            }
+            "next" | "data" => emit(Event::In(pretty(&msg["payload"]))),
+            "ping" => send!(json!({ "type": "pong" })),
+            "pong" | "ka" => {}
+            "error" | "connection_error" => {
+                return emit(Event::Error(pretty(&msg["payload"])));
+            }
+            "complete" => {
+                let _ = sink
+                    .send(Message::Close {
+                        code: CloseCode::Normal,
+                        reason: String::new(),
+                    })
+                    .await;
+                return emit(Event::Closed("subscription complete".into()));
+            }
+            _ => emit(Event::In(text)),
+        }
+    }
+    emit(Event::Closed("connection closed".into()))
 }
 
 /// Incremental `text/event-stream` parser. Works on bytes so multi-byte characters
@@ -331,6 +430,111 @@ mod tests {
                 Event::Closed("disconnected".into()),
             ]
         );
+    }
+
+    /// The handshake against a server that insists on its subprotocol: init, ack,
+    /// subscribe with the query and variables, results until it completes; a ping
+    /// mid-stream is answered or the server would drop the connection. Run against both
+    /// protocols, which name their messages differently.
+    // tungstenite's handshake callback type fixes the error type the lint objects to.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn graphql_subscriptions_stream_results_until_complete() {
+        use serde_json::{Value, json};
+        use tungstenite::handshake::server::{Request as Hs, Response};
+        for (proto, subscribe, next) in [
+            ("graphql-transport-ws", "subscribe", "next"),
+            ("graphql-ws", "start", "data"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (s, _) = listener.accept().unwrap();
+                let pick = |req: &Hs, mut resp: Response| {
+                    let offered = req.headers()["sec-websocket-protocol"].to_str().unwrap();
+                    assert!(offered.contains(proto), "{offered}");
+                    resp.headers_mut()
+                        .insert("sec-websocket-protocol", proto.parse().unwrap());
+                    Ok(resp)
+                };
+                let mut ws = tungstenite::accept_hdr(s, pick).unwrap();
+                let read = |ws: &mut tungstenite::WebSocket<_>| -> Value {
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap()
+                };
+                let send = |ws: &mut tungstenite::WebSocket<_>, v: Value| {
+                    ws.send(tungstenite::Message::text(v.to_string())).unwrap()
+                };
+                assert_eq!(read(&mut ws)["type"], "connection_init");
+                send(&mut ws, json!({"type": "connection_ack"}));
+                let sub = read(&mut ws);
+                assert_eq!(sub["type"], subscribe);
+                assert_eq!(sub["payload"]["variables"]["room"], "a");
+                let id = sub["id"].clone();
+                send(
+                    &mut ws,
+                    json!({"id": id, "type": next, "payload": {"data": {"n": 1}}}),
+                );
+                if proto == "graphql-transport-ws" {
+                    send(&mut ws, json!({"type": "ping"}));
+                    assert_eq!(read(&mut ws)["type"], "pong");
+                } else {
+                    send(&mut ws, json!({"type": "ka"}));
+                }
+                send(
+                    &mut ws,
+                    json!({"id": id, "type": next, "payload": {"data": {"n": 2}}}),
+                );
+                send(&mut ws, json!({"id": id, "type": "complete"}));
+                let _ = ws.read();
+            });
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let client = rt
+                .block_on(crate::net::build_client(crate::net::Network::default()))
+                .unwrap()
+                .http;
+            let req = Request {
+                method: "GRAPHQL".into(),
+                url: format!("http://{addr}/graphql"),
+                body: Body::GraphQL {
+                    query: "subscription ($room: String) { messages(room: $room) { n } }".into(),
+                    variables: r#"{"room": "a"}"#.into(),
+                },
+                ..Default::default()
+            };
+            let events = std::sync::Mutex::new(Vec::new());
+            rt.block_on(graphql(client, req, |e| events.lock().unwrap().push(e)));
+            server.join().unwrap();
+            let events = events.into_inner().unwrap();
+            let ins: Vec<_> = (events.iter())
+                .filter_map(|e| match e {
+                    Event::In(t) => Some(t.replace([' ', '\n'], "")),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                ins,
+                [r#"{"data":{"n":1}}"#, r#"{"data":{"n":2}}"#],
+                "{proto}"
+            );
+            assert_eq!(events[0], Event::Open(format!("connected ({proto})")));
+            assert_eq!(
+                events.last(),
+                Some(&Event::Closed("subscription complete".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn subscriptions_are_told_from_queries() {
+        use crate::graphql::is_subscription;
+        assert!(is_subscription("# live\n  subscription OnMsg { m }"));
+        assert!(is_subscription("subscription{ m }"));
+        assert!(!is_subscription("query { subscriptionCount }"));
+        assert!(!is_subscription("subscriptions { x }"));
+        assert!(!is_subscription("{ m }"));
     }
 
     /// A server that never ends a line can't fill RAM: the line keeps its first MiB and
