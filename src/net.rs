@@ -67,6 +67,8 @@ pub struct Clients {
     pub note: Option<String>,
     /// The same proxy choice, for connections reqwest doesn't make (MQTT).
     pub route: Route,
+    /// What `pm.cookies` reads and writes: the jar these clients send from.
+    pub jar: Arc<crate::cookies::Jar>,
     variants: Arc<Variants>,
 }
 
@@ -164,6 +166,7 @@ pub async fn build_client_with_jar(
     // clang; aws-lc-rs needs cmake/nasm). Installing is idempotent, and doing it here covers
     // every client, including the PAC fetcher below.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let scripts_jar = jar.clone();
 
     // Any explicit `.proxy()` turns off reqwest's own system-proxy lookup.
     let mut note = None;
@@ -267,6 +270,7 @@ pub async fn build_client_with_jar(
         grpc: build(grpc)?,
         note,
         route,
+        jar: scripts_jar,
         variants: Arc::new(Variants {
             build: Box::new(build),
             built: Default::default(),

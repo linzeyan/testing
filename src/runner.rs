@@ -77,7 +77,10 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
         f => format!(" of folder \"{f}\""),
     };
 
+    let jar = req.settings.cookies.then_some(&client.jar);
     for (folder, code) in scripts(&req.inherited.pre_request, &req.pre_request) {
+        // What the request would go to now: scripts before this one may have changed it.
+        let cookie_url = http::wire_url(&req.resolved(&merge(&vars, &collection, &locals)).0.url);
         let wire = WireRequest {
             method: req.method.clone(),
             url: req.url.clone(),
@@ -99,6 +102,8 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
             locals: &locals,
             request: &wire,
             response: None,
+            cookie_url: &cookie_url,
+            jar,
         };
         let result = tokio::task::block_in_place(|| script::run(&code, &input));
         let error = result.error.clone();
@@ -121,13 +126,8 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
         }
     }
 
-    // Precedence like Postman: request-local > data row > environment > folder > globals.
-    let mut merged = vars.globals.clone();
-    merged.extend(collection.clone());
-    merged.extend(vars.env.clone());
-    merged.extend(vars.data.clone());
-    merged.extend(locals.clone());
-    let (wire, _) = req.resolved(&merged);
+    let (wire, _) = req.resolved(&merge(&vars, &collection, &locals));
+    let cookie_url = http::wire_url(&wire.url);
     let response = send(&client, wire).await;
 
     if let Ok(resp) = &response {
@@ -155,6 +155,8 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
                 locals: &locals,
                 request: &wire,
                 response: Some(sr),
+                cookie_url: &cookie_url,
+                jar,
             };
             let result = tokio::task::block_in_place(|| script::run(&code, &input));
             let error = result.error.clone();
@@ -170,6 +172,20 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
     }
     out.response = response;
     out
+}
+
+/// Precedence like Postman: request-local > data row > environment > folder > globals.
+fn merge(
+    vars: &Vars,
+    collection: &HashMap<String, String>,
+    locals: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = vars.globals.clone();
+    merged.extend(collection.clone());
+    merged.extend(vars.env.clone());
+    merged.extend(vars.data.clone());
+    merged.extend(locals.clone());
+    merged
 }
 
 /// Sends an already-resolved request with the client its protocol needs.
@@ -372,6 +388,76 @@ pub fn clip(text: &mut String, max: usize) {
 mod tests {
     use super::*;
     use crate::net::{Network, ProxyMode, build_client};
+
+    /// Scripts see the jar Send uses: a test reads the session cookie a login just set,
+    /// and a cookie a pre-request script puts in the jar goes out with that same request.
+    #[test]
+    fn scripts_read_and_write_the_cookie_jar_send_uses() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt
+            .block_on(build_client(Network {
+                proxy: ProxyMode::None,
+                ..Default::default()
+            }))
+            .unwrap();
+        let addr = crate::http::tests::serve(|raw| match raw.split(' ').nth(1).unwrap_or("") {
+            "/login" => (
+                "200 OK\r\nset-cookie: sid=s3cr3t; Path=/".into(),
+                String::new(),
+            ),
+            _ => ("200 OK".into(), raw.to_lowercase()),
+        });
+        let run = |path: &str, pre: &str, tests: &str| {
+            let req = Request {
+                url: format!("http://{{{{host}}}}{path}"),
+                pre_request: pre.into(),
+                tests: tests.into(),
+                ..Default::default()
+            };
+            let vars = Vars {
+                env: HashMap::from([("host".to_owned(), addr.to_string())]),
+                ..Default::default()
+            };
+            rt.block_on(super::run(
+                client.clone(),
+                &Info::single("t".into()),
+                req,
+                vars,
+            ))
+        };
+        let out = run(
+            "/login",
+            "",
+            r#"pm.test("sid", function () {
+                 pm.expect(pm.cookies.get("sid")).to.equal("s3cr3t");
+                 pm.expect(pm.cookies.has("nope")).to.equal(false);
+               });"#,
+        );
+        assert!(out.tests.iter().all(|t| t.passed), "{:?}", out.tests);
+        assert_eq!(out.tests.len(), 1);
+
+        let out = run(
+            "/echo",
+            r#"var url = "http://" + pm.environment.get("host") + "/";
+               pm.cookies.jar().set(url, "extra", "1", function (err, c) {
+                 if (err) throw err;
+                 console.log(c.name);
+               });
+               pm.cookies.jar().unset(url, "sid");"#,
+            "",
+        );
+        assert_eq!(out.logs, ["extra"]);
+        let body = out.response.unwrap().body;
+        assert!(body.contains("cookie: extra=1"), "{body}");
+        assert!(
+            !body.contains("sid="),
+            "unset in the jar before sending: {body}"
+        );
+    }
 
     #[test]
     fn request_settings_change_how_it_goes_out() {

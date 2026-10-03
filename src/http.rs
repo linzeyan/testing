@@ -146,6 +146,21 @@ pub fn wire_method(method: &str) -> Result<reqwest::Method, String> {
     }
 }
 
+/// Like Postman: a bare "localhost:8080/x" means http. WebSocket URLs are upgraded from
+/// plain HTTP(S), which is what ws(s):// means on the wire.
+pub fn wire_url(url: &str) -> String {
+    let url = url.trim();
+    if let Some(rest) = url.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else if let Some(rest) = url.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if url.contains("://") {
+        url.to_owned()
+    } else {
+        format!("http://{url}")
+    }
+}
+
 /// Builds the wire request for an already-resolved `Request` (see `Request::resolved`).
 /// Shared by plain sends, SSE and WebSocket so all get the same auth/headers/proxy.
 pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestBuilder, String> {
@@ -154,17 +169,7 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
     if url.is_empty() {
         return Err("URL is empty".into());
     }
-    // Like Postman: a bare "localhost:8080/x" means http. WebSocket URLs are upgraded
-    // from plain HTTP(S), which is what ws(s):// means on the wire.
-    let url = if let Some(rest) = url.strip_prefix("ws://") {
-        format!("http://{rest}")
-    } else if let Some(rest) = url.strip_prefix("wss://") {
-        format!("https://{rest}")
-    } else if url.contains("://") {
-        url.to_owned()
-    } else {
-        format!("http://{url}")
-    };
+    let url = wire_url(url);
 
     let pairs = |kv: &[KeyValue]| {
         kv.iter()

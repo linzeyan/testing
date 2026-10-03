@@ -41,6 +41,12 @@ pub struct Input<'a> {
     pub locals: &'a HashMap<String, String>,
     pub request: &'a WireRequest,
     pub response: Option<ScriptResponse<'a>>,
+    /// The resolved URL: `pm.cookies` lists what the jar sends to it.
+    pub cookie_url: &'a str,
+    /// The jar Send uses; `pm.cookies.jar()` writes go straight into it. None: no jar
+    /// (cookies turned off), and `pm.cookies` is empty.
+    #[serde(skip)]
+    pub jar: Option<&'a std::sync::Arc<crate::cookies::Jar>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -152,6 +158,44 @@ pm.variables = {
     });
   }
 };
+function __jarCall(op, url, name, value) {
+  var r = JSON.parse(__jar(op, String(url), name === undefined ? '' : String(name), value === undefined ? '' : __str(value)));
+  if (r.error) throw new Error(r.error);
+  return r.ok;
+}
+function __cookies() { return __in.cookie_url ? __jarCall('get', __in.cookie_url) : []; }
+pm.cookies = {
+  get: function (n) { var l = __cookies(); for (var i = 0; i < l.length; i++) if (l[i].name === n) return l[i].value; return undefined; },
+  has: function (n) { return pm.cookies.get(n) !== undefined; },
+  toObject: function () { var o = {}; __cookies().forEach(function (c) { o[c.name] = c.value; }); return o; },
+  all: function () { return __cookies(); },
+  count: function () { return __cookies().length; },
+  // Postman's jar API: callbacks are (error, result) and are called before returning.
+  jar: function () {
+    function call(cb, f) {
+      var v;
+      try { v = f(); } catch (e) { if (cb) return cb(e); throw e; }
+      if (cb) cb(null, v);
+    }
+    return {
+      get: function (url, name, cb) {
+        call(cb, function () {
+          var l = __jarCall('get', url);
+          for (var i = 0; i < l.length; i++) if (l[i].name === name) return l[i].value;
+          return undefined;
+        });
+      },
+      getAll: function (url, cb) { call(cb, function () { return __jarCall('get', url); }); },
+      set: function (url, name, value, cb) {
+        // set(url, {name, value}, cb) as well as set(url, name, value, cb).
+        if (name !== null && typeof name === 'object') { cb = value; value = name.value; name = name.name; }
+        call(cb, function () { __jarCall('set', url, name, value); return { name: String(name), value: __str(value) }; });
+      },
+      unset: function (url, name, cb) { call(cb, function () { __jarCall('unset', url, name); }); },
+      clear: function (url, cb) { call(cb, function () { __jarCall('clear', url); }); }
+    };
+  }
+};
 if (__in.response) {
   var __res = __in.response;
   var __resHeaders = {
@@ -242,6 +286,47 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
                 "__dynamic",
                 rquickjs::Function::new(ctx.clone(), |n: String| crate::fake::value(&n))
                     .map_err(caught)?,
+            )
+            .map_err(caught)?;
+        let jar = input.jar.cloned();
+        let jar_call = move |op: String, url: String, name: String, value: String| -> String {
+            let reply = (|| {
+                let jar = jar
+                    .as_ref()
+                    .ok_or("cookies are turned off for this request")?;
+                let url =
+                    reqwest::Url::parse(&url).map_err(|e| format!("cookie URL {url}: {e}"))?;
+                Ok::<_, String>(match op.as_str() {
+                    "get" => serde_json::json!(
+                        (jar.for_url(&url).into_iter())
+                            .map(
+                                |(name, value)| serde_json::json!({ "name": name, "value": value })
+                            )
+                            .collect::<Vec<_>>()
+                    ),
+                    "set" => {
+                        jar.set(&url, &name, &value)?;
+                        serde_json::Value::Null
+                    }
+                    "unset" => {
+                        jar.unset(&url, Some(&name));
+                        serde_json::Value::Null
+                    }
+                    _ => {
+                        jar.unset(&url, None);
+                        serde_json::Value::Null
+                    }
+                })
+            })();
+            match reply {
+                Ok(ok) => serde_json::json!({ "ok": ok }).to_string(),
+                Err(e) => serde_json::json!({ "error": e }).to_string(),
+            }
+        };
+        ctx.globals()
+            .set(
+                "__jar",
+                rquickjs::Function::new(ctx.clone(), jar_call).map_err(caught)?,
             )
             .map_err(caught)?;
         ctx.eval::<(), _>(PRELUDE).map_err(caught)?;
@@ -336,6 +421,8 @@ mod tests {
             locals: &EMPTY,
             request: req,
             response,
+            cookie_url: "",
+            jar: None,
         }
     }
 

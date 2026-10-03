@@ -95,6 +95,40 @@ impl Jar {
         rows
     }
 
+    /// What a request to `url` would send, as (name, value).
+    pub fn for_url(&self, url: &Url) -> Vec<(String, String)> {
+        (self.read().get_request_values(url))
+            .map(|(n, v)| (n.to_owned(), v.to_owned()))
+            .collect()
+    }
+
+    /// As if `url` had answered `Set-Cookie: name=value` (a session cookie for its host).
+    pub fn set(&self, url: &Url, name: &str, value: &str) -> Result<(), String> {
+        let cookie = RawCookie::parse(format!("{name}={value}"))
+            .map_err(|e| format!("cookie {name}: {e}"))?;
+        (self.write().insert_raw(&cookie, url))
+            .map(drop)
+            .map_err(|e| format!("cookie {name}: {e}"))
+    }
+
+    /// Removes the cookies named `name` (all of them: None) that `url` would be sent.
+    pub fn unset(&self, url: &Url, name: Option<&str>) {
+        let mut store = self.write();
+        let doomed: Vec<(String, String, String)> = (store.matches(url).into_iter())
+            .filter(|c| name.is_none_or(|n| c.name() == n))
+            .map(|c| {
+                (
+                    String::from(&c.domain),
+                    String::from(&c.path),
+                    c.name().to_owned(),
+                )
+            })
+            .collect();
+        for (domain, path, name) in doomed {
+            store.remove(&domain, &path, &name);
+        }
+    }
+
     pub fn remove(&self, row: &Row) {
         self.write().remove(&row.domain, &row.path, &row.name);
     }

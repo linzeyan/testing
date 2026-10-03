@@ -5841,6 +5841,10 @@ const PRE_SNIPPETS: &[(&str, &str)] = &[
         "Log a variable",
         "console.log(pm.environment.get(\"host\"));\n",
     ),
+    (
+        "Put a cookie in the jar",
+        "pm.cookies.jar().set(\"https://\" + pm.environment.get(\"host\"), \"session\", \"abc\");\n",
+    ),
 ];
 
 const POST_SNIPPETS: &[(&str, &str)] = &[
@@ -5863,6 +5867,10 @@ const POST_SNIPPETS: &[(&str, &str)] = &[
     (
         "Header is present",
         "pm.test(\"Content-Type is present\", function () {\n    pm.response.to.have.header(\"Content-Type\");\n});\n",
+    ),
+    (
+        "Cookie is set",
+        "pm.test(\"Session cookie is set\", function () {\n    pm.expect(pm.cookies.has(\"session\")).to.be.true;\n});\n",
     ),
     (
         "Save a JSON value to the environment",
