@@ -19,9 +19,12 @@ pub fn parse(text: &str) -> Result<Import, String> {
     if crate::openapi::is_spec(&v) {
         return Ok(crate::openapi::import(&v));
     }
+    if crate::har::is_har(&v) {
+        return Ok(crate::har::import(&v));
+    }
     crate::postman::from_value(&v).map_err(|_| {
-        "not something apitool imports: a Postman collection or environment, or an \
-         OpenAPI/Swagger spec"
+        "not something apitool imports: a Postman collection or environment, an \
+         OpenAPI/Swagger spec or a HAR file"
             .to_owned()
     })
 }

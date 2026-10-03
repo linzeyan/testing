@@ -10,6 +10,7 @@ mod docs;
 mod fake;
 mod graphql;
 mod grpc;
+mod har;
 mod http;
 mod import;
 mod jsonpath;
