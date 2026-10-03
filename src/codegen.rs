@@ -411,7 +411,8 @@ fn powershell(w: &Wire) -> String {
         let _ = writeln!(out, "    InFile = {}", ps_str(path));
     }
     if !w.parts.is_empty() {
-        out.push_str("    Form = @{\n");
+        // A plain hashtable sends the parts in no particular order.
+        out.push_str("    Form = [ordered]@{\n");
         for (key, part) in &w.parts {
             let value = match part {
                 Part::File(path) => format!("Get-Item -LiteralPath {}", ps_str(path)),
