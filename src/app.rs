@@ -6955,9 +6955,14 @@ fn response_ui(
                         1 => ", the redirect included".into(),
                         n => format!(", {n} redirects included"),
                     };
-                    let connect = match h.sent.connect {
-                        Some(c) => format!("Connect {} ms (DNS, TCP, TLS)\n", c.as_millis()),
-                        None => "Reused an open connection\n".into(),
+                    let connect = match (h.sent.connect, h.sent.dns) {
+                        (Some(c), Some(dns)) => format!(
+                            "DNS {} ms\nConnect {} ms (TCP, TLS)\n",
+                            dns.as_millis(),
+                            c.saturating_sub(dns).as_millis()
+                        ),
+                        (Some(c), None) => format!("Connect {} ms (TCP, TLS)\n", c.as_millis()),
+                        (None, _) => "Reused an open connection\n".into(),
                     };
                     let connected = waited.saturating_sub(h.sent.connect.unwrap_or_default());
                     ms.on_hover_text(format!(

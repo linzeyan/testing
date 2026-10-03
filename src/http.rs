@@ -24,9 +24,14 @@ pub struct Sent {
     pub waited: Option<Duration>,
     /// Part of `waited`: opening new connections, DNS, TCP, TLS and a proxy's CONNECT
     /// together. None when an open one was reused.
-    /// ponytail: not split further; DNS alone would need a resolver of our own.
+    /// ponytail: TCP and TLS stay together; telling them apart means wrapping rustls's
+    /// handshake inside reqwest's connector.
     #[serde(default)]
     pub connect: Option<Duration>,
+    /// Part of `connect`: looking the host up. None for an IP address, a reused
+    /// connection, or a SOCKS proxy that resolves names itself.
+    #[serde(default)]
+    pub dns: Option<Duration>,
 }
 
 /// Only used to build requests, never to send: the code panel and the Headers tab rebuild
@@ -46,8 +51,9 @@ const MAX_SENT_BODY: usize = 64 << 10;
 pub struct Trace {
     pub cookie: Option<String>,
     pub hops: Vec<(u16, String)>,
-    /// Filled in by the connector, see `net::TimeConnect`.
+    /// Filled in by the connector, see `net::TimeConnect` and `net::TimeDns`.
     pub connect: Option<Duration>,
+    pub dns: Option<Duration>,
 }
 
 tokio::task_local! {
@@ -377,7 +383,7 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
     sent.waited = Some(started.elapsed());
     sent.added(trace.cookie, body_len);
     sent.hops = trace.hops;
-    sent.connect = trace.connect;
+    (sent.connect, sent.dns) = (trace.connect, trace.dns);
     sent.remote = resp.remote_addr().map(|a| a.to_string());
     let status = resp.status();
     let version = format!("{:?}", resp.version());
@@ -1246,6 +1252,24 @@ pub(crate) mod tests {
         assert!(ms(200) <= waited && waited < ms(450), "{waited:?}");
         let download = resp.elapsed - waited;
         assert!(download >= ms(250), "{download:?}");
+    }
+
+    /// The time hover's DNS line: a host name is looked up inside the connect, an IP
+    /// address isn't looked up at all.
+    #[test]
+    fn a_host_name_lookup_is_timed_as_part_of_the_connect() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ip = serve_bytes("content-type: text/plain", b"x".to_vec());
+        let by_ip = get(&rt, ip);
+        assert!(
+            by_ip.sent.connect.is_some() && by_ip.sent.dns.is_none(),
+            "{:?}",
+            by_ip.sent
+        );
+        let name = serve_bytes("content-type: text/plain", b"x".to_vec());
+        let by_name = get(&rt, name.replace("127.0.0.1", "localhost"));
+        let (dns, connect) = (by_name.sent.dns.unwrap(), by_name.sent.connect.unwrap());
+        assert!(dns <= connect, "{:?}", by_name.sent);
     }
 
     /// A reused connection costs nothing to open; it must not show the last one's time.

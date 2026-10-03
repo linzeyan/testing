@@ -341,6 +341,7 @@ pub async fn build_client_with_jar(
             b = b.identity(id.clone());
         }
         b = b.connector_layer(tower_layer::layer_fn(TimeConnect));
+        b = b.dns_resolver(TimeDns);
         b = match v.version {
             HttpVersion::Auto => b,
             HttpVersion::Http1 => b.http1_only(),
@@ -692,6 +693,23 @@ where
             let took = started.elapsed();
             crate::http::trace(|t| *t.connect.get_or_insert_default() += took);
             conn
+        })
+    }
+}
+
+/// The system resolver (getaddrinfo, as reqwest's own), timed like `TimeConnect`, which it
+/// runs inside.
+struct TimeDns;
+
+impl reqwest::dns::Resolve for TimeDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let started = Instant::now();
+            let addrs = tokio::net::lookup_host((host, 0)).await;
+            let took = started.elapsed();
+            crate::http::trace(|t| *t.dns.get_or_insert_default() += took);
+            Ok(Box::new(addrs?) as reqwest::dns::Addrs)
         })
     }
 }
