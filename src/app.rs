@@ -4409,7 +4409,7 @@ impl App {
                     ui.weak("Connect directly, ignoring OS settings.");
                 }
                 ProxyMode::Manual => {
-                    field(ui, &mut net.proxy_url, "http://user:pass@proxy.corp:8080");
+                    field(ui, &mut net.proxy_url, "http://user:pass@proxy.corp:8080 or socks5h://host:1080");
                     field(ui, &mut net.no_proxy, "Bypass: localhost,127.0.0.1,.corp.local");
                 }
                 ProxyMode::Pac => {

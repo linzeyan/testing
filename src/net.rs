@@ -567,7 +567,11 @@ fn first_proxy(result: &str) -> Option<String> {
             ("DIRECT", _) => return None,
             ("PROXY" | "HTTP", Some(addr)) => return Some(format!("http://{addr}")),
             ("HTTPS", Some(addr)) => return Some(format!("https://{addr}")),
-            _ => {} // SOCKS isn't compiled in; fall through to the next entry
+            // As browsers read PAC: SOCKS is version 4. Names are resolved by the proxy
+            // (4a, 5h), which is what an intranet behind one needs.
+            ("SOCKS" | "SOCKS4", Some(addr)) => return Some(format!("socks4a://{addr}")),
+            ("SOCKS5", Some(addr)) => return Some(format!("socks5h://{addr}")),
+            _ => {}
         }
     }
     None
@@ -634,6 +638,8 @@ mod tests {
                  if (isPlainHostName(host) || dnsDomainIs(host, ".corp.local")) return "DIRECT";
                  if (isInNet(host, "10.0.0.0", "255.0.0.0")) return "DIRECT";
                  if (shExpMatch(host, "*.github.com")) return "SOCKS s:1080; PROXY gh:3128";
+                 if (shExpMatch(host, "*.lab")) return "SOCKS5 s5:1080";
+                 if (shExpMatch(host, "*.odd")) return "QUIC q:1; PROXY p:3128";
                  return "PROXY proxy.corp.local:8080; DIRECT";
                }"#,
         )
@@ -642,12 +648,69 @@ mod tests {
         assert_eq!(at("http://intranet/x"), None);
         assert_eq!(at("https://wiki.corp.local/"), None);
         assert_eq!(at("http://10.1.2.3:8080/"), None);
-        // SOCKS is unsupported, so the next entry must be used instead of going direct.
-        assert_eq!(at("https://api.github.com/"), Some("http://gh:3128".into()));
+        assert_eq!(
+            at("https://api.github.com/"),
+            Some("socks4a://s:1080".into())
+        );
+        assert_eq!(at("http://box.lab/"), Some("socks5h://s5:1080".into()));
+        // An entry it can't use falls through to the next, rather than going direct.
+        assert_eq!(at("http://x.odd/"), Some("http://p:3128".into()));
         assert_eq!(
             at("https://example.com/"),
             Some("http://proxy.corp.local:8080".into())
         );
+    }
+
+    /// A manual socks5h:// proxy carries the request, and gets the host name to resolve
+    /// itself (what an intranet behind one needs): played by a minimal RFC 1928 proxy
+    /// that sends every CONNECT to the echo server.
+    #[test]
+    fn requests_go_through_a_socks5_proxy() {
+        use std::io::{Read as _, Write as _};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let target = crate::http::tests::serve(|_| ("200 OK".into(), "via socks".into()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = asked.clone();
+        std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            let mut b = [0u8; 262];
+            c.read_exact(&mut b[..2]).unwrap(); // version, method count
+            let n = b[1] as usize;
+            c.read_exact(&mut b[..n]).unwrap();
+            c.write_all(&[5, 0]).unwrap(); // no authentication
+            c.read_exact(&mut b[..4]).unwrap(); // version, CONNECT, reserved, address type
+            assert_eq!(b[3], 3, "a domain name, for the proxy to resolve");
+            c.read_exact(&mut b[..1]).unwrap();
+            let len = b[0] as usize;
+            c.read_exact(&mut b[..len + 2]).unwrap();
+            *seen.lock().unwrap() = String::from_utf8_lossy(&b[..len]).into_owned();
+            c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+            let mut up = std::net::TcpStream::connect(target).unwrap();
+            let (mut c2, mut up2) = (c.try_clone().unwrap(), up.try_clone().unwrap());
+            std::thread::spawn(move || std::io::copy(&mut c2, &mut up2));
+            let _ = std::io::copy(&mut up, &mut c);
+        });
+        let net = Network {
+            proxy: ProxyMode::Manual,
+            proxy_url: format!("socks5h://{proxy}"),
+            ..Default::default()
+        };
+        let client = rt.block_on(build_client(net)).unwrap().http;
+        let body = rt.block_on(async {
+            let r = client
+                .get("http://api.intranet.test/x")
+                .send()
+                .await
+                .unwrap();
+            r.text().await.unwrap()
+        });
+        assert_eq!(body, "via socks");
+        assert_eq!(*asked.lock().unwrap(), "api.intranet.test");
     }
 
     #[test]

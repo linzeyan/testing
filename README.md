@@ -14,7 +14,7 @@ such as Citrix VDI. No installer: unzip and run.
   (topic, message, QoS, retain) goes with the connection; Postman-style pre-request/test
   scripts (`pm.*`, chai, `jsonSchema`; `pm.variables.replaceIn`; `pm.cookies` and `pm.cookies.jar()` read and write the jar Send uses); all of Postman's dynamic variables (`{{$guid}}`, `{{$timestamp}}`, `{{$randomEmail}}`, `{{$randomBankAccountIban}}`… 120 of them, a fresh value each use, `{{email` completes to `$randomEmail`); collection runner with CSV/JSON data (counts cover every row; the list keeps
   failures and the latest 1000 results); load test
-  pane (response bodies are read and dropped, so many users cost no RAM); proxy/PAC/WPAD, custom CA and client certificates. JSON, text (Text/XML/HTML/JavaScript
+  pane (response bodies are read and dropped, so many users cost no RAM); proxy/PAC/WPAD (http, https and SOCKS proxies: `socks5h://host:1080`, or a PAC `SOCKS`/`SOCKS5` entry), custom CA and client certificates. JSON, text (Text/XML/HTML/JavaScript
   sets the Content-Type; XML has Beautify), form and multipart
   bodies (a value `@path` uploads a file), and a Binary body that sends a file as it is,
   streamed from disk with its type guessed from the extension (text past 128 KB, in a body,

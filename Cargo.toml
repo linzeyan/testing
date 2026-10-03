@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.56.0"
+version = "0.57.0"
 edition = "2024"
 
 [dependencies]
@@ -21,7 +21,8 @@ p12-keystore = "0.3"
 prost = "0.14.4"
 prost-reflect = { version = "0.16.5", features = ["serde"] }
 protox = "0.9.1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "charset", "gzip", "query", "form", "multipart", "stream", "cookies"] }
+# socks: implemented in hyper-util, which is already here; no crate of its own.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "system-proxy", "charset", "gzip", "query", "form", "multipart", "stream", "cookies", "socks"] }
 reqwest-websocket = "0.6"
 rquickjs = { version = "0.14", features = ["parallel"] }
 # Already in the tree as rustls's crypto provider: HMAC-SHA256 for AWS Signature v4.
