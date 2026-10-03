@@ -5910,6 +5910,10 @@ const PRE_SNIPPETS: &[(&str, &str)] = &[
         "Put a cookie in the jar",
         "pm.cookies.jar().set(\"https://\" + pm.environment.get(\"host\"), \"session\", \"abc\");\n",
     ),
+    (
+        "Fetch a token first",
+        "pm.sendRequest({\n    url: pm.variables.replaceIn(\"{{baseUrl}}/token\"),\n    method: \"POST\",\n    body: { mode: \"raw\", raw: { id: pm.environment.get(\"clientId\") }, options: { raw: { language: \"json\" } } }\n}, function (err, res) {\n    if (err) throw err;\n    pm.environment.set(\"token\", res.json().token);\n});\n",
+    ),
 ];
 
 const POST_SNIPPETS: &[(&str, &str)] = &[

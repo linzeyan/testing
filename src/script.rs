@@ -47,6 +47,9 @@ pub struct Input<'a> {
     /// (cookies turned off), and `pm.cookies` is empty.
     #[serde(skip)]
     pub jar: Option<&'a std::sync::Arc<crate::cookies::Jar>>,
+    /// What `pm.sendRequest` sends with. None: not available (it says so when called).
+    #[serde(skip)]
+    pub client: Option<&'a crate::net::Clients>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -196,6 +199,41 @@ pm.cookies = {
     };
   }
 };
+function __response(r) {
+  var headers = {
+    get: function (n) { var i = __findHeader(r.headers, n); return i < 0 ? undefined : r.headers[i][1]; },
+    has: function (n) { return __findHeader(r.headers, n) >= 0; },
+    toObject: function () { var o = {}; r.headers.forEach(function (h) { o[h[0]] = h[1]; }); return o; }
+  };
+  return {
+    code: r.code, status: r.status, responseTime: r.time, headers: headers,
+    text: function () { return r.body; },
+    json: function () { return JSON.parse(r.body); }
+  };
+}
+// Postman's request shapes: a URL, or { url, method, header (list or object), body }.
+// The call blocks until the answer is in; the callback runs before it returns, and
+// without one it gives a promise, for `await`.
+pm.sendRequest = function (req, cb) {
+  if (typeof req === 'string') req = { url: req };
+  var headers = [], h = req.header || req.headers || [];
+  if (Array.isArray(h)) h.forEach(function (x) {
+    if (typeof x === 'string') { var i = x.indexOf(':'); headers.push([x.slice(0, i).trim(), x.slice(i + 1).trim()]); }
+    else if (!x.disabled) headers.push([String(x.key), __str(x.value)]);
+  });
+  else Object.keys(h).forEach(function (k) { headers.push([k, __str(h[k])]); });
+  var b = req.body || {}, body = null;
+  function rows(l) { return (l || []).filter(function (x) { return !x.disabled; }).map(function (x) { return [String(x.key), __str(x.value)]; }); }
+  if (b.mode === 'raw') body = { raw: __str(b.raw === undefined ? '' : b.raw), json: !!(b.options && b.options.raw && b.options.raw.language === 'json') };
+  else if (b.mode === 'urlencoded') body = { form: rows(b.urlencoded) };
+  else if (b.mode === 'formdata') body = { multipart: rows(b.formdata) };
+  else if (b.mode === 'graphql') body = { raw: JSON.stringify({ query: b.graphql.query, variables: b.graphql.variables }), json: true };
+  var r = JSON.parse(__send(JSON.stringify({ method: String(req.method || 'GET').toUpperCase(), url: String(req.url), headers: headers, body: body })));
+  var err = r.error === undefined ? null : new Error(r.error), res = err ? null : __response(r);
+  if (cb) { cb(err, res); return; }
+  return err ? Promise.reject(err) : Promise.resolve(res);
+};
+var __asyncError;
 if (__in.response) {
   var __res = __in.response;
   var __resHeaders = {
@@ -329,16 +367,113 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
                 rquickjs::Function::new(ctx.clone(), jar_call).map_err(caught)?,
             )
             .map_err(caught)?;
+        let client = input.client.cloned();
+        let send = move |spec: String| -> String {
+            let reply = (|| {
+                let client = client.as_ref().ok_or("pm.sendRequest isn't available here")?;
+                let req = send_request(&spec)?;
+                let handle = tokio::runtime::Handle::try_current().map_err(|e| e.to_string())?;
+                // Scripts run under `block_in_place`, where blocking on the runtime is allowed.
+                let r = handle.block_on(crate::runner::send(client, req))?;
+                Ok::<_, String>(serde_json::json!({
+                    "code": r.status, "status": r.reason, "time": r.elapsed.as_millis() as u64,
+                    "headers": r.headers, "body": r.body,
+                }))
+            })();
+            match reply {
+                Ok(r) => r.to_string(),
+                Err(e) => serde_json::json!({ "error": e }).to_string(),
+            }
+        };
+        ctx.globals()
+            .set(
+                "__send",
+                rquickjs::Function::new(ctx.clone(), send).map_err(caught)?,
+            )
+            .map_err(caught)?;
         ctx.eval::<(), _>(PRELUDE).map_err(caught)?;
+        // Top-level `await` (for `await pm.sendRequest(…)`) needs an async function around
+        // the script; on the same line, so error positions don't move.
+        let wrapped;
+        let script = match AWAIT.is_match(script) {
+            true => {
+                wrapped = format!(
+                    "(async function () {{ {script}\n}})().catch(function (e) {{ __asyncError = e; }});"
+                );
+                &wrapped
+            }
+            false => script,
+        };
         // The user's script may throw; keep whatever it recorded before that.
-        let error = ctx
+        let mut error = ctx
             .eval::<(), _>(script)
             .err()
             .map(|e| exception(&ctx, e, deadline, timeout));
+        while ctx.execute_pending_job() {}
+        if error.is_none() {
+            let async_error: rquickjs::Value = ctx.globals().get("__asyncError").map_err(caught)?;
+            if !async_error.is_undefined() {
+                error = Some(match async_error.as_exception() {
+                    Some(x) => x.message().unwrap_or_default(),
+                    None => async_error
+                        .as_string()
+                        .and_then(|s| s.to_string().ok())
+                        .unwrap_or_else(|| "script failed".into()),
+                });
+            }
+        }
         let out: String = ctx.eval(EPILOGUE).map_err(caught)?;
         let mut out: Output = serde_json::from_str(&out).map_err(|e| e.to_string())?;
         out.error = error;
         Ok(out)
+    })
+}
+
+static AWAIT: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\bawait\b").expect("valid"));
+
+/// The request `pm.sendRequest` normalised in JS, as one apitool sends.
+fn send_request(spec: &str) -> Result<crate::model::Request, String> {
+    use crate::model::{Body, KeyValue, Request};
+    let v: serde_json::Value = serde_json::from_str(spec).map_err(|e| e.to_string())?;
+    let rows = |v: &serde_json::Value| -> Vec<KeyValue> {
+        let pairs = v.as_array().into_iter().flatten();
+        pairs
+            .map(|p| {
+                KeyValue::new(
+                    p[0].as_str().unwrap_or_default(),
+                    p[1].as_str().unwrap_or_default(),
+                )
+            })
+            .collect()
+    };
+    let b = &v["body"];
+    let body = if let Some(raw) = b["raw"].as_str() {
+        match b["json"] == true {
+            true => Body::Json { text: raw.into() },
+            false => Body::Text { text: raw.into() },
+        }
+    } else if b["form"].is_array() {
+        Body::Form {
+            fields: rows(&b["form"]),
+        }
+    } else if b["multipart"].is_array() {
+        Body::Multipart {
+            parts: rows(&b["multipart"]),
+        }
+    } else {
+        Body::None
+    };
+    let url = v["url"].as_str().unwrap_or_default();
+    if url.is_empty() || url == "undefined" {
+        return Err("pm.sendRequest needs a URL".into());
+    }
+    Ok(Request {
+        method: v["method"].as_str().unwrap_or("GET").to_owned(),
+        url: url.to_owned(),
+        headers: rows(&v["headers"]),
+        body,
+        ..Default::default()
     })
 }
 
@@ -423,6 +558,7 @@ mod tests {
             response,
             cookie_url: "",
             jar: None,
+            client: None,
         }
     }
 

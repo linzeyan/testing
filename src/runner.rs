@@ -104,6 +104,7 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
             response: None,
             cookie_url: &cookie_url,
             jar,
+            client: Some(&client),
         };
         let result = tokio::task::block_in_place(|| script::run(&code, &input));
         let error = result.error.clone();
@@ -157,6 +158,7 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
                 response: Some(sr),
                 cookie_url: &cookie_url,
                 jar,
+                client: Some(&client),
             };
             let result = tokio::task::block_in_place(|| script::run(&code, &input));
             let error = result.error.clone();
@@ -457,6 +459,67 @@ mod tests {
             !body.contains("sid="),
             "unset in the jar before sending: {body}"
         );
+    }
+
+    /// The usual reason for `pm.sendRequest`: fetch a token before the request that needs
+    /// it, in Postman's callback form and with `await`; both see the answer before the
+    /// script ends, or the variable would be set too late.
+    #[test]
+    fn scripts_send_requests_of_their_own() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt.block_on(build_client(Network::default())).unwrap();
+        let addr = crate::http::tests::serve(|raw| match raw.split(' ').nth(1).unwrap_or("") {
+            // The token endpoint wants the JSON it was sent, labelled as JSON.
+            "/token"
+                if raw
+                    .to_lowercase()
+                    .contains("content-type: application/json")
+                    && raw.ends_with(r#"{"id":1}"#)
+                    && raw.to_lowercase().contains("x-client: app") =>
+            {
+                ("200 OK".into(), r#"{"token":"t1"}"#.into())
+            }
+            _ => ("200 OK".into(), raw.to_lowercase()),
+        });
+        let req = Request {
+            url: format!("http://{addr}/api"),
+            headers: vec![KeyValue::new("Authorization", "Bearer {{token}}")],
+            pre_request: format!(
+                r#"pm.sendRequest({{ url: "http://{addr}/token", method: "POST",
+                     header: {{ "X-Client": "app" }},
+                     body: {{ mode: "raw", raw: {{ id: 1 }}, options: {{ raw: {{ language: "json" }} }} }}
+                   }}, function (err, res) {{
+                     if (err) throw err;
+                     pm.environment.set("token", res.json().token);
+                   }});
+                   pm.sendRequest("http://127.0.0.1:1/", function (err) {{ console.log("down", !!err); }});"#
+            ),
+            tests: format!(
+                r#"const res = await pm.sendRequest({{ url: "http://{addr}/echo",
+                     header: [{{ key: "X-Seen", value: "yes" }}, {{ key: "X-Off", value: "1", disabled: true }}] }});
+                   pm.test("echo", () => {{
+                     pm.expect(res.code).to.equal(200);
+                     pm.expect(res.text()).to.include("x-seen: yes").and.not.include("x-off");
+                   }});"#
+            ),
+            ..Default::default()
+        };
+        let out = rt.block_on(super::run(
+            client,
+            &Info::single("t".into()),
+            req,
+            Vars::default(),
+        ));
+        assert_eq!(out.env["token"], Some("t1".into()));
+        assert_eq!(out.logs, ["down true"]);
+        let body = out.response.unwrap().body;
+        assert!(body.contains("authorization: bearer t1"), "{body}");
+        assert_eq!(out.tests.len(), 1, "{:?}", out.tests);
+        assert!(out.tests[0].passed, "{:?}", out.tests);
     }
 
     #[test]
