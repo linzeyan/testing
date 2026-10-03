@@ -324,6 +324,9 @@ struct ResponseView {
     filter_error: String,
     /// The body as shown before a filter replaced `text`.
     unfiltered: Option<String>,
+    /// Over `LARGE_BODY`: `text` is the body as received, not laid out until "Show
+    /// anyway"; true if its type is one shown raw.
+    held: Option<bool>,
 }
 
 impl Find {
@@ -377,6 +380,19 @@ impl ResponseView {
         self.wrapped = None;
         self.folds.clear();
         self.find = Find::default();
+    }
+
+    /// Lays a held body out as any other.
+    fn reveal(&mut self) {
+        let Some(raw) = self.held.take() else { return };
+        if let Some(pretty) = prettified(&self.head, &self.text, self.json) {
+            self.other = Some(std::mem::replace(&mut self.text, pretty));
+            self.pretty = true;
+        }
+        self.line_starts = line_starts(&self.text);
+        if raw {
+            self.set_pretty(false);
+        }
     }
 
     /// The body as the server sent it.
@@ -1724,23 +1740,38 @@ fn media_type(head: &http::Response) -> String {
 }
 
 /// As the user last chose for its content type: Raw if they switched to it.
+/// Text bodies past this wait for "Show anyway", as in Insomnia: re-indenting, indexing
+/// lines and colouring take a moment and a few copies of the body. Saving needs none of it.
+const LARGE_BODY: usize = 5 << 20;
+
 fn shown_view(head: http::Response, raw_types: &[String]) -> ResponseView {
+    let raw = raw_types.contains(&media_type(&head));
     let mut view = into_view(head);
-    if raw_types.contains(&media_type(&view.head)) {
-        view.set_pretty(false);
+    match &mut view.held {
+        Some(held) => *held = raw,
+        None if raw => view.set_pretty(false),
+        None => {}
     }
     view
+}
+
+fn prettified(head: &http::Response, body: &str, json: bool) -> Option<String> {
+    let xml = !json && (head.headers.iter()).any(|(k, v)| k == "content-type" && v.contains("xml"));
+    match (json, xml) {
+        (true, _) => http::pretty_json(body),
+        (_, true) => http::pretty_xml(body),
+        _ => None,
+    }
 }
 
 fn into_view(mut head: http::Response) -> ResponseView {
     let body = std::mem::take(&mut head.body);
     let raw_size = head.bytes.as_ref().map_or(body.len(), Vec::len);
     let json = head.is_json() || body.trim_start().starts_with(['{', '[']);
-    let xml = !json && (head.headers.iter()).any(|(k, v)| k == "content-type" && v.contains("xml"));
-    let pretty = match (json, xml) {
-        (true, _) => http::pretty_json(&body),
-        (_, true) => http::pretty_xml(&body),
-        _ => None,
+    let held = (head.bytes.is_none() && body.len() > LARGE_BODY).then_some(false);
+    let pretty = match held {
+        Some(_) => None,
+        None => prettified(&head, &body, json),
     };
     let (text, other) = match pretty {
         Some(pretty) => (pretty, Some(body)),
@@ -1748,7 +1779,11 @@ fn into_view(mut head: http::Response) -> ResponseView {
     };
     ResponseView {
         head,
-        line_starts: line_starts(&text),
+        line_starts: match held {
+            Some(_) => Vec::new(),
+            None => line_starts(&text),
+        },
+        held,
         text,
         pretty: other.is_some(),
         other,
@@ -2039,6 +2074,7 @@ impl eframe::App for App {
             if let Some(Shown {
                 result: Ok(view), ..
             }) = &mut self.response
+                && view.held.is_none()
             {
                 (view.find.open, view.find.focus) = (true, true);
             }
@@ -7041,7 +7077,7 @@ fn response_ui(
                         body: view.unfiltered.clone().unwrap_or_else(|| view.text.clone()),
                     });
                 }
-                if *tab == RespTab::Body && !binary {
+                if *tab == RespTab::Body && !binary && view.held.is_none() {
                     ui.separator();
                     if (ui.selectable_label(*wrap, "Wrap"))
                         .on_hover_text("Wrap long lines")
@@ -7206,6 +7242,21 @@ fn response_ui(
                 });
         }
         (_, Ok(view)) if view.head.bytes.is_some() => binary_body(ui, view),
+        (_, Ok(view)) if view.held.is_some() => {
+            ui.add_space(8.0);
+            ui.label(format!(
+                "This body is {}: showing it takes a moment and a lot of memory.",
+                human_size(view.raw_size)
+            ));
+            ui.horizontal(|ui| {
+                if ui.button("Show anyway").clicked() {
+                    view.reveal();
+                }
+                if ui.button("Save to file…").clicked() {
+                    *save_file = true;
+                }
+            });
+        }
         (_, Ok(view)) => {
             if view.other.is_some() {
                 filter_bar(ui, view, recent);
@@ -10157,6 +10208,56 @@ mod ui_tests {
         h.run();
         assert!(h.state().dialog.is_none());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), raw, "as received");
+    }
+
+    #[test]
+    fn a_huge_body_waits_to_be_shown_but_saves_at_once() {
+        let mut h = with_request("huge");
+        let body = format!(r#"{{"blob": "{}"}}"#, "x".repeat(LARGE_BODY));
+        show_response(&mut h, "application/json", body.clone());
+        shot(&mut h, "70-huge-body");
+        assert!(h.query_by_label_contains("This body is 5.0 MB").is_some());
+        for gone in ["Pretty", "Wrap", "Find"] {
+            assert!(
+                h.query_by_label(gone).is_none(),
+                "{gone} waits for the body"
+            );
+        }
+        h.get_by_label("Save to file…").click();
+        h.run();
+        assert!(matches!(h.state().dialog, Some(Dialog::SaveBody { .. })));
+        h.state_mut().dialog = None;
+        h.get_by_label("Show anyway").click();
+        h.run();
+        assert!(h.query_by_label("Pretty").is_some());
+        let view = h
+            .state()
+            .response
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap();
+        assert!(view.pretty && view.text.starts_with("{\n"));
+        assert_eq!(view.raw(), body);
+
+        // A type chosen to show raw stays raw once shown; a small body isn't held.
+        let head = |body: String| http::Response {
+            status: 200,
+            reason: "OK".into(),
+            version: "HTTP/1.1".into(),
+            elapsed: Duration::ZERO,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body,
+            truncated: false,
+            sent: Default::default(),
+            bytes: None,
+        };
+        let mut view = shown_view(head(body), &["application/json".into()]);
+        assert_eq!(view.held, Some(true));
+        view.reveal();
+        assert!(!view.pretty && view.other.is_some());
+        assert_eq!(into_view(head("{}".into())).held, None);
     }
 
     /// An image response shows as one, and Save… writes the very bytes that came: read as
