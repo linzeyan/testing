@@ -44,7 +44,7 @@ such as Citrix VDI. No installer: unzip and run.
   HTML one; a Timeline tab with the request as it went out (headers reqwest adds and jar
   cookies included), each redirect and the peer address; a History menu in the
   response bar with the last 10 responses of each request (kept on disk, 1 MiB of body
-  each); find in response (Ctrl+F; counts up to 10 000 hits); saved response
+  each); find in response (Ctrl+F; match case, whole word or regular expression; counts up to 10 000 hits); saved response
   examples; request history; Bearer, Basic, Digest, API key (header or query) and OAuth 2.0
   (client credentials, password, and authorization code with PKCE: Send opens the browser
   to sign in and catches the redirect on 127.0.0.1; an expired token is renewed with the

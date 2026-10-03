@@ -314,6 +314,18 @@ struct ResponseView {
     unfiltered: Option<String>,
 }
 
+impl Find {
+    /// The options stay as they were, as in an editor's find.
+    fn close(&mut self) {
+        *self = Find {
+            case: self.case,
+            word: self.word,
+            regex: self.regex,
+            ..Default::default()
+        };
+    }
+}
+
 impl ResponseView {
     fn set_pretty(&mut self, pretty: bool) {
         if pretty == self.pretty {
@@ -377,11 +389,20 @@ struct Row {
 /// Find-in-body state. Lives in the view, so a new response starts a fresh search.
 #[derive(Default)]
 struct Find {
+    /// The find row shows under the response bar.
+    open: bool,
+    /// Put the cursor in the query on the next draw.
+    focus: bool,
     query: String,
-    /// The query `hits` were computed for; recomputed only when the query changes.
-    searched: String,
-    /// Byte offsets of matches in `ResponseView::text`.
-    hits: Vec<usize>,
+    case: bool,
+    word: bool,
+    regex: bool,
+    /// The query and options `hits` were computed for; recomputed only when they change.
+    searched: (String, bool, bool, bool),
+    /// Byte ranges of matches in `ResponseView::text`.
+    hits: Vec<std::ops::Range<usize>>,
+    /// Why the pattern can't be used.
+    error: Option<String>,
     current: usize,
     /// Scroll the body to `current` on the next frame.
     scroll: bool,
@@ -1879,7 +1900,12 @@ impl eframe::App for App {
         }
         if ui.input_mut(|i| i.consume_shortcut(&FIND)) {
             self.resp_tab = RespTab::Body;
-            self.focus_request = Some(egui::Id::new("find"));
+            if let Some(Shown {
+                result: Ok(view), ..
+            }) = &mut self.response
+            {
+                (view.find.open, view.find.focus) = (true, true);
+            }
         }
         if ui.input_mut(|i| i.consume_shortcut(&SEND)) {
             let vars = self.all_vars();
@@ -6305,11 +6331,28 @@ fn response_ui(
                             view.set_pretty(true);
                         }
                     }
-                    find_bar(ui, view);
+                    let shortcut = ui.ctx().format_shortcut(&FIND);
+                    if (ui.selectable_label(view.find.open, "Find"))
+                        .on_hover_text(shortcut)
+                        .clicked()
+                    {
+                        match view.find.open {
+                            true => view.find.close(),
+                            false => (view.find.open, view.find.focus) = (true, true),
+                        }
+                    }
                 }
             });
         }
     });
+    // A row of its own: in the bar it squeezed out the tabs left of it.
+    if *tab == RespTab::Body
+        && let Ok(view) = &mut shown.result
+        && view.find.open
+        && view.head.bytes.is_none()
+    {
+        ui.horizontal(|ui| find_bar(ui, view));
+    }
     ui.separator();
     // A tab from the previous run may not exist in this one; fall back to the body.
     let current = match *tab {
@@ -6466,7 +6509,7 @@ fn response_ui(
             .auto_shrink(false);
             let mut scroll_to = None;
             if std::mem::take(&mut view.find.scroll)
-                && let Some(&at) = view.find.hits.get(view.find.current)
+                && let Some(at) = view.find.hits.get(view.find.current).map(|h| h.start)
             {
                 let line = view.line_starts.partition_point(|&s| s <= at) - 1;
                 // A hit inside a folded block opens it.
@@ -6645,50 +6688,77 @@ fn examples_editor(ui: &mut egui::Ui, examples: &mut Vec<Example>) {
 /// 8-byte offsets.
 const MAX_HITS: usize = 10_000;
 
-/// The find bar, laid out right to left next to Copy.
+/// The find row: query, options, count, stepping, close.
 fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     let ResponseView { text, find, .. } = view;
-    let next = ui.small_button("Next").on_hover_text("Enter").clicked();
-    let prev = ui
-        .small_button("Prev")
-        .on_hover_text("Shift+Enter")
-        .clicked();
-    if !find.searched.is_empty() {
-        let n = find.hits.len();
+    let edit = ui.add(
+        egui::TextEdit::singleline(&mut find.query)
+            .id(egui::Id::new("find"))
+            .hint_text("Find")
+            .desired_width(220.0),
+    );
+    let (enter, escape) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+    let (enter, escape) = (edit.lost_focus() && enter, edit.lost_focus() && escape);
+    // After the field has drawn: a click on the Find button would otherwise count as a
+    // click elsewhere and take the focus straight back.
+    if enter || std::mem::take(&mut find.focus) {
+        edit.request_focus(); // keep typing / pressing Enter for the next hit
+    }
+    ui.toggle_value(&mut find.case, "Aa")
+        .on_hover_text("Match case");
+    ui.toggle_value(&mut find.word, "W")
+        .on_hover_text("Whole word");
+    ui.toggle_value(&mut find.regex, ".*")
+        .on_hover_text("Regular expression");
+    let wanted = (find.query.clone(), find.case, find.word, find.regex);
+    if wanted != find.searched {
+        // Searched in place: lowercasing a copy of a 16 MiB body per keystroke was a
+        // 16 MiB allocation each time.
+        let pattern = match find.regex {
+            true => find.query.clone(),
+            false => regex::escape(&find.query),
+        };
+        // ASCII word boundaries: Unicode ones push the regex crate off its fast engine
+        // for any non-ASCII body.
+        let pattern = match find.word {
+            true => format!(r"(?-u:\b)(?:{pattern})(?-u:\b)"),
+            false => pattern,
+        };
+        let built = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(!find.case)
+            .build();
+        (find.hits, find.error) = match built {
+            _ if find.query.is_empty() => (Vec::new(), None),
+            // Empty matches (`a*`) would mark every position and highlight nothing.
+            Ok(re) => (
+                (re.find_iter(text).filter(|m| !m.is_empty()))
+                    .map(|m| m.range())
+                    .take(MAX_HITS)
+                    .collect(),
+                None,
+            ),
+            Err(e) => (Vec::new(), Some(e.to_string())),
+        };
+        find.searched = wanted;
+        find.current = 0;
+        find.scroll = !find.hits.is_empty();
+    }
+    let n = find.hits.len();
+    if let Some(e) = &find.error {
+        ui.colored_label(RED, "bad pattern").on_hover_text(e);
+    } else if !find.query.is_empty() {
         let more = if n == MAX_HITS { "+" } else { "" };
         ui.weak(format!(
             "{}/{n}{more}",
             if n == 0 { 0 } else { find.current + 1 }
         ));
     }
-    let edit = ui.add(
-        egui::TextEdit::singleline(&mut find.query)
-            .id(egui::Id::new("find"))
-            .hint_text("Find")
-            .desired_width(160.0),
-    );
-    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-    if enter {
-        edit.request_focus(); // keep typing / pressing Enter for the next hit
-    }
-    if find.query != find.searched {
-        // ASCII-only case folding, in place: lowercasing a copy of a 16 MiB body per
-        // keystroke was a 16 MiB allocation each time.
-        let finder = aho_corasick::AhoCorasick::builder()
-            .ascii_case_insensitive(true)
-            .build([&find.query]);
-        find.hits = match finder {
-            Ok(f) if !find.query.is_empty() => (f.find_iter(text.as_str()))
-                .map(|m| m.start())
-                .take(MAX_HITS)
-                .collect(),
-            _ => Vec::new(),
-        };
-        find.searched = find.query.clone();
-        find.current = 0;
-        find.scroll = !find.hits.is_empty();
-    }
-    let n = find.hits.len();
+    let prev = ui
+        .small_button("Prev")
+        .on_hover_text("Shift+Enter")
+        .clicked();
+    let next = ui.small_button("Next").on_hover_text("Enter").clicked();
+    let close = ui.small_button("×").on_hover_text("Close (Esc)").clicked();
     if n > 0 {
         let shift = ui.input(|i| i.modifiers.shift);
         if next || (enter && !shift) {
@@ -6698,6 +6768,9 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
             find.current = (find.current + n - 1) % n;
             find.scroll = true;
         }
+    }
+    if close || escape {
+        find.close();
     }
 }
 
@@ -6762,9 +6835,8 @@ fn highlighted(
     in_string: bool,
 ) -> egui::WidgetText {
     let (text, find) = (&view.text, &view.find);
-    let len = find.searched.len();
-    let mut hit = find.hits.partition_point(|&h| h + len <= line.start);
-    let no_hits = len == 0 || find.hits.get(hit).is_none_or(|&h| h >= line.end);
+    let mut hit = find.hits.partition_point(|h| h.end <= line.start);
+    let no_hits = find.hits.get(hit).is_none_or(|h| h.start >= line.end);
     if !view.json && no_hits {
         return RichText::new(&text[line]).monospace().into();
     }
@@ -6788,20 +6860,21 @@ fn highlighted(
         let end = line.start + end;
         let color = token.map_or(ui.visuals().text_color(), |t| token_color(ui, t));
         while pos < end {
-            match find.hits.get(hit).copied().filter(|_| len > 0) {
-                Some(h) if h < end && h + len > pos => {
-                    if h > pos {
-                        append(pos..h, color, Color32::TRANSPARENT);
-                        pos = h;
+            match find.hits.get(hit) {
+                Some(h) if h.start < end && h.end > pos => {
+                    if h.start > pos {
+                        append(pos..h.start, color, Color32::TRANSPARENT);
+                        pos = h.start;
                     }
-                    let to = (h + len).min(end);
+                    let to = h.end.min(end);
                     let mark = match hit == find.current {
                         true => ORANGE,
                         false => Color32::from_rgb(240, 220, 90),
                     };
+                    let done = h.end <= to;
                     append(pos..to, Color32::BLACK, mark);
                     pos = to;
-                    if h + len <= to {
+                    if done {
                         hit += 1;
                     }
                 }
@@ -8409,6 +8482,64 @@ mod ui_tests {
         h.event(egui::Event::Text("a".into()));
         h.run();
         h.get_by_label(&format!("1/{MAX_HITS}+"));
+    }
+
+    #[test]
+    fn find_can_match_case_whole_words_or_a_pattern() {
+        let mut h = with_request("find-options");
+        let body = "NEEDLE 7\nneedles 42\nhay 7\n";
+        show_response(&mut h, "text/plain", body.into());
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run();
+        let find = |h: &mut Harness<'_, App>, query: &str| {
+            let shown = h.state_mut().response.as_mut().unwrap();
+            shown.result.as_mut().unwrap().find.query = query.into();
+            h.run();
+        };
+        find(&mut h, "needle");
+        h.get_by_label("1/2");
+        h.get_by_label("Aa").click();
+        h.run();
+        h.get_by_label("1/1"); // only "needles"
+        h.get_by_label("Aa").click();
+        h.get_by_label("W").click();
+        h.run();
+        h.get_by_label("1/1"); // only "NEEDLE": "needles" goes on
+        h.get_by_label("W").click();
+        h.get_by_label(".*").click();
+        find(&mut h, r"\d+");
+        h.get_by_label("1/3");
+        shot(&mut h, "66-find-pattern");
+        // Matches of nothing would be thousands of invisible hits.
+        find(&mut h, "z*");
+        h.get_by_label("0/0");
+        find(&mut h, "(");
+        h.get_by_label("bad pattern");
+        // As text, the same query is just a bracket.
+        h.get_by_label(".*").click();
+        h.run();
+        h.get_by_label("0/0");
+
+        // Esc in the field closes the row, and its highlights with it; the Find button
+        // opens it again.
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::new("find")));
+        h.run();
+        h.key_press(Key::Escape);
+        h.run();
+        assert!(h.query_by_label("0/0").is_none() && h.query_by_label("Aa").is_none());
+        let shown = h.state().response.as_ref().unwrap();
+        let find = &shown.result.as_ref().unwrap().find;
+        assert!(
+            find.query.is_empty() && find.hits.is_empty(),
+            "nothing left marked"
+        );
+        h.get_by_label("Find").click();
+        h.run();
+        h.get_by_label("Aa");
+        assert!(
+            h.ctx.memory(|m| m.has_focus(egui::Id::new("find"))),
+            "ready to type"
+        );
     }
 
     #[test]
