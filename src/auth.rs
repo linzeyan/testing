@@ -391,7 +391,7 @@ async fn callback(
 
 /// ponytail: the OS's own opener rather than a crate; covers macOS, Windows and Linux
 /// desktops. A failure says where to sign in by hand.
-fn open_browser(url: &str) -> Result<(), String> {
+pub fn open_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut cmd = std::process::Command::new("open");
     #[cfg(windows)]
@@ -406,7 +406,7 @@ fn open_browser(url: &str) -> Result<(), String> {
     cmd.arg(url)
         .spawn()
         .map(drop)
-        .map_err(|e| format!("Couldn't open a browser ({e}); sign in at {url}"))
+        .map_err(|e| format!("Couldn't open a browser ({e}); open {url} by hand"))
 }
 
 /// Unguessable: a predictable PKCE verifier or state would defeat their purpose.

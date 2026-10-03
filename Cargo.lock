@@ -227,7 +227,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apitool"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -241,6 +241,7 @@ dependencies = [
  "h2",
  "http",
  "http-body-util",
+ "image",
  "jsonschema",
  "md-5",
  "memmap2",
@@ -2362,6 +2363,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

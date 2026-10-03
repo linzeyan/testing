@@ -67,6 +67,10 @@ pub struct Response {
     pub elapsed: Duration,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// The body as received when it isn't text (an image, a zip…); `body` is empty then.
+    /// ponytail: not kept in history, whose responses are JSON.
+    #[serde(skip)]
+    pub bytes: Option<Vec<u8>>,
     /// The body went past `MAX_BODY` and only its start was kept.
     pub truncated: bool,
     pub sent: Sent,
@@ -341,7 +345,7 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
     let status = resp.status();
     let version = format!("{:?}", resp.version());
     let headers = header_list(resp.headers());
-    let (body, truncated) = read_body(resp).await?;
+    let (body, bytes, truncated) = read_body(resp).await?;
     Ok(Response {
         status: status.as_u16(),
         reason: status.canonical_reason().unwrap_or("").to_owned(),
@@ -349,6 +353,7 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
         elapsed: started.elapsed(),
         headers,
         body,
+        bytes,
         truncated,
         sent,
     })
@@ -443,7 +448,10 @@ pub fn auto_headers(mut req: Request, own: &[KeyValue]) -> Vec<(String, String, 
 /// Up to `MAX_BODY` bytes, decoded by the Content-Type's charset as `text()` would (Big5
 /// and friends included). `text()` itself takes whatever arrives: a 1 GB download, or a
 /// small gzip that inflates to one.
-async fn read_body(mut resp: reqwest::Response) -> Result<(String, bool), String> {
+/// Text, bytes when it isn't text, and whether it was cut.
+type ReadBody = (String, Option<Vec<u8>>, bool);
+
+async fn read_body(mut resp: reqwest::Response) -> Result<ReadBody, String> {
     let sink = SINK.try_with(|s| match s {
         Sink::File(path) => Some(path.clone()),
         Sink::Discard => None,
@@ -452,20 +460,30 @@ async fn read_body(mut resp: reqwest::Response) -> Result<(String, bool), String
         // Only a success: an error body (or Digest's first 401) is small and worth reading.
         Ok(Some(path)) if resp.status().is_success() => {
             let n = download(resp, &path).await?;
-            return Ok((format!("Saved {n} bytes to {}", path.display()), false));
+            return Ok((
+                format!("Saved {n} bytes to {}", path.display()),
+                None,
+                false,
+            ));
         }
         // Still read to the end: that's part of the time, and frees the connection for reuse.
         Ok(None) => {
             while resp.chunk().await.map_err(|e| error_chain(&e))?.is_some() {}
-            return Ok((String::new(), false));
+            return Ok((String::new(), None, false));
         }
         _ => {}
     }
-    let charset = (resp.headers().get(CONTENT_TYPE))
+    let content_type = (resp.headers().get(CONTENT_TYPE))
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').find_map(|p| p.trim().strip_prefix("charset=")))
-        .and_then(|c| encoding_rs::Encoding::for_label(c.trim_matches('"').as_bytes()))
-        .unwrap_or(encoding_rs::UTF_8);
+        .unwrap_or("")
+        .to_owned();
+    let declared = (content_type.split(';'))
+        .find_map(|p| p.trim().strip_prefix("charset="))
+        .and_then(|c| encoding_rs::Encoding::for_label(c.trim_matches('"').as_bytes()));
+    // Said to be text: decoded even when it doesn't fit its charset (a Big5 page without
+    // a charset), as before. Anything else that isn't UTF-8 is binary.
+    let text_type = declared.is_some() || content_type.starts_with("text/");
+    let charset = declared.unwrap_or(encoding_rs::UTF_8);
     let mut bytes = Vec::new();
     let mut truncated = false;
     while let Some(chunk) = resp.chunk().await.map_err(|e| error_chain(&e))? {
@@ -481,9 +499,13 @@ async fn read_body(mut resp: reqwest::Response) -> Result<(String, bool), String
         // The usual case, without a copy.
         Ok(text) if charset == encoding_rs::UTF_8 => text,
         Ok(text) => charset.decode(text.as_bytes()).0.into_owned(),
+        // `error_len` None: only the end is short, where MAX_BODY cut a character.
+        Err(e) if !text_type && e.utf8_error().error_len().is_some() => {
+            return Ok((String::new(), Some(e.into_bytes()), truncated));
+        }
         Err(e) => charset.decode(e.as_bytes()).0.into_owned(),
     };
-    Ok((text, truncated))
+    Ok((text, None, truncated))
 }
 
 /// Streams the body to `path`, whatever its size. A failed download removes the file
@@ -1111,6 +1133,27 @@ pub(crate) mod tests {
         );
         assert!(!resp.truncated);
         assert_eq!(resp.body, "small");
+    }
+
+    /// An image read as text loses its bytes for good; Save… and the preview need them.
+    #[test]
+    fn a_binary_body_keeps_its_bytes_and_text_stays_text() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        let resp = get(&rt, serve_bytes("content-type: image/png", png.clone()));
+        assert_eq!((resp.bytes, resp.body.as_str()), (Some(png.clone()), ""));
+        // Said to be text: decoded as before, however wrong the bytes are.
+        let resp = get(&rt, serve_bytes("content-type: text/plain", png));
+        assert!(resp.bytes.is_none() && resp.body.starts_with('\u{FFFD}'));
+        // Cut at MAX_BODY through a character: still text, not binary.
+        let mut cut = vec![b'a'; MAX_BODY - 1];
+        cut.extend("é".repeat(10).as_bytes());
+        let resp = get(&rt, serve_bytes("content-type: application/json", cut));
+        assert!(
+            resp.truncated && resp.bytes.is_none(),
+            "{:?}",
+            resp.bytes.map(|b| b.len())
+        );
     }
 
     /// "Send and download" is how a body past MAX_BODY is kept whole: it goes to disk as

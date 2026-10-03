@@ -303,6 +303,8 @@ struct ResponseView {
     wrapped: Option<(usize, Vec<Row>)>,
     /// Folded JSON blocks, opening line → closing line (0-based).
     folds: BTreeMap<usize, usize>,
+    /// A binary body decoded for the preview, with its size in pixels; on first show.
+    image: Option<Result<(egui::TextureHandle, [u32; 2]), String>>,
     find: Find,
     /// The JSON filter as typed, the one `text` shows the result of, and why it can't apply.
     filter: String,
@@ -688,6 +690,8 @@ impl App {
             c if c.contains("xml") => "xml",
             c if c.contains("html") => "html",
             c if c.starts_with("text/") => "txt",
+            // image/png, image/svg+xml…
+            c if c.starts_with("image/") => c[6..].split([';', '+']).next().unwrap_or("bin"),
             _ => "bin",
         };
         let name = self.open.as_ref().map(Open::name).unwrap_or_default();
@@ -736,7 +740,7 @@ impl App {
             self.dialog = None;
             return;
         };
-        let body = view.raw();
+        let body = view.head.bytes.as_deref().unwrap_or(view.raw().as_bytes());
         match std::fs::write(&path, body) {
             Ok(()) => {
                 let cut = if view.head.truncated {
@@ -752,6 +756,19 @@ impl App {
                     *error = format!("{path}: {e}");
                 }
             }
+        }
+    }
+
+    /// HTML isn't drawn here: the browser shows it (relative links and assets won't load).
+    fn open_html(&mut self) {
+        let Some(Ok(view)) = self.response.as_ref().map(|s| &s.result) else {
+            return;
+        };
+        let path = std::env::temp_dir().join("apitool-response.html");
+        let opened = (std::fs::write(&path, view.raw()).map_err(|e| e.to_string()))
+            .and_then(|()| crate::auth::open_browser(&path.display().to_string()));
+        if let Err(e) = opened {
+            self.status = e;
         }
     }
 
@@ -1569,7 +1586,7 @@ impl App {
 
 fn into_view(mut head: http::Response) -> ResponseView {
     let body = std::mem::take(&mut head.body);
-    let raw_size = body.len();
+    let raw_size = head.bytes.as_ref().map_or(body.len(), Vec::len);
     let json = head.is_json() || body.trim_start().starts_with(['{', '[']);
     let xml = !json && (head.headers.iter()).any(|(k, v)| k == "content-type" && v.contains("xml"));
     let pretty = match (json, xml) {
@@ -1591,6 +1608,7 @@ fn into_view(mut head: http::Response) -> ResponseView {
         raw_size,
         wrapped: None,
         folds: BTreeMap::new(),
+        image: None,
         find: Find::default(),
         filter: String::new(),
         applied: String::new(),
@@ -2643,6 +2661,7 @@ impl App {
         // As in Postman: beside both the request and its response, so edits show live.
         let mut lang_changed = false;
         let mut save_file = false;
+        let mut open_html = false;
         let wrap_before = self.wrap_response;
         if self.code {
             egui::Panel::right("code")
@@ -3085,7 +3104,7 @@ impl App {
                 Some(shown) => {
                     let wrap = &mut self.wrap_response;
                     let tab = &mut self.resp_tab;
-                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut past);
+                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_html, &mut past);
                 }
             }
         });
@@ -3123,6 +3142,9 @@ impl App {
         }
         if save_file {
             self.ask_save_body();
+        }
+        if open_html {
+            self.open_html();
         }
 
         if save {
@@ -6068,13 +6090,15 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
 }
 
 /// Returns an example to save when the user asked for one.
-/// `wrap` is the word-wrap switch; `save_file` is set when the user asks to save the body.
+/// `wrap` is the word-wrap switch; `save_file` and `open_html` are set when the user asks
+/// to save the body or see it in a browser.
 fn response_ui(
     ui: &mut egui::Ui,
     shown: &mut Shown,
     tab: &mut RespTab,
     wrap: &mut bool,
     save_file: &mut bool,
+    open_html: &mut bool,
     past: &mut Past,
 ) -> Option<Example> {
     let mut example = None;
@@ -6152,12 +6176,13 @@ fn response_ui(
         if let Ok(view) = &mut shown.result {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let timeline = *tab == RespTab::Timeline;
+                let binary = view.head.bytes.is_some();
                 let what = if timeline {
                     "Copy the timeline"
                 } else {
                     "Copy body"
                 };
-                if ui.small_button("Copy").on_hover_text(what).clicked() {
+                if (timeline || !binary) && ui.small_button("Copy").on_hover_text(what).clicked() {
                     let text = match timeline {
                         true => view.head.timeline(),
                         false => view.text.clone(),
@@ -6170,10 +6195,21 @@ fn response_ui(
                 {
                     *save_file = true;
                 }
-                if ui
-                    .small_button("Save as example")
-                    .on_hover_text("Keep this response with the request")
-                    .clicked()
+                let html = (view.head.headers.iter())
+                    .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("html"));
+                if html
+                    && (ui.small_button("Open in browser"))
+                        .on_hover_text("Show the HTML in your browser")
+                        .clicked()
+                {
+                    *open_html = true;
+                }
+                // Examples hold text.
+                if !binary
+                    && ui
+                        .small_button("Save as example")
+                        .on_hover_text("Keep this response with the request")
+                        .clicked()
                 {
                     let h = &view.head;
                     let content_type = h
@@ -6189,7 +6225,7 @@ fn response_ui(
                         body: view.unfiltered.clone().unwrap_or_else(|| view.text.clone()),
                     });
                 }
-                if *tab == RespTab::Body {
+                if *tab == RespTab::Body && !binary {
                     ui.separator();
                     if (ui.selectable_label(*wrap, "Wrap"))
                         .on_hover_text("Wrap long lines")
@@ -6336,6 +6372,7 @@ fn response_ui(
                     ui.add(egui::Label::new(text).selectable(true).extend());
                 });
         }
+        (_, Ok(view)) if view.head.bytes.is_some() => binary_body(ui, view),
         (_, Ok(view)) => {
             if view.other.is_some() {
                 filter_bar(ui, view);
@@ -6602,6 +6639,59 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
 }
 
 /// One body row, JSON tokens coloured and find hits painted over it.
+/// A body that isn't text: shown when it's an image, else only its size.
+fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
+    let bytes = view.head.bytes.as_deref().unwrap_or_default();
+    let ctx = ui.ctx().clone();
+    match view.image.get_or_insert_with(|| decode_image(&ctx, bytes)) {
+        Ok((texture, [w, h])) => {
+            ui.weak(format!("{w} × {h}"));
+            // As big as it is, unless that doesn't fit.
+            let fit = ui.available_size();
+            ui.add(
+                egui::Image::from_texture(&*texture)
+                    .fit_to_original_size(1.0)
+                    .max_size(fit),
+            );
+        }
+        Err(e) => {
+            let size = human_size(bytes.len());
+            ui.weak(format!(
+                "{size} of binary data, not shown ({e}). Save… keeps it as received."
+            ));
+        }
+    }
+}
+
+/// PNG and JPEG. Bigger than the GPU takes, the picture is scaled down to fit.
+// ponytail: no GIF or WebP; enable those `image` features if APIs here serve them.
+fn decode_image(
+    ctx: &egui::Context,
+    bytes: &[u8],
+) -> Result<(egui::TextureHandle, [u32; 2]), String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    // A few bytes can claim a huge picture: 64 MiB decoded is 4096 × 4096.
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(64 << 20);
+    reader.limits(limits);
+    let img = reader.decode().map_err(|e| e.to_string())?;
+    let size = [img.width(), img.height()];
+    let side = ctx.input(|i| i.max_texture_side) as u32;
+    let img = match size[0].max(size[1]) > side {
+        true => img.thumbnail(side, side),
+        false => img,
+    };
+    let rgba = img.into_rgba8();
+    let pixels = [rgba.width() as usize, rgba.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(pixels, rgba.as_raw());
+    Ok((
+        ctx.load_texture("response-image", color, Default::default()),
+        size,
+    ))
+}
+
 fn highlighted(
     ui: &egui::Ui,
     view: &ResponseView,
@@ -7467,6 +7557,7 @@ mod ui_tests {
                 body,
                 truncated: false,
                 sent: Default::default(),
+                bytes: None,
             })),
             tests: Vec::new(),
             logs: Vec::new(),
@@ -7868,6 +7959,7 @@ mod ui_tests {
                 body: body.into(),
                 truncated: false,
                 sent: Default::default(),
+                bytes: None,
             })),
             tests: Vec::new(),
             logs: Vec::new(),
@@ -8010,6 +8102,7 @@ mod ui_tests {
             body: "<a><b>1</b></a>".into(),
             truncated: false,
             sent: Default::default(),
+            bytes: None,
         });
         assert_eq!(
             (view.text.as_str(), view.raw()),
@@ -8081,6 +8174,7 @@ mod ui_tests {
             body: String::new(),
             truncated: false,
             sent: Default::default(),
+            bytes: None,
         };
         let headers = vec![
             cookie("sid=abc; Path=/; Max-Age=3600; HttpOnly"),
@@ -8705,6 +8799,72 @@ mod ui_tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), raw, "as received");
     }
 
+    /// An image response shows as one, and Save… writes the very bytes that came: read as
+    /// text, they'd be mangled for good.
+    #[test]
+    fn an_image_response_is_previewed_and_saved_byte_for_byte() {
+        let mut h = with_request("image");
+        let img = image::RgbaImage::from_fn(120, 80, |x, y| {
+            image::Rgba([(x * 2) as u8, (y * 3) as u8, 160, 255])
+        });
+        let mut png = Vec::new();
+        (img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)).unwrap();
+        let show = |h: &mut Harness<'_, App>, bytes: Vec<u8>| {
+            h.state_mut().response = Some(Shown {
+                result: Ok(into_view(http::Response {
+                    status: 200,
+                    reason: "OK".into(),
+                    version: "HTTP/1.1".into(),
+                    elapsed: Duration::ZERO,
+                    headers: vec![("content-type".into(), "image/png".into())],
+                    body: String::new(),
+                    bytes: Some(bytes),
+                    truncated: false,
+                    sent: Default::default(),
+                })),
+                tests: Vec::new(),
+                logs: Vec::new(),
+                past: None,
+            });
+            h.run();
+        };
+        show(&mut h, png.clone());
+        shot(&mut h, "64-image-preview");
+        h.get_by_label("120 × 80");
+        h.get_by_label(&human_size(png.len())); // the bar's size is the bytes'
+        // The text tools have no text to work on.
+        for gone in ["Copy", "Save as example", "Wrap"] {
+            assert!(h.query_by_label(gone).is_none(), "{gone}");
+        }
+        h.get_by_label("Save…").click();
+        h.run();
+        let file = h.state().ws.root.join("body.png");
+        let Some(Dialog::SaveBody { path, .. }) = &mut h.state_mut().dialog else {
+            panic!("the save dialog should be open");
+        };
+        assert!(path.ends_with("r.png"), "named for its type: {path}");
+        *path = file.display().to_string();
+        h.key_press(Key::Enter);
+        h.run();
+        assert_eq!(std::fs::read(&file).unwrap(), png);
+
+        // Not a picture it reads: its size, and how to keep it.
+        show(&mut h, b"PK\x03\x04\xff\xff".to_vec());
+        assert!(h.query_by_label_contains("6 B of binary data").is_some());
+    }
+
+    /// A small file can claim a huge picture: decoding one would take more RAM than a VDI
+    /// has. This PNG of zeros is a few KB, and 70 MB decoded.
+    #[test]
+    fn an_image_too_big_to_decode_is_refused() {
+        let img = image::GrayImage::new(8400, 8400);
+        let mut png = Vec::new();
+        (img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)).unwrap();
+        let ctx = egui::Context::default();
+        let err = decode_image(&ctx, &png).err().unwrap();
+        assert!(err.contains("limit"), "{err}");
+    }
+
     /// A chatty stream keeps a bounded log: big messages keep their start, and old
     /// events scroll away by bytes as well as by count.
     #[test]
@@ -8916,6 +9076,61 @@ mod ui_tests {
         }
         println!(
             "10 MB pasted into the body editor: peak {peak} MiB, then {} MiB",
+            rss()
+        );
+
+        // A 12-megapixel photo as a JPEG response, previewed.
+        let photo = image::RgbImage::from_fn(4000, 3000, |x, y| {
+            image::Rgb([(x ^ y) as u8, (x * y) as u8, (x + y) as u8])
+        });
+        let mut jpeg = Vec::new();
+        (photo.write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        ))
+        .unwrap();
+        drop(photo);
+        let size = jpeg.len();
+        h.state_mut().response = None;
+        h.state_mut().resp_tab = RespTab::Body;
+        // The SSE run above left a stream view in place of the response.
+        h.state_mut().open.as_mut().unwrap().draft.method = "GET".into();
+        for _ in 0..5 {
+            h.step();
+        }
+        let before = rss();
+        h.state_mut().response = Some(Shown {
+            result: Ok(into_view(http::Response {
+                status: 200,
+                reason: "OK".into(),
+                version: "HTTP/1.1".into(),
+                elapsed: Duration::ZERO,
+                headers: vec![("content-type".into(), "image/jpeg".into())],
+                body: String::new(),
+                bytes: Some(jpeg),
+                truncated: false,
+                sent: Default::default(),
+            })),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            past: None,
+        });
+        let peak = settle(&mut h, &|_| true);
+        let shown = h
+            .state()
+            .response
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap();
+        assert!(
+            matches!(shown.image, Some(Ok((_, [4000, 3000])))),
+            "decoded"
+        );
+        println!(
+            "{:.1} MB 4000 × 3000 JPEG previewed: from {before} MiB, peak {peak} MiB, then {} MiB",
+            mb(size),
             rss()
         );
     }

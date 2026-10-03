@@ -36,7 +36,9 @@ such as Citrix VDI. No installer: unzip and run.
   of pretty JSON objects and arrays (find opens a fold it lands in), Pretty/Raw (XML responses are indented too), a JSONPath filter (`$.items[*].id`, `..id`; Save… still writes the whole
   body), a Tests tab filter (All/Passed/Failed with counts), word wrap and Save… to a file (bodies past 16 MiB keep their start, to
   spare RAM; Send ⏷ "Send and download…" streams a successful response straight to a
-  file instead, however big); a Timeline tab with the request as it went out (headers reqwest adds and jar
+  file instead, however big); a PNG or JPEG response shows as a picture, other binary
+  bodies by their size (Save… writes them byte for byte), and "Open in browser" shows an
+  HTML one; a Timeline tab with the request as it went out (headers reqwest adds and jar
   cookies included), each redirect and the peer address; a History menu in the
   response bar with the last 10 responses of each request (kept on disk, 1 MiB of body
   each); find in response (Ctrl+F; counts up to 10 000 hits); saved response

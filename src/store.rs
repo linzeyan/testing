@@ -370,6 +370,7 @@ impl Workspace {
             false => to_json(resp)?,
             true => to_json(&crate::http::Response {
                 body: resp.body[..resp.body.floor_char_boundary(MAX_RESPONSE_BODY)].to_owned(),
+                bytes: None,
                 truncated: true,
                 headers: resp.headers.clone(),
                 sent: resp.sent.clone(),
@@ -1475,6 +1476,7 @@ mod tests {
             body,
             truncated: false,
             sent: Default::default(),
+            bytes: None,
         };
         let big = ws
             .add_response(&path, &resp(500, "é".repeat(MAX_RESPONSE_BODY)))

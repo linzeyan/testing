@@ -256,6 +256,7 @@ pub async fn call(client: reqwest::Client, req: Request) -> Result<Response, Str
         headers,
         body: body.to_string(),
         truncated: false,
+        bytes: None,
         sent: Default::default(),
     })
 }
