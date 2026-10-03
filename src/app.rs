@@ -593,6 +593,7 @@ pub struct App {
     side_by_side: bool,
     hide_sidebar: bool,
     env_colors: HashMap<String, [u8; 3]>,
+    recent_filters: Vec<String>,
     mock: Option<MockServer>,
     active_env: Option<String>,
     vars: HashMap<String, String>,
@@ -654,6 +655,7 @@ impl App {
             side_by_side: state.side_by_side,
             hide_sidebar: state.hide_sidebar,
             env_colors: state.env_colors.clone(),
+            recent_filters: state.recent_filters.clone(),
             mock: None,
             ws,
             active_env: None,
@@ -808,6 +810,7 @@ impl App {
             side_by_side: self.side_by_side,
             hide_sidebar: self.hide_sidebar,
             env_colors: self.env_colors.clone(),
+            recent_filters: self.recent_filters.clone(),
         });
     }
 
@@ -1659,7 +1662,16 @@ fn into_view(mut head: http::Response) -> ResponseView {
 /// big body (a transient several times its size), so Enter applies the filter instead.
 const LIVE_FILTER_MAX: usize = 1 << 20;
 
-fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
+const MAX_RECENT_FILTERS: usize = 10;
+
+/// To the front, once.
+fn remember(recent: &mut Vec<String>, path: &str) {
+    recent.retain(|r| r != path);
+    recent.insert(0, path.to_owned());
+    recent.truncate(MAX_RECENT_FILTERS);
+}
+
+fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView, recent: &mut Vec<String>) {
     ui.horizontal(|ui| {
         let edit = ui.add(
             egui::TextEdit::singleline(&mut view.filter)
@@ -1676,6 +1688,23 @@ fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
         let live = view.raw_size <= LIVE_FILTER_MAX;
         if view.filter != view.applied && (live || enter) {
             view.apply_filter();
+        }
+        // Once typing is done: applied live, every prefix of a path would be kept too.
+        let path = view.applied.trim();
+        if edit.lost_focus() && !path.is_empty() && view.filter_error.is_empty() {
+            remember(recent, path);
+        }
+        if !recent.is_empty() {
+            ui.menu_button("Recent", |ui| {
+                for r in recent.iter() {
+                    if ui.button(RichText::new(r).monospace()).clicked() {
+                        view.filter = r.clone();
+                        view.apply_filter();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Filters used before");
         }
         if !view.filter.is_empty()
             && ui.small_button("×").on_hover_text("Show the whole body").clicked()
@@ -2716,6 +2745,7 @@ impl App {
         let mut save_file = false;
         let mut open_html = false;
         let wrap_before = self.wrap_response;
+        let filters_before = self.recent_filters.first().cloned();
         if self.code {
             egui::Panel::right("code")
                 .resizable(true)
@@ -3158,7 +3188,8 @@ impl App {
                 Some(shown) => {
                     let wrap = &mut self.wrap_response;
                     let tab = &mut self.resp_tab;
-                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_html, &mut past);
+                    let recent = &mut self.recent_filters;
+                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_html, &mut past, recent);
                 }
             }
         });
@@ -3191,7 +3222,10 @@ impl App {
         if let Some(example) = example {
             self.save_example(example);
         }
-        if lang_changed || wrap_before != self.wrap_response {
+        if lang_changed
+            || wrap_before != self.wrap_response
+            || filters_before != self.recent_filters.first().cloned()
+        {
             self.save_state();
         }
         if save_file {
@@ -6178,6 +6212,9 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
 /// Returns an example to save when the user asked for one.
 /// `wrap` is the word-wrap switch; `save_file` and `open_html` are set when the user asks
 /// to save the body or see it in a browser.
+// Each is a separate App field borrowed for the pane; a struct for this one call would
+// only rename them.
+#[allow(clippy::too_many_arguments)]
 fn response_ui(
     ui: &mut egui::Ui,
     shown: &mut Shown,
@@ -6186,6 +6223,7 @@ fn response_ui(
     save_file: &mut bool,
     open_html: &mut bool,
     past: &mut Past,
+    recent: &mut Vec<String>,
 ) -> Option<Example> {
     let mut example = None;
     let passed = shown.tests.iter().filter(|t| t.passed).count();
@@ -6478,7 +6516,7 @@ fn response_ui(
         (_, Ok(view)) if view.head.bytes.is_some() => binary_body(ui, view),
         (_, Ok(view)) => {
             if view.other.is_some() {
-                filter_bar(ui, view);
+                filter_bar(ui, view, recent);
             }
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
             let font = egui::TextStyle::Monospace.resolve(ui.style());
@@ -8116,6 +8154,18 @@ mod ui_tests {
     }
 
     #[test]
+    fn a_filter_used_again_moves_to_the_front_and_the_list_stays_short() {
+        let mut recent = Vec::new();
+        for i in 0..12 {
+            remember(&mut recent, &format!("$.f{i}"));
+        }
+        remember(&mut recent, "$.f5");
+        assert_eq!(recent.len(), MAX_RECENT_FILTERS);
+        assert_eq!(&recent[..3], ["$.f5", "$.f11", "$.f10"]);
+        assert_eq!(recent.iter().filter(|r| *r == "$.f5").count(), 1);
+    }
+
+    #[test]
     fn a_json_filter_narrows_the_body_but_save_keeps_it_whole() {
         let mut h = with_request("json-filter");
         let body = r#"{"items":[{"id":1},{"id":2}]}"#;
@@ -8147,9 +8197,14 @@ mod ui_tests {
             let field = (h.get_all_by_role(Role::TextInput))
                 .find(|n| n.accesskit_node().placeholder() == hint)
                 .unwrap();
+            // In two goes: "$.items" applies too, but isn't what was meant.
             match step {
                 0 => field.click(),
-                _ => field.type_text("$.items[*].id"),
+                _ => {
+                    field.type_text("$.items");
+                    h.run();
+                    h.event(egui::Event::Text("[*].id".into()));
+                }
             }
             h.run();
         }
@@ -8170,6 +8225,15 @@ mod ui_tests {
         h.get_all_by_label("×").last().unwrap().click();
         h.run();
         assert!(view(&h).0.starts_with("{\n  \"items\""), "{}", view(&h).0);
+        // Kept once typing was done (clicking Raw took the focus), not every prefix of it.
+        let kept = vec!["$.items[*].id".to_owned()];
+        assert_eq!(h.state().ws.load_state().recent_filters, kept);
+        h.get_by_label("Recent").click();
+        h.run();
+        shot(&mut h, "67-recent-filters");
+        h.get_by_label("$.items[*].id").click();
+        h.run();
+        assert_eq!(view(&h).0, "[\n  1,\n  2\n]");
     }
 
     #[test]

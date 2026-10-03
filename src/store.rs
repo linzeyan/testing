@@ -140,6 +140,8 @@ pub struct State {
     /// By environment name. ponytail: a renamed or deleted environment leaves its entry
     /// behind; harmless, prune it if the list ever matters.
     pub env_colors: HashMap<String, [u8; 3]>,
+    /// JSON filters that applied, newest first.
+    pub recent_filters: Vec<String>,
 }
 
 /// Clones share one connection: the GUI's mock server reads from its own thread.
