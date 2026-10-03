@@ -6,12 +6,21 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::model::{Example, Request};
 use crate::store::Workspace;
+
+/// Calls handled at once. Each loads every request in scope, so a burst (a load test aimed
+/// at the mock) mustn't multiply that without limit; the rest wait to be accepted.
+const MAX_CONNECTIONS: usize = 16;
+/// A client that connects and says nothing would otherwise keep its slot for good.
+/// Shorter in tests, which wait it out.
+const READ_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 
 /// Serves until the task is dropped. Requests are re-read from disk for every call, so a
 /// saved edit (a new example) is live at once. `log` gets one line per call.
@@ -21,9 +30,13 @@ pub async fn serve(
     listener: TcpListener,
     log: impl Fn(String) + Clone + Send + 'static,
 ) {
-    while let Ok((stream, _)) = listener.accept().await {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    while let Ok(slot) = slots.clone().acquire_owned().await
+        && let Ok((stream, _)) = listener.accept().await
+    {
         let (ws, scope, log) = (ws.clone(), scope.clone(), log.clone());
         tokio::spawn(async move {
+            let _slot = slot;
             if let Some(line) = handle(&ws, &scope, stream).await {
                 log(line);
             }
@@ -32,7 +45,8 @@ pub async fn serve(
 }
 
 async fn handle(ws: &Workspace, scope: &std::path::Path, mut stream: TcpStream) -> Option<String> {
-    let (method, target, headers) = read_head(&mut stream).await?;
+    let read = tokio::time::timeout(READ_TIMEOUT, read_head(&mut stream));
+    let (method, target, headers) = read.await.ok()??;
     let header = |name: &str| headers.get(name).map(String::as_str);
     let path = target.split(['?', '#']).next().unwrap_or("/");
     let (status, content_type, body, note) =
@@ -316,6 +330,47 @@ mod tests {
             assert_eq!(
                 preflight.headers()["access-control-allow-headers"],
                 "authorization"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn calls_at_once_are_capped_and_a_silent_client_lets_go() {
+        let root = std::env::temp_dir().join(format!("apitool-mock-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::open(root.clone()).unwrap();
+        let user = req("GET", "{{base}}/users/{{id}}", &[("found", 200)]);
+        ws.save_request(&ws.collections().join("user.toml"), &user)
+            .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve(ws.clone(), ws.collections(), listener, |_| {}));
+            let call = |addr| async move {
+                let mut s = TcpStream::connect(addr).await.unwrap();
+                s.write_all(b"GET /users/7 HTTP/1.1\r\nhost: x\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut reply = String::new();
+                let read = tokio::time::timeout(READ_TIMEOUT * 3, s.read_to_string(&mut reply));
+                read.await.expect("served").unwrap();
+                reply
+            };
+            // The first connection to a new binary can take a second to set up (the macOS
+            // firewall); not timed, and not asked anything.
+            drop(TcpStream::connect(addr).await.unwrap());
+            let started = tokio::time::Instant::now();
+            let mut silent = Vec::new();
+            for _ in 0..MAX_CONNECTIONS {
+                silent.push(TcpStream::connect(addr).await.unwrap());
+            }
+            let reply = call(addr).await;
+            assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+            assert!(
+                started.elapsed() >= READ_TIMEOUT,
+                "waited for a silent client to time out"
             );
         });
         let _ = std::fs::remove_dir_all(&root);
