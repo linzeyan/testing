@@ -56,6 +56,8 @@ enum Msg {
     RunDone(u64, Changes, Changes),
     /// GraphQL introspection result for the URL it was fetched from.
     Schema(String, Result<graphql::Schema, String>),
+    /// gRPC reflection finished: how many services the server has.
+    Reflected(Result<usize, String>),
 }
 
 /// Stream events kept per session, by count and by bytes; older ones scroll away.
@@ -1349,7 +1351,8 @@ impl App {
         let is_ws = req.method.eq_ignore_ascii_case("WS");
         let socketio = req.method == "SOCKETIO";
         let is_mqtt = req.method == "MQTT";
-        let grpc = (req.method == "GRPC").then(|| (req.proto.clone(), req.rpc.clone()));
+        let grpc = (req.method == "GRPC")
+            .then(|| (crate::grpc::source(&req.proto, &req.url), req.rpc.clone()));
         let sends = is_ws
             || socketio
             || rpc_of(&open.draft, &self.grpc_methods).is_some_and(|r| r.client_streaming);
@@ -1489,6 +1492,15 @@ impl App {
                         self.explorer.schema = Some(result);
                         self.explorer.loading = false;
                     }
+                    continue;
+                }
+                Msg::Reflected(result) => {
+                    // The picker asks again, and this time finds them.
+                    self.grpc_methods = None;
+                    self.status = match result {
+                        Ok(n) => format!("The server has {n} services (gRPC reflection)"),
+                        Err(e) => e,
+                    };
                     continue;
                 }
                 Msg::Response(path, outcome) => (path, *outcome),
@@ -2806,6 +2818,7 @@ impl App {
         let (mut download, mut save_as) = (false, false);
         let mut define: Option<Vec<String>> = None;
         let mut fetch_schema = false;
+        let mut reflect = false;
         let mut example = None;
         let pending = self.pending.iter().find(|p| p.path == open.path);
         // The folders above the request, outermost first, for the breadcrumb.
@@ -2827,11 +2840,15 @@ impl App {
             .collect();
         let mut folder_clicked: Option<PathBuf> = None;
         // Before `streaming`: whether a gRPC method streams comes from its proto.
-        if open.draft.method == "GRPC"
-            && (self.grpc_methods.as_ref()).is_none_or(|(p, _)| *p != open.draft.proto)
+        let grpc_source = (open.draft.method == "GRPC").then(|| {
+            let url = open.draft.resolved(&all_vars).0.url;
+            crate::grpc::source(&open.draft.proto, &url)
+        });
+        if let Some(source) = &grpc_source
+            && (self.grpc_methods.as_ref()).is_none_or(|(p, _)| p != source)
         {
-            let methods = crate::grpc::methods(&open.draft.proto);
-            self.grpc_methods = Some((open.draft.proto.clone(), methods));
+            let methods = crate::grpc::methods(source);
+            self.grpc_methods = Some((source.clone(), methods));
         }
         let streaming = streams(&open.draft, &self.grpc_methods);
         let session = self.stream.as_mut().filter(|s| s.path == open.path);
@@ -3056,10 +3073,12 @@ impl App {
                         });
                 }
             });
-            if open.draft.method == "GRPC"
-                && let Some(e) = grpc_bar(ui, &mut open.draft, &mut self.grpc_methods)
-            {
-                self.status = e;
+            if let Some(source) = &grpc_source {
+                let (error, ask) = grpc_bar(ui, &mut open.draft, source, &mut self.grpc_methods);
+                if let Some(e) = error {
+                    self.status = e;
+                }
+                reflect |= ask;
             }
             let (_, mut missing) = open.draft.resolved(&all_vars);
             // `{{?name}}` is asked for on Send, not missing.
@@ -3434,6 +3453,9 @@ impl App {
             let copy = format!("{} copy", self.ws.display_name(&open.path));
             self.dialog = Some(Dialog::name(NameKind::SaveAs(open.path.clone()), copy));
         }
+        if reflect {
+            self.reflect(ui.ctx());
+        }
         if fetch_schema {
             self.fetch_schema(ui.ctx());
         }
@@ -3498,6 +3520,31 @@ impl App {
                 Err(e) => Err(format!("Network settings: {e}")),
             };
             let _ = tx.send(Msg::Schema(url, result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn reflect(&mut self, ctx: &egui::Context) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let (req, _) = open.draft.resolved(&self.all_vars());
+        self.status = "Asking the server for its methods…".into();
+        let (cell, net, tx, ctx) = (
+            self.client.clone(),
+            (self.network.clone(), self.cookies.clone()),
+            self.tx.clone(),
+            ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let result = match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
+                Ok(client) => crate::grpc::reflect(&client.grpc, &req).await,
+                Err(e) => Err(format!("Network settings: {e}")),
+            };
+            let _ = tx.send(Msg::Reflected(result));
             ctx.request_repaint();
         });
     }
@@ -6187,8 +6234,12 @@ fn primary(text: &str) -> egui::Button<'static> {
 type Rpcs = Option<(String, Result<Vec<crate::grpc::Rpc>, String>)>;
 
 fn rpc_of<'a>(req: &Request, rpcs: &'a Rpcs) -> Option<&'a crate::grpc::Rpc> {
+    let reflected =
+        |source: &str| req.proto.trim().is_empty() && source.starts_with(crate::grpc::REFLECTION);
     match rpcs {
-        Some((proto, Ok(list))) if req.method == "GRPC" && *proto == req.proto => {
+        Some((source, Ok(list)))
+            if req.method == "GRPC" && (*source == req.proto || reflected(source)) =>
+        {
             list.iter().find(|r| r.name == req.rpc)
         }
         _ => None,
@@ -6207,21 +6258,32 @@ fn subscribes(req: &Request) -> bool {
         && matches!(&req.body, Body::GraphQL { query, .. } if crate::graphql::is_subscription(query))
 }
 
-fn grpc_bar(ui: &mut egui::Ui, req: &mut Request, methods: &mut Rpcs) -> Option<String> {
-    let mut error = None;
+/// Returns an error to show, and whether to ask the server for its methods (reflection).
+fn grpc_bar(
+    ui: &mut egui::Ui,
+    req: &mut Request,
+    source: &str,
+    methods: &mut Rpcs,
+) -> (Option<String>, bool) {
+    let (mut error, mut ask) = (None, false);
+    let reflection = source.starts_with(crate::grpc::REFLECTION);
     ui.horizontal(|ui| {
         ui.label("Proto");
         ui.add(
             egui::TextEdit::singleline(&mut req.proto)
-                .hint_text("protos/service.proto (relative to the workspace)")
+                .hint_text("protos/service.proto, or empty to ask the server")
                 .desired_width(260.0),
         );
         let reload = ui
             .small_button("↻")
-            .on_hover_text("Reload .proto")
+            .on_hover_text(match reflection {
+                true => "Ask the server for its methods (gRPC reflection)",
+                false => "Reload .proto",
+            })
             .clicked();
-        if reload || methods.as_ref().is_none_or(|(p, _)| *p != req.proto) {
-            *methods = Some((req.proto.clone(), crate::grpc::methods(&req.proto)));
+        ask = reload && reflection;
+        if reload || methods.as_ref().is_none_or(|(p, _)| p != source) {
+            *methods = Some((source.to_owned(), crate::grpc::methods(source)));
         }
         let Some((_, list)) = methods else { return };
         match list {
@@ -6251,20 +6313,22 @@ fn grpc_bar(ui: &mut egui::Ui, req: &mut Request, methods: &mut Rpcs) -> Option<
                     .on_hover_text("Replace the body with an empty request message")
                     .clicked()
                 {
-                    match crate::grpc::template(&req.proto, &req.rpc) {
+                    match crate::grpc::template(source, &req.rpc) {
                         Ok(text) => req.body = Body::Json { text },
                         Err(e) => error = Some(e),
                     }
                 }
             }
-            Err(_) if req.proto.trim().is_empty() => {}
+            Err(e) if reflection => {
+                ui.weak(e.as_str());
+            }
             Err(e) => {
                 ui.colored_label(RED, e.lines().next().unwrap_or_default())
                     .on_hover_text(e.as_str());
             }
         }
     });
-    error
+    (error, ask)
 }
 
 /// Returns true when Start was pressed.

@@ -15,9 +15,34 @@ use crate::http::{self, Response, error_chain, header_list};
 use crate::model::{Body, Request};
 use crate::stream::Event;
 
+/// Where a request's methods come from: its `.proto` file, or with none set, what the
+/// server said over gRPC reflection (`reflection:` and its URL).
+pub fn source(proto: &str, url: &str) -> String {
+    match proto.trim() {
+        "" => format!("{REFLECTION}{}", url.trim().trim_end_matches('/')),
+        p => p.to_owned(),
+    }
+}
+
+pub const REFLECTION: &str = "reflection:";
+
+/// What servers answered over reflection, by URL, for as long as the app runs.
+static REFLECTED: Mutex<Option<std::collections::HashMap<String, DescriptorPool>>> =
+    Mutex::new(None);
+
+fn reflected(url: &str) -> Option<DescriptorPool> {
+    REFLECTED.lock().unwrap().as_ref()?.get(url).cloned()
+}
+
 /// Relative proto paths resolve against the working directory, which `main` sets to the
 /// workspace root.
 fn pool(proto: &str) -> Result<DescriptorPool, String> {
+    if let Some(url) = proto.strip_prefix(REFLECTION) {
+        return reflected(url).ok_or_else(|| {
+            "No .proto file set: press ↻ to ask the server for its methods (gRPC reflection)"
+                .to_owned()
+        });
+    }
     // ponytail: single-entry cache; enough for one request or a runner/load test hammering
     // the same RPC. Key includes mtime so edits to the .proto are picked up.
     static CACHE: Mutex<Option<(PathBuf, SystemTime, DescriptorPool)>> = Mutex::new(None);
@@ -198,10 +223,186 @@ fn take_message(method: &MethodDescriptor, buf: &mut Vec<u8>) -> Option<Result<V
     )
 }
 
+/// The request's method, asking the server over reflection first when there's no
+/// `.proto` and it hasn't been asked yet.
+async fn method_for(client: &reqwest::Client, req: &Request) -> Result<MethodDescriptor, String> {
+    let source = source(&req.proto, &req.url);
+    if let Some(url) = source.strip_prefix(REFLECTION)
+        && reflected(url).is_none()
+    {
+        reflect(client, req).await?;
+    }
+    method(&source, &req.rpc)
+}
+
+/// gRPC server reflection's messages (grpc/reflection/v1/reflection.proto), the fields
+/// used only: listing services and fetching the files that define them.
+mod reflection {
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct Request {
+        #[prost(oneof = "Ask", tags = "4, 7")]
+        pub ask: Option<Ask>,
+    }
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Ask {
+        #[prost(string, tag = "4")]
+        FileContainingSymbol(String),
+        #[prost(string, tag = "7")]
+        ListServices(String),
+    }
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct Response {
+        #[prost(oneof = "Answer", tags = "4, 6, 7")]
+        pub answer: Option<Answer>,
+    }
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Answer {
+        #[prost(message, tag = "4")]
+        Files(Files),
+        #[prost(message, tag = "6")]
+        Services(Services),
+        #[prost(message, tag = "7")]
+        Error(Error),
+    }
+    /// Also how a FileDescriptorSet is laid out: its files are field 1.
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct Files {
+        #[prost(bytes = "vec", repeated, tag = "1")]
+        pub file_descriptor_proto: Vec<Vec<u8>>,
+    }
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct Services {
+        #[prost(message, repeated, tag = "1")]
+        pub service: Vec<Service>,
+    }
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct Service {
+        #[prost(string, tag = "1")]
+        pub name: String,
+    }
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct Error {
+        #[prost(int32, tag = "1")]
+        pub error_code: i32,
+        #[prost(string, tag = "2")]
+        pub error_message: String,
+    }
+}
+
+/// One reflection exchange: every question in one request stream, the answers in order.
+/// v1 first; servers from before it was final only speak v1alpha.
+async fn ask(
+    client: &reqwest::Client,
+    req: &Request,
+    asks: Vec<reflection::Ask>,
+) -> Result<Vec<reflection::Answer>, String> {
+    let mut frames = Vec::new();
+    for ask in asks {
+        let payload = reflection::Request { ask: Some(ask) }.encode_to_vec();
+        frames.push(0);
+        frames.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frames.extend_from_slice(&payload);
+    }
+    for version in ["v1", "v1alpha"] {
+        let rpc = format!("grpc.reflection.{version}.ServerReflection/ServerReflectionInfo");
+        let wire_req = Request { rpc, ..req.clone() };
+        let resp = wire(client, wire_req)?
+            .body(frames.clone())
+            .send()
+            .await
+            .map_err(|e| error_chain(&e))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {} (is this a gRPC endpoint?)", resp.status()));
+        }
+        let mut headers = header_list(resp.headers());
+        let collected = reqwest::Body::from(resp)
+            .collect()
+            .await
+            .map_err(|e| error_chain(&e))?;
+        if let Some(t) = collected.trailers() {
+            headers.extend(header_list(t));
+        }
+        let get = |k: &str| {
+            headers
+                .iter()
+                .find(|(h, _)| h == k)
+                .map(|(_, v)| v.as_str())
+        };
+        if get("grpc-status") == Some("12") && version == "v1" {
+            continue; // UNIMPLEMENTED: try the older name
+        }
+        status(get("grpc-status"), get("grpc-message"))
+            .map_err(|e| format!("Server reflection: {e}"))?;
+        let mut buf = collected.to_bytes().to_vec();
+        let mut answers = Vec::new();
+        while buf.len() >= 5 {
+            let len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+            if buf.len() < 5 + len {
+                break;
+            }
+            let frame: Vec<u8> = buf.drain(..5 + len).collect();
+            let r = reflection::Response::decode(&frame[5..])
+                .map_err(|e| format!("Server reflection: {e}"))?;
+            match r.answer {
+                Some(reflection::Answer::Error(e)) => {
+                    return Err(format!("Server reflection: {}", e.error_message));
+                }
+                Some(a) => answers.push(a),
+                None => {}
+            }
+        }
+        return Ok(answers);
+    }
+    Err("Server reflection isn't enabled on this server".into())
+}
+
+/// Asks the server which services it has and the files describing them, and keeps them
+/// as this URL's methods. Returns how many services there are.
+pub async fn reflect(client: &reqwest::Client, req: &Request) -> Result<usize, String> {
+    use reflection::{Answer, Ask};
+    let listed = ask(client, req, vec![Ask::ListServices(String::new())]).await?;
+    let services: Vec<String> = (listed.into_iter())
+        .filter_map(|a| match a {
+            Answer::Services(s) => Some(s.service),
+            _ => None,
+        })
+        .flatten()
+        .map(|s| s.name)
+        // Its own service isn't one anybody means to call.
+        .filter(|n| !n.starts_with("grpc.reflection."))
+        .collect();
+    let asks = services
+        .iter()
+        .cloned()
+        .map(Ask::FileContainingSymbol)
+        .collect();
+    let mut files: Vec<Vec<u8>> = Vec::new();
+    for answer in ask(client, req, asks).await? {
+        if let Answer::Files(f) = answer {
+            for file in f.file_descriptor_proto {
+                // Each answer repeats the files its symbol's file imports.
+                if !files.contains(&file) {
+                    files.push(file);
+                }
+            }
+        }
+    }
+    let set = reflection::Files {
+        file_descriptor_proto: files,
+    };
+    let pool = DescriptorPool::decode(set.encode_to_vec().as_slice())
+        .map_err(|e| format!("Server reflection: {e}"))?;
+    let url = req.url.trim().trim_end_matches('/').to_owned();
+    (REFLECTED.lock().unwrap())
+        .get_or_insert_default()
+        .insert(url, pool);
+    Ok(services.len())
+}
+
 /// A whole call, streams included, as one response: what the runner, CLI and MCP send.
 /// Several replies come back as a JSON array.
 pub async fn call(client: reqwest::Client, req: Request) -> Result<Response, String> {
-    let method = method(&req.proto, &req.rpc)?;
+    let method = method_for(&client, &req).await?;
     let mut frames = Vec::new();
     for msg in body_messages(&method, &req.body)? {
         frames.extend(encode(&method, msg)?);
@@ -274,7 +475,7 @@ pub async fn stream(
     if let Err(e) = http::with_token(&clients.http, &mut req, false).await {
         return emit(Event::Error(e));
     }
-    let method = match method(&req.proto, &req.rpc) {
+    let method = match method_for(&clients.grpc, &req).await {
         Ok(m) => m,
         Err(e) => return emit(Event::Error(e)),
     };
@@ -477,7 +678,72 @@ pub(crate) mod tests {
                 while let Some(Ok((req, mut respond))) = conn.accept().await {
                     let pool = pool.clone();
                     tokio::spawn(async move {
-                        assert!(req.uri().path().starts_with("/greet.v1.Greeter/"));
+                        let path = req.uri().path().to_owned();
+                        // Reflection on the old name only, so a client must fall back to it.
+                        if path.starts_with("/grpc.reflection.v1.") {
+                            let head = ::http::Response::builder()
+                                .header("content-type", "application/grpc")
+                                .header("grpc-status", "12")
+                                .body(())
+                                .unwrap();
+                            respond.send_response(head, true).unwrap();
+                            return;
+                        }
+                        if path == "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"
+                        {
+                            use reflection::{Answer, Ask};
+                            let mut body = req.into_body();
+                            let mut data = Vec::new();
+                            while let Some(chunk) = body.data().await {
+                                data.extend_from_slice(&chunk.unwrap());
+                            }
+                            let mut out = Vec::new();
+                            while data.len() >= 5 {
+                                let len =
+                                    u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
+                                let frame: Vec<u8> = data.drain(..5 + len).collect();
+                                let ask = reflection::Request::decode(&frame[5..]).unwrap().ask;
+                                let answer = match ask.unwrap() {
+                                    Ask::ListServices(_) => {
+                                        Answer::Services(reflection::Services {
+                                            service: [
+                                                "greet.v1.Greeter",
+                                                "grpc.reflection.v1alpha.ServerReflection",
+                                            ]
+                                            .map(|name| reflection::Service { name: name.into() })
+                                            .to_vec(),
+                                        })
+                                    }
+                                    Ask::FileContainingSymbol(symbol) => {
+                                        assert_eq!(symbol, "greet.v1.Greeter");
+                                        Answer::Files(reflection::Files {
+                                            file_descriptor_proto: pool
+                                                .files()
+                                                .map(|f| f.file_descriptor_proto().encode_to_vec())
+                                                .collect(),
+                                        })
+                                    }
+                                };
+                                let payload = reflection::Response {
+                                    answer: Some(answer),
+                                }
+                                .encode_to_vec();
+                                out.push(0);
+                                out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                                out.extend_from_slice(&payload);
+                            }
+                            let head = ::http::Response::builder()
+                                .header("content-type", "application/grpc")
+                                .body(())
+                                .unwrap();
+                            let mut stream = respond.send_response(head, false).unwrap();
+                            stream.send_data(out.into(), false).unwrap();
+                            let mut trailers = ::http::HeaderMap::new();
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                            stream.send_trailers(trailers).unwrap();
+                            return;
+                        }
+                        assert!(path.starts_with("/greet.v1.Greeter/"));
                         assert_eq!(req.headers()["content-type"], "application/grpc");
                         let input = pool.get_message_by_name("greet.v1.HelloRequest").unwrap();
                         let output = pool.get_message_by_name("greet.v1.HelloReply").unwrap();
@@ -540,6 +806,46 @@ pub(crate) mod tests {
             });
         });
         format!("http://{addr}")
+    }
+
+    /// No .proto at hand: the server says what it has. Calls work from what it said, and
+    /// the picker lists its methods (not reflection's own).
+    #[test]
+    fn without_a_proto_the_server_is_asked_over_reflection() {
+        let proto = proto_file();
+        let url = server(pool(&proto).unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt
+            .block_on(crate::net::build_client(crate::net::Network::default()))
+            .unwrap()
+            .grpc;
+        let req = Request {
+            method: "GRPC".into(),
+            url: format!("{url}/"),
+            rpc: "greet.v1.Greeter/Hello".into(),
+            body: Body::Json {
+                text: r#"{"name": "ada", "times": 2}"#.into(),
+            },
+            ..Default::default()
+        };
+        let source = super::source("", &req.url);
+        assert!(methods(&source).unwrap_err().contains("press ↻"));
+        let resp = rt.block_on(call(client, req)).unwrap();
+        assert_eq!(resp.body, r#"{"message":"hi ada x2"}"#);
+        let names: Vec<_> = methods(&source)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, ["greet.v1.Greeter/Hello", "greet.v1.Greeter/Chat"]);
+        assert!(
+            template(&source, "greet.v1.Greeter/Hello")
+                .unwrap()
+                .contains("\"times\"")
+        );
     }
 
     #[test]
