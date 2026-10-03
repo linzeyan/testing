@@ -7,7 +7,8 @@ such as Citrix VDI. No installer: unzip and run.
   streaming methods connect like a WebSocket, and a JSON array body sends several
   messages); MQTT 3.1.1 or 5 over TCP, TLS or WebSocket (`mqtt://`, `mqtts://`, `ws://`,
   `wss://`; TLS takes the network settings' CA file, client certificate and "accept any
-  certificate", as https does) subscribes to the request's topics on Connect, follows changes to them while
+  certificate", and the connection goes through the proxy https would use, tunnelled with
+  CONNECT) subscribes to the request's topics on Connect, follows changes to them while
   connected, and publishes from the message panel with QoS and retain; Postman-style pre-request/test
   scripts (`pm.*`, chai, `jsonSchema`); collection runner with CSV/JSON data (counts cover every row; the list keeps
   failures and the latest 1000 results); load test

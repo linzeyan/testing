@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
+use hyper_util::client::proxy::matcher::Matcher;
 use serde::{Deserialize, Serialize};
 
 use crate::http::error_chain;
@@ -64,7 +65,44 @@ pub struct Clients {
     pub grpc: reqwest::Client,
     /// Why the system's PAC script was skipped, to show next to the proxy mode.
     pub note: Option<String>,
+    /// The same proxy choice, for connections reqwest doesn't make (MQTT).
+    pub route: Route,
     variants: Arc<Variants>,
+}
+
+#[derive(Clone, Default)]
+pub enum Route {
+    #[default]
+    Direct,
+    /// Manual settings, or the system's when it has no PAC script.
+    Rules(Arc<hyper_util::client::proxy::matcher::Matcher>),
+    Pac(Arc<Pac>),
+}
+
+impl Route {
+    /// The proxy for a connection to `url` (http or https) and its Basic credentials;
+    /// None is direct.
+    pub fn proxy_for(
+        &self,
+        url: &reqwest::Url,
+    ) -> Option<(reqwest::Url, Option<(String, String)>)> {
+        match self {
+            Route::Direct => None,
+            Route::Pac(pac) => Some((reqwest::Url::parse(&pac.proxy_for(url)?).ok()?, None)),
+            Route::Rules(rules) => {
+                let hit = rules.intercept(&url.as_str().parse().ok()?)?;
+                // The matcher only hands credentials out as a header value.
+                let login = (hit.basic_auth())
+                    .and_then(|v| v.to_str().ok()?.strip_prefix("Basic "))
+                    .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+                    .and_then(|raw| {
+                        let (user, password) = std::str::from_utf8(&raw).ok()?.split_once(':')?;
+                        Some((user.to_owned(), password.to_owned()))
+                    });
+                Some((reqwest::Url::parse(&hit.uri().to_string()).ok()?, login))
+            }
+        }
+    }
 }
 
 /// What request settings change about the connection itself (the timeout is set per
@@ -129,19 +167,34 @@ pub async fn build_client_with_jar(
 
     // Any explicit `.proxy()` turns off reqwest's own system-proxy lookup.
     let mut note = None;
-    let proxy = match net.proxy {
+    let (proxy, route) = match net.proxy {
         ProxyMode::System => {
-            let (proxy, skipped) = system_proxy(system_pac_url().await?).await;
+            let (pac, skipped) = system_proxy(system_pac_url().await?).await;
             note = skipped;
-            proxy
+            match pac {
+                Some(pac) => (Some(pac_proxy(&pac)), Route::Pac(pac)),
+                // reqwest reads the same system settings itself.
+                None => (None, Route::Rules(Arc::new(Matcher::from_system()))),
+            }
         }
-        ProxyMode::None => None,
+        ProxyMode::None => (None, Route::Direct),
         ProxyMode::Manual => {
-            let proxy = reqwest::Proxy::all(net.proxy_url.trim())
-                .map_err(|e| format!("proxy URL: {}", error_chain(&e)))?;
-            Some(proxy.no_proxy(reqwest::NoProxy::from_string(&net.no_proxy)))
+            let url = net.proxy_url.trim();
+            let proxy =
+                reqwest::Proxy::all(url).map_err(|e| format!("proxy URL: {}", error_chain(&e)))?;
+            let rules = Matcher::builder()
+                .all(url.to_owned())
+                .no(net.no_proxy.clone())
+                .build();
+            (
+                Some(proxy.no_proxy(reqwest::NoProxy::from_string(&net.no_proxy))),
+                Route::Rules(Arc::new(rules)),
+            )
         }
-        ProxyMode::Pac => Some(pac_proxy(net.pac_url.trim()).await?),
+        ProxyMode::Pac => {
+            let pac = load_pac(net.pac_url.trim()).await?;
+            (Some(pac_proxy(&pac)), Route::Pac(pac))
+        }
     };
 
     let ca = net.ca_file.trim();
@@ -212,6 +265,7 @@ pub async fn build_client_with_jar(
         http: build(default)?,
         grpc: build(grpc)?,
         note,
+        route,
         variants: Arc::new(Variants {
             build: Box::new(build),
             built: Default::default(),
@@ -221,12 +275,12 @@ pub async fn build_client_with_jar(
 
 /// The system's PAC script, or direct when it can't be used, as browsers do: WPAD often
 /// finds an intranet web page instead of a script. The second value says why it was skipped.
-async fn system_proxy(pac: Option<String>) -> (Option<reqwest::Proxy>, Option<String>) {
+async fn system_proxy(pac: Option<String>) -> (Option<Arc<Pac>>, Option<String>) {
     let Some(url) = pac else {
         return (None, None);
     };
-    match pac_proxy(&url).await {
-        Ok(proxy) => (Some(proxy), None),
+    match load_pac(&url).await {
+        Ok(pac) => (Some(pac), None),
         Err(e) => (
             None,
             Some(format!(
@@ -353,10 +407,13 @@ async fn system_pac_url() -> Result<Option<String>, String> {
     }
 }
 
-async fn pac_proxy(location: &str) -> Result<reqwest::Proxy, String> {
-    let script = fetch_pac(location).await?;
-    let pac = Pac::new(&script)?;
-    Ok(reqwest::Proxy::custom(move |url| pac.proxy_for(url)))
+async fn load_pac(location: &str) -> Result<Arc<Pac>, String> {
+    Ok(Arc::new(Pac::new(&fetch_pac(location).await?)?))
+}
+
+fn pac_proxy(pac: &Arc<Pac>) -> reqwest::Proxy {
+    let pac = pac.clone();
+    reqwest::Proxy::custom(move |url| pac.proxy_for(url))
 }
 
 async fn fetch_pac(location: &str) -> Result<String, String> {
@@ -572,6 +629,54 @@ mod tests {
         ))));
         assert!(proxy.is_some() && note.is_none());
         assert!(rt.block_on(system_proxy(None)).0.is_none());
+    }
+
+    #[test]
+    fn mqtt_gets_the_proxy_https_would_use() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let route = |net: Network| rt.block_on(build_client(net)).unwrap().route;
+        let at = |route: &Route, url: &str| {
+            let hit = route.proxy_for(&reqwest::Url::parse(url).unwrap());
+            hit.map(|(proxy, login)| (proxy.to_string(), login))
+        };
+        let manual = route(Network {
+            proxy: ProxyMode::Manual,
+            proxy_url: "http://u:p%40ss@proxy.test:3128".into(),
+            no_proxy: "intra.test".into(),
+            ..Default::default()
+        });
+        let login = Some(("u".to_owned(), "p@ss".to_owned()));
+        assert_eq!(
+            at(&manual, "https://broker.test:8883"),
+            Some(("http://proxy.test:3128/".into(), login))
+        );
+        assert_eq!(at(&manual, "https://mq.intra.test:8883"), None);
+
+        let path = std::env::temp_dir().join(format!("apitool-{}.pac", std::process::id()));
+        let script = r#"function FindProxyForURL(url, host) {
+                          return host == "broker.test" ? "PROXY pac.test:8080" : "DIRECT";
+                        }"#;
+        std::fs::write(&path, script).unwrap();
+        let pac = route(Network {
+            proxy: ProxyMode::Pac,
+            pac_url: path.display().to_string(),
+            ..Default::default()
+        });
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            at(&pac, "https://broker.test:8883"),
+            Some(("http://pac.test:8080/".into(), None))
+        );
+        assert_eq!(at(&pac, "https://other.test:8883"), None);
+
+        let direct = route(Network {
+            proxy: ProxyMode::None,
+            ..Default::default()
+        });
+        assert_eq!(at(&direct, "https://broker.test:8883"), None);
     }
 
     #[test]

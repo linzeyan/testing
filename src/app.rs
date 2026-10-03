@@ -1308,14 +1308,15 @@ impl App {
                 task_log.lock().unwrap().push(started.elapsed(), e);
                 ctx.request_repaint();
             };
-            // Not over HTTP: no proxy, so no client (and no PAC download) to wait for.
-            if is_mqtt {
-                return crate::mqtt::session(req, net.0, pub_rx, emit).await;
-            }
+            let tls = net.0.clone();
             match cell
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
                 .await
             {
+                // MQTT isn't HTTP, but it takes the client's proxy choice (maybe from PAC).
+                Ok(client) if is_mqtt => {
+                    crate::mqtt::session(req, tls, client.route.clone(), pub_rx, emit).await
+                }
                 Ok(client) if is_ws => {
                     stream::websocket(client.http.clone(), req, out_rx, emit).await
                 }

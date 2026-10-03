@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use rumqttc::v5::mqttbytes::v5 as p5;
 use rumqttc::{
-    Incoming, Outgoing, SubscribeFilter, SubscribeReasonCode, TlsConfiguration, Transport, v5,
+    Incoming, Outgoing, Proxy, ProxyAuth, ProxyType, SubscribeFilter, SubscribeReasonCode,
+    TlsConfiguration, Transport, v5,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject;
@@ -18,7 +19,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::sync::mpsc;
 
 use crate::model::{Auth, Request};
-use crate::net::Network;
+use crate::net::{Network, Route};
 use crate::stream::Event;
 
 /// ponytail: incoming and outgoing messages are capped at 1 MiB; raise it when a broker's
@@ -39,15 +40,16 @@ pub enum Command {
     Topics(Vec<(String, u8)>),
 }
 
-/// `req` is resolved. `net` gives mqtts:// and wss:// their TLS settings, as for https.
-/// Dropping the sender of `commands` disconnects.
+/// `req` is resolved. `net` gives mqtts:// and wss:// their TLS settings and `route` the
+/// proxy, as for https. Dropping the sender of `commands` disconnects.
 pub async fn session(
     req: Request,
     net: Network,
+    route: Route,
     mut commands: mpsc::UnboundedReceiver<Command>,
     emit: impl Fn(Event),
 ) {
-    let (client, mut events) = match connect(&req, &net) {
+    let (client, mut events) = match connect(&req, &net, &route) {
         Ok(c) => c,
         Err(e) => return emit(Event::Error(e)),
     };
@@ -340,8 +342,9 @@ fn target(url: &str) -> Result<(Wire, String, u16), String> {
     Ok((wire, address, port))
 }
 
-fn connect(req: &Request, net: &Network) -> Result<(Client, Events), String> {
+fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Events), String> {
     let (wire, address, port) = target(&req.url)?;
+    let proxy = proxy(route, &wire, &address, port)?;
     let m = &req.mqtt;
     let id = match m.client_id.trim() {
         "" => {
@@ -371,6 +374,9 @@ fn connect(req: &Request, net: &Network) -> Result<(Client, Events), String> {
             .set_clean_start(m.clean_session)
             .set_max_packet_size(Some(MAX_PACKET as u32))
             .set_transport(transport);
+        if let Some(p) = proxy {
+            o.set_proxy(p);
+        }
         // In v5 a session ends with the connection unless it's given a lifetime; "keep
         // the session" means what it does in 3.1.1: until the broker forgets it.
         if !m.clean_session {
@@ -387,11 +393,50 @@ fn connect(req: &Request, net: &Network) -> Result<(Client, Events), String> {
         .set_clean_session(m.clean_session)
         .set_max_packet_size(MAX_PACKET, MAX_PACKET)
         .set_transport(transport);
+    if let Some(p) = proxy {
+        o.set_proxy(p);
+    }
     if let Some((user, password)) = login {
         o.set_credentials(user, password);
     }
     let (c, e) = rumqttc::AsyncClient::new(o, 16);
     Ok((Client::V3(c), Events::V3(e)))
+}
+
+/// The proxy the settings pick for the broker, asked as for an https URL when the broker
+/// speaks TLS, else as for http. Tunnelled with CONNECT.
+fn proxy(route: &Route, wire: &Wire, address: &str, port: u16) -> Result<Option<Proxy>, String> {
+    let (scheme, host) = match wire {
+        Wire::Tcp => ("http", Some(address.to_owned())),
+        Wire::Tls => ("https", Some(address.to_owned())),
+        Wire::Ws | Wire::Wss => {
+            let url = reqwest::Url::parse(address).ok();
+            let host = url.as_ref().and_then(|u| u.host_str().map(str::to_owned));
+            (if *wire == Wire::Ws { "http" } else { "https" }, host)
+        }
+    };
+    let probe = host.and_then(|h| reqwest::Url::parse(&format!("{scheme}://{h}:{port}")).ok());
+    let Some((url, login)) = probe.and_then(|p| route.proxy_for(&p)) else {
+        return Ok(None);
+    };
+    // ponytail: plain http proxies only (what PAC's "PROXY" means); an https:// one would
+    // need ProxyType::Https with its own TLS settings.
+    let (Some(addr), Some(proxy_port), "http") =
+        (url.host_str(), url.port_or_known_default(), url.scheme())
+    else {
+        return Err(format!(
+            "MQTT can only go through an http:// proxy, not {url}"
+        ));
+    };
+    Ok(Some(Proxy {
+        ty: ProxyType::Http,
+        auth: match login {
+            Some((username, password)) => ProxyAuth::Basic { username, password },
+            None => ProxyAuth::None,
+        },
+        addr: addr.to_owned(),
+        port: proxy_port,
+    }))
 }
 
 /// As for https: the system's trust store plus the CA file, the client certificate, and
@@ -481,6 +526,7 @@ pub mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 
+    use base64::Engine as _;
     use bytes::BytesMut;
     use rumqttc::{ConnAck, ConnectReturnCode, Packet, QoS, SubAck, UnsubAck};
 
@@ -595,6 +641,31 @@ pub mod tests {
             .with_single_cert(vec![own.cert.der().clone()], key)
             .unwrap();
         Arc::new(config)
+    }
+
+    /// An HTTP proxy that lets u (password p@ss) CONNECT to broker.test:1883 and then is
+    /// that broker.
+    fn proxy_to_broker(serve: fn(&mut dyn Pipe)) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            // Byte by byte: what follows the request is MQTT.
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                s.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let auth = base64::engine::general_purpose::STANDARD.encode("u:p@ss");
+            assert!(head.starts_with("CONNECT broker.test:1883 "), "{head}");
+            assert!(head.contains(&format!("Basic {auth}\r\n")), "{head}");
+            s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .unwrap();
+            serve(&mut s)
+        });
+        port
     }
 
     /// Just enough MQTT 3.1.1 broker for client "tester" signing in as u/p: answers
@@ -767,6 +838,10 @@ pub mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let route = rt
+            .block_on(crate::net::build_client(net.clone()))
+            .unwrap()
+            .route;
         let (tx, rx) = mpsc::unbounded_channel();
         let tx = std::sync::Mutex::new(Some(tx));
         let events = std::sync::Mutex::new(Vec::new());
@@ -774,7 +849,7 @@ pub mod tests {
             let tx = tx.lock().unwrap();
             tx.as_ref().unwrap().send(c).ok().unwrap();
         };
-        rt.block_on(session(req, net, rx, |e| {
+        rt.block_on(session(req, net, route, rx, |e| {
             match &e {
                 Event::In(t) if t == "[a/1] hello" => command(Command::Publish(Publish {
                     topic: "cmd".into(),
@@ -871,6 +946,21 @@ pub mod tests {
     }
 
     #[test]
+    fn the_proxy_settings_carry_the_connection() {
+        // broker.test doesn't resolve: only the proxy can reach it.
+        let via = |serve, v5| {
+            let net = Network {
+                proxy: crate::net::ProxyMode::Manual,
+                proxy_url: format!("http://u:p%40ss@127.0.0.1:{}", proxy_to_broker(serve)),
+                ..Default::default()
+            };
+            exchange(request("mqtt://broker.test:1883".into(), v5), net)
+        };
+        assert_eq!(via(serve_v3, false), expected("refused"));
+        assert_eq!(via(serve_v5, true), expected("refused (NotAuthorized)"));
+    }
+
+    #[test]
     fn a_qos_change_resubscribes_without_unsubscribing() {
         let t = |f: &str, q| (f.to_owned(), q);
         let (gone, new) = changes(&[t("a", 0), t("b", 1)], &[t("b", 2), t("c", 0)]);
@@ -887,7 +977,9 @@ pub mod tests {
                 auth,
                 ..Default::default()
             };
-            connect(&req, &Network::default()).err().unwrap()
+            connect(&req, &Network::default(), &Route::Direct)
+                .err()
+                .unwrap()
         };
         assert!(bad("http://x", Auth::None).contains("mqtt://"));
         assert!(bad("mqtt://x:port", Auth::None).contains("port"));

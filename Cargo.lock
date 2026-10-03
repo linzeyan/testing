@@ -227,7 +227,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apitool"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "aho-corasick",
  "base64 0.23.1",
@@ -242,6 +242,7 @@ dependencies = [
  "h2",
  "http",
  "http-body-util",
+ "hyper-util",
  "image",
  "jsonschema",
  "md-5",
@@ -397,6 +398,18 @@ dependencies = [
  "futures-lite",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "async-http-proxy"
+version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29faa5d4d308266048bd7505ba55484315a890102f9345b9ff4b87de64201592"
+dependencies = [
+ "base64 0.13.1",
+ "httparse",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -588,6 +601,12 @@ name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
+name = "base64"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
 name = "base64"
@@ -4289,6 +4308,7 @@ version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0feff8d882bff0b2fddaf99355a10336d43dd3ed44204f85ece28cf9626ab519"
 dependencies = [
+ "async-http-proxy",
  "async-tungstenite 0.29.1",
  "bytes",
  "fixedbitset",
