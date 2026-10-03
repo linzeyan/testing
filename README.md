@@ -20,7 +20,8 @@ such as Citrix VDI. No installer: unzip and run.
   gets an `id` row under Params, filled in on Send, kept on Postman import and export); per-request settings (HTTP
   version, redirects, TLS check, cookies, timeout); paste a curl command into the URL bar
   to import it, and "</> Code" for the request as curl, wget, HTTPie, PowerShell, raw
-  HTTP, Python, fetch, axios, Go, Java, C#, PHP, Ruby, Rust, Swift or Kotlin; import a
+  HTTP, Python, fetch, axios, Go, Java, C#, PHP, Ruby, Rust, Swift or Kotlin (a Binary
+  body reads its file, and `--data-binary @file` pastes back as one); import a
   Postman v2.1 collection or environment (⋯ > "Import from Postman…": paste it, give its
   path or drop the file) and copy a folder or the whole collection as a Postman
   collection; duplicate requests and folders (Ctrl+D); Save ⏷ "Save as…" saves the edits

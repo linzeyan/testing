@@ -58,6 +58,7 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
     let mut digest = false;
     let mut data: Vec<String> = Vec::new();
     let mut parts: Vec<KeyValue> = Vec::new();
+    let mut file = None;
     while let Some(word) = words.next() {
         // `-XPOST` → (`-X`, `POST`)
         let (flag, glued) = match word.strip_prefix('-') {
@@ -85,12 +86,16 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
             }
             "-d" | "--data" | "--data-ascii" | "--data-binary" => {
                 let v = value()?;
-                if v.starts_with('@') {
-                    return Err(format!(
-                        "{flag} {v} reads a file; paste its contents instead"
-                    ));
+                // Only --data-binary sends the file as it is; -d drops its newlines.
+                match (flag.as_str(), v.strip_prefix('@')) {
+                    ("--data-binary", Some(path)) => file = Some(path.to_owned()),
+                    (_, Some(_)) => {
+                        return Err(format!(
+                            "{flag} {v} reads a file; paste its contents instead"
+                        ));
+                    }
+                    _ => data.push(v),
                 }
-                data.push(v);
             }
             "--data-raw" => data.push(value()?),
             // `name=content` encodes only the content; `content` / `=content` send it bare.
@@ -171,6 +176,16 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
         }
         req.url = url;
         req.body = Body::Multipart { parts };
+        req.method = method.unwrap_or_else(|| "POST".into());
+        req.sync_params();
+        return Ok(req);
+    }
+    if let Some(path) = file {
+        if !data.is_empty() {
+            return Err("--data-binary @file can't be combined with other -d".into());
+        }
+        req.url = url;
+        req.body = Body::File { path };
         req.method = method.unwrap_or_else(|| "POST".into());
         req.sync_params();
         return Ok(req);
@@ -402,6 +417,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(to_curl(head).unwrap(), "curl --location --head 'http://x/'");
+    }
+
+    /// A Binary body goes out as the file curl reads itself, typed as Send types it, and
+    /// pasting that back gives the same request.
+    #[test]
+    fn a_file_body_round_trips_as_data_binary() {
+        let req = Request {
+            method: "PUT".into(),
+            url: "http://h/up".into(),
+            body: Body::File {
+                path: "data/a b.txt".into(),
+            },
+            ..Default::default()
+        };
+        let exported = to_curl(req).unwrap();
+        assert_eq!(
+            exported,
+            "curl --location -X PUT 'http://h/up' \\\n  -H 'content-type: text/plain' \\\n  --data-binary '@data/a b.txt'"
+        );
+        let back = from_curl(&exported).unwrap();
+        assert_eq!(
+            back.body,
+            Body::File {
+                path: "data/a b.txt".into()
+            }
+        );
+        assert_eq!(to_curl(back).unwrap(), exported);
+        // -d strips newlines from what it reads, which no body here does.
+        assert!(from_curl("curl -d @a.txt http://h/").is_err());
     }
 
     #[test]

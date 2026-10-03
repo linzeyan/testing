@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 
 use crate::http::{OFFLINE, build, error_chain};
-use crate::model::{Auth, Body, HttpVersion, Request, Settings};
+use crate::model::{Auth, Body, HttpVersion, KeyValue, Request, Settings};
 
 type Generator = fn(&Wire) -> String;
 
@@ -49,6 +49,8 @@ pub struct Wire {
     /// language, which picks its own boundary).
     headers: Vec<(String, String)>,
     body: Option<String>,
+    /// A Binary body: the snippet reads this file, as Send does.
+    file: Option<String>,
     parts: Vec<(String, Part)>,
     /// Answered by the tool itself where it can, as curl --digest does.
     digest: Option<(String, String)>,
@@ -62,10 +64,26 @@ enum Part {
 
 impl Wire {
     fn new(mut req: Request) -> Result<Self, String> {
-        // ponytail: no generator writes a file body yet; add per language when asked for.
-        if matches!(req.body, Body::File { .. }) {
-            return Err("Code snippets don't cover a binary (file) body yet".into());
-        }
+        // Taken out before `build`, which would open the file; typed as Send types it.
+        let file = match std::mem::take(&mut req.body) {
+            Body::File { path } if path.trim().is_empty() => {
+                return Err("Pick a file to send as the body".into());
+            }
+            Body::File { path } => {
+                let own = (req.headers.iter())
+                    .any(|h| h.enabled && h.key.eq_ignore_ascii_case("content-type"));
+                if !own {
+                    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+                    req.headers
+                        .push(KeyValue::new("Content-Type", mime.as_ref()));
+                }
+                Some(path)
+            }
+            body => {
+                req.body = body;
+                None
+            }
+        };
         let parts = match std::mem::take(&mut req.body) {
             Body::Multipart { parts } => parts
                 .into_iter()
@@ -110,6 +128,7 @@ impl Wire {
             url: wire.url().clone(),
             headers,
             body,
+            file,
             parts,
             digest,
             settings,
@@ -269,6 +288,9 @@ fn curl(w: &Wire) -> String {
     if let Some(body) = &w.body {
         let _ = write!(out, " \\\n  --data-raw {}", sh(body));
     }
+    if let Some(path) = &w.file {
+        let _ = write!(out, " \\\n  --data-binary {}", sh(&format!("@{path}")));
+    }
     for (key, part) in &w.parts {
         // --form-string sends text as is; -F would treat `;` and a leading `<` specially.
         let (flag, part) = match part {
@@ -312,6 +334,9 @@ fn wget(w: &Wire) -> String {
     if let Some(body) = &w.body {
         let _ = write!(out, " \\\n  --body-data {}", sh(body));
     }
+    if let Some(path) = &w.file {
+        let _ = write!(out, " \\\n  --body-file {}", sh(path));
+    }
     let _ = write!(out, " \\\n  {}", sh(w.url.as_str()));
     out
 }
@@ -354,6 +379,10 @@ fn httpie(w: &Wire) -> String {
     if let Some(body) = &w.body {
         let _ = write!(out, " \\\n  --raw {}", sh(body));
     }
+    // HTTPie reads a lone `@path` as the body, like stdin.
+    if let Some(path) = &w.file {
+        let _ = write!(out, " \\\n  {}", sh(&format!("@{path}")));
+    }
     out
 }
 
@@ -377,6 +406,9 @@ fn powershell(w: &Wire) -> String {
     }
     if let Some(body) = &w.body {
         let _ = writeln!(out, "    Body = {}", ps_str(body));
+    }
+    if let Some(path) = &w.file {
+        let _ = writeln!(out, "    InFile = {}", ps_str(path));
     }
     if !w.parts.is_empty() {
         out.push_str("    Form = @{\n");
@@ -441,6 +473,11 @@ fn raw(w: &Wire) -> String {
     }
     if let Some(body) = &w.body {
         let _ = write!(out, "content-length: {}\n\n{body}", body.len());
+    } else if let Some(path) = &w.file {
+        let _ = write!(
+            out,
+            "content-length: <size of {path}>\n\n<contents of {path}>"
+        );
     } else if !w.parts.is_empty() {
         let boundary = "----apitool";
         let _ = write!(
@@ -516,6 +553,10 @@ fn python(w: &Wire) -> String {
         // A str body would go out as Latin-1.
         args.push("data=payload.encode(\"utf-8\")".into());
     }
+    if let Some(path) = &w.file {
+        // A file object is streamed, not read into memory.
+        args.push(format!("data=open({}, \"rb\")", dq(path)));
+    }
     if !w.parts.is_empty() {
         args.push("files=files".into());
     }
@@ -572,7 +613,7 @@ fn js_headers(headers: &[&(String, String)], indent: &str, out: &mut String) {
 /// An ES module (top-level await): a browser, Deno, or Node 18+ as `.mjs`.
 fn fetch(w: &Wire) -> String {
     let mut out = String::new();
-    if w.parts.iter().any(|(_, p)| matches!(p, Part::File(_))) {
+    if w.file.is_some() || w.parts.iter().any(|(_, p)| matches!(p, Part::File(_))) {
         out.push_str("import { openAsBlob } from \"node:fs\"; // Node 20+\n\n");
     }
     if !w.parts.is_empty() {
@@ -600,6 +641,9 @@ fn fetch(w: &Wire) -> String {
     if let Some(body) = &w.body {
         let _ = writeln!(out, "  body: {},", dq(body));
     }
+    if let Some(path) = &w.file {
+        let _ = writeln!(out, "  body: await openAsBlob({}),", dq(path));
+    }
     if !w.parts.is_empty() {
         out.push_str("  body: form,\n");
     }
@@ -625,6 +669,9 @@ fn axios(w: &Wire) -> String {
     if w.parts.iter().any(|(_, p)| matches!(p, Part::File(_))) {
         out.push_str("const { openAsBlob } = require(\"node:fs\"); // Node 20+\n");
     }
+    if w.file.is_some() {
+        out.push_str("const { readFile } = require(\"node:fs/promises\");\n");
+    }
     out.push_str("\nasync function main() {\n");
     if !w.parts.is_empty() {
         let mut form = String::new();
@@ -642,6 +689,9 @@ fn axios(w: &Wire) -> String {
     }
     if let Some(body) = &w.body {
         let _ = writeln!(out, "    data: {},", dq(body));
+    }
+    if let Some(path) = &w.file {
+        let _ = writeln!(out, "    data: await readFile({}),", dq(path));
     }
     if !w.parts.is_empty() {
         out.push_str("    data: form,\n");
@@ -679,6 +729,8 @@ fn go(w: &Wire) -> String {
     }
     if files {
         imports.extend(["os", "path/filepath"]);
+    } else if w.file.is_some() {
+        imports.push("os");
     }
     if w.settings.timeout_ms > 0 {
         imports.push("time");
@@ -698,6 +750,13 @@ fn go(w: &Wire) -> String {
     out.push_str(")\n\nfunc main() {\n");
     let body = if let Some(body) = &w.body {
         let _ = writeln!(out, "\tpayload := strings.NewReader({})", dq(body));
+        "payload"
+    } else if let Some(path) = &w.file {
+        let _ = write!(
+            out,
+            "\tpayload, err := os.Open({})\n\tif err != nil {{\n\t\tpanic(err)\n\t}}\n\tdefer payload.Close()\n",
+            dq(path)
+        );
         "payload"
     } else if !w.parts.is_empty() {
         out.push_str("\tpayload := &bytes.Buffer{}\n\twriter := multipart.NewWriter(payload)\n");
@@ -797,6 +856,9 @@ fn java(w: &Wire) -> String {
         "import java.net.URI;\nimport java.net.http.HttpClient;\n\
          import java.net.http.HttpRequest;\nimport java.net.http.HttpResponse;\n",
     );
+    if w.file.is_some() {
+        out.push_str("import java.nio.file.Path;\n");
+    }
     if w.settings.timeout_ms > 0 {
         out.push_str("import java.time.Duration;\n");
     }
@@ -825,9 +887,10 @@ fn java(w: &Wire) -> String {
         HttpVersion::Http2 => out.push_str("            .version(HttpClient.Version.HTTP_2)\n"),
     }
     out.push_str("            .build();\n");
-    let publisher = match &w.body {
-        Some(body) => format!("HttpRequest.BodyPublishers.ofString({})", dq(body)),
-        None => "HttpRequest.BodyPublishers.noBody()".into(),
+    let publisher = match (&w.body, &w.file) {
+        (Some(body), _) => format!("HttpRequest.BodyPublishers.ofString({})", dq(body)),
+        (_, Some(path)) => format!("HttpRequest.BodyPublishers.ofFile(Path.of({}))", dq(path)),
+        _ => "HttpRequest.BodyPublishers.noBody()".into(),
     };
     let _ = write!(
         out,
@@ -908,8 +971,13 @@ fn csharp(w: &Wire) -> String {
             dq(v)
         );
     }
-    if let Some(body) = &w.body {
-        let _ = writeln!(out, "request.Content = new StringContent({});", dq(body));
+    let content = match (&w.body, &w.file) {
+        (Some(body), _) => Some(format!("new StringContent({})", dq(body))),
+        (_, Some(path)) => Some(format!("new StreamContent(File.OpenRead({}))", dq(path))),
+        _ => None,
+    };
+    if let Some(content) = content {
+        let _ = writeln!(out, "request.Content = {content};");
         // StringContent says text/plain unless told otherwise.
         match w.content_type() {
             Some(ct) => {
@@ -1021,6 +1089,10 @@ fn php(w: &Wire) -> String {
     if let Some(body) = &w.body {
         opt(&mut out, "CURLOPT_POSTFIELDS", php_str(body));
     }
+    if let Some(path) = &w.file {
+        let read = format!("file_get_contents({})", php_str(path));
+        opt(&mut out, "CURLOPT_POSTFIELDS", read);
+    }
     if !w.parts.is_empty() {
         out.push_str("    CURLOPT_POSTFIELDS => [\n");
         for (key, part) in &w.parts {
@@ -1052,7 +1124,7 @@ fn ruby(w: &Wire) -> String {
     if let Some(s) = w.timeout_secs() {
         let _ = writeln!(out, "http.open_timeout = {s}\nhttp.read_timeout = {s}");
     }
-    let has_body = w.body.is_some() || !w.parts.is_empty();
+    let has_body = w.body.is_some() || w.file.is_some() || !w.parts.is_empty();
     let _ = writeln!(
         out,
         "request = Net::HTTPGenericRequest.new({}, {has_body}, {}, uri.request_uri)",
@@ -1064,6 +1136,9 @@ fn ruby(w: &Wire) -> String {
     }
     if let Some(body) = &w.body {
         let _ = writeln!(out, "request.body = {}", ruby_str(body));
+    }
+    if let Some(path) = &w.file {
+        let _ = writeln!(out, "request.body = File.binread({})", ruby_str(path));
     }
     if !w.parts.is_empty() {
         out.push_str("request.set_form([\n");
@@ -1166,6 +1241,13 @@ fn rust(w: &Wire) -> String {
     if let Some(body) = &w.body {
         let _ = write!(out, "\n        .body({})", braced(body));
     }
+    if let Some(path) = &w.file {
+        let _ = write!(
+            out,
+            "\n        .body(tokio::fs::read({}).await?)",
+            braced(path)
+        );
+    }
     if !w.parts.is_empty() {
         out.push_str("\n        .multipart(form)");
     }
@@ -1213,6 +1295,13 @@ fn swift(w: &Wire) -> String {
     }
     if let Some(body) = &w.body {
         let _ = writeln!(out, "request.httpBody = Data({}.utf8)", braced(body));
+    }
+    if let Some(path) = &w.file {
+        let _ = writeln!(
+            out,
+            "request.httpBody = try Data(contentsOf: URL(fileURLWithPath: {}))",
+            braced(path)
+        );
     }
     // URLSession has no multipart builder, so the body is put together by hand.
     if !w.parts.is_empty() {
@@ -1264,18 +1353,19 @@ fn kotlin(w: &Wire) -> String {
     let ct = w.content_type();
     // OkHttp throws on a POST, PUT or PATCH without a body.
     let empty = w.body.is_none()
+        && w.file.is_none()
         && w.parts.is_empty()
         && matches!(w.method.as_str(), "POST" | "PUT" | "PATCH");
     if w.body.is_some() || empty {
         imports.push("okhttp3.RequestBody.Companion.toRequestBody");
-        if ct.is_some() {
-            imports.push("okhttp3.MediaType.Companion.toMediaType");
-        }
+    }
+    if (w.body.is_some() || w.file.is_some()) && ct.is_some() {
+        imports.push("okhttp3.MediaType.Companion.toMediaType");
     }
     if !w.parts.is_empty() {
         imports.push("okhttp3.MultipartBody");
     }
-    if w.parts.iter().any(|(_, p)| matches!(p, Part::File(_))) {
+    if w.file.is_some() || w.parts.iter().any(|(_, p)| matches!(p, Part::File(_))) {
         imports.extend([
             "okhttp3.RequestBody.Companion.asRequestBody",
             "java.io.File",
@@ -1321,15 +1411,22 @@ fn kotlin(w: &Wire) -> String {
         }
     }
     out.push_str("        .build()\n");
+    let media = match ct {
+        Some(ct) => format!("{}.toMediaType()", kotlin_str(ct)),
+        None => "null".into(),
+    };
     let body = if let Some(body) = &w.body {
-        let media = match ct {
-            Some(ct) => format!("{}.toMediaType()", kotlin_str(ct)),
-            None => "null".into(),
-        };
         let _ = writeln!(
             out,
             "    val body = {}.toRequestBody({media})",
             kotlin_str(body)
+        );
+        "body"
+    } else if let Some(path) = &w.file {
+        let _ = writeln!(
+            out,
+            "    val body = File({}).asRequestBody({media})",
+            kotlin_str(path)
         );
         "body"
     } else if !w.parts.is_empty() {
@@ -1451,6 +1548,17 @@ mod tests {
                             KeyValue::new("note", tricky),
                             KeyValue::new("doc", "@upload.txt"),
                         ],
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "file",
+                Request {
+                    method: "POST".into(),
+                    url: "http://echo.test:8080/raw".into(),
+                    body: Body::File {
+                        path: "upload.txt".into(),
                     },
                     ..Default::default()
                 },
