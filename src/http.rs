@@ -1316,7 +1316,9 @@ pub(crate) mod tests {
         let c = rt.block_on(crate::net::build_client(net)).unwrap().http;
         let req = Request {
             method: "GET".into(),
-            url: format!("https://localhost:{}/", addr.port()),
+            // Not localhost: Windows tries ::1 first, and a refused connection there takes
+            // hyper's 300 ms fallback to IPv4, which is TCP time too.
+            url: format!("https://{addr}/"),
             ..Default::default()
         };
         let sent = rt.block_on(execute(c, req)).unwrap().sent;
