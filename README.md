@@ -46,7 +46,7 @@ such as Citrix VDI. No installer: unzip and run.
   of pretty JSON objects and arrays (find opens a fold it lands in), Pretty/Raw (XML responses are indented too; Raw, once chosen, sticks to that content type), a JSONPath filter (`$.items[*].id`, `..id`, `$.items[?(@.price < 10 && @.tag == 'x')]`, or XPath on XML: `//item[@id='b']/name/text()`, prefixes ignored; the last 10 used come back from Recent; Save… still writes the whole
   body), a Tests tab filter (All/Passed/Failed with counts), word wrap (between words) and Save… to a file (text bodies past 5 MiB wait behind "Show anyway / Save to file…"; bodies past 16 MiB keep their start, to
   spare RAM; Send ⏷ "Send and download…" streams a successful response straight to a
-  file instead, however big, and a failed or cancelled one leaves no partial file; Send ⏷ "Repeat every N s" sends again on that interval, never two at once, until Stop repeat, Cancel or another tab); a PNG, JPEG or WebP response shows as a picture, other binary
+  file instead, however big, and a failed or cancelled one leaves no partial file; Send ⏷ "Repeat every N s" sends again on that interval, never two at once, until Stop repeat, Cancel or another tab); a PNG, JPEG or WebP response shows as a picture, an SVG one too (Preview, beside Pretty and Raw for its XML), other binary
   bodies by their size (Save… writes them byte for byte), and "Open in browser" shows an
   HTML, PDF or SVG one (a PDF in the system's viewer); a Timeline tab with the request as it went out (headers reqwest adds and jar
   cookies included), each redirect and the peer address; a History menu in the

@@ -321,8 +321,11 @@ struct ResponseView {
     wrapped: Option<(usize, Vec<Row>)>,
     /// Folded JSON blocks, opening line → closing line (0-based).
     folds: BTreeMap<usize, usize>,
-    /// A binary body decoded for the preview, with its size in pixels; on first show.
+    /// A binary body or an SVG decoded for the preview, with its size in pixels; on first
+    /// show.
     image: Option<Result<(egui::TextureHandle, [u32; 2]), String>>,
+    /// An SVG drawn rather than shown as text.
+    preview: bool,
     find: Find,
     /// The JSON filter as typed, the one `text` shows the result of, and why it can't apply.
     filter: String,
@@ -1818,6 +1821,8 @@ fn into_view(mut head: http::Response) -> ResponseView {
         Some(pretty) => (pretty, Some(body)),
         None => (body, None),
     };
+    // Drawn first, as Postman's Preview does; Pretty and Raw show the XML.
+    let preview = held.is_none() && head.bytes.is_none() && external_type(&head) == Some("svg");
     ResponseView {
         head,
         line_starts: match held {
@@ -1833,6 +1838,7 @@ fn into_view(mut head: http::Response) -> ResponseView {
         wrapped: None,
         folds: BTreeMap::new(),
         image: None,
+        preview,
         find: Find::default(),
         filter: String::new(),
         applied: String::new(),
@@ -7165,28 +7171,39 @@ fn response_ui(
                 }
                 if *tab == RespTab::Body && !binary && view.held.is_none() {
                     ui.separator();
-                    if (ui.selectable_label(*wrap, "Wrap"))
-                        .on_hover_text("Wrap long lines")
-                        .clicked()
+                    let svg = external_type(&view.head) == Some("svg");
+                    if !view.preview
+                        && (ui.selectable_label(*wrap, "Wrap"))
+                            .on_hover_text("Wrap long lines")
+                            .clicked()
                     {
                         *wrap = !*wrap;
                     }
-                    // Right to left: Raw is added first to sit on the right.
-                    if view.other.is_some() {
-                        if (ui.selectable_label(!view.pretty, "Raw"))
+                    // Right to left: Raw is added first to sit on the right. An SVG that
+                    // isn't valid XML has no Pretty, but Raw still leaves the preview.
+                    if (view.other.is_some() || svg)
+                        && (ui.selectable_label(!view.pretty && !view.preview, "Raw"))
                             .on_hover_text("As received")
                             .clicked()
-                        {
-                            view.set_pretty(false);
-                        }
-                        if ui.selectable_label(view.pretty, "Pretty").clicked() {
-                            view.set_pretty(true);
-                        }
+                    {
+                        view.preview = false;
+                        view.set_pretty(false);
+                    }
+                    if view.other.is_some()
+                        && (ui.selectable_label(view.pretty && !view.preview, "Pretty")).clicked()
+                    {
+                        view.preview = false;
+                        view.set_pretty(true);
+                    }
+                    if svg && ui.selectable_label(view.preview, "Preview").clicked() {
+                        view.preview = true;
+                        view.find.close();
                     }
                     let shortcut = ui.ctx().format_shortcut(&FIND);
-                    if (ui.selectable_label(view.find.open, "Find"))
-                        .on_hover_text(shortcut)
-                        .clicked()
+                    if !view.preview
+                        && (ui.selectable_label(view.find.open, "Find"))
+                            .on_hover_text(shortcut)
+                            .clicked()
                     {
                         match view.find.open {
                             true => view.find.close(),
@@ -7202,6 +7219,7 @@ fn response_ui(
         && let Ok(view) = &mut shown.result
         && view.find.open
         && view.head.bytes.is_none()
+        && !view.preview
     {
         ui.horizontal(|ui| find_bar(ui, view));
     }
@@ -7327,7 +7345,7 @@ fn response_ui(
                     ui.add(egui::Label::new(text).selectable(true).extend());
                 });
         }
-        (_, Ok(view)) if view.head.bytes.is_some() => binary_body(ui, view),
+        (_, Ok(view)) if view.head.bytes.is_some() || view.preview => binary_body(ui, view),
         (_, Ok(view)) if view.held.is_some() => {
             ui.add_space(8.0);
             ui.label(format!(
@@ -7654,28 +7672,82 @@ fn external_type(head: &http::Response) -> Option<&'static str> {
     }
 }
 
-/// A body that isn't text: shown when it's an image, else only its size.
+/// A body that isn't text, or an SVG in Preview: shown when it's a picture, else only
+/// its size.
 fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
-    let bytes = view.head.bytes.as_deref().unwrap_or_default();
     let ctx = ui.ctx().clone();
-    match view.image.get_or_insert_with(|| decode_image(&ctx, bytes)) {
+    if view.image.is_none() {
+        view.image = Some(match &view.head.bytes {
+            Some(bytes) => decode_image(&ctx, bytes),
+            None => svg_pixels(view.raw(), ctx.pixels_per_point(), max_side(&ctx)).map(
+                |(pixels, size)| {
+                    (
+                        ctx.load_texture("response-svg", pixels, Default::default()),
+                        size,
+                    )
+                },
+            ),
+        });
+    }
+    match view.image.as_ref().expect("decoded above") {
         Ok((texture, [w, h])) => {
             ui.weak(format!("{w} × {h}"));
-            // As big as it is, unless that doesn't fit.
+            // As big as it is in points, unless that doesn't fit; an SVG's texture has
+            // more pixels than that on a HiDPI screen, to stay sharp.
             let fit = ui.available_size();
-            ui.add(
-                egui::Image::from_texture(&*texture)
-                    .fit_to_original_size(1.0)
-                    .max_size(fit),
-            );
+            let size = egui::vec2(*w as f32, *h as f32);
+            let image =
+                egui::Image::from_texture(egui::load::SizedTexture::new(texture.id(), size));
+            // An SVG is a page: drawn on white, as a browser shows it; black lines on the
+            // dark theme would vanish.
+            let page = view.head.bytes.is_none();
+            ui.add(image.max_size(fit).bg_fill(match page {
+                true => egui::Color32::WHITE,
+                false => egui::Color32::TRANSPARENT,
+            }));
+        }
+        Err(e) if view.head.bytes.is_none() => {
+            ui.weak(format!(
+                "This SVG can't be drawn ({e}). Raw shows its text."
+            ));
         }
         Err(e) => {
-            let size = human_size(bytes.len());
+            let size = human_size(view.raw_size);
             ui.weak(format!(
                 "{size} of binary data, not shown ({e}). Save… keeps it as received."
             ));
         }
     }
+}
+
+fn max_side(ctx: &egui::Context) -> u32 {
+    ctx.input(|i| i.max_texture_side) as u32
+}
+
+/// An SVG drawn at `scale` pixels per unit, less if that would pass `side` pixels or 64 MiB
+/// (as `decode_image`), with its size in its own units.
+// ponytail: drawn on the UI thread, as pictures are decoded; a huge SVG stalls a frame.
+fn svg_pixels(svg: &str, scale: f32, side: u32) -> Result<(egui::ColorImage, [u32; 2]), String> {
+    use resvg::{tiny_skia, usvg};
+    let mut options = usvg::Options::default();
+    // Reading the system's fonts costs time and memory; only text needs them.
+    if svg.contains("<text") {
+        std::sync::Arc::make_mut(&mut options.fontdb).load_system_fonts();
+    }
+    let tree = usvg::Tree::from_str(svg, &options).map_err(|e| e.to_string())?;
+    let (w, h) = (tree.size().width(), tree.size().height());
+    let side = (side as f32).min(4096.0);
+    let scale = scale.min(side / w.max(h));
+    let (pw, ph) = ((w * scale).ceil() as u32, (h * scale).ceil() as u32);
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph).ok_or("it has no size")?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let pixels =
+        egui::ColorImage::from_rgba_premultiplied([pw as usize, ph as usize], pixmap.data());
+    Ok((pixels, [w.round() as u32, h.round() as u32]))
 }
 
 /// PNG, JPEG and WebP. Bigger than the GPU takes, the picture is scaled down to fit.
@@ -7693,7 +7765,7 @@ fn decode_image(
     reader.limits(limits);
     let img = reader.decode().map_err(|e| e.to_string())?;
     let size = [img.width(), img.height()];
-    let side = ctx.input(|i| i.max_texture_side) as u32;
+    let side = max_side(ctx);
     let img = match size[0].max(size[1]) > side {
         true => img.thumbnail(side, side),
         false => img,
@@ -10531,6 +10603,58 @@ mod ui_tests {
             panic!("the save dialog should be open");
         };
         assert!(path.ends_with(".pdf"), "{path}");
+    }
+
+    /// An SVG is drawn sharp on a HiDPI screen (pixels per point times its size), yet no
+    /// bigger than the GPU takes; the size shown is the SVG's own.
+    #[test]
+    fn an_svg_is_drawn_at_the_screens_scale_within_the_gpus_limit() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80">
+            <rect width="120" height="80" fill="#ff0000"/></svg>"##;
+        let (pixels, size) = svg_pixels(svg, 2.0, 8192).unwrap();
+        assert_eq!((pixels.size, size), ([240, 160], [120, 80]));
+        assert_eq!(pixels.pixels[160 * 240 / 2 + 120], egui::Color32::RED);
+        let (pixels, _) = svg_pixels(svg, 2.0, 60).unwrap();
+        assert_eq!(pixels.size, [60, 40]);
+        assert!(svg_pixels("<svg", 1.0, 8192).is_err());
+    }
+
+    /// An SVG response opens drawn, as Postman's Preview; Raw and Pretty show its XML
+    /// with the text tools, and Preview comes back to the picture.
+    #[test]
+    fn an_svg_response_opens_as_a_picture_and_switches_to_its_text() {
+        let mut h = with_request("logo");
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80"><rect width="10" height="10"/></svg>"#;
+        h.state_mut().response = Some(Shown {
+            result: Ok(into_view(http::Response {
+                status: 200,
+                reason: "OK".into(),
+                version: "HTTP/1.1".into(),
+                elapsed: Duration::ZERO,
+                headers: vec![("content-type".into(), "image/svg+xml".into())],
+                body: svg.into(),
+                bytes: None,
+                truncated: false,
+                sent: Default::default(),
+            })),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            past: None,
+        });
+        h.run();
+        shot(&mut h, "65-svg-preview");
+        h.get_by_label("120 × 80");
+        for gone in ["Wrap", "Find"] {
+            assert!(h.query_by_label(gone).is_none(), "{gone}");
+        }
+        h.get_by_label("Raw").click();
+        h.run();
+        assert!(h.query_by_label("120 × 80").is_none());
+        assert!(h.query_by_label_contains("<rect").is_some());
+        h.get_by_label("Find");
+        h.get_by_label("Preview").click();
+        h.run();
+        h.get_by_label("120 × 80");
     }
 
     /// A small file can claim a huge picture: decoding one would take more RAM than a VDI
