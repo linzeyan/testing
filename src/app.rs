@@ -7022,14 +7022,24 @@ fn response_ui(
                         1 => ", the redirect included".into(),
                         n => format!(", {n} redirects included"),
                     };
-                    let connect = match (h.sent.connect, h.sent.dns) {
-                        (Some(c), Some(dns)) => format!(
-                            "DNS {} ms\nConnect {} ms (TCP, TLS)\n",
-                            dns.as_millis(),
-                            c.saturating_sub(dns).as_millis()
-                        ),
-                        (Some(c), None) => format!("Connect {} ms (TCP, TLS)\n", c.as_millis()),
-                        (None, _) => "Reused an open connection\n".into(),
+                    let connect = match h.sent.connect {
+                        Some(c) => {
+                            let (dns, tls) = (h.sent.dns, h.sent.tls);
+                            let tcp = (c.saturating_sub(dns.unwrap_or_default()))
+                                .saturating_sub(tls.unwrap_or_default());
+                            let line = |name, d: Option<Duration>| {
+                                d.map_or(String::new(), |d| {
+                                    format!("{name} {} ms\n", d.as_millis())
+                                })
+                            };
+                            format!(
+                                "{}{}{}",
+                                line("DNS", dns),
+                                line("TCP", Some(tcp)),
+                                line("TLS", tls)
+                            )
+                        }
+                        None => "Reused an open connection\n".into(),
                     };
                     let connected = waited.saturating_sub(h.sent.connect.unwrap_or_default());
                     ms.on_hover_text(format!(

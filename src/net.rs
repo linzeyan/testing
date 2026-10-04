@@ -246,7 +246,7 @@ pub async fn build_client_with_jar(
     // reqwest is built with `rustls-no-provider` (ring cross-compiles to Windows with just
     // clang; aws-lc-rs needs cmake/nasm). Installing is idempotent, and doing it here covers
     // every client, including the PAC fetcher below.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_provider();
     let scripts_jar = jar.clone();
 
     // Any explicit `.proxy()` turns off reqwest's own system-proxy lookup.
@@ -689,11 +689,46 @@ where
         let started = Instant::now();
         let connecting = self.0.call(req);
         Box::pin(async move {
+            crate::http::trace(|t| t.hello = None);
             let conn = connecting.await;
-            let took = started.elapsed();
-            crate::http::trace(|t| *t.connect.get_or_insert_default() += took);
+            let done = Instant::now();
+            crate::http::trace(|t| {
+                *t.connect.get_or_insert_default() += done - started;
+                // Through an https:// proxy the first hello is the proxy's, so TLS also
+                // holds the CONNECT and the server's own handshake.
+                if let Some(hello) = t.hello.take() {
+                    *t.tls.get_or_insert_default() += done - hello;
+                }
+            });
             conn
         })
+    }
+}
+
+/// ring, with `HelloAt` drawing its random numbers. Installing is idempotent: the first
+/// install wins, so every place that installs one goes through here.
+pub fn install_provider() {
+    let _ = rustls::crypto::CryptoProvider {
+        secure_random: &HelloAt,
+        ..rustls::crypto::ring::default_provider()
+    }
+    .install_default();
+}
+
+/// Marks when a TLS handshake starts, for the time hover's TCP/TLS split. reqwest's
+/// connector does TCP, a proxy's CONNECT and TLS in one call, but rustls draws the
+/// ClientHello's random first thing in a handshake, and draws it from the provider. Later
+/// draws in the same handshake keep the first mark.
+#[derive(Debug)]
+struct HelloAt;
+
+impl rustls::crypto::SecureRandom for HelloAt {
+    fn fill(&self, buf: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
+        crate::http::trace(|t| {
+            t.hello.get_or_insert_with(Instant::now);
+        });
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), buf)
+            .map_err(|_| rustls::crypto::GetRandomFailed)
     }
 }
 

@@ -290,7 +290,7 @@ mod tests {
             tokio::spawn(serve(ws.clone(), ws.collections(), listener, |_| {}));
             addr
         });
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::net::install_provider();
         let client = reqwest::Client::new();
         rt.block_on(async {
             let resp = client

@@ -24,10 +24,12 @@ pub struct Sent {
     pub waited: Option<Duration>,
     /// Part of `waited`: opening new connections, DNS, TCP, TLS and a proxy's CONNECT
     /// together. None when an open one was reused.
-    /// ponytail: TCP and TLS stay together; telling them apart means wrapping rustls's
-    /// handshake inside reqwest's connector.
     #[serde(default)]
     pub connect: Option<Duration>,
+    /// Part of `connect`: the TLS handshakes. None over plain HTTP, and from before it
+    /// was kept.
+    #[serde(default)]
+    pub tls: Option<Duration>,
     /// Part of `connect`: looking the host up. None for an IP address, a reused
     /// connection, or a SOCKS proxy that resolves names itself.
     #[serde(default)]
@@ -38,7 +40,7 @@ pub struct Sent {
 /// every frame, and a client loads root certificates and system proxies when made.
 pub(crate) static OFFLINE: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     // Client::new panics without a provider, and nothing may have been sent yet.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::net::install_provider();
     reqwest::Client::new()
 });
 
@@ -51,9 +53,13 @@ const MAX_SENT_BODY: usize = 64 << 10;
 pub struct Trace {
     pub cookie: Option<String>,
     pub hops: Vec<(u16, String)>,
-    /// Filled in by the connector, see `net::TimeConnect` and `net::TimeDns`.
+    /// Filled in by the connector, see `net::TimeConnect`, `net::TimeDns` and
+    /// `net::HelloAt`.
     pub connect: Option<Duration>,
     pub dns: Option<Duration>,
+    pub tls: Option<Duration>,
+    /// When the handshake of the connection being opened started.
+    pub hello: Option<Instant>,
 }
 
 tokio::task_local! {
@@ -383,7 +389,7 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
     sent.waited = Some(started.elapsed());
     sent.added(trace.cookie, body_len);
     sent.hops = trace.hops;
-    (sent.connect, sent.dns) = (trace.connect, trace.dns);
+    (sent.connect, sent.dns, sent.tls) = (trace.connect, trace.dns, trace.tls);
     sent.remote = resp.remote_addr().map(|a| a.to_string());
     let status = resp.status();
     let version = format!("{:?}", resp.version());
@@ -742,7 +748,7 @@ pub(crate) mod tests {
     }
 
     /// The whole request: a streamed body can arrive after the headers.
-    fn read_request(stream: &mut std::net::TcpStream) -> String {
+    fn read_request(stream: &mut impl Read) -> String {
         let (mut req, mut buf) = (Vec::new(), [0; 16 * 1024]);
         loop {
             let n = stream.read(&mut buf).unwrap_or(0);
@@ -1270,6 +1276,55 @@ pub(crate) mod tests {
         let by_name = get(&rt, name.replace("127.0.0.1", "localhost"));
         let (dns, connect) = (by_name.sent.dns.unwrap(), by_name.sent.connect.unwrap());
         assert!(dns <= connect, "{:?}", by_name.sent);
+    }
+
+    /// The time hover's TCP and TLS lines: a server slow to answer the ClientHello shows
+    /// as TLS time, while TCP (accepted by the OS backlog at once) stays short.
+    #[test]
+    fn a_slow_tls_handshake_is_timed_apart_from_tcp() {
+        crate::net::install_provider();
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(own.signing_key.serialize_der());
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![own.cert.der().clone()], key.unwrap())
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            // The ClientHello is in: everything from here on is the handshake.
+            s.peek(&mut [0]).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let mut conn = rustls::ServerConnection::new(config.into()).unwrap();
+            let mut tls = rustls::Stream::new(&mut conn, &mut s);
+            read_request(&mut tls);
+            let _ = tls
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok");
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // A process's first connection can take seconds here, which is TCP's to show.
+        get(&rt, serve_bytes("content-type: text/plain", b"x".to_vec()));
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            insecure: true,
+            ..Default::default()
+        };
+        let c = rt.block_on(crate::net::build_client(net)).unwrap().http;
+        let req = Request {
+            method: "GET".into(),
+            url: format!("https://localhost:{}/", addr.port()),
+            ..Default::default()
+        };
+        let sent = rt.block_on(execute(c, req)).unwrap().sent;
+        let (connect, tls) = (sent.connect.unwrap(), sent.tls.unwrap());
+        let ms = Duration::from_millis;
+        assert!(tls >= ms(300) && tls <= connect, "{sent:?}");
+        let tcp = connect - tls - sent.dns.unwrap_or_default();
+        assert!(tcp < ms(200), "{sent:?}");
     }
 
     /// A reused connection costs nothing to open; it must not show the last one's time.
