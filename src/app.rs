@@ -781,6 +781,7 @@ impl App {
             c if c.contains("json") => "json",
             c if c.contains("xml") => "xml",
             c if c.contains("html") => "html",
+            c if c.contains("pdf") => "pdf",
             c if c.starts_with("text/") => "txt",
             // image/png, image/svg+xml…
             c if c.starts_with("image/") => c[6..].split([';', '+']).next().unwrap_or("bin"),
@@ -851,13 +852,18 @@ impl App {
         }
     }
 
-    /// HTML isn't drawn here: the browser shows it (relative links and assets won't load).
-    fn open_html(&mut self) {
+    /// HTML and PDF aren't drawn here: the browser (or the system's PDF viewer) shows them
+    /// from a temp file, so an HTML page's relative links and assets won't load.
+    fn open_external(&mut self) {
         let Some(Ok(view)) = self.response.as_ref().map(|s| &s.result) else {
             return;
         };
-        let path = std::env::temp_dir().join("apitool-response.html");
-        let opened = (std::fs::write(&path, view.raw()).map_err(|e| e.to_string()))
+        let Some(ext) = external_type(&view.head) else {
+            return;
+        };
+        let path = std::env::temp_dir().join(format!("apitool-response.{ext}"));
+        let body = view.head.bytes.as_deref().unwrap_or(view.raw().as_bytes());
+        let opened = (std::fs::write(&path, body).map_err(|e| e.to_string()))
             .and_then(|()| crate::auth::open_browser(&path.display().to_string()));
         if let Err(e) = opened {
             self.status = e;
@@ -2987,7 +2993,7 @@ impl App {
         // As in Postman: beside both the request and its response, so edits show live.
         let mut lang_changed = false;
         let mut save_file = false;
-        let mut open_html = false;
+        let mut open_external = false;
         let wrap_before = self.wrap_response;
         let filters_before = self.recent_filters.first().cloned();
         let mut raw_changed = false;
@@ -3505,7 +3511,7 @@ impl App {
                     let wrap = &mut self.wrap_response;
                     let tab = &mut self.resp_tab;
                     let recent = &mut self.recent_filters;
-                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_html, &mut past, recent);
+                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_external, &mut past, recent);
                     if let Ok(view) = &shown.result
                         && pretty_before != Some(view.pretty)
                     {
@@ -3569,8 +3575,8 @@ impl App {
         if save_file {
             self.ask_save_body();
         }
-        if open_html {
-            self.open_html();
+        if open_external {
+            self.open_external();
         }
 
         if save {
@@ -6988,7 +6994,7 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
 }
 
 /// Returns an example to save when the user asked for one.
-/// `wrap` is the word-wrap switch; `save_file` and `open_html` are set when the user asks
+/// `wrap` is the word-wrap switch; `save_file` and `open_external` are set when the user asks
 /// to save the body or see it in a browser.
 // Each is a separate App field borrowed for the pane; a struct for this one call would
 // only rename them.
@@ -6999,7 +7005,7 @@ fn response_ui(
     tab: &mut RespTab,
     wrap: &mut bool,
     save_file: &mut bool,
-    open_html: &mut bool,
+    open_external: &mut bool,
     past: &mut Past,
     recent: &mut Vec<String>,
 ) -> Option<Example> {
@@ -7129,14 +7135,12 @@ fn response_ui(
                 {
                     *save_file = true;
                 }
-                let html = (view.head.headers.iter())
-                    .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("html"));
-                if html
+                if external_type(&view.head).is_some()
                     && (ui.small_button("Open in browser"))
-                        .on_hover_text("Show the HTML in your browser")
+                        .on_hover_text("Show it in your browser, or the system's PDF viewer")
                         .clicked()
                 {
-                    *open_html = true;
+                    *open_external = true;
                 }
                 // Examples hold text.
                 if !binary
@@ -7637,6 +7641,19 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     }
 }
 
+/// The file extension for a body a browser shows better than this pane: HTML, PDF, SVG.
+fn external_type(head: &http::Response) -> Option<&'static str> {
+    let content_type = (head.headers.iter())
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map_or("", |(_, v)| v.as_str());
+    match content_type {
+        c if c.contains("html") => Some("html"),
+        c if c.contains("pdf") => Some("pdf"),
+        c if c.contains("svg") => Some("svg"),
+        _ => None,
+    }
+}
+
 /// A body that isn't text: shown when it's an image, else only its size.
 fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
     let bytes = view.head.bytes.as_deref().unwrap_or_default();
@@ -7661,8 +7678,8 @@ fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
     }
 }
 
-/// PNG and JPEG. Bigger than the GPU takes, the picture is scaled down to fit.
-// ponytail: no GIF or WebP; enable those `image` features if APIs here serve them.
+/// PNG, JPEG and WebP. Bigger than the GPU takes, the picture is scaled down to fit.
+// ponytail: no GIF; enable that `image` feature if APIs here serve them.
 fn decode_image(
     ctx: &egui::Context,
     bytes: &[u8],
@@ -10458,9 +10475,62 @@ mod ui_tests {
         h.run();
         assert_eq!(std::fs::read(&file).unwrap(), png);
 
+        let mut webp = Vec::new();
+        (img.write_to(
+            &mut std::io::Cursor::new(&mut webp),
+            image::ImageFormat::WebP,
+        ))
+        .unwrap();
+        show(&mut h, webp);
+        h.get_by_label("120 × 80");
+
         // Not a picture it reads: its size, and how to keep it.
         show(&mut h, b"PK\x03\x04\xff\xff".to_vec());
         assert!(h.query_by_label_contains("6 B of binary data").is_some());
+        assert!(h.query_by_label("Open in browser").is_none());
+    }
+
+    /// What this pane can't draw goes to the browser (or PDF viewer) with the bytes that
+    /// came: a PDF read as text would be mangled. Save… names a PDF for its type too.
+    #[test]
+    fn html_pdf_and_svg_open_outside_with_their_own_extension() {
+        let head = |content_type: &str| http::Response {
+            status: 200,
+            reason: "OK".into(),
+            version: "HTTP/1.1".into(),
+            elapsed: Duration::ZERO,
+            headers: vec![("Content-Type".into(), content_type.into())],
+            body: String::new(),
+            bytes: None,
+            truncated: false,
+            sent: Default::default(),
+        };
+        assert_eq!(
+            external_type(&head("text/html; charset=utf-8")),
+            Some("html")
+        );
+        assert_eq!(external_type(&head("application/pdf")), Some("pdf"));
+        assert_eq!(external_type(&head("image/svg+xml")), Some("svg"));
+        assert_eq!(external_type(&head("application/json")), None);
+
+        let mut h = with_request("report");
+        h.state_mut().response = Some(Shown {
+            result: Ok(into_view(http::Response {
+                bytes: Some(b"%PDF-1.7\n\xe2\xe3\xcf\xd3".to_vec()),
+                ..head("application/pdf")
+            })),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            past: None,
+        });
+        h.run();
+        h.get_by_label("Open in browser");
+        h.get_by_label("Save…").click();
+        h.run();
+        let Some(Dialog::SaveBody { path, .. }) = &h.state().dialog else {
+            panic!("the save dialog should be open");
+        };
+        assert!(path.ends_with(".pdf"), "{path}");
     }
 
     /// A small file can claim a huge picture: decoding one would take more RAM than a VDI
