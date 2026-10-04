@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.82.1"
+version = "0.83.0"
 edition = "2024"
 
 [dependencies]
@@ -10,6 +10,8 @@ eframe = { version = "0.36", default-features = false, features = ["wgpu", "glow
 # Already in the tree via eframe (PNG, for icons); JPEG added for the response preview.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # No raster-images (pictures inside an SVG) or svgz: those pull in more decoders.
+# Pure-Rust PDF rasterizer; embeds stand-ins for the 14 standard fonts (~240 KB).
+hayro = "0.7"
 resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 futures-util = "0.3"
 getrandom = "0.3"

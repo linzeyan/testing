@@ -326,6 +326,9 @@ struct ResponseView {
     image: Option<Result<(egui::TextureHandle, [u32; 2]), String>>,
     /// An SVG drawn rather than shown as text.
     preview: bool,
+    /// A PDF's page on show (0-based) and its number of pages, known once drawn.
+    page: usize,
+    pages: usize,
     find: Find,
     /// The JSON filter as typed, the one `text` shows the result of, and why it can't apply.
     filter: String,
@@ -1839,6 +1842,8 @@ fn into_view(mut head: http::Response) -> ResponseView {
         folds: BTreeMap::new(),
         image: None,
         preview,
+        page: 0,
+        pages: 0,
         find: Find::default(),
         filter: String::new(),
         applied: String::new(),
@@ -7676,17 +7681,42 @@ fn external_type(head: &http::Response) -> Option<&'static str> {
 /// its size.
 fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
     let ctx = ui.ctx().clone();
+    // Before the drawing: a page turned here is drawn in the same frame.
+    if view.pages > 1 {
+        ui.horizontal(|ui| {
+            let (page, pages) = (view.page, view.pages);
+            let back = ui.add_enabled(page > 0, egui::Button::new("‹"));
+            if back.on_hover_text("Previous page").clicked() {
+                (view.page, view.image) = (page - 1, None);
+            }
+            ui.label(format!("Page {} of {pages}", page + 1));
+            let next = ui.add_enabled(page + 1 < pages, egui::Button::new("›"));
+            if next.on_hover_text("Next page").clicked() {
+                (view.page, view.image) = (page + 1, None);
+            }
+        });
+    }
     if view.image.is_none() {
+        let (scale, side) = (ctx.pixels_per_point(), max_side(&ctx));
+        let texture = |pixels: egui::ColorImage, size: [u32; 2]| {
+            (
+                ctx.load_texture("response-preview", pixels, Default::default()),
+                size,
+            )
+        };
         view.image = Some(match &view.head.bytes {
+            Some(bytes) if external_type(&view.head) == Some("pdf") => {
+                pdf_pixels(bytes, view.page, scale, side).map(|(pixels, size, pages)| {
+                    if view.pages != pages {
+                        // The arrows above need another frame now that the count is known.
+                        view.pages = pages;
+                        ctx.request_repaint();
+                    }
+                    texture(pixels, size)
+                })
+            }
             Some(bytes) => decode_image(&ctx, bytes),
-            None => svg_pixels(view.raw(), ctx.pixels_per_point(), max_side(&ctx)).map(
-                |(pixels, size)| {
-                    (
-                        ctx.load_texture("response-svg", pixels, Default::default()),
-                        size,
-                    )
-                },
-            ),
+            None => svg_pixels(view.raw(), scale, side).map(|(p, size)| texture(p, size)),
         });
     }
     match view.image.as_ref().expect("decoded above") {
@@ -7718,6 +7748,45 @@ fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
             ));
         }
     }
+}
+
+/// One page of a PDF, drawn as `svg_pixels` draws an SVG (on white, its size in points),
+/// and the number of pages. A PDF is the server's: one hayro can't read must not take the
+/// app down with it, so its panics end here as an error.
+// ponytail: parsed again for each page turned, and drawn on the UI thread; a heavy page
+// stalls a frame. Keep the parsed Pdf or draw on a thread if that shows.
+fn pdf_pixels(
+    bytes: &[u8],
+    page: usize,
+    scale: f32,
+    side: u32,
+) -> Result<(egui::ColorImage, [u32; 2], usize), String> {
+    let draw = || {
+        let pdf = hayro::hayro_syntax::Pdf::new(std::sync::Arc::new(bytes.to_vec())).map_err(
+            |e| match e {
+                hayro::hayro_syntax::LoadPdfError::Decryption(_) => "it's encrypted".to_owned(),
+                hayro::hayro_syntax::LoadPdfError::Invalid => "not a PDF it can read".to_owned(),
+            },
+        )?;
+        let pages = pdf.pages();
+        let shown = pages.get(page).ok_or("it has no pages")?;
+        let (w, h) = shown.render_dimensions();
+        let side = (side as f32).min(4096.0);
+        let scale = scale.min(side / w.max(h));
+        let settings = hayro::RenderSettings {
+            x_scale: scale,
+            y_scale: scale,
+            bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+            ..Default::default()
+        };
+        let cache = hayro::RenderCache::new();
+        let pixmap = hayro::render(shown, &cache, &Default::default(), &settings);
+        let size = [pixmap.width() as usize, pixmap.height() as usize];
+        let pixels = egui::ColorImage::from_rgba_premultiplied(size, pixmap.data_as_u8_slice());
+        Ok((pixels, [w.round() as u32, h.round() as u32], pages.len()))
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(draw))
+        .unwrap_or_else(|_| Err("not a PDF it can read".into()))
 }
 
 fn max_side(ctx: &egui::Context) -> u32 {
@@ -10655,6 +10724,87 @@ mod ui_tests {
         h.get_by_label("Preview").click();
         h.run();
         h.get_by_label("120 × 80");
+    }
+
+    /// A PDF of `pages` 200 × 100 pt pages, each filled with its colour ("r g b").
+    fn pdf_of(pages: &[&str]) -> Vec<u8> {
+        let n = pages.len();
+        let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 3 + 2 * i)).collect();
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            format!("<< /Type /Pages /Kids [{}] /Count {n} >>", kids.join(" ")),
+        ];
+        for (i, rgb) in pages.iter().enumerate() {
+            objects.push(format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents {} 0 R >>",
+                4 + 2 * i
+            ));
+            let content = format!("{rgb} rg 0 0 200 100 re f");
+            objects.push(format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ));
+        }
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+        for o in offsets {
+            pdf.extend(format!("{o:010} 00000 n \n").bytes());
+        }
+        let trailer = format!("trailer\n<< /Size {} /Root 1 0 R >>\n", objects.len() + 1);
+        pdf.extend(format!("{trailer}startxref\n{xref}\n%%EOF\n").bytes());
+        pdf
+    }
+
+    /// A PDF page is drawn sharp at the screen's scale, sized in points; what isn't a PDF
+    /// hayro can read is an error, never a crash: the bytes are the server's.
+    #[test]
+    fn a_pdf_page_is_drawn_and_a_broken_one_is_an_error() {
+        let pdf = pdf_of(&["1 0 0", "0 0 1"]);
+        let (pixels, size, pages) = pdf_pixels(&pdf, 1, 2.0, 8192).unwrap();
+        assert_eq!((pixels.size, size, pages), ([400, 200], [200, 100], 2));
+        assert_eq!(pixels.pixels[200 * 400 / 2 + 200], egui::Color32::BLUE);
+        let (pixels, ..) = pdf_pixels(&pdf, 0, 2.0, 100).unwrap();
+        assert_eq!(pixels.size, [100, 50]);
+        assert_eq!(pixels.pixels[25 * 100 + 50], egui::Color32::RED);
+        assert!(pdf_pixels(b"%PDF-1.4 garbage", 0, 1.0, 8192).is_err());
+    }
+
+    /// A PDF response shows its first page, and the arrows turn the pages.
+    #[test]
+    fn a_pdf_response_is_previewed_page_by_page() {
+        let mut h = with_request("pages");
+        h.state_mut().response = Some(Shown {
+            result: Ok(into_view(http::Response {
+                status: 200,
+                reason: "OK".into(),
+                version: "HTTP/1.1".into(),
+                elapsed: Duration::ZERO,
+                headers: vec![("content-type".into(), "application/pdf".into())],
+                body: String::new(),
+                bytes: Some(pdf_of(&["1 0 0", "0 0 1", "0 1 0"])),
+                truncated: false,
+                sent: Default::default(),
+            })),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            past: None,
+        });
+        h.run();
+        shot(&mut h, "66-pdf-preview");
+        h.get_by_label("200 × 100");
+        h.get_by_label("Page 1 of 3");
+        h.get_by_label("›").click();
+        h.run();
+        h.get_by_label("Page 2 of 3");
+        h.get_by_label("‹").click();
+        h.run();
+        h.get_by_label("Page 1 of 3");
     }
 
     /// A small file can claim a huge picture: decoding one would take more RAM than a VDI
