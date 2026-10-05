@@ -112,6 +112,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "接受任何伺服器憑證。只在排查 CA 問題時使用。",
     ),
     ("API key", "API 金鑰"),
+    ("apitool {} is the latest", "apitool {} 已是最新版本"),
     ("App settings", "應用程式設定"),
     ("Apply", "套用"),
     ("As received", "依收到的原樣"),
@@ -153,6 +154,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ("cancelled", "已取消"),
     ("Certificate; empty sends none", "憑證；留空則不送"),
     ("Certificates", "憑證"),
+    ("Check every day", "每天檢查"),
+    ("Check every week", "每週檢查"),
+    ("Check now", "立即檢查"),
+    ("Check when apitool starts", "每次啟動 apitool 時檢查"),
     (
         "Checked in order before the one above",
         "依序比對，優先於上方的憑證",
@@ -243,6 +248,11 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Disconnect", "中斷連線"),
     ("Docs", "文件"),
     ("Domain", "網域"),
+    ("Don't check", "不檢查"),
+    (
+        "Downloads it in the background; it starts next time",
+        "在背景下載，下次啟動時生效",
+    ),
     ("Duplicate", "複製一份"),
     ("Duplicate environment", "複製環境"),
     ("Duplicate Tab", "複製分頁"),
@@ -344,6 +354,9 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Import a collection or spec", "匯入集合或規格"),
     ("Import…", "匯入…"),
     ("Inherit from parent", "繼承上層"),
+    ("Install", "安裝"),
+    ("Install automatically", "自動安裝"),
+    ("Installing {}…", "正在安裝 {}…"),
     ("Interface font", "介面字型"),
     (
         "Introspect using this request's URL, headers and auth",
@@ -515,6 +528,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Refresh", "重新整理"),
     ("Region", "區域"),
     ("Regular expression", "規則運算式"),
+    ("Release notes", "版本說明"),
     ("Reload", "重新載入"),
     ("Remove", "移除"),
     ("Rename", "重新命名"),
@@ -543,6 +557,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Reset to defaults", "重設為預設值"),
     ("Response matches its schema", "回應符合 schema"),
     ("Response time is below 500 ms", "回應時間低於 500 ms"),
+    ("Restart now", "立即重新啟動"),
     ("Retain", "保留"),
     ("Reused an open connection\n", "沿用已開啟的連線\n"),
     ("Run", "執行"),
@@ -559,6 +574,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Save as…", "另存為…"),
     ("Save changes to \"{}\"?", "要儲存「{}」的變更嗎？"),
+    (
+        "Save or close the requests with unsaved edits first",
+        "請先儲存或關閉有未儲存修改的請求",
+    ),
     (
         "Save the body to a file, as received",
         "將內容依收到的原樣存成檔案",
@@ -738,6 +757,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Undefined: {}", "未定義：{}"),
     ("Unfold", "展開"),
     ("Unsaved changes", "尚未儲存的變更"),
+    ("Update", "更新"),
+    ("Updates", "更新"),
     ("Use the files", "使用檔案"),
     ("Username", "使用者名稱"),
     (
@@ -807,6 +828,11 @@ const ZH_TW: &[(&str, &str)] = &[
     ("{} d ago", "{} 天前"),
     ("{} failed requests", "{} 個請求失敗"),
     ("{} h ago", "{} 小時前"),
+    ("{} is available", "有新版本 {}"),
+    (
+        "{} is installed and starts next time",
+        "{} 已安裝，下次啟動時生效",
+    ),
     ("{} items", "{} 個項目"),
     (
         "{} jumps to any request or environment",

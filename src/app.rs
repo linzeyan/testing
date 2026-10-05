@@ -68,6 +68,21 @@ enum Msg {
     Schema(String, Result<graphql::Schema, String>),
     /// gRPC reflection finished: how many services the server has.
     Reflected(Result<usize, String>),
+    Latest(Result<crate::update::Release, String>),
+    /// An update was installed, or why not.
+    Installed(crate::update::Release, Result<(), String>),
+}
+
+/// Where looking for and installing an update is at.
+enum Update {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(crate::update::Release),
+    Installing(String),
+    /// Used from the next start.
+    Installed(String),
+    Failed(String),
 }
 
 /// Stream events kept per session, by count and by bytes; older ones scroll away.
@@ -675,6 +690,12 @@ pub struct App {
     /// change in Settings.
     applied: Option<Appearance>,
     settings: bool,
+    updates: crate::update::Updates,
+    update: Update,
+    /// Checks on `updates`' schedule. Only the real app does: tests mustn't reach GitHub.
+    auto_update: bool,
+    /// Start the installed update once the window has closed.
+    restart: bool,
     /// The system's fonts for the pickers, read when Settings first opens.
     font_families: Option<Vec<(String, bool)>>,
     mock: Option<MockServer>,
@@ -751,6 +772,10 @@ impl App {
             raw_types: state.raw_types.clone(),
             appearance: state.appearance.clone(),
             applied: None,
+            updates: state.updates.clone(),
+            update: Update::Idle,
+            auto_update: false,
+            restart: false,
             settings: false,
             font_families: None,
             mock: None,
@@ -919,6 +944,7 @@ impl App {
             recent_filters: self.recent_filters.clone(),
             raw_types: self.raw_types.clone(),
             appearance: self.appearance.clone(),
+            updates: self.updates.clone(),
         });
     }
 
@@ -1010,6 +1036,58 @@ impl App {
         self.tree = self.ws.tree();
         self.statuses = self.ws.last_statuses();
         self.envs = self.ws.env_names();
+    }
+
+    /// For the real app, not tests: clears what the last update left and checks for the
+    /// next on the schedule chosen in Settings.
+    pub fn auto_update(&mut self) {
+        crate::update::clean_up();
+        self.auto_update = true;
+    }
+
+    fn check_updates(&mut self, ctx: &egui::Context) {
+        self.update = Update::Checking;
+        self.updates.checked = store::unix_now();
+        self.save_state();
+        let (cell, net, tx, ctx) = (
+            self.client.clone(),
+            (self.network.clone(), self.cookies.clone()),
+            self.tx.clone(),
+            ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            // Through the proxy chosen for requests: a VDI may have no other way out.
+            let result = match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
+                Ok(clients) => crate::update::latest(&clients.http).await,
+                Err(e) => Err(format!("Network settings: {e}")),
+            };
+            let _ = tx.send(Msg::Latest(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn install_update(&mut self, release: crate::update::Release, ctx: &egui::Context) {
+        self.update = Update::Installing(release.version.clone());
+        let (cell, net, tx, ctx) = (
+            self.client.clone(),
+            (self.network.clone(), self.cookies.clone()),
+            self.tx.clone(),
+            ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let result = match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
+                Ok(clients) => crate::update::install(&clients.http, &release).await,
+                Err(e) => Err(format!("Network settings: {e}")),
+            };
+            let _ = tx.send(Msg::Installed(release, result));
+            ctx.request_repaint();
+        });
     }
 
     /// The workspace folder's files and the database into step (`Workspace::sync`): on
@@ -1569,7 +1647,7 @@ impl App {
         }
     }
 
-    fn receive(&mut self) {
+    fn receive(&mut self, ctx: &egui::Context) {
         if let Some(s) = self.stream.as_mut().filter(|s| s.live)
             && s.log.lock().unwrap().ended
         {
@@ -1621,6 +1699,28 @@ impl App {
                     self.status = match result {
                         Ok(n) => format!("The server has {n} services (gRPC reflection)"),
                         Err(e) => e,
+                    };
+                    continue;
+                }
+                Msg::Latest(result) => {
+                    self.update = match result {
+                        Ok(release) if crate::update::is_newer(&release.version) => {
+                            if self.updates.install && release.archive.is_some() {
+                                self.install_update(release, ctx);
+                                continue;
+                            }
+                            Update::Available(release)
+                        }
+                        Ok(_) => Update::UpToDate,
+                        // Only Settings shows it: offline is no news.
+                        Err(e) => Update::Failed(e),
+                    };
+                    continue;
+                }
+                Msg::Installed(release, result) => {
+                    self.update = match result {
+                        Ok(()) => Update::Installed(release.version),
+                        Err(e) => Update::Failed(format!("{}: {e}", release.version)),
                     };
                     continue;
                 }
@@ -2191,8 +2291,14 @@ impl eframe::App for App {
             }
             self.applied = Some(self.appearance.clone());
         }
-        self.receive();
+        self.receive(ui.ctx());
         self.tick_repeat(ui.ctx());
+        if self.auto_update
+            && !matches!(self.update, Update::Checking | Update::Installing(_))
+            && (self.updates).due(store::unix_now(), !matches!(self.update, Update::Idle))
+        {
+            self.check_updates(ui.ctx());
+        }
         let focus = ui.input(|i| {
             i.events.iter().find_map(|e| match e {
                 egui::Event::WindowFocused(focused) => Some(*focused),
@@ -2303,6 +2409,11 @@ impl eframe::App for App {
                 self.dialog = Some(Dialog::Unsaved(Next::Quit));
             } else {
                 self.sync();
+                if self.restart
+                    && let Err(e) = crate::update::restart()
+                {
+                    eprintln!("restarting: {e}");
+                }
             }
         }
 
@@ -2349,6 +2460,18 @@ impl App {
                     .clicked()
                 {
                     self.settings = true;
+                }
+                let news = match &self.update {
+                    Update::Available(r) => Some((&r.version, t("{} is available"))),
+                    Update::Installed(v) => Some((v, t("{} is installed and starts next time"))),
+                    _ => None,
+                };
+                if let Some((version, hint)) = news {
+                    let text = RichText::new(format!("{} {version}", icon::ARROW_CIRCLE_UP));
+                    let button = named(ui.small_button(text.color(GREEN)), t("Update"), None);
+                    if button.on_hover_text(tf(hint, &[version])).clicked() {
+                        self.settings = true;
+                    }
                 }
                 let proxy = match self.network.proxy {
                     ProxyMode::System => t("System proxy"),
@@ -4996,11 +5119,15 @@ impl App {
         if !self.settings {
             return;
         }
+        // A restart that waited on the unsaved-edits question could come on a later close.
+        let unsaved = !self.unsaved().is_empty();
         let families = self
             .font_families
             .get_or_insert_with(crate::appearance::families);
         let a = &mut self.appearance;
+        let (updates, update) = (&mut self.updates, &self.update);
         let (mut close, mut network) = (false, false);
+        let (mut check, mut install, mut restart) = (false, None, false);
         let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
             ui.set_width(460.0);
             ui.heading(t("Settings"));
@@ -5046,6 +5173,77 @@ impl App {
                     ui.label(t("Network"));
                     network = ui.button(t("Proxy and certificates…")).clicked();
                     ui.end_row();
+                    ui.label(t("Updates"));
+                    ui.vertical(|ui| {
+                        use crate::update::Check;
+                        let label = |c| match c {
+                            Check::Never => t("Don't check"),
+                            Check::AtStart => t("Check when apitool starts"),
+                            Check::Daily => t("Check every day"),
+                            Check::Weekly => t("Check every week"),
+                        };
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("update-check")
+                                .selected_text(label(updates.check))
+                                .show_ui(ui, |ui| {
+                                    for c in
+                                        [Check::Never, Check::AtStart, Check::Daily, Check::Weekly]
+                                    {
+                                        ui.selectable_value(&mut updates.check, c, label(c));
+                                    }
+                                });
+                            ui.checkbox(&mut updates.install, t("Install automatically"))
+                                .on_hover_text(t(
+                                    "Downloads it in the background; it starts next time",
+                                ));
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            let busy = matches!(update, Update::Checking | Update::Installing(_));
+                            check = ui
+                                .add_enabled(!busy, egui::Button::new(t("Check now")))
+                                .clicked();
+                            match update {
+                                Update::Idle => {
+                                    ui.weak(format!("apitool {}", crate::update::CURRENT));
+                                }
+                                Update::Checking => {
+                                    ui.spinner();
+                                }
+                                Update::UpToDate => {
+                                    ui.label(tf(
+                                        "apitool {} is the latest",
+                                        &[&crate::update::CURRENT],
+                                    ));
+                                }
+                                Update::Available(r) => {
+                                    ui.label(tf("{} is available", &[&r.version]));
+                                    if r.archive.is_some() && ui.button(t("Install")).clicked() {
+                                        install = Some(r.clone());
+                                    }
+                                    ui.hyperlink_to(t("Release notes"), &r.page);
+                                }
+                                Update::Installing(v) => {
+                                    ui.spinner();
+                                    ui.label(tf("Installing {}…", &[v]));
+                                }
+                                Update::Installed(v) => {
+                                    ui.label(tf("{} is installed and starts next time", &[v]));
+                                    restart = (ui.add_enabled(
+                                        !unsaved,
+                                        egui::Button::new(t("Restart now")),
+                                    ))
+                                    .on_disabled_hover_text(t(
+                                        "Save or close the requests with unsaved edits first",
+                                    ))
+                                    .clicked();
+                                }
+                                Update::Failed(e) => {
+                                    ui.colored_label(ORANGE, clip(e, 200));
+                                }
+                            }
+                        });
+                    });
+                    ui.end_row();
                 });
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5058,6 +5256,17 @@ impl App {
         }
         if network {
             self.network_editor = Some(self.network.clone());
+        }
+        if check {
+            self.check_updates(ctx);
+        }
+        if let Some(release) = install {
+            self.install_update(release, ctx);
+        }
+        if restart {
+            // Through the usual close, which asks about unsaved edits first.
+            self.restart = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -9313,6 +9522,42 @@ mod ui_tests {
 
     fn draft<'h>(h: &'h Harness<'_, App>) -> &'h Request {
         &h.state().open.as_ref().unwrap().draft
+    }
+
+    /// A newer release is pointed at from the status bar and offered in Settings; the
+    /// same or an older one is no news. (Tests never check on a schedule: no GitHub.)
+    #[test]
+    fn a_newer_release_shows_in_the_status_bar_and_settings() {
+        use crate::update::{CURRENT, Release};
+        let mut h = harness(workspace("update"));
+        h.run();
+        let release = |version: &str| Release {
+            version: version.into(),
+            page: "https://example.test/notes".into(),
+            archive: None,
+        };
+        h.state()
+            .tx
+            .send(Msg::Latest(Ok(release("999.0.0"))))
+            .unwrap();
+        h.run();
+        h.get_by_label("Update").click();
+        h.run();
+        assert!(h.state().settings);
+        h.get_by_label("999.0.0 is available");
+        shot(&mut h, "update-available");
+        assert!(
+            h.query_by_label("Install").is_none(),
+            "no build for this platform"
+        );
+
+        h.state()
+            .tx
+            .send(Msg::Latest(Ok(release(CURRENT))))
+            .unwrap();
+        h.run();
+        h.get_by_label(&format!("apitool {CURRENT} is the latest"));
+        assert!(h.query_by_label("Update").is_none());
     }
 
     /// "Create a collection" was asked for by name: the sidebar's button makes a top-level

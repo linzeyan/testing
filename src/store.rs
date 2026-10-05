@@ -98,7 +98,7 @@ impl HistoryEntry {
     }
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -156,6 +156,7 @@ pub struct State {
     /// Content types last switched to Raw: their responses open that way.
     pub raw_types: Vec<String>,
     pub appearance: crate::appearance::Appearance,
+    pub updates: crate::update::Updates,
 }
 
 /// Clones share one connection: the GUI's mock server reads from its own thread.

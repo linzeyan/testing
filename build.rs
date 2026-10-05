@@ -3,6 +3,9 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/apitool.res");
+    // The updater picks the release archive built for the same target.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    println!("cargo:rustc-env=APITOOL_TARGET={target}");
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     if os == "windows" && env == "msvc" {

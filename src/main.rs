@@ -58,10 +58,9 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             // The app installs it with the fonts chosen in Settings.
             let font = appearance::cjk().map_or("none: CJK text will not render", |(p, _)| p);
-            Ok(Box::new(app::App::new(
-                ws,
-                format!("{}\nCJK font: {font}", renderer_info(cc)),
-            )))
+            let mut app = app::App::new(ws, format!("{}\nCJK font: {font}", renderer_info(cc)));
+            app.auto_update();
+            Ok(Box::new(app))
         }),
     )
 }
