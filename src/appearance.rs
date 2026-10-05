@@ -60,6 +60,18 @@ pub fn apply(ctx: &egui::Context, a: &Appearance) -> Result<(), String> {
         }
     });
     let mut fonts = egui::FontDefinitions::default();
+    // Before the chosen fonts: it goes second in its family, and should stay behind egui's
+    // own text font. Its code points are private-use, so it can't shadow text either way.
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    // Its glyphs are drawn for 16 px and read small beside 13 px text.
+    if let Some(data) = fonts.font_data.get_mut("phosphor") {
+        let data = Arc::make_mut(data);
+        data.tweak.scale = 1.25;
+        data.tweak.y_offset_factor = 0.08;
+    }
+    // Method badges draw icons in monospace rows.
+    let mono = fonts.families.entry(FontFamily::Monospace).or_default();
+    mono.push("phosphor".into());
     let mut missing = Vec::new();
     for (name, family) in [
         (&a.ui_font, FontFamily::Proportional),

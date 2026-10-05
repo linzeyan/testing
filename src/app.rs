@@ -17,6 +17,7 @@ use crate::script::{Changes, TestResult};
 use crate::store::{self, HistoryEntry, Node, State, Workspace};
 use crate::stream::{self, Event};
 use crate::varedit::{clip, var_edit};
+use egui_phosphor::regular as icon;
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 /// Below this workbench width (logical px) the response goes under the request: each half
@@ -2330,7 +2331,8 @@ impl App {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let shortcut = ui.ctx().format_shortcut(&SETTINGS);
-                if (ui.small_button("⚙"))
+                let gear = ui.small_button(icon::GEAR_SIX);
+                if (named(gear, "App settings", None))
                     .on_hover_text(format!("Settings ({shortcut})"))
                     .clicked()
                 {
@@ -2346,12 +2348,12 @@ impl App {
                     Some(Ok(c)) => c.note.as_deref(),
                     _ => None,
                 };
-                let mut label = RichText::new(format!("🌐 {proxy}"));
+                let mut label = RichText::new(format!("{} {proxy}", icon::GLOBE));
                 if note.is_some() {
-                    label = RichText::new(format!("🌐 {proxy} · direct")).color(ORANGE);
+                    label = RichText::new(format!("{} {proxy} · direct", icon::GLOBE)).color(ORANGE);
                 }
                 if self.network.insecure {
-                    label = RichText::new(format!("🌐 {proxy} · TLS verify OFF")).color(RED);
+                    label = RichText::new(format!("{} {proxy} · TLS verify OFF", icon::GLOBE)).color(RED);
                 }
                 if ui
                     .small_button(label)
@@ -2362,7 +2364,9 @@ impl App {
                 }
                 ui.separator();
                 let mut sidebar = !self.hide_sidebar;
-                if (ui.toggle_value(&mut sidebar, "Sidebar"))
+                let shown = sidebar;
+                let toggle = ui.toggle_value(&mut sidebar, icon::SIDEBAR_SIMPLE);
+                if (named(toggle, "Sidebar", Some(shown)))
                     .on_hover_text("Show or hide collections and history, for more room")
                     .changed()
                 {
@@ -2374,8 +2378,9 @@ impl App {
                     true => "The window is too narrow: the response is under the request until it is wider",
                     false => "The response beside the request instead of under it",
                 };
-                if ui
-                    .toggle_value(&mut self.side_by_side, "Side by side")
+                let on = self.side_by_side;
+                let toggle = ui.toggle_value(&mut self.side_by_side, icon::COLUMNS);
+                if (named(toggle, "Side by side", Some(on)))
                     .on_hover_text(hint)
                     .changed()
                 {
@@ -2427,8 +2432,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.strong("Environment");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("+ New")
+                if named(ui.small_button(icon::PLUS), "New environment", None)
                     .on_hover_text("New environment")
                     .clicked()
                 {
@@ -2501,14 +2505,15 @@ impl App {
                 .on_hover_text("Colour this environment, e.g. prod in red");
             }
             if let Some(name) = self.active_env.clone()
-                && ui
-                    .small_button("Edit")
+                && named(ui.small_button(icon::PENCIL_SIMPLE), "Edit", None)
                     .on_hover_text("Edit this environment's variables")
                     .clicked()
             {
                 self.open_env_editor(Some(name), &[]);
             }
-            ui.toggle_value(&mut self.quick_look, "👁")
+            let on = self.quick_look;
+            let look = ui.toggle_value(&mut self.quick_look, icon::EYE);
+            named(look, "Quick look", Some(on))
                 .on_hover_text("Quick look: every variable in scope");
         });
         ui.separator();
@@ -2530,63 +2535,65 @@ impl App {
         }
         ui.horizontal(|ui| {
             let root = self.ws.collections();
-            if ui
-                .small_button("+ Request")
-                .on_hover_text(ui.ctx().format_shortcut(&NEW_REQUEST))
+            let shortcut = ui.ctx().format_shortcut(&NEW_REQUEST);
+            if named(ui.small_button(icon::FILE_PLUS), "New request", None)
+                .on_hover_text(format!("New request ({shortcut})"))
                 .clicked()
             {
                 self.dialog = Some(Dialog::name(NameKind::NewRequest(root.clone()), ""));
             }
-            if ui.small_button("+ Folder").clicked() {
+            let folder = named(ui.small_button(icon::FOLDER_PLUS), "New folder", None);
+            if folder.on_hover_text("New folder").clicked() {
                 self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
             }
-            ui.menu_button("⋯", |ui| {
-                if ui.button("Copy docs as Markdown").clicked() {
-                    self.copy_docs(&root, ui.ctx());
-                    ui.close();
-                }
-                if ui.button("Copy as Postman collection").clicked() {
-                    self.copy_postman(&root, ui.ctx());
-                    ui.close();
-                }
-                if ui.button("Start mock server").clicked() {
-                    self.start_mock(root.clone(), ui.ctx());
-                    ui.close();
-                }
-                ui.separator();
-                if ui
-                    .button("Import…")
-                    .on_hover_text(
-                        "A Postman collection or environment, or an OpenAPI/Swagger spec",
-                    )
-                    .clicked()
-                {
-                    self.dialog = Some(Dialog::Paste {
-                        text: String::new(),
-                        note: String::new(),
-                    });
-                    ui.close();
-                }
-                let export = ui.button("Export to files").on_hover_text(
-                    "Writes collections/, environments/ and globals.toml into the workspace \
+            let more = ui
+                .menu_button(icon::DOTS_THREE, |ui| {
+                    if ui.button("Copy docs as Markdown").clicked() {
+                        self.copy_docs(&root, ui.ctx());
+                        ui.close();
+                    }
+                    if ui.button("Copy as Postman collection").clicked() {
+                        self.copy_postman(&root, ui.ctx());
+                        ui.close();
+                    }
+                    if ui.button("Start mock server").clicked() {
+                        self.start_mock(root.clone(), ui.ctx());
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .button("Import…")
+                        .on_hover_text(
+                            "A Postman collection or environment, or an OpenAPI/Swagger spec",
+                        )
+                        .clicked()
+                    {
+                        self.dialog = Some(Dialog::Paste {
+                            text: String::new(),
+                            note: String::new(),
+                        });
+                        ui.close();
+                    }
+                    let export = ui.button("Export to files").on_hover_text(
+                        "Writes collections/, environments/ and globals.toml into the workspace \
                      folder, for git. Secrets, history and cookies stay out.",
-                );
-                if export.clicked() {
-                    self.export();
-                    ui.close();
-                }
-                let import = ui
-                    .button("Import from files…")
-                    .on_hover_text("Reads those files back, e.g. after a git pull");
-                if import.clicked() {
-                    self.dialog = Some(Dialog::Import);
-                    ui.close();
-                }
-            })
-            .response
-            .on_hover_text("The whole collection");
-            if ui
-                .small_button("▶ Run")
+                    );
+                    if export.clicked() {
+                        self.export();
+                        ui.close();
+                    }
+                    let import = ui
+                        .button("Import from files…")
+                        .on_hover_text("Reads those files back, e.g. after a git pull");
+                    if import.clicked() {
+                        self.dialog = Some(Dialog::Import);
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text("The whole collection");
+            named(more, "More", None);
+            if named(ui.small_button(icon::PLAY), "Run", None)
                 .on_hover_text("Run the whole collection")
                 .clicked()
             {
@@ -2632,7 +2639,10 @@ impl App {
             .auto_shrink(false)
             .show(ui, |ui| {
                 if self.tree.is_empty() {
-                    ui.weak("No requests yet. Click \"+ Request\".");
+                    ui.weak(format!(
+                        "No requests yet. Click {} to add one.",
+                        icon::FILE_PLUS
+                    ));
                 } else if nodes.is_empty() {
                     ui.weak("Nothing matches.");
                 }
@@ -2879,12 +2889,7 @@ impl App {
                 for (i, e) in self.history.iter().enumerate().rev() {
                     let method = &e.request.method;
                     let row = ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{:<4}", short_method(method)))
-                                .monospace()
-                                .small()
-                                .color(method_color(method)),
-                        );
+                        method_badge(ui, method, 4);
                         let status = match e.status {
                             0 => "ERR".to_owned(),
                             s => s.to_string(),
@@ -2949,8 +2954,7 @@ impl App {
                     };
                     if let Some(o) = open {
                         let m = &o.draft.method;
-                        let badge = RichText::new(short_method(m)).monospace().small();
-                        ui.label(badge.color(method_color(m)));
+                        method_badge(ui, m, 0);
                     }
                     let name = leaf_name(&tab.path);
                     let mut text = RichText::new(match open.is_some_and(Open::dirty) {
@@ -3041,7 +3045,10 @@ impl App {
         let all_vars = self.all_vars();
         let Some(open) = &mut self.open else {
             ui.centered_and_justified(|ui| {
-                ui.weak("Select a request on the left, or create one with \"+ Request\".")
+                ui.weak(format!(
+                    "Select a request on the left, or create one with {}.",
+                    icon::FILE_PLUS
+                ))
             });
             return;
         };
@@ -3178,13 +3185,19 @@ impl App {
                         .on_hover_text(ui.ctx().format_shortcut(&SAVE))
                         .clicked();
                     if !streaming {
-                        toggle_load = ui
-                            .selectable_label(self.load.is_some(), "⚡ Load test")
+                        let on = self.load.is_some();
+                        let load = ui.selectable_label(on, icon::GAUGE);
+                        toggle_load = named(load, "Load test", Some(on))
+                            .on_hover_text("Load test: many virtual users sending this request")
                             .clicked();
                     }
-                    ui.toggle_value(&mut self.cookie_manager, "Cookies")
+                    let on = self.cookie_manager;
+                    let cookies = ui.toggle_value(&mut self.cookie_manager, icon::COOKIE);
+                    named(cookies, "Cookies", Some(on))
                         .on_hover_text("Cookies the server set, sent back automatically");
-                    ui.toggle_value(&mut self.code, "</> Code")
+                    let on = self.code;
+                    let code = ui.toggle_value(&mut self.code, icon::CODE);
+                    named(code, "Code", Some(on))
                         .on_hover_text("This request as curl, Python, Go, … to copy");
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
@@ -3207,18 +3220,19 @@ impl App {
             });
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("method")
-                    .selected_text(
-                        RichText::new(&open.draft.method)
-                            .color(method_color(&open.draft.method))
-                            .strong(),
-                    )
-                    .width(90.0)
+                    .selected_text(method_text(&open.draft.method).strong())
+                    .width(110.0)
                     // All 16 at once: at the default height the stream types scrolled away.
                     .height(f32::INFINITY)
                     .show_ui(ui, |ui| {
                         for m in METHODS {
-                            let text = RichText::new(*m).color(method_color(m));
-                            ui.selectable_value(&mut open.draft.method, (*m).to_owned(), text);
+                            let on = open.draft.method == *m;
+                            let r = ui.selectable_value(
+                                &mut open.draft.method,
+                                (*m).to_owned(),
+                                method_text(m),
+                            );
+                            named(r, method_name(m), Some(on));
                         }
                     });
                 // GRAPHQL is a POST whose body is always a query; open the query editor.
@@ -4108,21 +4122,15 @@ impl App {
                     let mut go = None;
                     for (i, (_, (label, badge, target))) in hits.iter().enumerate() {
                         let row = ui.horizontal(|ui| {
-                            let color = match target {
-                                Go::Request(_) => method_color(badge),
-                                Go::Folder(_) | Go::Env(_) | Go::Action(_) => {
-                                    ui.visuals().weak_text_color()
+                            match target {
+                                Go::Request(_) => {
+                                    method_badge(ui, badge, 7);
                                 }
-                            };
-                            ui.add_sized(
-                                [44.0, 18.0],
-                                egui::Label::new(
-                                    RichText::new(badge.as_str())
-                                        .monospace()
-                                        .small()
-                                        .color(color),
-                                ),
-                            );
+                                Go::Folder(_) | Go::Env(_) | Go::Action(_) => {
+                                    let text = RichText::new(format!("{badge:<7}"));
+                                    ui.label(text.monospace().small().weak());
+                                }
+                            }
                             ui.add(egui::Button::selectable(i == *selected, label.as_str()))
                         });
                         if row.inner.clicked() || (enter && i == *selected) {
@@ -4509,7 +4517,10 @@ impl App {
                                 domain = &r.domain;
                             }
                             ui.horizontal(|ui| {
-                                if ui.small_button("🗑").on_hover_text("Delete").clicked() {
+                                if named(ui.small_button(icon::TRASH), "Delete", None)
+                                    .on_hover_text("Delete")
+                                    .clicked()
+                                {
                                     remove = Some(i);
                                 }
                                 ui.monospace(format!("{}={}", r.name, clip(&r.value, 60)));
@@ -4997,7 +5008,7 @@ impl App {
                     if pfx(&c.cert) {
                         ui.add(egui::TextEdit::singleline(&mut c.password).password(true).hint_text("PFX password").desired_width(100.0));
                     }
-                    if ui.small_button("🗑").on_hover_text("Remove").clicked() {
+                    if named(ui.small_button(icon::TRASH), "Remove", None).on_hover_text("Remove").clicked() {
                         removed = Some(i);
                     }
                 });
@@ -5036,12 +5047,7 @@ impl App {
 fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
     ui.horizontal(|ui| {
         ui.weak(format!("#{:<3}", item.iteration + 1));
-        ui.label(
-            RichText::new(format!("{:<5}", short_method(&item.method)))
-                .monospace()
-                .small()
-                .color(method_color(&item.method)),
-        );
+        method_badge(ui, &item.method, 5);
         ui.label(item.name.as_str());
         match &item.status {
             Ok((code, ms)) => {
@@ -5172,8 +5178,7 @@ fn switch_targets(nodes: &[Node], root: &Path, envs: &[String]) -> Vec<(String, 
                     walk(children, root, out);
                 }
                 Node::Request { path, method, .. } => {
-                    let badge = short_method(method).to_owned();
-                    out.push((label(path), badge, Go::Request(path.clone())));
+                    out.push((label(path), method.clone(), Go::Request(path.clone())));
                 }
             }
         }
@@ -5268,13 +5273,7 @@ fn tree_ui(
             Node::Request { name, path, method } => {
                 let resp = ui
                     .horizontal(|ui| {
-                        let badge = format!("{:<5}", short_method(method));
-                        ui.label(
-                            RichText::new(badge)
-                                .monospace()
-                                .small()
-                                .color(method_color(method)),
-                        );
+                        method_badge(ui, method, 5);
                         let row =
                             ui.selectable_label(selected == Some(path.as_path()), name.as_str());
                         if let Some(&status) = statuses.get(path) {
@@ -5376,9 +5375,14 @@ fn more_button(
     if !ui.rect_contains_pointer(line) && !egui::Popup::is_id_open(ui.ctx(), id) {
         return;
     }
-    let size = egui::vec2(22.0, row.rect.height());
+    // Wide enough for the icon and the button's padding, or the button outgrows it.
+    let size = egui::vec2(26.0, row.rect.height());
     let rect = egui::Rect::from_min_size(egui::pos2(line.right() - size.x, line.top()), size);
-    let button = ui.put(rect, egui::Button::new("⋯").small());
+    let button = named(
+        ui.put(rect, egui::Button::new(icon::DOTS_THREE).small()),
+        "More",
+        None,
+    );
     egui::Popup::menu(&button).id(id).show(menu);
 }
 
@@ -5595,7 +5599,11 @@ fn kv_table(
                         .desired_width(desc_width),
                 );
             }
-            if real && ui.small_button("🗑").on_hover_text("Remove").clicked() {
+            if real
+                && named(ui.small_button(icon::TRASH), "Remove", None)
+                    .on_hover_text("Remove")
+                    .clicked()
+            {
                 remove = Some(i);
             }
         });
@@ -6394,7 +6402,10 @@ fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) 
         ui.horizontal(|ui| {
             done |= ui.checkbox(&mut t.enabled, "").changed();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("🗑").on_hover_text("Remove").clicked() {
+                if named(ui.small_button(icon::TRASH), "Remove", None)
+                    .on_hover_text("Remove")
+                    .clicked()
+                {
                     remove = Some(i);
                 }
                 done |= qos_box(ui, ("topic-qos", i), &mut t.qos);
@@ -6820,8 +6831,7 @@ fn grpc_bar(
             &[("Protocol Buffers", &["proto"])],
             false,
         );
-        let reload = ui
-            .small_button("↻")
+        let reload = named(ui.small_button(icon::ARROWS_CLOCKWISE), "Reload", None)
             .on_hover_text(match reflection {
                 true => "Ask the server for its methods (gRPC reflection)",
                 false => "Reload .proto",
@@ -7199,11 +7209,14 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
     if past.list.is_empty() {
         return;
     }
-    let label = match past.list.iter().find(|m| Some(m.id) == shown) {
-        Some(m) => format!("History: {}", ago(m.at)),
-        None => "History".into(),
+    let (text, label) = match past.list.iter().find(|m| Some(m.id) == shown) {
+        Some(m) => (
+            format!("{} {}", icon::CLOCK_COUNTER_CLOCKWISE, ago(m.at)),
+            format!("History: {}", ago(m.at)),
+        ),
+        None => (icon::CLOCK_COUNTER_CLOCKWISE.to_owned(), "History".into()),
     };
-    ui.menu_button(label, |ui| {
+    let menu = ui.menu_button(text, |ui| {
         for m in &past.list {
             let text = RichText::new(format!("{}  ·  {} ms  ·  {}", m.status, m.ms, ago(m.at)))
                 .color(status_color(m.status));
@@ -7232,9 +7245,8 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
         if ui.button("Clear history").clicked() {
             past.clear = true;
         }
-    })
-    .response
-    .on_hover_text(format!(
+    });
+    named(menu.response, &label, None).on_hover_text(format!(
         "Earlier responses to this request (the last {})",
         store::MAX_RESPONSES
     ));
@@ -7358,32 +7370,43 @@ fn response_ui(
                 } else {
                     "Copy body"
                 };
-                if (timeline || !binary) && ui.small_button("Copy").on_hover_text(what).clicked() {
+                if (timeline || !binary)
+                    && named(ui.small_button(icon::COPY), "Copy", None)
+                        .on_hover_text(what)
+                        .clicked()
+                {
                     let text = match timeline {
                         true => view.head.timeline(),
                         false => view.text.clone(),
                     };
                     ui.ctx().copy_text(text);
                 }
-                if (ui.small_button("Save…"))
+                if named(ui.small_button(icon::DOWNLOAD_SIMPLE), "Save…", None)
                     .on_hover_text("Save the body to a file, as received")
                     .clicked()
                 {
                     *save_file = true;
                 }
                 if external_type(&view.head).is_some()
-                    && (ui.small_button("Open in browser"))
-                        .on_hover_text("Show it in your browser, or the system's PDF viewer")
-                        .clicked()
+                    && named(
+                        ui.small_button(icon::ARROW_SQUARE_OUT),
+                        "Open in browser",
+                        None,
+                    )
+                    .on_hover_text("Show it in your browser, or the system's PDF viewer")
+                    .clicked()
                 {
                     *open_external = true;
                 }
                 // Examples hold text.
                 if !binary
-                    && ui
-                        .small_button("Save as example")
-                        .on_hover_text("Keep this response with the request")
-                        .clicked()
+                    && named(
+                        ui.small_button(icon::BOOKMARK_SIMPLE),
+                        "Save as example",
+                        None,
+                    )
+                    .on_hover_text("Save as example: keep this response with the request")
+                    .clicked()
                 {
                     let h = &view.head;
                     let content_type = h
@@ -7440,9 +7463,13 @@ fn response_ui(
                 }
                 let shortcut = ui.ctx().format_shortcut(&FIND);
                 if !view.preview
-                    && (ui.selectable_label(view.find.open, "Find"))
-                        .on_hover_text(shortcut)
-                        .clicked()
+                    && named(
+                        ui.selectable_label(view.find.open, icon::MAGNIFYING_GLASS),
+                        "Find",
+                        Some(view.find.open),
+                    )
+                    .on_hover_text(format!("Find ({shortcut})"))
+                    .clicked()
                 {
                     match view.find.open {
                         true => view.find.close(),
@@ -7830,8 +7857,7 @@ fn examples_editor(ui: &mut egui::Ui, examples: &mut Vec<Example>) {
                     ui.text_edit_singleline(&mut ex.name);
                     ui.label("Status");
                     ui.add(egui::DragValue::new(&mut ex.status).range(100..=599));
-                    if ui
-                        .small_button("🗑")
+                    if named(ui.small_button(icon::TRASH), "Delete example", None)
                         .on_hover_text("Delete example")
                         .clicked()
                     {
@@ -8191,12 +8217,90 @@ fn highlighted(
     job.into()
 }
 
+/// An icon reads to screen readers, and to tests, as the words it stands for; `selected`
+/// for toggles.
+fn named(r: egui::Response, label: &str, selected: Option<bool>) -> egui::Response {
+    let enabled = r.enabled();
+    r.widget_info(|| match selected {
+        Some(on) => egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, on, label),
+        None => egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label),
+    });
+    r
+}
+
+/// Streams and RPCs go by icon; HTTP methods by name, as everywhere.
+fn method_icon(m: &str) -> Option<&'static str> {
+    Some(match m {
+        // Both ways at once.
+        "WS" => icon::ARROWS_LEFT_RIGHT,
+        "SOCKETIO" => icon::LIGHTNING,
+        "MQTT" => icon::BROADCAST,
+        "SSE" => icon::RSS,
+        "GRAPHQL" => icon::GRAPH,
+        // A remote procedure call.
+        "GRPC" => icon::FUNCTION,
+        _ => return None,
+    })
+}
+
+fn method_name(m: &str) -> &str {
+    match m {
+        "WS" => "WebSocket",
+        "SOCKETIO" => "Socket.IO",
+        "GRAPHQL" => "GraphQL",
+        "GRPC" => "gRPC",
+        m => m,
+    }
+}
+
+/// For the method picker: the icon and name, or the HTTP method.
+fn method_text(m: &str) -> RichText {
+    let text = match method_icon(m) {
+        Some(i) => format!("{i} {}", method_name(m)),
+        None => m.to_owned(),
+    };
+    RichText::new(text).color(method_color(m))
+}
+
+/// The method in `cols` monospace columns, or its own width if wider, so the names after
+/// it line up. Icons are named on hover.
+fn method_badge(ui: &mut egui::Ui, m: &str, cols: usize) -> egui::Response {
+    let size = egui::TextStyle::Small.resolve(ui.style()).size;
+    let mono = egui::FontId::monospace(size);
+    let color = method_color(m);
+    let column = ui
+        .painter()
+        .layout_no_wrap(" ".repeat(cols), mono.clone(), color);
+    let galley = match method_icon(m) {
+        // Small text is too small for an icon.
+        Some(i) => {
+            ui.painter()
+                .layout_no_wrap(i.to_owned(), egui::FontId::proportional(size * 1.2), color)
+        }
+        None => ui
+            .painter()
+            .layout_no_wrap(short_method(m).to_owned(), mono, color),
+    };
+    let width = column.size().x.max(galley.size().x);
+    let height = galley
+        .size()
+        .y
+        .max(ui.text_style_height(&egui::TextStyle::Small));
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let top = rect.center().y - galley.size().y / 2.0;
+    ui.painter()
+        .galley(egui::pos2(rect.left(), top), galley, color);
+    match method_icon(m) {
+        Some(_) => resp.on_hover_text(method_name(m)),
+        None => resp,
+    }
+}
+
 fn short_method(m: &str) -> &str {
     match m {
         "DELETE" => "DEL",
         "OPTIONS" => "OPT",
         "CONNECT" => "CONN",
-        "GRAPHQL" => "GQL",
         m => m,
     }
 }
@@ -8345,7 +8449,7 @@ mod ui_tests {
         h.run();
         shot(&mut h, "01-empty");
         // Keyboard only: Enter is OK in every dialog, Escape cancels.
-        h.get_by_label("+ New").click();
+        h.get_by_label("New environment").click();
         h.run();
         type_into(&mut h, 0, "dev");
         h.key_press(Key::Enter);
@@ -8366,13 +8470,13 @@ mod ui_tests {
         assert!(h.state().env_editor.is_none());
         assert_eq!(h.state().vars.get("host"), Some(&host));
 
-        h.get_by_label("+ Folder").click();
+        h.get_by_label("New folder").click();
         h.run();
         h.key_press(Key::Escape);
         h.run();
         assert!(h.state().dialog.is_none() && h.state().tree.is_empty());
 
-        h.get_by_label("+ Request").click();
+        h.get_by_label("New request").click();
         h.run();
         type_into(&mut h, 0, "r1");
         h.key_press(Key::Enter);
@@ -8405,7 +8509,7 @@ mod ui_tests {
     fn new_environment_opens_ready_to_type_and_never_drops_variables() {
         let mut h = harness(workspace("env-keys"));
         h.run();
-        h.get_by_label("+ New").click();
+        h.get_by_label("New environment").click();
         h.run();
         type_into(&mut h, 0, "dev");
         h.get_by_label("OK").click();
@@ -8731,14 +8835,14 @@ mod ui_tests {
         let mut h = with_request("export");
         let file = h.state().ws.root.join("collections/r.toml");
         // The collection's ⋯, drawn before the hovered tree row's.
-        h.get_all_by_label("⋯").next().unwrap().click();
+        h.get_all_by_label("More").next().unwrap().click();
         h.run();
         h.get_by_label("Export to files").click();
         h.run();
         assert!(file.exists(), "{}", h.state().status);
 
         std::fs::write(&file, "url = 'http://pulled.test'\n").unwrap();
-        h.get_all_by_label("⋯").next().unwrap().click();
+        h.get_all_by_label("More").next().unwrap().click();
         h.run();
         h.get_by_label("Import from files…").click();
         h.run();
@@ -8777,7 +8881,7 @@ mod ui_tests {
             { "name": "signed", "request": { "method": "GET", "url": "{{base}}/s",
                                              "auth": { "type": "ntlm", "ntlm": [] } } } ] }"#;
         std::fs::write(&file, shop).unwrap();
-        h.get_all_by_label("⋯").next().unwrap().click();
+        h.get_all_by_label("More").next().unwrap().click();
         h.run();
         h.get_by_label("Import…").click();
         h.run();
@@ -8857,7 +8961,7 @@ mod ui_tests {
     fn code_panel_shows_what_send_sends_and_keeps_the_language() {
         let mut h = with_request("code");
         h.state_mut().open.as_mut().unwrap().draft.url = "{{host}}/items".into();
-        h.get_by_label("</> Code").click();
+        h.get_by_label("Code").click();
         h.run();
         let snippet = |h: &Harness<'_, App>| {
             let roles = [Role::MultilineTextInput, Role::TextInput];
@@ -9042,7 +9146,7 @@ mod ui_tests {
         h.get_by_label("Cookies").click();
         h.run();
         h.get_by_label("sid=abc");
-        h.get_by_label("🗑").click();
+        h.get_by_label("Delete").click();
         h.run();
         assert!(h.state().cookies.rows().is_empty());
         assert!(!h.state().ws.load_cookies().contains("sid"));
@@ -9167,7 +9271,7 @@ mod ui_tests {
         let row = h.get_all_by_label("r").next().unwrap().rect();
         // The collection header has its own ⋯; the row's is the one on the row's line.
         let on_row = |h: &Harness<'_, App>| {
-            h.get_all_by_label("⋯")
+            h.get_all_by_label("More")
                 .filter(|n| n.rect().center().y.round() == row.center().y.round())
                 .count()
         };
@@ -9175,7 +9279,7 @@ mod ui_tests {
         h.hover_at(row.center());
         h.run();
         let more = h
-            .get_all_by_label("⋯")
+            .get_all_by_label("More")
             .find(|n| n.rect().center().y.round() == row.center().y.round())
             .unwrap()
             .rect()
@@ -9184,7 +9288,7 @@ mod ui_tests {
         h.hover_at(more);
         h.run();
         assert_eq!(on_row(&h), 1);
-        h.get_all_by_label("⋯")
+        h.get_all_by_label("More")
             .find(|n| n.rect().center() == more)
             .unwrap()
             .click();
@@ -9867,7 +9971,10 @@ mod ui_tests {
         h.run();
         h.get_by_label("Sidebar").click();
         h.run();
-        assert!(h.query_by_label("+ Request").is_none(), "the tree is gone");
+        assert!(
+            h.query_by_label("New request").is_none(),
+            "the tree is gone"
+        );
         assert!(h.state().ws.load_state().hide_sidebar, "and stays gone");
         h.get_by_label("Sidebar").click();
         h.run();
@@ -10383,7 +10490,7 @@ mod ui_tests {
         assert_eq!(h.state().globals["apiKey"], "k-123");
         let reopened = Workspace::open(h.state().ws.root.clone()).unwrap();
         assert_eq!(reopened.env_vars(None).unwrap()["apiKey"], "k-123");
-        h.get_by_label("👁").click();
+        h.get_by_label("Quick look").click();
         h.run();
         shot(&mut h, "21-quick-look");
         assert!(h.query_by_label("k-123").is_some());
@@ -10584,7 +10691,7 @@ mod ui_tests {
             .value("GET");
         h.get(picker).click();
         h.run();
-        h.get_by_label("GRAPHQL").click();
+        h.get_by_label("GraphQL").click();
         h.run();
         assert!(matches!(draft(&h).body, Body::GraphQL { .. }));
         assert!(
@@ -11428,7 +11535,7 @@ mod ui_tests {
         h.run();
         h.get_by_label("r").click();
         h.run();
-        h.get_by_label("⚙").click();
+        h.get_by_label("App settings").click();
         h.run();
         h.get_by_label("Light").click();
         h.run();
@@ -11659,7 +11766,7 @@ mod ui_tests {
             for url in ["http://grpcb.in:9000", "https://grpcb.in:9001"] {
                 set(&mut h, "GRPC", url, json(r#"{"greeting": "apitool"}"#));
                 let source = crate::grpc::source("", url);
-                h.get_by_label("↻").click();
+                h.get_by_label("Reload").click();
                 let listed = |app: &App| {
                     crate::grpc::methods(&source).is_ok_and(|m| !m.is_empty())
                         || app.status.contains("rror")

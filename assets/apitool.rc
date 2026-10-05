@@ -1,0 +1,3 @@
+// The exe icon Explorer and the taskbar show. Compiled to apitool.res, which build.rs
+// links, with: llvm-rc /fo apitool.res apitool.rc
+1 ICON "icon.ico"
