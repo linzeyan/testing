@@ -2,6 +2,9 @@ name: release
 
 on:
   push:
+    # A tag's run can only restore caches saved on its own ref or on main, so with tags
+    # alone every release built from scratch. main's runs keep the cache warm.
+    branches: [main]
     tags: ["v*"]
 
 permissions:
@@ -33,6 +36,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          # No later run can read a tag's cache; saving it would only push main's out of
+          # the repository's 10 GB.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         if: matrix.check
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -58,6 +64,7 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           name="apitool-${GITHUB_REF_NAME}-${{ matrix.target }}"
@@ -69,6 +76,7 @@ jobs:
             tar -C "$dir" -czf "dist/$name.tar.gz" apitool apitool-cli
           fi
       - uses: actions/upload-artifact@v7
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           name: ${{ matrix.target }}
           path: dist/*
@@ -76,6 +84,7 @@ jobs:
 
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
