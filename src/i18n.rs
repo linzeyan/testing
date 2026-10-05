@@ -34,8 +34,14 @@ pub fn t(en: &'static str) -> &'static str {
 
 /// `t(template)` with each `{}` filled in from `args`, in order.
 pub fn tf(template: &'static str, args: &[&dyn std::fmt::Display]) -> String {
+    fill(t(template), args)
+}
+
+/// `text`'s `{}` filled in from `args`, in order. For text built off the UI thread: other
+/// threads read English, so the template is translated with `t` before handing it over.
+pub fn fill(text: &str, args: &[&dyn std::fmt::Display]) -> String {
     use std::fmt::Write as _;
-    let mut parts = t(template).split("{}");
+    let mut parts = text.split("{}");
     let mut out = parts.next().unwrap_or_default().to_owned();
     for (part, arg) in parts.zip(args.iter().map(Some).chain(std::iter::repeat(None))) {
         if let Some(arg) = arg {
@@ -55,12 +61,30 @@ pub const fn n_(en: &'static str) -> &'static str {
 static ZH_TW_MAP: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| ZH_TW.iter().copied().collect());
 
 const ZH_TW: &[(&str, &str)] = &[
+    ("  · bidi stream", "  · 雙向串流"),
+    ("  · client stream", "  · 用戶端串流"),
+    ("  · server stream", "  · 伺服器串流"),
+    (" and 1 environment", "，以及 1 個環境"),
+    (" and {} environments", "，以及 {} 個環境"),
+    ("(top level)", "（最上層）"),
     ("*.corp.com or host:8443", "*.corp.com 或 host:8443"),
+    (
+        "+ and # are for subscribing; publish to one topic",
+        "+ 和 # 只用於訂閱；發布時請指定單一主題",
+    ),
     ("+ Certificate for a host", "+ 為主機加入憑證"),
     ("+ File…", "+ 檔案…"),
     ("+ Topic", "+ 主題"),
     (", the redirect included", "，含重新導向"),
     (", {} redirects included", "，含 {} 次重新導向"),
+    (
+        "// Runs after the response arrives.\n// pm.test(name, fn), pm.expect(...), pm.response.json()",
+        "// 收到回應後執行。\n// pm.test(name, fn), pm.expect(...), pm.response.json()",
+    ),
+    (
+        "// Runs before the request is sent.\n// pm.request, pm.environment, pm.variables, console.log",
+        "// 送出請求前執行。\n// pm.request, pm.environment, pm.variables, console.log",
+    ),
     ("0 sends no pings", "0 表示不送 ping"),
     (
         "0 uses the network settings' timeout",
@@ -71,12 +95,28 @@ const ZH_TW: &[(&str, &str)] = &[
         "0：最多一次 · 1：至少一次 · 2：恰好一次",
     ),
     (
+        "1 tab with unsaved edits left open",
+        "1 個分頁有未儲存的變更，保持開啟",
+    ),
+    (
         "5.0 says why a broker refuses or hangs up, and has user properties",
         "5.0 會說明 broker 拒絕或斷線的原因，並支援使用者屬性",
     ),
     (
+        "; left out {} WebSocket/SSE/gRPC, which collections can't hold",
+        "；略過 {} 個 WebSocket/SSE/gRPC，集合無法容納",
+    ),
+    ("\"{}\" already exists", "「{}」已存在"),
+    ("\"{}\" already exists there", "那裡已有「{}」"),
+    ("\"{}\" no longer exists", "「{}」已不存在"),
+    (
         "A broker drops the older of two connections with the same ID",
         "同一個 ID 有兩條連線時，broker 會斷開較舊的那條",
+    ),
+    ("A folder can't go inside itself", "資料夾不能放進自己裡面"),
+    (
+        "a folder name can't end with .toml",
+        "資料夾名稱不能以 .toml 結尾",
     ),
     (
         "A Postman collection (v2.1) or environment, or an OpenAPI 3 / Swagger 2 spec (JSON or YAML): choose the file, paste it or its path, or drop the file here. Nothing already here is replaced.",
@@ -95,6 +135,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "以 @ 開頭的值會上傳該檔案，例如 @files/photo.png（相對於工作區）。也可以把檔案拖到這裡。",
     ),
     ("Aa", "Aa"),
+    (
+        "Accepted: received, but not acted on yet.",
+        "Accepted：已收到，但尚未處理。",
+    ),
     ("Access key", "存取金鑰"),
     ("Access token", "存取權杖"),
     ("Add a file part", "加入檔案欄位"),
@@ -102,9 +146,18 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Algorithm", "演算法"),
     ("All ({})", "全部 ({})"),
     ("All collections", "所有集合"),
+    ("all collections", "所有集合"),
     (
         "Always available: $guid, $timestamp, $randomInt, $randomEmail… ({} in all; type {{$ for the list)",
         "隨時可用：$guid、$timestamp、$randomInt、$randomEmail…（共 {} 個；輸入 {{$ 可看清單）",
+    ),
+    (
+        "An event and its argument: chat {\"text\": \"hi\"}",
+        "事件與其參數：chat {\"text\": \"hi\"}",
+    ),
+    (
+        "Answers with the saved examples of {}. Click to copy the URL.",
+        "以 {} 已儲存的範例回應。點一下複製 URL。",
     ),
     ("Any server certificate is accepted", "接受任何伺服器憑證"),
     (
@@ -112,18 +165,31 @@ const ZH_TW: &[(&str, &str)] = &[
         "接受任何伺服器憑證。只在排查 CA 問題時使用。",
     ),
     ("API key", "API 金鑰"),
+    (
+        "API key (or use the Auth tab)",
+        "API 金鑰（或使用「驗證」分頁）",
+    ),
     ("apitool {} is the latest", "apitool {} 已是最新版本"),
     ("App settings", "應用程式設定"),
     ("Apply", "套用"),
     ("As received", "依收到的原樣"),
     (
+        "Ask the server for its methods (gRPC reflection)",
+        "向伺服器查詢方法（gRPC reflection）",
+    ),
+    (
         "Asked by {{?name}}; kept until apitool closes, never saved.",
         "由 {{?name}} 詢問；保留到 apitool 關閉，不會儲存。",
+    ),
+    (
+        "Asking the server for its methods…",
+        "正在向伺服器查詢方法…",
     ),
     ("Asserts", "斷言"),
     ("Auth", "驗證"),
     ("Auth URL", "授權網址"),
     ("Authorization code", "授權碼"),
+    ("Auto", "自動"),
     (
         "Auto uses HTTP/2 when an https server offers it",
         "自動：https 伺服器支援時使用 HTTP/2",
@@ -133,7 +199,15 @@ const ZH_TW: &[(&str, &str)] = &[
         "所有環境都可使用；與環境變數同名時，以環境變數為準。",
     ),
     ("AWS Signature", "AWS 簽章"),
+    (
+        "Bad Gateway: a proxy or gateway got a bad answer from upstream.",
+        "Bad Gateway：代理或閘道從上游收到無效的回應。",
+    ),
     ("bad pattern", "樣式錯誤"),
+    (
+        "Bad Request: the server can't process the request as sent (syntax, framing, values).",
+        "Bad Request：伺服器無法處理送出的請求（語法、格式或值有誤）。",
+    ),
     ("Basic auth", "Basic 驗證"),
     ("Bearer token", "Bearer 權杖"),
     ("Beautify", "美化"),
@@ -145,6 +219,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Blue", "藍"),
     ("Body", "內容"),
     ("Body matches a JSON schema", "內容符合 JSON schema"),
+    ("Body was too large to keep", "內容太大，未保存"),
     ("Bulk Edit", "批次編輯"),
     (
         "Bypass: localhost,127.0.0.1,.corp.local",
@@ -169,6 +244,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Clear", "清除"),
     ("Clear all", "全部清除"),
     ("Clear history", "清除歷史紀錄"),
+    (
+        "Cleared this request's response history",
+        "已清除此請求的回應紀錄",
+    ),
     ("Click again to delete", "再點一次即刪除"),
     ("Click to load what was sent.", "點一下載入當時送出的內容。"),
     (
@@ -181,7 +260,13 @@ const ZH_TW: &[(&str, &str)] = &[
         "用戶端憑證（含金鑰的 .pem，或 .pfx / .p12）",
     ),
     ("Client credentials", "用戶端憑證"),
+    (
+        "Client error: the request is wrong or can't be fulfilled.",
+        "用戶端錯誤：請求有誤或無法完成。",
+    ),
     ("Client ID", "用戶端 ID"),
+    ("client IP behind a proxy", "代理後方的用戶端 IP"),
+    ("client name and version", "用戶端名稱與版本"),
     ("Client secret", "用戶端密鑰"),
     ("Close", "關閉"),
     ("Close (Esc)", "關閉 (Esc)"),
@@ -189,13 +274,22 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Close All Tabs", "關閉所有分頁"),
     ("Close Other Tabs", "關閉其他分頁"),
     ("Close Tab", "關閉分頁"),
+    ("Close tab", "關閉分頁"),
     ("Close Tabs to the Right", "關閉右側分頁"),
     ("Code", "程式碼"),
     ("Code font", "程式碼字型"),
+    ("Collection settings", "集合設定"),
+    ("Collection settings…", "集合設定…"),
+    ("Collection, spec or HAR", "集合、規格或 HAR"),
+    ("Collection: {}", "集合：{}"),
     ("Collections", "集合"),
     (
         "Colour this environment, e.g. prod in red",
         "為此環境上色，例如 prod 用紅色",
+    ),
+    (
+        "Conflict: the request clashes with the resource's current state.",
+        "Conflict：請求與資源目前的狀態衝突。",
     ),
     ("Connect", "連線"),
     (
@@ -203,9 +297,17 @@ const ZH_TW: &[(&str, &str)] = &[
         "直接連線，忽略作業系統設定。",
     ),
     ("Connected {} s", "已連線 {} 秒"),
+    (
+        "Connected: a change is (un)subscribed as soon as you finish it.",
+        "已連線：改完就會立即訂閱或取消訂閱。",
+    ),
     ("Console ({})", "主控台 ({})"),
     ("Consumer key", "Consumer 金鑰"),
     ("Consumer secret", "Consumer 密鑰"),
+    (
+        "Content Too Large: the body is bigger than the server accepts.",
+        "Content Too Large：內容超過伺服器接受的大小。",
+    ),
     ("Cookie is set", "已設定 cookie"),
     ("Cookie jar", "Cookie 罐"),
     ("Cookies", "Cookie"),
@@ -214,11 +316,28 @@ const ZH_TW: &[(&str, &str)] = &[
         "Cookies the server set, sent back automatically",
         "伺服器設定的 cookie，之後會自動送回",
     ),
+    ("Copied the docs as Markdown", "已將文件複製為 Markdown"),
+    ("Copied the mock server URL", "已複製模擬伺服器 URL"),
+    (
+        "Copied {} requests as a Postman collection{}",
+        "已將 {} 個請求複製為 Postman 集合{}",
+    ),
+    ("Copied {} snippet", "已複製 {} 程式碼片段"),
     ("Copy", "複製"),
     ("Copy as Postman collection", "複製為 Postman 集合"),
     ("Copy body", "複製內容"),
     ("Copy docs as Markdown", "複製文件為 Markdown"),
     ("Copy the timeline", "複製時間軸"),
+    (
+        "Created: the request succeeded and a new resource was created.",
+        "Created：請求成功，並建立了新資源。",
+    ),
+    (
+        "credentials (or use the Auth tab)",
+        "憑證（或使用「驗證」分頁）",
+    ),
+    ("CSV or JSON", "CSV 或 JSON"),
+    ("curl import: {}", "curl 匯入：{}"),
     ("Dark", "深色"),
     ("Data file", "資料檔"),
     ("Default", "預設"),
@@ -256,6 +375,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Duplicate", "複製一份"),
     ("Duplicate environment", "複製環境"),
     ("Duplicate Tab", "複製分頁"),
+    ("Duplicated as \"{}\"", "已複製為「{}」"),
     ("Duplicate…", "複製一份…"),
     ("Duration (s)", "時長 (秒)"),
     (
@@ -279,9 +399,12 @@ const ZH_TW: &[(&str, &str)] = &[
     ("End stream", "結束串流"),
     ("Enter to apply", "按 Enter 套用"),
     ("Environment", "環境"),
+    ("Environment \"{}\" already exists", "環境「{}」已存在"),
     ("Environment: {}", "環境：{}"),
     ("Error", "錯誤"),
     ("Errors", "錯誤"),
+    ("ETag from an earlier response", "先前回應的 ETag"),
+    ("ETag to match", "要比對的 ETag"),
     ("Examples", "範例"),
     ("Expires", "到期"),
     (
@@ -305,9 +428,12 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Fill body", "填入內容"),
     ("Filter by name", "依名稱篩選"),
     ("Filter fields", "篩選欄位"),
+    ("Filter: $.items[*].id", "篩選：$.items[*].id"),
+    ("Filter: //item/@id", "篩選：//item/@id"),
     ("Filters used before", "先前用過的篩選"),
     ("Find", "尋找"),
     ("Find ({})", "尋找 ({})"),
+    ("Find in the response", "在回應中尋找"),
     ("Fold", "收合"),
     ("Folder", "資料夾"),
     ("Folder scripts run first: {}", "會先執行資料夾指令碼：{}"),
@@ -315,12 +441,33 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Folder settings…", "資料夾設定…"),
     ("Folder: {}", "資料夾：{}"),
     ("Follow redirects", "跟隨重新導向"),
+    ("for CORS", "用於 CORS"),
+    (
+        "Forbidden: the credentials are known but not allowed to do this.",
+        "Forbidden：憑證有效，但沒有權限執行此操作。",
+    ),
     ("Form", "表單"),
+    (
+        "Found: the resource is at another URL for now.",
+        "Found：資源暫時位於另一個 URL。",
+    ),
     ("from {}", "來自 {}"),
+    (
+        "Gateway Timeout: a proxy or gateway got no answer from upstream in time.",
+        "Gateway Timeout：代理或閘道沒有及時收到上游的回應。",
+    ),
     ("Globals", "全域變數"),
+    (
+        "Go to a request, folder or action",
+        "前往請求、資料夾或動作",
+    ),
     (
         "Go to a request, folder, environment or action",
         "前往請求、資料夾、環境或動作",
+    ),
+    (
+        "Gone: the resource was here and was removed for good.",
+        "Gone：資源曾經存在，但已永久移除。",
     ),
     ("Grant", "授權類型"),
     ("GraphQL", "GraphQL"),
@@ -332,6 +479,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Headers {}\nBody {}", "標頭 {}\n內容 {}"),
     ("History", "歷史紀錄"),
     ("History: {}", "歷史紀錄：{}"),
+    ("HTTP date", "HTTP 日期"),
     ("HTTP version", "HTTP 版本"),
     (
         "http://127.0.0.1:<any free port>/callback",
@@ -345,6 +493,11 @@ const ZH_TW: &[(&str, &str)] = &[
         "http://wpad/proxy.pac  or  C:\\path\\proxy.pac",
         "http://wpad/proxy.pac  或  C:\\path\\proxy.pac",
     ),
+    ("id for this request", "此請求的 ID"),
+    (
+        "id to trace a call across services",
+        "跨服務追蹤呼叫用的 ID",
+    ),
     ("Implicit", "隱含"),
     ("Import", "匯入"),
     (
@@ -352,16 +505,33 @@ const ZH_TW: &[(&str, &str)] = &[
         "匯入（Postman、OpenAPI、Swagger）",
     ),
     ("Import a collection or spec", "匯入集合或規格"),
+    ("Imported curl command", "已匯入 curl 指令"),
+    ("Imported environment \"{}\"", "已匯入環境「{}」"),
+    (
+        "Imported {} requests into \"{}\"",
+        "已匯入 {} 個請求到「{}」",
+    ),
     ("Import…", "匯入…"),
+    (
+        "Informational: the request was received and goes on.",
+        "資訊：請求已收到，處理中。",
+    ),
     ("Inherit from parent", "繼承上層"),
     ("Install", "安裝"),
     ("Install automatically", "自動安裝"),
     ("Installing {}…", "正在安裝 {}…"),
     ("Interface font", "介面字型"),
     (
+        "Internal Server Error: the server failed while handling the request.",
+        "Internal Server Error：伺服器處理請求時發生錯誤。",
+    ),
+    (
         "Introspect using this request's URL, headers and auth",
         "以此請求的網址、標頭與驗證查詢 schema",
     ),
+    ("it has no pages", "沒有任何頁面"),
+    ("it has no size", "沒有尺寸"),
+    ("it's encrypted", "已加密"),
     ("Iterations", "迭代次數"),
     ("JSON body has a property", "JSON 內容有某個屬性"),
     ("JSON, YAML or a path", "JSON、YAML 或路徑"),
@@ -369,12 +539,21 @@ const ZH_TW: &[(&str, &str)] = &[
     ("JWT Bearer", "JWT Bearer"),
     ("Keep alive", "保持連線"),
     ("Keep this workspace", "保留此工作區"),
+    ("Keeping the response: {}", "保存回應時發生錯誤：{}"),
     (
         "Kept on this machine only (in apitool.db), never written to the files. Overrides shared values; values set by scripts land here.",
         "只存在這台電腦（apitool.db），不會寫入檔案。會覆蓋共用的值；指令碼設定的值也存在這裡。",
     ),
     ("Key", "鍵"),
     ("Key-Value Edit", "鍵值編輯"),
+    (
+        "key: value, one per line; // in front turns a line off",
+        "key: value，一行一個；行首加 // 可停用該行",
+    ),
+    (
+        "Key: what to check, e.g. res.status, res.body.items.length, res.body[0].id, res.headers['content-type'], res.responseTime.\nValue: an operator and what to compare with, e.g. eq 200, neq, gt 0, gte, lt 500, lte, in 200,201, notIn, contains ok, notContains, length 3, matches ^ok, notMatches, startsWith, endsWith, between 1,10, isEmpty, isNotEmpty, isNull, isUndefined, isDefined, isTruthy, isFalsy, isJson, isNumber, isString, isBoolean, isArray; no operator is eq. {{variables}} work. Each row shows up under Tests.",
+        "鍵：要檢查的項目，例如 res.status, res.body.items.length, res.body[0].id, res.headers['content-type'], res.responseTime。\n值：運算子與比較的值，例如 eq 200, neq, gt 0, gte, lt 500, lte, in 200,201, notIn, contains ok, notContains, length 3, matches ^ok, notMatches, startsWith, endsWith, between 1,10, isEmpty, isNotEmpty, isNull, isUndefined, isDefined, isTruthy, isFalsy, isJson, isNumber, isString, isBoolean, isArray；沒寫運算子就是 eq。可使用 {{variables}}。每一列都會出現在「測試」下。",
+    ),
     ("Language", "語言"),
     ("Last response", "上次回應"),
     ("Last will", "遺囑訊息"),
@@ -395,16 +574,43 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Max", "最大"),
     ("Maximum redirects", "最多重新導向次數"),
     ("Mean", "平均"),
+    ("media type of the body", "內容的媒體類型"),
+    ("media types the client takes", "用戶端接受的媒體類型"),
+    ("Message", "訊息"),
+    ("Message (JSON)", "訊息（JSON）"),
+    (
+        "Method Not Allowed: the URL exists but not for this method.",
+        "Method Not Allowed：URL 存在，但不支援此方法。",
+    ),
+    ("Mock server for {} at {}", "{} 的模擬伺服器：{}"),
+    ("Mock server stopped", "模擬伺服器已停止"),
+    ("Mock server: {}", "模擬伺服器：{}"),
+    ("Mock {}", "模擬 {}"),
+    ("Mock: {}", "模擬：{}"),
     ("More", "更多"),
+    (
+        "Moved Permanently: the resource has a new URL for good.",
+        "Moved Permanently：資源已永久移到新的 URL。",
+    ),
+    ("Moved to \"{}\"", "已移到「{}」"),
+    ("Moved {} items to \"{}\"", "已將 {} 個項目移到「{}」"),
     ("Multipart", "Multipart"),
     ("Mutation", "變更"),
     ("Name", "名稱"),
+    ("name can't be empty", "名稱不能空白"),
+    (
+        "name can't be empty or start/end with '.'",
+        "名稱不能空白，也不能以「.」開頭或結尾",
+    ),
+    ("name can't contain '{}'", "名稱不能包含「{}」"),
     ("Network", "網路"),
     ("Network settings", "網路設定"),
     (
         "Network settings (proxy, certificates)",
         "網路設定（代理伺服器、憑證）",
     ),
+    ("Network settings applied", "已套用網路設定"),
+    ("Network settings: {}", "網路設定：{}"),
     ("New collection", "新增集合"),
     (
         "New collection: requests with their own variables, auth and scripts",
@@ -418,15 +624,26 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Next page", "下一頁"),
     ("No auth", "不驗證"),
     (
+        "No Content: succeeded, with no body to return.",
+        "No Content：成功，沒有內容可回傳。",
+    ),
+    (
         "No cookies yet. Set-Cookie responses fill the jar.",
         "還沒有 Cookie。回應裡的 Set-Cookie 會放進罐子。",
     ),
     ("No environment", "無環境"),
     (
+        "No environment selected: pm.environment.set was stored as a global",
+        "未選擇環境：pm.environment.set 已存為全域變數",
+    ),
+    (
         "No folder above sets auth, so none is sent.",
         "上層資料夾都沒有設定驗證，因此不送驗證。",
     ),
     ("No proxy", "不用代理伺服器"),
+    ("no request is open", "沒有開啟的請求"),
+    ("No requests to run here.", "這裡沒有可執行的請求。"),
+    ("no requests under {}", "{} 底下沒有請求"),
     (
         "No requests yet. Click {} to add one.",
         "還沒有請求。按 {} 新增一個。",
@@ -436,9 +653,34 @@ const ZH_TW: &[(&str, &str)] = &[
         "還沒有變數。可以加到環境或全域變數裡。",
     ),
     ("None", "無"),
+    ("not a PDF it can read", "不是可讀取的 PDF"),
+    (
+        "Not Acceptable: nothing matches the Accept headers.",
+        "Not Acceptable：沒有符合 Accept 標頭的內容。",
+    ),
     ("Not connected", "未連線"),
+    (
+        "Not Found: nothing at this URL.",
+        "Not Found：這個 URL 沒有東西。",
+    ),
+    (
+        "Not Implemented: the server doesn't support this method.",
+        "Not Implemented：伺服器不支援此方法。",
+    ),
+    (
+        "Not Modified: the cached copy is still good.",
+        "Not Modified：快取的副本仍然有效。",
+    ),
     ("Not valid JSON: {}", "不是有效的 JSON：{}"),
+    (
+        "Note: the runner uses saved files; unsaved edits are not included.",
+        "注意：執行器使用已儲存的檔案，不含未儲存的變更。",
+    ),
     ("Nothing matches.", "沒有符合的項目。"),
+    (
+        "Nothing to mock yet: send a request, then \"Save as example\"",
+        "還沒有可模擬的內容：先送出請求，再按「存為範例」",
+    ),
     ("OAuth 1.0", "OAuth 1.0"),
     ("OAuth 2.0", "OAuth 2.0"),
     (
@@ -453,6 +695,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "Off: the broker keeps subscriptions and queued messages for this client ID",
         "關閉：broker 會為這個用戶端 ID 保留訂閱與排隊中的訊息",
     ),
+    ("OK: the request succeeded.", "OK：請求成功。"),
     ("Open in browser", "在瀏覽器開啟"),
     ("optional", "選填"),
     (
@@ -464,6 +707,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ("PAC script", "PAC 指令碼"),
     ("Page {} of {}", "第 {} 頁，共 {} 頁"),
     ("Params", "參數"),
+    (
+        "Partial Content: only the requested range is returned.",
+        "Partial Content：只回傳請求的範圍。",
+    ),
     ("Passed ({})", "通過 ({})"),
     ("Password", "密碼"),
     ("Path", "路徑"),
@@ -473,6 +720,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "path/to/file（相對於工作區）",
     ),
     ("Payload", "內容"),
+    (
+        "Permanent Redirect: repeat the same request at another URL, from now on.",
+        "Permanent Redirect：從此改向另一個 URL 重送同一個請求。",
+    ),
     ("PFX password", "PFX 密碼"),
     (
         "Pick the exported file instead of pasting it",
@@ -509,6 +760,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Proxy", "代理伺服器"),
     ("Proxy and certificates…", "代理伺服器與憑證…"),
+    ("Publish needs a topic", "發布需要指定主題"),
     ("Publish to", "發布到"),
     ("Purple", "紫"),
     ("Put a cookie in the jar", "在 cookie jar 放入 cookie"),
@@ -521,18 +773,31 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("random", "隨機"),
     ("Raw", "原始"),
+    ("raw bytes", "原始位元組"),
+    ("Read the changed workspace files", "已讀入變更的工作區檔案"),
+    ("Reading that response: {}", "讀取該回應時發生錯誤：{}"),
     ("Realm", "Realm"),
     ("Recent", "最近"),
     ("Red", "紅"),
     ("Redirect URI", "重新導向 URI"),
+    (
+        "Redirection: more action is needed to complete the request.",
+        "重新導向：需要進一步的動作才能完成請求。",
+    ),
     ("Refresh", "重新整理"),
     ("Region", "區域"),
     ("Regular expression", "規則運算式"),
     ("Release notes", "版本說明"),
     ("Reload", "重新載入"),
+    ("Reload .proto", "重新載入 .proto"),
+    (
+        "Reloaded {}: changed on disk",
+        "已重新載入 {}：磁碟上的檔案已變更",
+    ),
     ("Remove", "移除"),
     ("Rename", "重新命名"),
     ("Reopen Closed Tab", "重新開啟已關閉的分頁"),
+    ("Reopen closed tab", "重新開啟關閉的分頁"),
     ("Repeat every", "每隔一段時間重送"),
     (
         "Replace the body with a request message, each field a random value of its type",
@@ -540,6 +805,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Request cancelled", "已取消請求"),
     ("Request failed", "請求失敗"),
+    (
+        "Request Timeout: the server gave up waiting for the request.",
+        "Request Timeout：伺服器等待請求逾時。",
+    ),
     ("Requests", "請求數"),
     (
         "Requests run in the order shown on the left, with the selected environment.",
@@ -562,6 +831,11 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Reused an open connection\n", "沿用已開啟的連線\n"),
     ("Run", "執行"),
     ("Run all collections", "執行所有集合"),
+    (
+        "Run cancelled; variable changes from it were discarded.",
+        "已取消執行；這次執行的變數變更已捨棄。",
+    ),
+    ("Run collection", "執行集合"),
     ("Run folder", "執行資料夾"),
     ("Run: {}", "執行：{}"),
     ("Save", "儲存"),
@@ -573,11 +847,13 @@ const ZH_TW: &[(&str, &str)] = &[
         "存為範例：將此回應與請求一起保存",
     ),
     ("Save as…", "另存為…"),
+    ("Save changes", "儲存變更"),
     ("Save changes to \"{}\"?", "要儲存「{}」的變更嗎？"),
     (
         "Save or close the requests with unsaved edits first",
         "請先儲存或關閉有未儲存修改的請求",
     ),
+    ("Save response body", "儲存回應內容"),
     (
         "Save the body to a file, as received",
         "將內容依收到的原樣存成檔案",
@@ -595,19 +871,34 @@ const ZH_TW: &[(&str, &str)] = &[
         "Save, then copy into a new environment (e.g. dev → prod)",
         "儲存後複製成新環境（例如 dev → prod）",
     ),
+    ("Saved as \"{}\"", "已另存為「{}」"),
+    ("Saved example \"{}\"", "已儲存範例「{}」"),
     ("Saved {}", "已儲存 {}"),
+    (
+        "Saved {} (cut at 16 MiB) to {}",
+        "已將 {}（截斷於 16 MiB）儲存到 {}",
+    ),
+    ("Saved {} to {}", "已將 {} 儲存到 {}"),
     ("Save…", "儲存…"),
+    ("Saving environment: {}", "儲存環境時發生錯誤：{}"),
+    ("Saving globals: {}", "儲存全域變數時發生錯誤：{}"),
     ("Schema", "Schema"),
     ("Scope", "範圍"),
     ("Scripts", "指令碼"),
     ("Secret", "機密"),
     ("Secret key", "秘密金鑰"),
     (
+        "See Other: get the result from another URL with GET.",
+        "See Other：請用 GET 從另一個 URL 取得結果。",
+    ),
+    (
         "Select a request on the left, or create one with {}.",
         "從左側選一個請求，或按 {} 新增。",
     ),
     ("Select method", "選擇方法"),
+    ("Select the URL", "選取 URL"),
     ("Send", "傳送"),
+    ("Send and download", "傳送並下載"),
     ("Send and download…", "傳送並下載…"),
     (
         "Send now and again at this interval, until stopped",
@@ -621,6 +912,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "Send opens your browser to sign in; the provider hands the token straight back to this machine. It is reused until it expires or is rejected, then you sign in again (the implicit grant has no refresh tokens).",
         "傳送時會開啟瀏覽器登入，提供者會把權杖直接交回本機。權杖會重複使用直到過期或被拒，之後需重新登入（implicit 授權沒有 refresh token）。",
     ),
+    ("Send request", "傳送請求"),
     (
         "Send stored cookies and keep the ones the server sets",
         "送出已存的 Cookie，並保留伺服器設定的 Cookie",
@@ -635,10 +927,26 @@ const ZH_TW: &[(&str, &str)] = &[
         "Sent back to matching URLs, unless a request sets its own Cookie header.",
         "會送回相符的網址，除非請求自己設了 Cookie 標頭。",
     ),
+    (
+        "Sent with every message you publish.",
+        "每則發布的訊息都會帶上。",
+    ),
+    (
+        "Server error: the server failed to fulfil a valid request.",
+        "伺服器錯誤：伺服器無法完成有效的請求。",
+    ),
     ("Service", "服務"),
+    (
+        "Service Unavailable: overloaded or down for maintenance; see Retry-After.",
+        "Service Unavailable：伺服器過載或維護中；請看 Retry-After。",
+    ),
     ("Session token", "工作階段權杖"),
     ("Set a request header", "設定請求標頭"),
     ("Set an environment variable", "設定環境變數"),
+    (
+        "set by the Body tab's form-data mode",
+        "由「內容」分頁的 form-data 模式設定",
+    ),
     ("Set by the number of data rows", "由資料列數決定"),
     ("Sets the Content-Type header", "會設定 Content-Type 標頭"),
     ("Settings", "設定"),
@@ -691,9 +999,21 @@ const ZH_TW: &[(&str, &str)] = &[
         "Stored on this machine only (in apitool.db), never exported.",
         "只存在這台電腦（apitool.db），不會匯出。",
     ),
+    (
+        "Subscribed to on Connect. + matches one level, # everything below.",
+        "連線時訂閱。+ 符合一層，# 符合以下所有層。",
+    ),
+    (
+        "Success: the request was received, understood and accepted.",
+        "成功：請求已收到、理解並接受。",
+    ),
     ("System", "系統"),
     ("System proxy", "系統代理伺服器"),
     ("temporary credentials only", "僅限臨時憑證"),
+    (
+        "Temporary Redirect: repeat the same request at another URL.",
+        "Temporary Redirect：向另一個 URL 重送同一個請求。",
+    ),
     ("Tests ({}/{})", "測試 ({}/{})"),
     ("Tests {}/{}", "測試 {}/{}"),
     ("Tests: {}/{} passed", "測試：{}/{} 通過"),
@@ -708,6 +1028,14 @@ const ZH_TW: &[(&str, &str)] = &[
         "連線未正常結束時，broker 會發布這則訊息",
     ),
     (
+        "The collection runner is already running.",
+        "集合執行器已在執行中。",
+    ),
+    (
+        "The collection runner is still running; cancel it first.",
+        "集合執行器仍在執行，請先取消。",
+    ),
+    (
         "The file's bytes are the body, as they are. Content-Type comes from the extension unless set under Headers. Or drop a file here.",
         "檔案的位元組原封不動作為內容。除非在標頭裡設定，Content-Type 依副檔名決定。也可以把檔案拖到這裡。",
     ),
@@ -719,9 +1047,27 @@ const ZH_TW: &[(&str, &str)] = &[
         "The OS certificate store is always trusted; these are added on top.",
         "一律信任作業系統的憑證存放區；這些是額外加入的。",
     ),
+    ("the page linking here", "連到這裡的頁面"),
+    ("The request isn't open any more", "這個請求已經沒有開啟"),
+    (
+        "The response beside the request instead of under it",
+        "回應放在請求旁邊，而不是下方",
+    ),
+    (
+        "The response was over {} and wasn't kept while the tab was in the background: send again to see it",
+        "回應超過 {}，分頁在背景時沒有保留：請重新傳送以查看",
+    ),
+    (
+        "The server has {} services (gRPC reflection)",
+        "伺服器有 {} 個服務（gRPC reflection）",
+    ),
     (
         "The token is fetched on Send and reused until it expires or is rejected.",
         "傳送時取得權杖，並重複使用到過期或被拒絕為止。",
+    ),
+    (
+        "The window is too narrow: the response is under the request until it is wider",
+        "視窗太窄：回應會放在請求下方，直到視窗夠寬",
     ),
     ("Theme", "主題"),
     (
@@ -752,14 +1098,38 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Token", "權杖"),
     ("Token secret", "權杖密鑰"),
     ("Token URL", "權杖網址"),
+    (
+        "Too Many Requests: rate limited; see Retry-After.",
+        "Too Many Requests：已被限流；請看 Retry-After。",
+    ),
     ("Topics", "主題"),
     ("Types ({})", "型別 ({})"),
+    (
+        "Unauthorized: credentials are missing or wrong.",
+        "Unauthorized：缺少憑證或憑證錯誤。",
+    ),
     ("Undefined: {}", "未定義：{}"),
     ("Unfold", "展開"),
+    (
+        "Unprocessable Content: well-formed, but the values don't pass validation.",
+        "Unprocessable Content：格式正確，但值沒有通過驗證。",
+    ),
     ("Unsaved changes", "尚未儲存的變更"),
+    (
+        "Unsupported Media Type: the server doesn't take this Content-Type.",
+        "Unsupported Media Type：伺服器不接受此 Content-Type。",
+    ),
     ("Update", "更新"),
     ("Updates", "更新"),
     ("Use the files", "使用檔案"),
+    (
+        "User properties need MQTT 5.0 (Settings)",
+        "使用者屬性需要 MQTT 5.0（設定）",
+    ),
+    (
+        "User properties need MQTT 5.0 (Settings).",
+        "使用者屬性需要 MQTT 5.0（設定）。",
+    ),
     ("Username", "使用者名稱"),
     (
         "Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// use the certificate settings in Network settings, and the connection goes through its proxy.",
@@ -775,6 +1145,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Value", "值"),
     ("Values for this request", "這個請求的值"),
+    ("Variables", "變數"),
     ("Variables (JSON)", "變數 (JSON)"),
     ("Variables ({})", "變數 ({})"),
     (
@@ -786,6 +1157,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "所有環境都能用的變數",
     ),
     ("Variables in scope", "可用的變數"),
+    ("Variables not loaded: {}", "變數未載入：{}"),
     ("Verify TLS certificate", "驗證 TLS 憑證"),
     ("Version", "版本"),
     ("Virtual users", "虛擬使用者"),
@@ -801,7 +1173,6 @@ const ZH_TW: &[(&str, &str)] = &[
         "What was sent, redirects, and what came back",
         "送出的內容、重新導向與收到的回應",
     ),
-    ("Whole collection", "整個集合"),
     ("Whole word", "全字相符"),
     ("Will message", "遺囑訊息內容"),
     (
@@ -813,6 +1184,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "Windows 已設定 PAC 指令碼，將會使用：\n{}",
     ),
     ("Workspace files changed", "工作區檔案已變更"),
+    ("Workspace files not in step: {}", "工作區檔案未同步：{}"),
     ("Wrap", "自動換行"),
     ("Wrap long lines", "長行自動換行"),
     (
@@ -820,11 +1192,19 @@ const ZH_TW: &[(&str, &str)] = &[
         "寫入工作區資料夾中的 {}，供 git 使用。",
     ),
     (
+        "XPath: /a/b, //b, *, ., .., @attr, text(), [2], [last()], [@id], [@id='x'], [name='x'], [text()='x']; prefixes are ignored",
+        "XPath：/a/b, //b, *, ., .., @attr, text(), [2], [last()], [@id], [@id='x'], [name='x'], [text()='x']；命名空間前綴會被忽略",
+    ),
+    (
         "{{private_key}} or -----BEGIN PRIVATE KEY-----…",
         "{{private_key}} 或 -----BEGIN PRIVATE KEY-----…",
     ),
     ("{} (cut)", "{} (已截斷)"),
     ("{} added on Send", "傳送時加入 {} 個"),
+    (
+        "{} changed on disk; saving will overwrite that change",
+        "{} 在磁碟上已變更；儲存會覆蓋該變更",
+    ),
     ("{} d ago", "{} 天前"),
     ("{} failed requests", "{} 個請求失敗"),
     ("{} h ago", "{} 小時前"),
@@ -843,7 +1223,20 @@ const ZH_TW: &[(&str, &str)] = &[
         "{} of binary data, not shown ({}). Save… keeps it as received.",
         "{} 的二進位資料，未顯示（{}）。「儲存…」會依原樣保存。",
     ),
+    (
+        "{} tabs with unsaved edits left open",
+        "{} 個分頁有未儲存的變更，保持開啟",
+    ),
+    (
+        "{} was deleted on disk; Save recreates it",
+        "{} 已從磁碟刪除；儲存會重新建立",
+    ),
+    (
+        "{}. Not carried over as it was:\n{}",
+        "{}。以下未能照原樣匯入：\n{}",
+    ),
     ("{}/{} tests", "{}/{} 項測試"),
+    ("{}: no data rows", "{}：沒有資料列"),
     (
         "{}\nOnly the first {} were kept, to save memory.",
         "{}\n為了節省記憶體，只保留前 {}。",
@@ -871,6 +1264,7 @@ mod tests {
             include_str!("app.rs"),
             include_str!("varedit.rs"),
             include_str!("appearance.rs"),
+            include_str!("store.rs"),
         ];
         let mut wrapped = std::collections::BTreeSet::new();
         for src in sources {

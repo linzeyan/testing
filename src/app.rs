@@ -9,7 +9,7 @@ use crate::appearance::Appearance;
 use crate::cookies::Jar;
 use crate::graphql::{self, Operation};
 use crate::http;
-use crate::i18n::{n_, t, tf};
+use crate::i18n::{fill, n_, t, tf};
 use crate::loadtest::{self, Stats};
 use crate::model::{self, Auth, Body, Example, Folder, Inherited, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
@@ -896,12 +896,11 @@ impl App {
         let body = view.head.bytes.as_deref().unwrap_or(view.raw().as_bytes());
         match std::fs::write(&path, body) {
             Ok(()) => {
-                let cut = if view.head.truncated {
-                    " (cut at 16 MiB)"
-                } else {
-                    ""
+                let size = human_size(body.len());
+                self.status = match view.head.truncated {
+                    true => tf("Saved {} (cut at 16 MiB) to {}", &[&size, &path]),
+                    false => tf("Saved {} to {}", &[&size, &path]),
                 };
-                self.status = format!("Saved {}{cut} to {path}", human_size(body.len()));
                 self.dialog = None;
             }
             Err(e) => {
@@ -959,13 +958,14 @@ impl App {
             self.tx.clone(),
             ctx.clone(),
         );
+        let (applied, failed) = (t("Network settings applied"), t("Network settings: {}"));
         self.rt.spawn(async move {
             let msg = match cell
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
                 .await
             {
-                Ok(_) => "Network settings applied".to_owned(),
-                Err(e) => format!("Network settings: {e}"),
+                Ok(_) => applied.to_owned(),
+                Err(e) => fill(failed, &[&e]),
             };
             let _ = tx.send(Msg::Status(msg));
             ctx.request_repaint();
@@ -991,7 +991,7 @@ impl App {
     fn reload_vars(&mut self) {
         let mut load = |env: Option<&str>| {
             self.ws.env_vars(env).unwrap_or_else(|e| {
-                self.status = format!("Variables not loaded: {e}");
+                self.status = tf("Variables not loaded: {}", &[&e]);
                 HashMap::new()
             })
         };
@@ -1055,6 +1055,7 @@ impl App {
             self.tx.clone(),
             ctx.clone(),
         );
+        let failed = t("Network settings: {}");
         self.rt.spawn(async move {
             // Through the proxy chosen for requests: a VDI may have no other way out.
             let result = match cell
@@ -1062,7 +1063,7 @@ impl App {
                 .await
             {
                 Ok(clients) => crate::update::latest(&clients.http).await,
-                Err(e) => Err(format!("Network settings: {e}")),
+                Err(e) => Err(fill(failed, &[&e])),
             };
             let _ = tx.send(Msg::Latest(result));
             ctx.request_repaint();
@@ -1077,13 +1078,14 @@ impl App {
             self.tx.clone(),
             ctx.clone(),
         );
+        let failed = t("Network settings: {}");
         self.rt.spawn(async move {
             let result = match cell
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
                 .await
             {
                 Ok(clients) => crate::update::install(&clients.http, &release).await,
-                Err(e) => Err(format!("Network settings: {e}")),
+                Err(e) => Err(fill(failed, &[&e])),
             };
             let _ = tx.send(Msg::Installed(release, result));
             ctx.request_repaint();
@@ -1096,14 +1098,14 @@ impl App {
     fn sync(&mut self) {
         match self.ws.sync() {
             Ok(Synced::Imported) => {
-                self.status = "Read the changed workspace files".into();
+                self.status = t("Read the changed workspace files").into();
                 // May replace the status: an open request with unsaved edits is flagged.
                 self.refresh_from_disk();
             }
             // Never over another dialog; the next look asks again.
             Ok(Synced::Conflict) if self.dialog.is_none() => self.dialog = Some(Dialog::Sync),
             Ok(_) => {}
-            Err(e) => self.status = format!("Workspace files not in step: {e}"),
+            Err(e) => self.status = tf("Workspace files not in step: {}", &[&e]),
         }
     }
 
@@ -1132,16 +1134,16 @@ impl App {
             Ok(disk) if !open.dirty() => {
                 open.saved = disk.clone();
                 open.draft = disk;
-                self.status = format!("Reloaded {}: changed on disk", open.name());
+                self.status = tf("Reloaded {}: changed on disk", &[&open.name()]);
             }
             Ok(_) => {
-                self.status = format!(
+                self.status = tf(
                     "{} changed on disk; saving will overwrite that change",
-                    open.name()
+                    &[&open.name()],
                 )
             }
             Err(_) if !self.ws.exists(&open.path) => {
-                self.status = format!("{} was deleted on disk; Save recreates it", open.name())
+                self.status = tf("{} was deleted on disk; Save recreates it", &[&open.name()])
             }
             Err(e) => self.status = e,
         }
@@ -1204,9 +1206,9 @@ impl App {
                 Some(p) => {
                     (self.open, self.response, self.load) = (Some(p.open), p.response, p.load);
                     if p.dropped {
-                        self.status = format!(
+                        self.status = tf(
                             "The response was over {} and wasn't kept while the tab was in the background: send again to see it",
-                            human_size(MAX_PARKED_RESPONSE)
+                            &[&human_size(MAX_PARKED_RESPONSE)],
                         );
                     }
                     self.refresh_open();
@@ -1276,8 +1278,10 @@ impl App {
             }
         }
         if kept > 0 {
-            let tabs = if kept == 1 { "tab" } else { "tabs" };
-            self.status = format!("{kept} {tabs} with unsaved edits left open");
+            self.status = match kept {
+                1 => t("1 tab with unsaved edits left open").to_owned(),
+                n => tf("{} tabs with unsaved edits left open", &[&n]),
+            };
         }
     }
 
@@ -1334,7 +1338,7 @@ impl App {
         let runner = self.runner.as_ref().and_then(|r| r.run.as_ref());
         let busy = runner.is_some_and(RunState::running);
         if busy {
-            self.status = "The collection runner is still running; cancel it first.".into();
+            self.status = t("The collection runner is still running; cancel it first.").into();
         }
         busy
     }
@@ -1420,7 +1424,7 @@ impl App {
         on_disk.examples.push(example.clone());
         match self.ws.save_request(&open.path, &on_disk) {
             Ok(()) => {
-                self.status = format!("Saved example \"{}\"", example.name);
+                self.status = tf("Saved example \"{}\"", &[&example.name]);
                 open.saved = on_disk;
                 open.draft.examples.push(example);
                 self.req_tab = ReqTab::Examples;
@@ -1488,6 +1492,7 @@ impl App {
             self.tx.clone(),
             ctx.clone(),
         );
+        let failed = t("Network settings: {}");
         let task = self.rt.spawn(async move {
             let outcome = match cell
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
@@ -1505,7 +1510,7 @@ impl App {
                         None => run.await,
                     }
                 }
-                Err(e) => Outcome::failed(format!("Network settings: {e}")),
+                Err(e) => Outcome::failed(fill(failed, &[&e])),
             };
             let _ = tx.send(Msg::Response(path, Box::new(outcome)));
             ctx.request_repaint();
@@ -1545,6 +1550,7 @@ impl App {
             log.clone(),
             ctx.clone(),
         );
+        let failed = t("Network settings: {}");
         let task = self.rt.spawn(async move {
             let emit = |e| {
                 task_log.lock().unwrap().push(started.elapsed(), e);
@@ -1574,10 +1580,10 @@ impl App {
                         Ok(http) if socketio => stream::socketio(http, req, out_rx, emit).await,
                         Ok(http) if upgrades => stream::graphql(http, req, emit).await,
                         Ok(http) => stream::sse(http, req, emit).await,
-                        Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
+                        Err(e) => emit(Event::Error(fill(failed, &[&e]))),
                     }
                 }
-                Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
+                Err(e) => emit(Event::Error(fill(failed, &[&e]))),
             }
         });
         self.stream = Some(StreamSession {
@@ -1587,9 +1593,9 @@ impl App {
             selected: None,
             outgoing,
             hint: match (&grpc, socketio) {
-                (Some(_), _) => "Message (JSON)",
-                (None, true) => "An event and its argument: chat {\"text\": \"hi\"}",
-                (None, false) => "Message",
+                (Some(_), _) => t("Message (JSON)"),
+                (None, true) => t("An event and its argument: chat {\"text\": \"hi\"}"),
+                (None, false) => t("Message"),
             },
             grpc,
             live: true,
@@ -1697,7 +1703,7 @@ impl App {
                     // The picker asks again, and this time finds them.
                     self.grpc_methods = None;
                     self.status = match result {
-                        Ok(n) => format!("The server has {n} services (gRPC reflection)"),
+                        Ok(n) => tf("The server has {} services (gRPC reflection)", &[&n]),
                         Err(e) => e,
                     };
                     continue;
@@ -1744,7 +1750,7 @@ impl App {
                 Ok(r) => {
                     self.statuses.insert(path.clone(), r.status);
                     (self.ws.add_response(&path, r))
-                        .inspect_err(|e| self.status = format!("Keeping the response: {e}"))
+                        .inspect_err(|e| self.status = tf("Keeping the response: {}", &[&e]))
                         .ok()
                 }
                 Err(_) => None,
@@ -1775,24 +1781,28 @@ impl App {
     /// value" it stays on this machine, and it survives restarts so chained tokens keep working.
     fn apply_changes(&mut self, env: Changes, globals: Changes) {
         let mut globals = globals;
+        let mut failed = false;
         if !env.is_empty() {
             match self.active_env.clone() {
                 Some(name) => {
                     if let Err(e) = self.ws.apply_changes(Some(&name), &env) {
-                        self.status = format!("Saving environment: {e}");
+                        self.status = tf("Saving environment: {}", &[&e]);
+                        failed = true;
                     }
                 }
                 None => {
                     self.status =
-                        "No environment selected: pm.environment.set was stored as a global".into();
+                        t("No environment selected: pm.environment.set was stored as a global")
+                            .into();
                     globals.extend(env);
                 }
             }
         }
         if let Err(e) = self.ws.apply_changes(None, &globals) {
-            self.status = format!("Saving globals: {e}");
+            self.status = tf("Saving globals: {}", &[&e]);
+            failed = true;
         }
-        if !self.status.starts_with("Saving") {
+        if !failed {
             self.reload_vars();
         }
     }
@@ -1842,13 +1852,13 @@ impl App {
         self.tree_picked.clear();
         if let Some(new) = last {
             if count == 1 {
-                self.status = format!("Moved to \"{}\"", self.ws.display_name(&new));
+                self.status = tf("Moved to \"{}\"", &[&self.ws.display_name(&new)]);
             } else if count > 1 {
                 let dir = new
                     .parent()
                     .map(|d| self.ws.display_name(d))
                     .unwrap_or_default();
-                self.status = format!("Moved {count} items to \"{dir}\"");
+                self.status = tf("Moved {} items to \"{}\"", &[&count, &dir]);
             }
             self.reload();
             self.save_state();
@@ -1864,10 +1874,10 @@ impl App {
     fn save_as(&mut self, old: &Path, folder: &Path, name: &str) -> Result<PathBuf, String> {
         let new = store::request_in(folder, name)?;
         if self.ws.exists(&new) {
-            return Err(format!("\"{}\" already exists", self.ws.display_name(&new)));
+            return Err(tf("\"{}\" already exists", &[&self.ws.display_name(&new)]));
         }
         let Some(open) = self.open.as_mut().filter(|o| o.path == old) else {
-            return Err("The request isn't open any more".into());
+            return Err(t("The request isn't open any more").into());
         };
         self.ws.save_request(&new, &open.draft)?;
         open.saved = open.draft.clone();
@@ -1875,7 +1885,7 @@ impl App {
         // Another folder passes down other variables, auth and scripts.
         self.refresh_inherited();
         self.reveal = Some(new.clone());
-        self.status = format!("Saved as \"{}\"", self.ws.display_name(&new));
+        self.status = tf("Saved as \"{}\"", &[&self.ws.display_name(&new)]);
         Ok(new)
     }
 
@@ -1889,7 +1899,7 @@ impl App {
             NameKind::NewFolder(dir) => self.ws.create_folder(dir, &name).map(|_| None),
             // Never overwrite: an existing name would silently wipe that environment.
             NameKind::NewEnv | NameKind::DuplicateEnv(_) if self.envs.contains(&name) => {
-                Err(format!("Environment \"{name}\" already exists"))
+                Err(tf("Environment \"{}\" already exists", &[&name]))
             }
             NameKind::NewEnv => self.ws.save_env(Some(&name), &[], &[]).map(|()| None),
             NameKind::DuplicateEnv(from) => self
@@ -2076,15 +2086,15 @@ fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView, recent: &mut Vec<Strin
                 // Not an auto id: the × appearing would change it and drop focus.
                 .id(egui::Id::new("json-filter"))
                 .hint_text(match view.json {
-                    true => "Filter: $.items[*].id",
-                    false => "Filter: //item/@id",
+                    true => t("Filter: $.items[*].id"),
+                    false => t("Filter: //item/@id"),
                 })
                 .font(egui::TextStyle::Monospace)
                 .desired_width(280.0),
         );
         let edit = edit.on_hover_text(match view.json {
             true => "JSONPath: $, .key, ['key'], [0], [-1], [*], .*, ..key, [?(@.price < 10 && @.tag == 'x')]",
-            false => "XPath: /a/b, //b, *, ., .., @attr, text(), [2], [last()], [@id], [@id='x'], [name='x'], [text()='x']; prefixes are ignored",
+            false => t("XPath: /a/b, //b, *, ., .., @attr, text(), [2], [last()], [@id], [@id='x'], [name='x'], [text()='x']; prefixes are ignored"),
         });
         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         let live = view.raw_size <= LIVE_FILTER_MAX;
@@ -2388,6 +2398,20 @@ impl eframe::App for App {
         if ui.input_mut(|i| i.consume_shortcut(&SETTINGS)) {
             self.settings = true;
         }
+        // As the picked rows' "Delete N items"; ⌘⌫ for Mac keyboards, which have no Delete.
+        // Not while typing: there the keys edit the text.
+        if !self.tree_picked.is_empty()
+            && self.dialog.is_none()
+            && self.env_editor.is_none()
+            && self.folder_editor.is_none()
+            && !ui.ctx().text_edit_focused()
+            && ui.input_mut(|i| {
+                i.consume_key(Modifiers::NONE, Key::Delete)
+                    || i.consume_key(Modifiers::COMMAND, Key::Backspace)
+            })
+        {
+            self.dialog = Some(Dialog::Delete(self.tree_picked.clone()));
+        }
         if ui.input_mut(|i| i.consume_shortcut(&FOCUS_URL))
             && let Some(open) = &self.open
         {
@@ -2510,8 +2534,8 @@ impl App {
                 }
                 ui.separator();
                 let hint = match self.narrow {
-                    true => "The window is too narrow: the response is under the request until it is wider",
-                    false => "The response beside the request instead of under it",
+                    true => t("The window is too narrow: the response is under the request until it is wider"),
+                    false => t("The response beside the request instead of under it"),
                 };
                 let on = self.side_by_side;
                 let toggle = ui.toggle_value(&mut self.side_by_side, icon::COLUMNS);
@@ -2525,24 +2549,24 @@ impl App {
                 let mut stop_mock = false;
                 if let Some(m) = &self.mock {
                     ui.colored_label(GREEN, "●");
-                    let hover = format!(
+                    let hover = tf(
                         "Answers with the saved examples of {}. Click to copy the URL.",
-                        m.folder
+                        &[&m.folder],
                     );
                     if ui
-                        .small_button(format!("Mock {}", m.url))
+                        .small_button(tf("Mock {}", &[&m.url]))
                         .on_hover_text(hover)
                         .clicked()
                     {
                         ui.ctx().copy_text(m.url.clone());
-                        self.status = "Copied the mock server URL".into();
+                        self.status = t("Copied the mock server URL").into();
                     }
                     stop_mock = ui.small_button(t("Stop")).clicked();
                     ui.separator();
                 }
                 if stop_mock {
                     self.mock = None;
-                    self.status = "Mock server stopped".into();
+                    self.status = t("Mock server stopped").into();
                 }
                 if let Some(m) = memory_stats::memory_stats() {
                     ui.weak(format!("RAM {:.0} MB", mb(m.physical_mem)))
@@ -2899,7 +2923,7 @@ impl App {
         match self.ws.duplicate(path) {
             Ok(new) => {
                 self.reload();
-                self.status = format!("Duplicated as \"{}\"", self.ws.display_name(&new));
+                self.status = tf("Duplicated as \"{}\"", &[&self.ws.display_name(&new)]);
                 if crate::store::is_request(&new) && !self.runner_busy() {
                     self.runner = None;
                     self.activate(new, true);
@@ -2925,13 +2949,12 @@ impl App {
                     .map(|w| format!("• {w}"))
                     .collect();
                 if warnings.len() > SHOWN {
-                    lines.push(format!("… and {} more", warnings.len() - SHOWN));
+                    lines.push(tf("… and {} more", &[&(warnings.len() - SHOWN)]));
                 }
                 text.clear();
-                *note = format!(
+                *note = tf(
                     "{}. Not carried over as it was:\n{}",
-                    self.status,
-                    lines.join("\n")
+                    &[&self.status, &lines.join("\n")],
                 );
             }
             Err(e) => *note = e,
@@ -2945,9 +2968,15 @@ impl App {
                 ctx.copy_text(json);
                 let left = match skipped {
                     0 => String::new(),
-                    n => format!("; left out {n} WebSocket/SSE/gRPC, which collections can't hold"),
+                    n => tf(
+                        "; left out {} WebSocket/SSE/gRPC, which collections can't hold",
+                        &[&n],
+                    ),
                 };
-                format!("Copied {count} requests as a Postman collection{left}")
+                tf(
+                    "Copied {} requests as a Postman collection{}",
+                    &[&count, &left],
+                )
             }
             Err(e) => e,
         };
@@ -2978,11 +3007,14 @@ impl App {
                 for (env, shared, secret) in &environments {
                     self.add_env(env, shared, secret)?;
                 }
-                self.status = format!("Imported {} requests into \"{name}\"", requests.len());
+                self.status = tf(
+                    "Imported {} requests into \"{}\"",
+                    &[&requests.len(), &name],
+                );
                 match environments.len() {
                     0 => {}
-                    1 => self.status += " and 1 environment",
-                    n => self.status += &format!(" and {n} environments"),
+                    1 => self.status += t(" and 1 environment"),
+                    n => self.status += &tf(" and {} environments", &[&n]),
                 }
                 warnings
             }
@@ -2992,7 +3024,7 @@ impl App {
                 secret,
             } => {
                 let name = self.add_env(&name, &shared, &secret)?;
-                self.status = format!("Imported environment \"{name}\"");
+                self.status = tf("Imported environment \"{}\"", &[&name]);
                 Vec::new()
             }
         };
@@ -3020,7 +3052,7 @@ impl App {
         match crate::docs::markdown(&self.ws, dir) {
             Ok(md) => {
                 ctx.copy_text(md);
-                self.status = "Copied the docs as Markdown".into();
+                self.status = t("Copied the docs as Markdown").into();
             }
             Err(e) => self.status = e,
         }
@@ -3030,7 +3062,7 @@ impl App {
     fn start_mock(&mut self, dir: PathBuf, ctx: &egui::Context) {
         let requests = self.ws.load_requests_in(&dir).unwrap_or_default();
         if !requests.iter().any(|(_, r)| !r.examples.is_empty()) {
-            self.status = "Nothing to mock yet: send a request, then \"Save as example\"".into();
+            self.status = t("Nothing to mock yet: send a request, then \"Save as example\"").into();
             return;
         }
         self.mock = None;
@@ -3042,24 +3074,24 @@ impl App {
         });
         let listener = match bound.and_then(|l| Ok((l.local_addr()?, l))) {
             Ok(l) => l,
-            Err(e) => return self.status = format!("Mock server: {e}"),
+            Err(e) => return self.status = tf("Mock server: {}", &[&e]),
         };
         let (addr, listener) = listener;
         let folder = if dir == self.ws.collections() {
-            "the whole collection".to_owned()
+            t("all collections").to_owned()
         } else {
             store::folder_name(&self.ws.collections(), &dir)
         };
-        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        let (tx, ctx, logged) = (self.tx.clone(), ctx.clone(), t("Mock: {}"));
         let log = move |line: String| {
-            let _ = tx.send(Msg::Status(format!("Mock: {line}")));
+            let _ = tx.send(Msg::Status(fill(logged, &[&line])));
             ctx.request_repaint();
         };
         let task = self
             .rt
             .spawn(crate::mock::serve(self.ws.clone(), dir, listener, log));
         let url = format!("http://{addr}");
-        self.status = format!("Mock server for {folder} at {url}");
+        self.status = tf("Mock server for {} at {}", &[&folder, &url]);
         self.mock = Some(MockServer {
             url,
             folder,
@@ -3104,10 +3136,9 @@ impl App {
                                 .sense(egui::Sense::click()),
                         )
                     });
-                    let note = if e.body_dropped {
-                        "\nBody was too large to keep"
-                    } else {
-                        ""
+                    let note = match e.body_dropped {
+                        true => format!("\n{}", t("Body was too large to keep")),
+                        false => String::new(),
                     };
                     let hover = format!("{}\n{} · {} ms{note}", e.request.url, ago(e.at), e.ms);
                     if row.inner.on_hover_text(hover).clicked() {
@@ -3125,7 +3156,7 @@ impl App {
                 }
                 _ => {
                     let name = store::unescape_path(&e.path);
-                    self.status = format!("\"{name}\" no longer exists");
+                    self.status = tf("\"{}\" no longer exists", &[&name]);
                 }
             }
         }
@@ -3323,7 +3354,7 @@ impl App {
                                 && ui.add(primary(t("Copy"))).clicked()
                             {
                                 ui.ctx().copy_text(code.clone());
-                                self.status = format!("Copied {} snippet", self.code_lang);
+                                self.status = tf("Copied {} snippet", &[&self.code_lang]);
                             }
                         });
                     });
@@ -3399,9 +3430,14 @@ impl App {
                         .on_hover_text(t("This request as curl, Python, Go, … to copy"));
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
-                        for (name, dir) in &crumbs {
+                        for (i, (name, dir)) in crumbs.iter().enumerate() {
                             let link = ui.link(RichText::new(name).weak());
-                            if link.on_hover_text(t("Folder settings")).clicked() {
+                            // The outermost is the collection.
+                            let hover = match i {
+                                0 => t("Collection settings"),
+                                _ => t("Folder settings"),
+                            };
+                            if link.on_hover_text(hover).clicked() {
                                 folder_clicked = Some(dir.clone());
                             }
                             ui.weak("›");
@@ -3475,9 +3511,9 @@ impl App {
                             (d.method, d.url, d.params) = (r.method, r.url, r.params);
                             (d.headers, d.body, d.auth) = (r.headers, r.body, r.auth);
                             d.settings = r.settings;
-                            self.status = "Imported curl command".into();
+                            self.status = t("Imported curl command").into();
                         }
-                        Err(e) => self.status = format!("curl import: {e}"),
+                        Err(e) => self.status = tf("curl import: {}", &[&e]),
                     }
                 } else if url.changed() {
                     open.draft.params_from_url();
@@ -3743,7 +3779,7 @@ impl App {
                     ReqTab::Asserts => {
                         kv_table(ui, "asserts", &mut open.draft.asserts, &all_vars, false);
                         ui.add_space(8.0);
-                        ui.weak(ASSERTS_HINT);
+                        ui.weak(t(ASSERTS_HINT));
                     }
                     ReqTab::Settings if open.draft.method == "MQTT" => {
                         mqtt_settings(ui, &mut open.draft.mqtt)
@@ -3769,8 +3805,8 @@ impl App {
                         );
                         ui.add_space(8.0);
                         ui.weak(match m.v5 {
-                            true => "Sent with every message you publish.",
-                            false => "User properties need MQTT 5.0 (Settings).",
+                            true => t("Sent with every message you publish."),
+                            false => t("User properties need MQTT 5.0 (Settings)."),
                         });
                     }
                     ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
@@ -3852,7 +3888,7 @@ impl App {
             match self.ws.clear_responses(path) {
                 Ok(()) => {
                     self.statuses.remove(path);
-                    self.status = "Cleared this request's response history".into();
+                    self.status = t("Cleared this request's response history").into();
                 }
                 Err(e) => self.status = e,
             }
@@ -3879,7 +3915,7 @@ impl App {
                         past: Some(id),
                     })
                 }
-                Err(e) => self.status = format!("Reading that response: {e}"),
+                Err(e) => self.status = tf("Reading that response: {}", &[&e]),
             }
         }
         if let Some(example) = example {
@@ -3980,6 +4016,7 @@ impl App {
             self.tx.clone(),
             ctx.clone(),
         );
+        let failed = t("Network settings: {}");
         self.rt.spawn(async move {
             let url = req.url.clone();
             let result = match cell
@@ -3996,7 +4033,7 @@ impl App {
                     )),
                     Err(e) => Err(e),
                 },
-                Err(e) => Err(format!("Network settings: {e}")),
+                Err(e) => Err(fill(failed, &[&e])),
             };
             let _ = tx.send(Msg::Schema(url, result));
             ctx.request_repaint();
@@ -4008,13 +4045,14 @@ impl App {
             return;
         };
         let (req, _) = open.draft.resolved(&self.all_vars());
-        self.status = "Asking the server for its methods…".into();
+        self.status = t("Asking the server for its methods…").into();
         let (cell, net, tx, ctx) = (
             self.client.clone(),
             (self.network.clone(), self.cookies.clone()),
             self.tx.clone(),
             ctx.clone(),
         );
+        let failed = t("Network settings: {}");
         self.rt.spawn(async move {
             let result = match cell
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
@@ -4022,9 +4060,9 @@ impl App {
             {
                 Ok(client) => match client.grpc_for(&req.url) {
                     Ok(grpc) => crate::grpc::reflect(&grpc, &req).await,
-                    Err(e) => Err(format!("Network settings: {e}")),
+                    Err(e) => Err(fill(failed, &[&e])),
                 },
-                Err(e) => Err(format!("Network settings: {e}")),
+                Err(e) => Err(fill(failed, &[&e])),
             };
             let _ = tx.send(Msg::Reflected(result));
             ctx.request_repaint();
@@ -4046,6 +4084,7 @@ impl App {
             stats.clone(),
         );
         let ctx = ctx.clone();
+        let failed = t("Network settings: {}");
         let task = self.rt.spawn(async move {
             match cell
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
@@ -4055,7 +4094,7 @@ impl App {
                     loadtest::run(client.clone(), req, vus, Duration::from_secs(secs), s).await
                 }
                 Err(e) => {
-                    let _ = tx.send(Msg::Status(format!("Network settings: {e}")));
+                    let _ = tx.send(Msg::Status(fill(failed, &[&e])));
                     let mut s = s.lock().unwrap();
                     s.finished = Some(s.started.elapsed());
                 }
@@ -4089,7 +4128,7 @@ impl App {
                 ..
             } => {
                 let root = self.ws.collections();
-                let mut found = vec![("(top level)".to_owned(), root.clone())];
+                let mut found = vec![(t("(top level)").to_owned(), root.clone())];
                 let all = switch_targets(&self.tree, &root, &[]).into_iter();
                 found.extend(all.filter_map(|(label, _, go)| match go {
                     Go::Folder(dir) => Some((label, dir)),
@@ -4256,8 +4295,8 @@ impl App {
                     download,
                 } => {
                     ui.heading(match download {
-                        true => "Send and download",
-                        false => "Save response body",
+                        true => t("Send and download"),
+                        false => t("Save response body"),
                     });
                     if *download {
                         ui.weak(t(
@@ -4408,7 +4447,8 @@ impl App {
                                     match app.ws.resolve(use_files) {
                                         Ok(()) => app.refresh_from_disk(),
                                         Err(e) => {
-                                            app.status = format!("Workspace files not in step: {e}")
+                                            app.status =
+                                                tf("Workspace files not in step: {}", &[&e])
                                         }
                                     }
                                 }));
@@ -4463,7 +4503,7 @@ impl App {
                             .clicked()
                             .then(|| {
                                 let kinds: &[&str] = &["json", "yaml", "yml", "har"];
-                                pick_file("", &[("Collection, spec or HAR", kinds)], false)
+                                pick_file("", &[(t("Collection, spec or HAR"), kinds)], false)
                             })
                             .flatten();
                         let input = dropped.or(chosen).or(import.then(|| text.clone()));
@@ -4581,8 +4621,8 @@ impl App {
         };
         match self.ws.save_env(ed.env.as_deref(), &ed.shared, &ed.secret) {
             Ok(()) => {
-                let name = ed.env.clone().unwrap_or_else(|| "Globals".into());
-                self.status = format!("Saved {name}");
+                let name = ed.env.clone().unwrap_or_else(|| t("Globals").into());
+                self.status = tf("Saved {}", &[&name]);
                 self.env_editor = None;
                 self.reload_vars();
                 true
@@ -4617,6 +4657,7 @@ impl App {
     }
 
     fn folder_editor_ui(&mut self, ctx: &egui::Context) {
+        let collections = self.ws.collections();
         let Some(ed) = &mut self.folder_editor else {
             return;
         };
@@ -4629,7 +4670,10 @@ impl App {
         // Like the environment editor: only explicit buttons close it.
         egui::Modal::new(egui::Id::new("folder-editor")).show(ctx, |ui| {
             ui.set_width(620.0);
-            ui.heading(tf("Folder: {}", &[&ed.name]));
+            ui.heading(match ed.dir.parent() == Some(&collections) {
+                true => tf("Collection: {}", &[&ed.name]),
+                false => tf("Folder: {}", &[&ed.name]),
+            });
             ui.weak(t(
                 "Shared by every request in this folder and its subfolders. \
                  Written to its .folder.toml, for git.",
@@ -4642,7 +4686,7 @@ impl App {
                     .filter(|v| v.enabled && !v.key.is_empty())
                     .count();
                 let vars_label = match n {
-                    0 => "Variables".to_owned(),
+                    0 => t("Variables").to_owned(),
                     n => tf("Variables ({})", &[&n]),
                 };
                 let dot = |set: bool, name: &str| match set {
@@ -4725,7 +4769,7 @@ impl App {
         };
         match self.ws.save_folder(&ed.dir, &ed.folder) {
             Ok(()) => {
-                self.status = format!("Saved folder {}", ed.name);
+                self.status = tf("Saved {}", &[&ed.name]);
                 self.folder_editor = None;
                 self.refresh_inherited();
             }
@@ -4861,11 +4905,11 @@ impl App {
             .and_then(|r| r.run.as_ref())
             .is_some_and(RunState::running)
         {
-            self.status = "The collection runner is already running.".into();
+            self.status = t("The collection runner is already running.").into();
             return;
         }
         let title = if scope == self.ws.collections() {
-            t("Whole collection").to_owned()
+            t("All collections").to_owned()
         } else {
             self.ws.display_name(&scope)
         };
@@ -4903,7 +4947,7 @@ impl App {
             "" => Ok(Vec::new()),
             p => runner::load_data(Path::new(p)).and_then(|rows| {
                 if rows.is_empty() {
-                    Err(format!("{p}: no data rows"))
+                    Err(tf("{}: no data rows", &[&p]))
                 } else {
                     Ok(rows)
                 }
@@ -4917,7 +4961,7 @@ impl App {
             }
         };
         if requests.is_empty() && error.is_empty() {
-            error = "No requests to run here.".into();
+            error = t("No requests to run here.").into();
         }
         let view = self.runner.as_mut().expect("runner open");
         view.error = error;
@@ -4926,7 +4970,7 @@ impl App {
         }
         if self.open.as_ref().is_some_and(Open::dirty) {
             self.status =
-                "Note: the runner uses saved files; unsaved edits are not included.".into();
+                t("Note: the runner uses saved files; unsaved edits are not included.").into();
         }
         let count = if data.is_empty() {
             view.iterations.max(1)
@@ -4953,6 +4997,7 @@ impl App {
             data: HashMap::new(),
         };
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        let failed = t("Network settings: {}");
         let task = self.rt.spawn(async move {
             let client = match cell
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
@@ -4960,7 +5005,7 @@ impl App {
             {
                 Ok(c) => c.clone(),
                 Err(e) => {
-                    let _ = tx.send(Msg::Status(format!("Network settings: {e}")));
+                    let _ = tx.send(Msg::Status(fill(failed, &[&e])));
                     let _ = tx.send(Msg::RunDone(id, Changes::new(), Changes::new()));
                     ctx.request_repaint();
                     return;
@@ -5008,7 +5053,7 @@ impl App {
                             .hint_text(t("Optional CSV (with header row) or JSON array; one iteration per row"))
                             .desired_width(480.0),
                     );
-                    browse(ui, &mut view.data_path, &[("CSV or JSON", &["csv", "json"])], false);
+                    browse(ui, &mut view.data_path, &[(t("CSV or JSON"), &["csv", "json"])], false);
                 });
                 ui.end_row();
                 ui.label(t("Iterations"));
@@ -5030,7 +5075,8 @@ impl App {
                     let run = view.run.as_mut().expect("running");
                     run.abort.abort();
                     run.finished = Some(run.started.elapsed());
-                    self.status = "Run cancelled; variable changes from it were discarded.".into();
+                    self.status =
+                        t("Run cancelled; variable changes from it were discarded.").into();
                 }
             } else {
                 let label = RichText::new(t("▶ Run")).strong().color(Color32::WHITE);
@@ -5668,8 +5714,9 @@ fn tree_ui(
                 if row.drag_started() {
                     actions.push(TreeAction::Drag(path.clone()));
                 }
-                let own =
-                    |ui: &mut egui::Ui, a: &mut Vec<TreeAction>| folder_menu(ui, path, name, a);
+                let own = |ui: &mut egui::Ui, a: &mut Vec<TreeAction>| {
+                    folder_menu(ui, path, name, collection, a)
+                };
                 row.context_menu(|ui| row_menu(ui, view.picked, path, actions, own));
                 more_button(ui, &row, path, |ui| {
                     row_menu(ui, view.picked, path, actions, own)
@@ -5897,7 +5944,13 @@ fn tree_drop(
     }
 }
 
-fn folder_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<TreeAction>) {
+fn folder_menu(
+    ui: &mut egui::Ui,
+    path: &Path,
+    name: &str,
+    collection: bool,
+    actions: &mut Vec<TreeAction>,
+) {
     let mut item = |ui: &mut egui::Ui, label: &str, a: TreeAction| {
         if ui.button(label).clicked() {
             actions.push(a);
@@ -5925,11 +5978,11 @@ fn folder_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<Tre
         TreeAction::Dialog(Dialog::Delete(vec![path.clone()])),
     );
     ui.separator();
-    item(
-        ui,
-        t("Folder settings…"),
-        TreeAction::FolderSettings(path.clone()),
-    );
+    let settings = match collection {
+        true => t("Collection settings…"),
+        false => t("Folder settings…"),
+    };
+    item(ui, settings, TreeAction::FolderSettings(path.clone()));
     item(
         ui,
         t("Copy docs as Markdown"),
@@ -5941,7 +5994,11 @@ fn folder_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<Tre
         TreeAction::CopyPostman(path.clone()),
     );
     item(ui, t("Start mock server"), TreeAction::Mock(path.clone()));
-    item(ui, t("Run folder"), TreeAction::Run(path));
+    let run = match collection {
+        true => t("Run collection"),
+        false => t("Run folder"),
+    };
+    item(ui, run, TreeAction::Run(path));
 }
 
 fn request_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<TreeAction>) {
@@ -5990,28 +6047,28 @@ fn more_button(
 }
 
 const HEADER_NAMES: &[(&str, &str)] = &[
-    ("Accept", "media types the client takes"),
+    ("Accept", n_("media types the client takes")),
     ("Accept-Encoding", "gzip, deflate, br"),
     ("Accept-Language", "en-US, zh-TW"),
-    ("Authorization", "credentials (or use the Auth tab)"),
+    ("Authorization", n_("credentials (or use the Auth tab)")),
     ("Cache-Control", "no-cache, max-age=0"),
     ("Connection", "keep-alive, close"),
     ("Content-Disposition", "attachment; filename=…"),
     ("Content-Encoding", "gzip"),
-    ("Content-Type", "media type of the body"),
+    ("Content-Type", n_("media type of the body")),
     ("Cookie", "name=value; …"),
-    ("If-Match", "ETag to match"),
-    ("If-Modified-Since", "HTTP date"),
-    ("If-None-Match", "ETag from an earlier response"),
-    ("Origin", "for CORS"),
+    ("If-Match", n_("ETag to match")),
+    ("If-Modified-Since", n_("HTTP date")),
+    ("If-None-Match", n_("ETag from an earlier response")),
+    ("Origin", n_("for CORS")),
     ("Pragma", "no-cache"),
     ("Range", "bytes=0-1023"),
-    ("Referer", "the page linking here"),
-    ("User-Agent", "client name and version"),
-    ("X-API-Key", "API key (or use the Auth tab)"),
-    ("X-Correlation-ID", "id to trace a call across services"),
-    ("X-Forwarded-For", "client IP behind a proxy"),
-    ("X-Request-ID", "id for this request"),
+    ("Referer", n_("the page linking here")),
+    ("User-Agent", n_("client name and version")),
+    ("X-API-Key", n_("API key (or use the Auth tab)")),
+    ("X-Correlation-ID", n_("id to trace a call across services")),
+    ("X-Forwarded-For", n_("client IP behind a proxy")),
+    ("X-Request-ID", n_("id for this request")),
     ("X-Requested-With", "XMLHttpRequest"),
 ];
 
@@ -6021,12 +6078,12 @@ const CONTENT_TYPES: &[(&str, &str)] = &[
     ("application/x-www-form-urlencoded", ""),
     (
         "multipart/form-data",
-        "set by the Body tab's form-data mode",
+        n_("set by the Body tab's form-data mode"),
     ),
     ("text/plain", ""),
     ("text/html", ""),
     ("text/csv", ""),
-    ("application/octet-stream", "raw bytes"),
+    ("application/octet-stream", n_("raw bytes")),
 ];
 
 /// What Send adds to the user's headers, greyed and folded away by default like Postman's
@@ -6094,7 +6151,7 @@ fn kv_table(
             let edited = ui.add(
                 egui::TextEdit::multiline(text)
                     .code_editor()
-                    .hint_text(BULK_HINT)
+                    .hint_text(t(BULK_HINT))
                     .desired_rows(8)
                     .desired_width(f32::INFINITY),
             );
@@ -6229,7 +6286,7 @@ fn path_vars_table(ui: &mut egui::Ui, rows: &mut [KeyValue], vars: &HashMap<Stri
     }
 }
 
-const BULK_HINT: &str = "key: value, one per line; // in front turns a line off";
+const BULK_HINT: &str = n_("key: value, one per line; // in front turns a line off");
 
 /// Postman's bulk format: `key: value` per line, `//` in front of a disabled one.
 fn to_bulk(rows: &[KeyValue]) -> String {
@@ -7061,8 +7118,8 @@ fn qos_box(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, qos: &
 /// subscribe to "a" and "a/" on the way.
 fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) -> bool {
     ui.weak(match live {
-        true => "Connected: a change is (un)subscribed as soon as you finish it.",
-        false => "Subscribed to on Connect. + matches one level, # everything below.",
+        true => t("Connected: a change is (un)subscribed as soon as you finish it."),
+        false => t("Subscribed to on Connect. + matches one level, # everything below."),
     });
     let mut done = false;
     let mut remove = None;
@@ -7182,7 +7239,7 @@ fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_s
         .show(ui, |ui| {
             ui.label(t("HTTP version"));
             let name = |v: HttpVersion| match v {
-                HttpVersion::Auto => "Auto",
+                HttpVersion::Auto => t("Auto"),
                 HttpVersion::Http1 => "HTTP/1.1",
                 HttpVersion::Http2 => "HTTP/2",
             };
@@ -7255,15 +7312,15 @@ fn shortcut_list(ui: &mut egui::Ui) {
         .spacing([16.0, 4.0])
         .show(ui, |ui| {
             for (what, key) in [
-                ("Send request", &SEND),
-                ("Save changes", &SAVE),
-                ("Go to a request, folder or action", &SWITCH),
-                ("New request", &NEW_REQUEST),
-                ("Duplicate", &DUPLICATE),
-                ("Select the URL", &FOCUS_URL),
-                ("Find in the response", &FIND),
-                ("Close tab", &CLOSE_TAB),
-                ("Reopen closed tab", &REOPEN_TAB),
+                (t("Send request"), &SEND),
+                (t("Save changes"), &SAVE),
+                (t("Go to a request, folder or action"), &SWITCH),
+                (t("New request"), &NEW_REQUEST),
+                (t("Duplicate"), &DUPLICATE),
+                (t("Select the URL"), &FOCUS_URL),
+                (t("Find in the response"), &FIND),
+                (t("Close tab"), &CLOSE_TAB),
+                (t("Reopen closed tab"), &REOPEN_TAB),
             ] {
                 ui.weak(what);
                 ui.weak(RichText::new(ui.ctx().format_shortcut(key)).monospace());
@@ -7272,13 +7329,15 @@ fn shortcut_list(ui: &mut egui::Ui) {
         });
 }
 
-const ASSERTS_HINT: &str = "Key: what to check, e.g. res.status, res.body.items.length, \
+const ASSERTS_HINT: &str = n_(
+    "Key: what to check, e.g. res.status, res.body.items.length, \
     res.body[0].id, res.headers['content-type'], res.responseTime.\n\
     Value: an operator and what to compare with, e.g. eq 200, neq, gt 0, gte, lt 500, lte, \
     in 200,201, notIn, contains ok, notContains, length 3, matches ^ok, notMatches, \
     startsWith, endsWith, between 1,10, isEmpty, isNotEmpty, isNull, isUndefined, isDefined, \
     isTruthy, isFalsy, isJson, isNumber, isString, isBoolean, isArray; no operator is eq. \
-    {{variables}} work. Each row shows up under Tests.";
+    {{variables}} work. Each row shows up under Tests.",
+);
 
 const PRE_SNIPPETS: &[(&str, &str)] = &[
     (
@@ -7391,12 +7450,16 @@ fn scripts_editor(
     let (text, hint, id) = match tab {
         ScriptTab::Pre => (
             pre_request,
-            "// Runs before the request is sent.\n// pm.request, pm.environment, pm.variables, console.log",
+            t(
+                "// Runs before the request is sent.\n// pm.request, pm.environment, pm.variables, console.log",
+            ),
             "pre-request-script",
         ),
         ScriptTab::Post => (
             tests,
-            "// Runs after the response arrives.\n// pm.test(name, fn), pm.expect(...), pm.response.json()",
+            t(
+                "// Runs after the response arrives.\n// pm.test(name, fn), pm.expect(...), pm.response.json()",
+            ),
             "tests-script",
         ),
     };
@@ -7513,8 +7576,8 @@ fn grpc_bar(
         );
         let reload = named(ui.small_button(icon::ARROWS_CLOCKWISE), t("Reload"), None)
             .on_hover_text(match reflection {
-                true => "Ask the server for its methods (gRPC reflection)",
-                false => "Reload .proto",
+                true => t("Ask the server for its methods (gRPC reflection)"),
+                false => t("Reload .proto"),
             })
             .clicked();
         ask = reload && reflection;
@@ -7536,9 +7599,9 @@ fn grpc_bar(
                         for m in list.iter() {
                             let kind = match (m.client_streaming, m.server_streaming) {
                                 (false, false) => "",
-                                (false, true) => "  · server stream",
-                                (true, false) => "  · client stream",
-                                (true, true) => "  · bidi stream",
+                                (false, true) => t("  · server stream"),
+                                (true, false) => t("  · client stream"),
+                                (true, true) => t("  · bidi stream"),
                             };
                             let label = format!("{}{kind}", m.name);
                             ui.selectable_value(&mut req.rpc, m.name.clone(), label);
@@ -7682,13 +7745,13 @@ impl StreamSession {
             }
             // An empty message is fine: retained, it clears what the broker keeps.
             Some(Outgoing::Mqtt(tx)) => {
-                let m = mqtt.ok_or("no request is open")?;
+                let m = mqtt.ok_or(t("no request is open"))?;
                 let topic = model::resolve(m.topic.trim(), vars, &mut Vec::new());
                 if topic.is_empty() {
-                    return Err("Publish needs a topic".into());
+                    return Err(t("Publish needs a topic").into());
                 }
                 if topic.contains(['+', '#']) {
-                    return Err("+ and # are for subscribing; publish to one topic".into());
+                    return Err(t("+ and # are for subscribing; publish to one topic").into());
                 }
                 let properties: Vec<_> = (m.user_properties.iter())
                     .filter(|p| p.enabled && !p.key.trim().is_empty())
@@ -7700,7 +7763,7 @@ impl StreamSession {
                 // ponytail: goes by the request's version now, not the connection's; they
                 // differ only if it's switched while connected.
                 if !m.v5 && !properties.is_empty() {
-                    return Err("User properties need MQTT 5.0 (Settings)".into());
+                    return Err(t("User properties need MQTT 5.0 (Settings)").into());
                 }
                 let _ = tx.send(crate::mqtt::Command::Publish(crate::mqtt::Publish {
                     topic,
@@ -7943,7 +8006,7 @@ fn font_picker<'a>(
     families: impl Iterator<Item = &'a String>,
 ) {
     let shown = match font.is_empty() {
-        true => "Default".to_owned(),
+        true => t("Default").to_owned(),
         false => font.clone(),
     };
     egui::ComboBox::from_id_salt(id)
@@ -7965,7 +8028,7 @@ fn status_line(ui: &mut egui::Ui, view: &ResponseView) {
             .strong()
             .color(status_color(h.status)),
     )
-    .on_hover_text(status_meaning(h.status));
+    .on_hover_text(t(status_meaning(h.status)));
     let ms = ui.weak(format!("{} ms", h.elapsed.as_millis()));
     if let Some(waited) = h.sent.waited {
         let hops = match h.sent.hops.len() {
@@ -8765,12 +8828,12 @@ fn pdf_pixels(
     let draw = || {
         let pdf = hayro::hayro_syntax::Pdf::new(std::sync::Arc::new(bytes.to_vec())).map_err(
             |e| match e {
-                hayro::hayro_syntax::LoadPdfError::Decryption(_) => "it's encrypted".to_owned(),
-                hayro::hayro_syntax::LoadPdfError::Invalid => "not a PDF it can read".to_owned(),
+                hayro::hayro_syntax::LoadPdfError::Decryption(_) => t("it's encrypted").to_owned(),
+                hayro::hayro_syntax::LoadPdfError::Invalid => t("not a PDF it can read").to_owned(),
             },
         )?;
         let pages = pdf.pages();
-        let shown = pages.get(page).ok_or("it has no pages")?;
+        let shown = pages.get(page).ok_or(t("it has no pages"))?;
         let (w, h) = shown.render_dimensions();
         let side = (side as f32).min(4096.0);
         let scale = scale.min(side / w.max(h));
@@ -8787,7 +8850,7 @@ fn pdf_pixels(
         Ok((pixels, [w.round() as u32, h.round() as u32], pages.len()))
     };
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(draw))
-        .unwrap_or_else(|_| Err("not a PDF it can read".into()))
+        .unwrap_or_else(|_| Err(t("not a PDF it can read").into()))
 }
 
 fn max_side(ctx: &egui::Context) -> u32 {
@@ -8809,7 +8872,7 @@ fn svg_pixels(svg: &str, scale: f32, side: u32) -> Result<(egui::ColorImage, [u3
     let side = (side as f32).min(4096.0);
     let scale = scale.min(side / w.max(h));
     let (pw, ph) = ((w * scale).ceil() as u32, (h * scale).ceil() as u32);
-    let mut pixmap = tiny_skia::Pixmap::new(pw, ph).ok_or("it has no size")?;
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph).ok_or(t("it has no size"))?;
     resvg::render(
         &tree,
         tiny_skia::Transform::from_scale(scale, scale),
@@ -9038,43 +9101,43 @@ fn status_color(status: u16) -> Color32 {
 /// What a status code means, for the hover on it, as Postman shows.
 fn status_meaning(status: u16) -> &'static str {
     match status {
-        200 => "OK: the request succeeded.",
-        201 => "Created: the request succeeded and a new resource was created.",
-        202 => "Accepted: received, but not acted on yet.",
-        204 => "No Content: succeeded, with no body to return.",
-        206 => "Partial Content: only the requested range is returned.",
-        301 => "Moved Permanently: the resource has a new URL for good.",
-        302 => "Found: the resource is at another URL for now.",
-        303 => "See Other: get the result from another URL with GET.",
-        304 => "Not Modified: the cached copy is still good.",
-        307 => "Temporary Redirect: repeat the same request at another URL.",
-        308 => "Permanent Redirect: repeat the same request at another URL, from now on.",
-        400 => {
-            "Bad Request: the server can't process the request as sent (syntax, framing, values)."
-        }
-        401 => "Unauthorized: credentials are missing or wrong.",
-        403 => "Forbidden: the credentials are known but not allowed to do this.",
-        404 => "Not Found: nothing at this URL.",
-        405 => "Method Not Allowed: the URL exists but not for this method.",
-        406 => "Not Acceptable: nothing matches the Accept headers.",
-        408 => "Request Timeout: the server gave up waiting for the request.",
-        409 => "Conflict: the request clashes with the resource's current state.",
-        410 => "Gone: the resource was here and was removed for good.",
-        413 => "Content Too Large: the body is bigger than the server accepts.",
-        415 => "Unsupported Media Type: the server doesn't take this Content-Type.",
-        422 => "Unprocessable Content: well-formed, but the values don't pass validation.",
-        429 => "Too Many Requests: rate limited; see Retry-After.",
-        500 => "Internal Server Error: the server failed while handling the request.",
-        501 => "Not Implemented: the server doesn't support this method.",
-        502 => "Bad Gateway: a proxy or gateway got a bad answer from upstream.",
-        503 => "Service Unavailable: overloaded or down for maintenance; see Retry-After.",
-        504 => "Gateway Timeout: a proxy or gateway got no answer from upstream in time.",
+        200 => n_("OK: the request succeeded."),
+        201 => n_("Created: the request succeeded and a new resource was created."),
+        202 => n_("Accepted: received, but not acted on yet."),
+        204 => n_("No Content: succeeded, with no body to return."),
+        206 => n_("Partial Content: only the requested range is returned."),
+        301 => n_("Moved Permanently: the resource has a new URL for good."),
+        302 => n_("Found: the resource is at another URL for now."),
+        303 => n_("See Other: get the result from another URL with GET."),
+        304 => n_("Not Modified: the cached copy is still good."),
+        307 => n_("Temporary Redirect: repeat the same request at another URL."),
+        308 => n_("Permanent Redirect: repeat the same request at another URL, from now on."),
+        400 => n_(
+            "Bad Request: the server can't process the request as sent (syntax, framing, values).",
+        ),
+        401 => n_("Unauthorized: credentials are missing or wrong."),
+        403 => n_("Forbidden: the credentials are known but not allowed to do this."),
+        404 => n_("Not Found: nothing at this URL."),
+        405 => n_("Method Not Allowed: the URL exists but not for this method."),
+        406 => n_("Not Acceptable: nothing matches the Accept headers."),
+        408 => n_("Request Timeout: the server gave up waiting for the request."),
+        409 => n_("Conflict: the request clashes with the resource's current state."),
+        410 => n_("Gone: the resource was here and was removed for good."),
+        413 => n_("Content Too Large: the body is bigger than the server accepts."),
+        415 => n_("Unsupported Media Type: the server doesn't take this Content-Type."),
+        422 => n_("Unprocessable Content: well-formed, but the values don't pass validation."),
+        429 => n_("Too Many Requests: rate limited; see Retry-After."),
+        500 => n_("Internal Server Error: the server failed while handling the request."),
+        501 => n_("Not Implemented: the server doesn't support this method."),
+        502 => n_("Bad Gateway: a proxy or gateway got a bad answer from upstream."),
+        503 => n_("Service Unavailable: overloaded or down for maintenance; see Retry-After."),
+        504 => n_("Gateway Timeout: a proxy or gateway got no answer from upstream in time."),
         _ => match status / 100 {
-            1 => "Informational: the request was received and goes on.",
-            2 => "Success: the request was received, understood and accepted.",
-            3 => "Redirection: more action is needed to complete the request.",
-            4 => "Client error: the request is wrong or can't be fulfilled.",
-            _ => "Server error: the server failed to fulfil a valid request.",
+            1 => n_("Informational: the request was received and goes on."),
+            2 => n_("Success: the request was received, understood and accepted."),
+            3 => n_("Redirection: more action is needed to complete the request."),
+            4 => n_("Client error: the request is wrong or can't be fulfilled."),
+            _ => n_("Server error: the server failed to fulfil a valid request."),
         },
     }
 }
@@ -9280,7 +9343,8 @@ mod ui_tests {
         // The tree's "api", drawn before the breadcrumb's.
         h.get_all_by_label("api").next().unwrap().click_secondary();
         h.run();
-        h.get_by_label("Folder settings…").click();
+        // A top-level folder is a collection, and its menu says so.
+        h.get_by_label("Collection settings…").click();
         h.run();
         // Opens ready to type, like the environment editor.
         for c in "base".chars() {
@@ -10136,6 +10200,65 @@ mod ui_tests {
                 .iter()
                 .all(|t| t.path.starts_with(&top) && !t.path.starts_with(&api))
         );
+    }
+
+    /// Delete, or ⌘⌫ on a Mac keyboard, asks to delete the picked rows as their menu does;
+    /// in a text field the key stays with the text.
+    #[test]
+    fn the_delete_key_deletes_the_picked_rows_but_not_while_typing() {
+        let ws = workspace("delete-key");
+        let top = ws.collections();
+        let paths: Vec<PathBuf> = (["a", "b", "c"].iter())
+            .map(|n| ws.create_request(&top, n).unwrap())
+            .collect();
+        let mut h = harness(ws);
+        h.run();
+        let click = |h: &mut Harness<'_, App>, name: &str, m: Modifiers| {
+            h.get_all_by_label(name).next().unwrap().click_modifiers(m);
+            h.run();
+        };
+        click(&mut h, "a", Modifiers::NONE);
+        click(&mut h, "b", Modifiers::COMMAND);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::L);
+        h.run();
+        h.key_press(Key::Delete);
+        h.run();
+        assert!(
+            h.state().dialog.is_none(),
+            "typing in the URL, not deleting"
+        );
+        h.key_press(Key::Escape);
+        h.run();
+        h.key_press(Key::Delete);
+        h.run();
+        assert!(matches!(&h.state().dialog, Some(Dialog::Delete(p)) if p.len() == 2));
+        h.get_all_by_label("Delete").last().unwrap().click();
+        h.run();
+        let ws = &h.state().ws;
+        assert!(!ws.exists(&paths[0]) && !ws.exists(&paths[1]) && ws.exists(&paths[2]));
+        click(&mut h, "c", Modifiers::COMMAND);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Backspace);
+        h.run();
+        assert!(matches!(&h.state().dialog, Some(Dialog::Delete(p)) if p == &paths[2..]));
+    }
+
+    /// A message built on a runtime thread, which reads English, still comes in the user's
+    /// language: its template is translated before the task starts.
+    #[test]
+    fn a_message_from_a_background_task_follows_the_language() {
+        let mut h = harness(workspace("zh-network"));
+        h.state_mut().appearance.language = crate::i18n::Lang::ZhTw;
+        h.run();
+        let network = Network {
+            proxy: ProxyMode::Manual,
+            proxy_url: "not a proxy".into(),
+            ..Default::default()
+        };
+        let ctx = h.ctx.clone();
+        h.state_mut().apply_network(network, &ctx);
+        wait(&mut h, |app| !app.status.is_empty());
+        let status = &h.state().status;
+        assert!(status.starts_with("網路設定："), "{status}");
     }
 
     /// The bottom request of a long tree reaches a folder at the top: held near the tree's

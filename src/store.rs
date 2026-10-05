@@ -23,6 +23,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::{t, tf};
 use crate::model::{Auth, Folder, Inherited, KeyValue, Request};
 
 const DB: &str = "apitool.db";
@@ -809,7 +810,7 @@ impl Workspace {
         let mut paths = Vec::new();
         requests_in(&self.tree(), scope, &mut paths);
         if paths.is_empty() {
-            return Err(format!("no requests under {}", self.display_name(scope)));
+            return Err(tf("no requests under {}", &[&self.display_name(scope)]));
         }
         paths
             .iter()
@@ -821,7 +822,7 @@ impl Workspace {
     pub fn create_request(&self, dir: &Path, name: &str) -> Result<PathBuf, String> {
         let path = request_in(dir, name)?;
         if self.exists(&path) {
-            return Err(format!("\"{name}\" already exists"));
+            return Err(tf("\"{}\" already exists", &[&name]));
         }
         self.save_request(&path, &Request::default())?;
         Ok(path)
@@ -830,7 +831,7 @@ impl Workspace {
     pub fn create_folder(&self, dir: &Path, name: &str) -> Result<PathBuf, String> {
         let path = dir.join(folder_segment(name)?);
         if self.exists(&path) {
-            return Err(format!("\"{name}\" already exists"));
+            return Err(tf("\"{}\" already exists", &[&name]));
         }
         let mut db = self.db();
         let tx = sql(db.transaction())?;
@@ -847,7 +848,7 @@ impl Workspace {
             false => path.with_file_name(folder_segment(name)?),
         };
         if self.exists(&new) {
-            return Err(format!("\"{}\" already exists", name.trim()));
+            return Err(tf("\"{}\" already exists", &[&name.trim()]));
         }
         self.relocate(path, &new)?;
         // Keep its place among its siblings.
@@ -866,7 +867,7 @@ impl Workspace {
         let name = path.file_name().unwrap_or_default();
         let new = folder.join(name);
         if folder.starts_with(path) {
-            return Err("A folder can't go inside itself".into());
+            return Err(t("A folder can't go inside itself").into());
         }
         if new == path {
             return Ok(new);
@@ -876,7 +877,7 @@ impl Workspace {
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy();
-            return Err(format!("\"{name}\" already exists there"));
+            return Err(tf("\"{}\" already exists there", &[&name]));
         }
         self.relocate(path, &new)?;
         Ok(new)
@@ -1628,7 +1629,7 @@ pub fn request_in(dir: &Path, name: &str) -> Result<PathBuf, String> {
 /// A name typed or imported, as a key segment.
 fn segment(name: &str) -> Result<String, String> {
     match escape_name(name) {
-        s if s.is_empty() => Err("name can't be empty".into()),
+        s if s.is_empty() => Err(t("name can't be empty").into()),
         s => Ok(s),
     }
 }
@@ -1638,13 +1639,13 @@ fn segment(name: &str) -> Result<String, String> {
 fn valid_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
     if name.is_empty() || name.starts_with('.') || name.ends_with('.') {
-        return Err("name can't be empty or start/end with '.'".into());
+        return Err(t("name can't be empty or start/end with '.'").into());
     }
     if let Some(c) = name
         .chars()
         .find(|c| r#"<>:"/\|?*"#.contains(*c) || c.is_control())
     {
-        return Err(format!("name can't contain '{c}'"));
+        return Err(tf("name can't contain '{}'", &[&c]));
     }
     Ok(name)
 }
@@ -1669,7 +1670,7 @@ pub fn safe_name(name: &str) -> String {
 fn folder_segment(name: &str) -> Result<String, String> {
     let name = segment(name)?;
     match name.ends_with(".toml") {
-        true => Err("a folder name can't end with .toml".into()),
+        true => Err(t("a folder name can't end with .toml").into()),
         false => Ok(name),
     }
 }

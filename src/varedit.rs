@@ -102,7 +102,7 @@ pub fn var_edit(
     style: TextStyle,
     multiline: bool,
     lang: Option<Lang>,
-    words: &[(&str, &str)],
+    words: &[(&str, &'static str)],
     configure: impl FnOnce(egui::TextEdit<'_>) -> egui::TextEdit<'_>,
 ) -> egui::Response {
     if let Some(response) = too_big(ui, id, text) {
@@ -310,7 +310,7 @@ fn suggest(prefix: &str, vars: &HashMap<String, String>) -> Vec<(String, String)
 
 /// Words containing what's typed, those starting with it first, else in list order. Nothing
 /// for an empty field (the list would cover the rows below) or a finished word.
-fn suggest_words(text: &str, words: &[(&str, &str)]) -> Vec<(String, String)> {
+fn suggest_words(text: &str, words: &[(&str, &'static str)]) -> Vec<(String, String)> {
     let typed = text.trim().to_lowercase();
     if typed.is_empty() || words.iter().any(|(w, _)| w.to_lowercase() == typed) {
         return Vec::new();
@@ -318,7 +318,7 @@ fn suggest_words(text: &str, words: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = words
         .iter()
         .filter(|(w, _)| w.to_lowercase().contains(&typed))
-        .map(|(w, d)| (w.to_string(), d.to_string()))
+        .map(|(w, d)| (w.to_string(), t(d).to_owned()))
         .collect();
     out.sort_by_key(|(w, _)| !w.to_lowercase().starts_with(&typed));
     out.truncate(MAX_SUGGESTIONS);
