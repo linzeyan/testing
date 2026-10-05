@@ -489,7 +489,8 @@ enum Dialog {
         name: String,
         error: String,
     },
-    Delete(PathBuf),
+    /// Requests and folders, none inside another.
+    Delete(Vec<PathBuf>),
     Unsaved(Next),
     /// Confirmed first: it replaces what was edited here since the last export.
     Import,
@@ -567,10 +568,16 @@ enum TreeAction {
     CopyDocs(PathBuf),
     CopyPostman(PathBuf),
     Mock(PathBuf),
-    /// Drag and drop: this request or folder into that folder.
-    Move(PathBuf, PathBuf),
+    /// Ctrl+click: in or out of the picked rows.
+    Pick(PathBuf),
+    /// Shift+click: the requests from the last picked (or the open one) to this one.
+    PickTo(PathBuf),
+    /// A drag began on this row: it's held, or all picked rows if it's one of them.
+    Drag(PathBuf),
+    /// Drag and drop: these requests or folders into that folder.
+    Move(Vec<PathBuf>, PathBuf),
     /// What, next to which, after it (else before).
-    Place(PathBuf, PathBuf, bool),
+    Place(Vec<PathBuf>, PathBuf, bool),
 }
 
 /// Collection runner pane. Settings persist while the pane is open; results are summaries only.
@@ -633,6 +640,8 @@ pub struct App {
     show_history: bool,
     /// Sidebar filter: requests whose name contains it, and the folders leading to them.
     tree_filter: String,
+    /// Rows picked with Ctrl or Shift+click; empty while just the open request is.
+    tree_picked: Vec<PathBuf>,
     /// Set by a drop: the folders above it open on the next frame, so it stays in sight.
     reveal: Option<PathBuf>,
     /// Closed tabs and where they were, newest last, for Reopen Closed Tab. This session
@@ -720,6 +729,7 @@ impl App {
             history: ws.load_history(),
             show_history: false,
             tree_filter: String::new(),
+            tree_picked: Vec::new(),
             reveal: None,
             closed: Vec::new(),
             repeat: None,
@@ -1714,19 +1724,39 @@ impl App {
         self.closed.iter_mut().for_each(|(p, _)| moved(p));
     }
 
-    /// After a drag and drop in the tree; a reorder in place keeps the path.
-    fn moved(&mut self, path: &Path, result: Result<PathBuf, String>) {
-        match result {
-            Ok(new) => {
-                if new != path {
-                    self.follow_move(path, &new);
-                    self.status = format!("Moved to \"{}\"", self.ws.display_name(&new));
+    /// After a drag and drop in the tree, with where each went; a reorder in place keeps
+    /// the path.
+    fn moved(&mut self, moves: Vec<(PathBuf, Result<PathBuf, String>)>) {
+        let (mut last, mut count, mut errors) = (None, 0, Vec::new());
+        for (path, result) in moves {
+            match result {
+                Ok(new) => {
+                    if new != path {
+                        self.follow_move(&path, &new);
+                        count += 1;
+                    }
+                    last = Some(new);
                 }
-                self.reload();
-                self.save_state();
-                self.reveal = Some(new);
+                Err(e) => errors.push(e),
             }
-            Err(e) => self.status = e,
+        }
+        self.tree_picked.clear();
+        if let Some(new) = last {
+            if count == 1 {
+                self.status = format!("Moved to \"{}\"", self.ws.display_name(&new));
+            } else if count > 1 {
+                let dir = new
+                    .parent()
+                    .map(|d| self.ws.display_name(d))
+                    .unwrap_or_default();
+                self.status = format!("Moved {count} items to \"{dir}\"");
+            }
+            self.reload();
+            self.save_state();
+            self.reveal = Some(new);
+        }
+        if !errors.is_empty() {
+            self.status = errors.join("; ");
         }
     }
 
@@ -2626,7 +2656,8 @@ impl App {
             });
         }
         let mut actions = Vec::new();
-        let selected = self.open.as_ref().map(|o| o.path.as_path());
+        let mut rows = Vec::new();
+        let open = self.open.as_ref().map(|o| o.path.clone());
         let query = self.tree_filter.trim().to_lowercase();
         let found;
         let nodes = if query.is_empty() {
@@ -2649,25 +2680,37 @@ impl App {
                 } else if nodes.is_empty() {
                     ui.weak(t("Nothing matches."));
                 }
-                tree_ui(ui, nodes, selected, &self.statuses, &expand, &mut actions);
+                let view = TreeView {
+                    open: open.as_deref(),
+                    picked: &self.tree_picked,
+                    statuses: &self.statuses,
+                    expand: &expand,
+                };
+                tree_ui(ui, nodes, &view, &mut rows, &mut actions);
                 // The empty space under the tree takes a drop to the top level.
                 let size = egui::vec2(ui.available_width(), ui.available_height().max(24.0));
                 let rest = ui.allocate_response(size, egui::Sense::hover());
-                drop_into(ui, &rest, &self.ws.collections(), &mut actions);
+                tree_drop(ui, &rows, rest.rect, &self.ws.collections(), &mut actions);
             });
-        // What is being dragged follows the pointer.
-        if let Some(path) = egui::DragAndDrop::payload::<PathBuf>(ui.ctx())
+        // What is being dragged follows the pointer, on a backing of its own: bare text
+        // ran over the rows' names.
+        if let Some(held) = egui::DragAndDrop::payload::<Vec<PathBuf>>(ui.ctx())
             && let Some(pos) = ui.ctx().pointer_interact_pos()
         {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tree-drag"));
-            ui.ctx().layer_painter(layer).text(
-                pos + egui::vec2(14.0, 0.0),
-                egui::Align2::LEFT_CENTER,
-                leaf_name(&path),
-                egui::TextStyle::Body.resolve(ui.style()),
-                ui.visuals().strong_text_color(),
-            );
+            let text = match held.as_slice() {
+                [one] => leaf_name(one),
+                all => tf("{} items", &[&all.len()]),
+            };
+            egui::Area::new(egui::Id::new("tree-drag"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(pos + egui::vec2(14.0, -10.0))
+                .interactable(false)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.add(egui::Label::new(text).selectable(false).extend());
+                    });
+                });
         }
         for action in actions {
             match action {
@@ -2675,8 +2718,51 @@ impl App {
                     if self.runner_busy() {
                         continue;
                     }
+                    self.tree_picked.clear();
                     self.runner = None;
                     self.activate(path, pin);
+                }
+                TreeAction::Pick(path) => {
+                    // The open request was the one picked so far.
+                    if self.tree_picked.is_empty()
+                        && let Some(open) = open.clone().filter(|o| *o != path)
+                    {
+                        self.tree_picked.push(open);
+                    }
+                    match self.tree_picked.iter().position(|p| *p == path) {
+                        Some(i) => drop(self.tree_picked.remove(i)),
+                        None => self.tree_picked.push(path),
+                    }
+                }
+                TreeAction::PickTo(path) => {
+                    let anchor = self.tree_picked.last().cloned().or(open.clone());
+                    let at = |p: &Path| rows.iter().position(|r| r.path == p);
+                    self.tree_picked = match anchor.as_deref().and_then(at).zip(at(&path)) {
+                        // Requests only: a folder in between would take all it holds along.
+                        Some((a, b)) => (rows[a.min(b)..=a.max(b)].iter())
+                            .filter(|r| r.folder.is_none())
+                            .map(|r| r.path.clone())
+                            .collect(),
+                        None => vec![path],
+                    };
+                    // Last stays the anchor for the next Shift+click.
+                    if let Some(anchor) = anchor.filter(|a| self.tree_picked.contains(a)) {
+                        self.tree_picked.retain(|p| *p != anchor);
+                        self.tree_picked.push(anchor);
+                    }
+                }
+                TreeAction::Drag(path) => {
+                    let held = match self.tree_picked.contains(&path) {
+                        // In the tree's order, so they land in it.
+                        true => outermost(
+                            &(rows.iter())
+                                .filter(|r| self.tree_picked.contains(&r.path))
+                                .map(|r| r.path.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                        false => vec![path],
+                    };
+                    egui::DragAndDrop::set_payload(ui.ctx(), held);
                 }
                 TreeAction::Dialog(d) => self.dialog = Some(d),
                 TreeAction::Duplicate(path) => self.duplicate(&path),
@@ -2685,13 +2771,26 @@ impl App {
                 TreeAction::CopyDocs(dir) => self.copy_docs(&dir, ui.ctx()),
                 TreeAction::CopyPostman(dir) => self.copy_postman(&dir, ui.ctx()),
                 TreeAction::Mock(dir) => self.start_mock(dir, ui.ctx()),
-                TreeAction::Move(path, folder) => {
-                    let moved = self.ws.move_into(&path, &folder);
-                    self.moved(&path, moved);
+                TreeAction::Move(paths, folder) => {
+                    let moves = (paths.into_iter())
+                        .map(|p| {
+                            let moved = self.ws.move_into(&p, &folder);
+                            (p, moved)
+                        })
+                        .collect();
+                    self.moved(moves);
                 }
-                TreeAction::Place(path, target, after) => {
-                    let moved = self.ws.place(&path, &target, after);
-                    self.moved(&path, moved);
+                TreeAction::Place(paths, mut target, mut after) => {
+                    let mut moves = Vec::new();
+                    for p in paths {
+                        let moved = self.ws.place(&p, &target, after);
+                        // Each goes after the one before, so they keep their order.
+                        if let Ok(new) = &moved {
+                            (target, after) = (new.clone(), true);
+                        }
+                        moves.push((p, moved));
+                    }
+                    self.moved(moves);
                 }
             }
         }
@@ -3951,44 +4050,65 @@ impl App {
                         cancel = ui.button(t("Cancel")).clicked();
                     });
                 }
-                Dialog::Delete(path) => {
+                Dialog::Delete(paths) => {
                     ui.heading(t("Delete"));
-                    let what = if !crate::store::is_request(path) {
-                        tf(
+                    let what = match paths.as_slice() {
+                        [path] if !crate::store::is_request(path) => tf(
                             "Delete the folder \"{}\" and everything in it?",
                             &[&leaf_name(path)],
-                        )
-                    } else {
-                        tf("Delete the request \"{}\"?", &[&leaf_name(path)])
+                        ),
+                        [path] => tf("Delete the request \"{}\"?", &[&leaf_name(path)]),
+                        _ if paths.iter().all(|p| crate::store::is_request(p)) => {
+                            tf("Delete these {} requests?", &[&paths.len()])
+                        }
+                        _ => tf(
+                            "Delete these {} items, folders with everything in them?",
+                            &[&paths.len()],
+                        ),
                     };
                     ui.label(what);
+                    if paths.len() > 1 {
+                        const SHOWN: usize = 8;
+                        for path in paths.iter().take(SHOWN) {
+                            let slash = if crate::store::is_request(path) {
+                                ""
+                            } else {
+                                "/"
+                            };
+                            ui.weak(format!("• {}{slash}", leaf_name(path)));
+                        }
+                        if paths.len() > SHOWN {
+                            ui.weak(tf("… and {} more", &[&(paths.len() - SHOWN)]));
+                        }
+                    }
                     ui.horizontal(|ui| {
                         let delete = egui::Button::new(
                             RichText::new(t("Delete")).strong().color(Color32::WHITE),
                         )
                         .fill(RED);
                         if ui.add(delete).clicked() || enter_pressed(ui) {
-                            let path = path.clone();
+                            let paths = outermost(paths);
                             then = Some(Box::new(move |app, _| {
                                 app.dialog = None;
-                                match app.ws.delete(&path) {
-                                    // The delete was confirmed; its tabs close without asking.
-                                    Ok(()) => {
-                                        let active = app.open.as_ref().map(|o| o.path.clone());
-                                        let gone = |p: &Path| p.starts_with(&path);
-                                        app.tabs.retain(|t| {
-                                            !gone(&t.path) || Some(&t.path) == active.as_ref()
-                                        });
-                                        if let Some(i) = active
-                                            .filter(|p| gone(p))
-                                            .and_then(|p| app.tab_index(&p))
-                                        {
-                                            app.drop_tab(i);
-                                        }
-                                        app.save_state();
+                                let mut deleted = Vec::new();
+                                for path in paths {
+                                    match app.ws.delete(&path) {
+                                        Ok(()) => deleted.push(path),
+                                        Err(e) => app.status = e,
                                     }
-                                    Err(e) => app.status = e,
                                 }
+                                // The delete was confirmed; its tabs close without asking.
+                                let active = app.open.as_ref().map(|o| o.path.clone());
+                                let gone = |p: &Path| deleted.iter().any(|d| p.starts_with(d));
+                                app.tabs
+                                    .retain(|t| !gone(&t.path) || Some(&t.path) == active.as_ref());
+                                if let Some(i) =
+                                    active.filter(|p| gone(p)).and_then(|p| app.tab_index(&p))
+                                {
+                                    app.drop_tab(i);
+                                }
+                                app.tree_picked.clear();
+                                app.save_state();
                                 app.reload();
                             }));
                         }
@@ -5260,14 +5380,42 @@ fn filtered(nodes: &[Node], query: &str) -> Vec<Node> {
         .collect()
 }
 
-/// Folders for which `expand` is true are opened, so what a filter found or a drop moved
-/// is in view.
+/// A tree row as drawn this frame: where a drop lands, and the order Shift+click picks in.
+struct TreeRow {
+    path: PathBuf,
+    rect: egui::Rect,
+    /// For a folder, whether it's open.
+    folder: Option<bool>,
+}
+
+/// Where what's held over the tree would go.
+#[derive(Debug, PartialEq)]
+enum DropAt {
+    Into(PathBuf),
+    /// Next to that row: after it, else before.
+    Beside(PathBuf, bool),
+}
+
+/// What the tree is drawn with, besides its nodes.
+struct TreeView<'a> {
+    /// The open request: highlighted while nothing is picked.
+    open: Option<&'a Path>,
+    /// Picked with Ctrl or Shift+click, to move or delete together.
+    picked: &'a [PathBuf],
+    statuses: &'a HashMap<PathBuf, u16>,
+    /// Folders for which this is true are opened, so what a filter found or a drop moved
+    /// is in view.
+    expand: &'a dyn Fn(&Path) -> bool,
+}
+
+/// Kept free at a row's right end for its "⋯", so the button never covers the name.
+const MORE_WIDTH: f32 = 26.0;
+
 fn tree_ui(
     ui: &mut egui::Ui,
     nodes: &[Node],
-    selected: Option<&Path>,
-    statuses: &HashMap<PathBuf, u16>,
-    expand: &dyn Fn(&Path) -> bool,
+    view: &TreeView,
+    rows: &mut Vec<TreeRow>,
     actions: &mut Vec<TreeAction>,
 ) {
     for node in nodes {
@@ -5277,54 +5425,268 @@ fn tree_ui(
                 path,
                 children,
             } => {
-                let resp = egui::CollapsingHeader::new(name.as_str())
-                    .id_salt(path)
-                    // Reveal the open request on startup instead of hiding it in a collapsed folder.
-                    .default_open(selected.is_some_and(|s| s.starts_with(path)))
-                    .open(expand(path).then_some(true))
-                    .show(ui, |ui| {
-                        tree_ui(ui, children, selected, statuses, expand, actions)
-                    });
-                let header = &resp.header_response;
-                header
-                    .interact(egui::Sense::drag())
-                    .dnd_set_drag_payload(path.clone());
-                // The header's top edge is "before this folder"; the rest is "into it".
-                let edge = header.rect.top() + header.rect.height() / 3.0;
-                match ui.ctx().pointer_latest_pos().is_some_and(|p| p.y < edge) {
-                    true => drop_beside(ui, header, path, actions),
-                    false => drop_into(ui, header, path, actions),
+                let id = egui::Id::new(("tree-folder", path));
+                // Reveal the open request on startup instead of hiding it in a collapsed folder.
+                let default_open = view.open.is_some_and(|s| s.starts_with(path));
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    id,
+                    default_open,
+                );
+                if (view.expand)(path) {
+                    state.set_open(true);
                 }
-                header.context_menu(|ui| folder_menu(ui, path, name, actions));
-                more_button(ui, header, path, |ui| folder_menu(ui, path, name, actions));
+                let open = state.is_open();
+                let caret = if open {
+                    icon::CARET_DOWN
+                } else {
+                    icon::CARET_RIGHT
+                };
+                let lead = |ui: &mut egui::Ui| {
+                    ui.add(egui::Label::new(RichText::new(caret).weak()).selectable(false));
+                };
+                let picked = view.picked.contains(path);
+                let row = tree_row(ui, path, name, picked, lead, None);
+                rows.push(TreeRow {
+                    path: path.clone(),
+                    rect: row.rect,
+                    folder: Some(open),
+                });
+                if row.clicked() {
+                    match ui.input(|i| i.modifiers.command) {
+                        true => actions.push(TreeAction::Pick(path.clone())),
+                        false => state.toggle(ui),
+                    }
+                }
+                if row.drag_started() {
+                    actions.push(TreeAction::Drag(path.clone()));
+                }
+                let own =
+                    |ui: &mut egui::Ui, a: &mut Vec<TreeAction>| folder_menu(ui, path, name, a);
+                row.context_menu(|ui| row_menu(ui, view.picked, path, actions, own));
+                more_button(ui, &row, path, |ui| {
+                    row_menu(ui, view.picked, path, actions, own)
+                });
+                state.show_body_indented(&row, ui, |ui| tree_ui(ui, children, view, rows, actions));
             }
             Node::Request { name, path, method } => {
-                let resp = ui
-                    .horizontal(|ui| {
-                        method_badge(ui, method, 5);
-                        let row =
-                            ui.selectable_label(selected == Some(path.as_path()), name.as_str());
-                        if let Some(&status) = statuses.get(path) {
-                            let text = RichText::new(status.to_string())
-                                .small()
-                                .color(status_color(status));
-                            ui.label(text).on_hover_text(t("Last response"));
-                        }
-                        row
-                    })
-                    .inner;
-                if resp.double_clicked() {
+                let picked = match view.picked.is_empty() {
+                    true => view.open == Some(path.as_path()),
+                    false => view.picked.contains(path),
+                };
+                let status = (view.statuses.get(path)).map(|&status| {
+                    let text = RichText::new(status.to_string()).small();
+                    (text.color(status_color(status)), t("Last response"))
+                });
+                let lead = |ui: &mut egui::Ui| {
+                    method_badge(ui, method, 5);
+                };
+                let row = tree_row(ui, path, name, picked, lead, status);
+                rows.push(TreeRow {
+                    path: path.clone(),
+                    rect: row.rect,
+                    folder: None,
+                });
+                let modifiers = ui.input(|i| i.modifiers);
+                if row.clicked() && modifiers.command {
+                    actions.push(TreeAction::Pick(path.clone()));
+                } else if row.clicked() && modifiers.shift {
+                    actions.push(TreeAction::PickTo(path.clone()));
+                } else if row.double_clicked() {
                     actions.push(TreeAction::Open(path.clone(), true));
-                } else if resp.clicked() {
+                } else if row.clicked() {
                     actions.push(TreeAction::Open(path.clone(), false));
                 }
-                resp.interact(egui::Sense::drag())
-                    .dnd_set_drag_payload(path.clone());
-                drop_beside(ui, &resp, path, actions);
-                resp.context_menu(|ui| request_menu(ui, path, name, actions));
-                more_button(ui, &resp, path, |ui| request_menu(ui, path, name, actions));
+                if row.drag_started() {
+                    actions.push(TreeAction::Drag(path.clone()));
+                }
+                let own =
+                    |ui: &mut egui::Ui, a: &mut Vec<TreeAction>| request_menu(ui, path, name, a);
+                row.context_menu(|ui| row_menu(ui, view.picked, path, actions, own));
+                more_button(ui, &row, path, |ui| {
+                    row_menu(ui, view.picked, path, actions, own)
+                });
             }
         }
+    }
+}
+
+/// One tree row across the whole width: a click or a drag anywhere on it counts (not just
+/// on the name), and the name is cut short before `right` and the room kept for "⋯".
+fn tree_row(
+    ui: &mut egui::Ui,
+    path: &Path,
+    name: &str,
+    selected: bool,
+    lead: impl FnOnce(&mut egui::Ui),
+    right: Option<(RichText, &str)>,
+) -> egui::Response {
+    let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    // By path, so a row held in a drag stays the same widget while the tree changes.
+    let id = egui::Id::new(("tree-row", path));
+    let row = ui.interact(rect, id, egui::Sense::click_and_drag());
+    row.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, name)
+    });
+    let visuals = ui.style().interact_selectable(&row, selected);
+    if selected || row.hovered() {
+        (ui.painter()).rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+    }
+    let pad = ui.spacing().button_padding.x;
+    let mut content = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(egui::vec2(pad, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    lead(&mut content);
+    let galley = |text: RichText, wrap, width, style| {
+        egui::WidgetText::from(text).into_galley(&content, Some(wrap), width, style)
+    };
+    let right = right.map(|(text, hover)| {
+        let wrap = egui::TextWrapMode::Extend;
+        let size = galley(text.clone(), wrap, f32::INFINITY, egui::TextStyle::Small).size();
+        (text, hover, size)
+    });
+    let room = MORE_WIDTH + right.as_ref().map_or(0.0, |(_, _, size)| size.x + pad);
+    let width = (content.available_width() - room).max(0.0);
+    let text = galley(
+        name.into(),
+        egui::TextWrapMode::Truncate,
+        width,
+        egui::TextStyle::Button,
+    );
+    let color = visuals.text_color();
+    let at = |x: f32, g: &egui::Galley| egui::pos2(x, rect.center().y - g.size().y / 2.0);
+    // A label, unlike the name: it has its own tooltip, and takes no clicks from the row.
+    if let Some((text, hover, size)) = right {
+        let min = egui::pos2(
+            rect.right() - MORE_WIDTH - size.x,
+            rect.center().y - size.y / 2.0,
+        );
+        let label = egui::Label::new(text).selectable(false);
+        content
+            .put(egui::Rect::from_min_size(min, size), label)
+            .on_hover_text(hover);
+    }
+    let pos = at(content.cursor().left(), &text);
+    ui.painter().galley(pos, text, color);
+    row
+}
+
+/// The picked rows' menu when this row is one of several picked, else the row's own.
+fn row_menu(
+    ui: &mut egui::Ui,
+    picked: &[PathBuf],
+    path: &Path,
+    actions: &mut Vec<TreeAction>,
+    own: impl FnOnce(&mut egui::Ui, &mut Vec<TreeAction>),
+) {
+    if picked.len() < 2 || !picked.iter().any(|p| p == path) {
+        return own(ui, actions);
+    }
+    if ui.button(tf("Delete {} items", &[&picked.len()])).clicked() {
+        actions.push(TreeAction::Dialog(Dialog::Delete(picked.to_vec())));
+        ui.close();
+    }
+}
+
+/// Without what's inside another of them: a folder moved or deleted takes it along.
+fn outermost(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let inside = |p: &PathBuf| paths.iter().any(|q| q != p && p.starts_with(q));
+    paths.iter().filter(|p| !inside(p)).cloned().collect()
+}
+
+/// Where something held at height `y` goes: beside a request by its nearer half; beside a
+/// folder over its top quarter (or the bottom one, when closed), else into it; below every
+/// row, into `root`. Rows reach halfway into the spacing between them, so there's no gap
+/// where a drop does nothing.
+fn drop_at(rows: &[TreeRow], y: f32, gap: f32, root: &Path) -> Option<DropAt> {
+    if rows.first().is_some_and(|r| y < r.rect.top() - gap / 2.0) {
+        return None;
+    }
+    let Some(row) = rows.iter().find(|r| y < r.rect.bottom() + gap / 2.0) else {
+        return Some(DropAt::Into(root.to_owned()));
+    };
+    let f = (y - row.rect.top()) / row.rect.height();
+    let path = row.path.clone();
+    Some(match row.folder {
+        None => DropAt::Beside(path, f >= 0.5),
+        Some(_) if f < 0.25 => DropAt::Beside(path, false),
+        Some(false) if f > 0.75 => DropAt::Beside(path, true),
+        Some(_) => DropAt::Into(path),
+    })
+}
+
+/// While rows are held over the tree: scrolls it near its edges, shows where they would
+/// land, and moves them there on release. `rest` is the space under the last row.
+fn tree_drop(
+    ui: &egui::Ui,
+    rows: &[TreeRow],
+    rest: egui::Rect,
+    root: &Path,
+    actions: &mut Vec<TreeAction>,
+) {
+    let ctx = ui.ctx();
+    let held = egui::DragAndDrop::payload::<Vec<PathBuf>>(ctx);
+    let (Some(held), Some(p)) = (held, ctx.pointer_latest_pos()) else {
+        return;
+    };
+    let view = ui.clip_rect();
+    // Near an edge, or past it, the tree scrolls that way, faster the closer: a folder out
+    // of view is still in reach.
+    const EDGE: f32 = 32.0;
+    if view.x_range().contains(p.x) {
+        let speed = (view.top() + EDGE - p.y).max(0.0) - (p.y - view.bottom() + EDGE).max(0.0);
+        // Only while there's more that way: at the end it would repaint for nothing.
+        let content = ui.min_rect();
+        let more = (speed > 0.0 && content.top() < view.top() - 0.5)
+            || (speed < 0.0 && content.bottom() > view.bottom() + 0.5);
+        if more {
+            let delta = egui::vec2(0.0, speed.clamp(-EDGE, EDGE) / 2.0);
+            ui.scroll_with_delta_animation(delta, egui::style::ScrollAnimation::none());
+            ctx.request_repaint();
+        }
+    }
+    if !view.contains(p) {
+        return;
+    }
+    let gap = ui.spacing().item_spacing.y;
+    let Some(at) = drop_at(rows, p.y, gap, root) else {
+        return;
+    };
+    let dir = match &at {
+        DropAt::Into(dir) => dir.as_path(),
+        DropAt::Beside(target, _) => target.parent().unwrap_or(root),
+    };
+    // A folder can't go inside itself.
+    if held.iter().any(|h| dir.starts_with(h)) {
+        return;
+    }
+    let rect = |path: &Path| rows.iter().find(|r| r.path == path).map(|r| r.rect);
+    let painter = ui.painter();
+    match &at {
+        DropAt::Beside(target, after) => {
+            if let Some(r) = rect(target) {
+                let y = if *after { r.bottom() } else { r.top() };
+                let y = y + if *after { gap } else { -gap } / 2.0;
+                let stroke = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
+                painter.hline(r.x_range(), y, stroke);
+            }
+        }
+        DropAt::Into(dir) => {
+            let r = rect(dir).unwrap_or(rest);
+            let stroke = ui.visuals().selection.stroke;
+            painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Inside);
+        }
+    }
+    if ui.input(|i| i.pointer.any_released()) {
+        egui::DragAndDrop::take_payload::<Vec<PathBuf>>(ctx);
+        let held = held.to_vec();
+        actions.push(match at {
+            DropAt::Into(dir) => TreeAction::Move(held, dir),
+            DropAt::Beside(target, after) => TreeAction::Place(held, target, after),
+        });
     }
 }
 
@@ -5353,7 +5715,7 @@ fn folder_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<Tre
     item(
         ui,
         t("Delete"),
-        TreeAction::Dialog(Dialog::Delete(path.clone())),
+        TreeAction::Dialog(Dialog::Delete(vec![path.clone()])),
     );
     ui.separator();
     item(
@@ -5388,14 +5750,14 @@ fn request_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<Tr
         ui.close();
     }
     if ui.button(t("Delete")).clicked() {
-        actions.push(TreeAction::Dialog(Dialog::Delete(path.to_path_buf())));
+        actions.push(TreeAction::Dialog(Dialog::Delete(vec![path.to_path_buf()])));
         ui.close();
     }
 }
 
 /// A "⋯" at the right end of a hovered tree row, opening the row's right-click menu:
-/// right-clicking is easy to miss. The hover area is the full row width, so the pointer
-/// can travel to the button.
+/// right-clicking is easy to miss. Not while dragging: buttons popping up on every row
+/// passed made the tree look like it was moving.
 fn more_button(
     ui: &mut egui::Ui,
     row: &egui::Response,
@@ -5403,49 +5765,21 @@ fn more_button(
     menu: impl FnOnce(&mut egui::Ui),
 ) {
     let id = egui::Id::new(("tree-more", path));
-    let line = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), row.rect.y_range());
-    if !ui.rect_contains_pointer(line) && !egui::Popup::is_id_open(ui.ctx(), id) {
+    let open = egui::Popup::is_id_open(ui.ctx(), id);
+    let dragging = egui::DragAndDrop::has_any_payload(ui.ctx());
+    if !open && (dragging || !ui.rect_contains_pointer(row.rect)) {
         return;
     }
     // Wide enough for the icon and the button's padding, or the button outgrows it.
-    let size = egui::vec2(26.0, row.rect.height());
-    let rect = egui::Rect::from_min_size(egui::pos2(line.right() - size.x, line.top()), size);
+    let size = egui::vec2(MORE_WIDTH, row.rect.height());
+    let rect =
+        egui::Rect::from_min_size(egui::pos2(row.rect.right() - size.x, row.rect.top()), size);
     let button = named(
         ui.put(rect, egui::Button::new(icon::DOTS_THREE).small()),
         t("More"),
         None,
     );
     egui::Popup::menu(&button).id(id).show(menu);
-}
-
-/// A tree drop target: outlined while something is held over it; a release moves that into
-/// `folder`.
-fn drop_into(ui: &egui::Ui, resp: &egui::Response, folder: &Path, actions: &mut Vec<TreeAction>) {
-    if resp.dnd_hover_payload::<PathBuf>().is_some() {
-        let stroke = ui.visuals().selection.stroke;
-        (ui.painter()).rect_stroke(resp.rect, 2.0, stroke, egui::StrokeKind::Inside);
-    }
-    if let Some(path) = resp.dnd_release_payload::<PathBuf>() {
-        actions.push(TreeAction::Move((*path).clone(), folder.to_owned()));
-    }
-}
-
-/// A tree drop target for arranging: a release over the row's upper half puts what is held
-/// before `target` (in target's folder), over the lower half after it; a line shows where.
-fn drop_beside(ui: &egui::Ui, resp: &egui::Response, target: &Path, actions: &mut Vec<TreeAction>) {
-    let after = (ui.ctx().pointer_latest_pos()).is_some_and(|p| p.y > resp.rect.center().y);
-    if resp.dnd_hover_payload::<PathBuf>().is_some() {
-        let y = if after {
-            resp.rect.bottom()
-        } else {
-            resp.rect.top()
-        };
-        let stroke = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
-        ui.painter().hline(ui.max_rect().x_range(), y, stroke);
-    }
-    if let Some(path) = resp.dnd_release_payload::<PathBuf>() {
-        actions.push(TreeAction::Place((*path).clone(), target.to_owned(), after));
-    }
 }
 
 const HEADER_NAMES: &[(&str, &str)] = &[
@@ -9323,6 +9657,170 @@ mod ui_tests {
         );
         assert_eq!(order(&h), ["a.toml", "api", "b.toml"]);
         assert!(h.state().ws.exists(&top.join("a.toml")));
+    }
+
+    /// Every height over the tree lands somewhere: the spacing between rows belongs to the
+    /// rows beside it (a drop there did nothing), a folder takes what's dropped on its
+    /// middle, and below the last row is the top level.
+    #[test]
+    fn every_height_over_the_tree_has_a_drop_target() {
+        let root = Path::new("/c");
+        let row = |name: &str, top: f32, folder| TreeRow {
+            path: root.join(name),
+            rect: egui::Rect::from_min_size(egui::pos2(0.0, top), egui::vec2(100.0, 20.0)),
+            folder,
+        };
+        let rows = [
+            row("a.toml", 0.0, None),
+            row("f", 24.0, Some(false)),
+            row("b.toml", 48.0, None),
+        ];
+        let at = |y| drop_at(&rows, y, 4.0, root);
+        let beside = |name: &str, after| Some(DropAt::Beside(root.join(name), after));
+        assert_eq!(at(-3.0), None, "above the tree");
+        assert_eq!(at(5.0), beside("a.toml", false));
+        assert_eq!(at(15.0), beside("a.toml", true));
+        assert_eq!(at(21.5), beside("a.toml", true), "the gap under a");
+        assert_eq!(at(23.0), beside("f", false), "the gap over f");
+        assert_eq!(at(34.0), Some(DropAt::Into(root.join("f"))));
+        assert_eq!(at(43.0), beside("f", true), "the bottom of a closed folder");
+        assert_eq!(at(200.0), Some(DropAt::Into(root.to_owned())));
+    }
+
+    /// Ctrl+click and Shift+click pick several requests; dragging one of them takes them
+    /// all, in the tree's order, and the picked ones are deleted together.
+    #[test]
+    fn picked_requests_move_and_delete_together() {
+        let ws = workspace("pick");
+        let top = ws.collections();
+        let api = ws.create_folder(&top, "api").unwrap();
+        for name in ["a", "b", "c", "d"] {
+            ws.create_request(&top, name).unwrap();
+        }
+        let mut h = harness(ws);
+        h.run();
+        let row =
+            |h: &Harness<'_, App>, name: &str| h.get_all_by_label(name).next().unwrap().rect();
+        let click = |h: &mut Harness<'_, App>, name: &str, m: Modifiers| {
+            h.get_all_by_label(name).next().unwrap().click_modifiers(m);
+            h.run();
+        };
+        let names = |h: &Harness<'_, App>| -> Vec<String> {
+            (h.state().tree_picked.iter())
+                .map(|p| leaf_name(p))
+                .collect()
+        };
+        click(&mut h, "a", Modifiers::NONE);
+        // The open request is the first one picked.
+        click(&mut h, "c", Modifiers::COMMAND);
+        assert_eq!(names(&h), ["a", "c"]);
+        // From the last picked to here, requests only.
+        click(&mut h, "d", Modifiers::SHIFT);
+        assert_eq!(names(&h), ["d", "c"]);
+        click(&mut h, "b", Modifiers::COMMAND);
+        click(&mut h, "d", Modifiers::COMMAND);
+        assert_eq!(names(&h), ["c", "b"]);
+        shot(&mut h, "51-tree-picked");
+        let (from, to) = (row(&h, "c").center(), row(&h, "api").center());
+        h.drag_at(from);
+        h.run();
+        h.hover_at(from + egui::vec2(0.0, 12.0));
+        h.run();
+        h.hover_at(to);
+        h.run();
+        shot(&mut h, "52-tree-drag-picked");
+        h.drop_at(to);
+        h.run();
+        let order = |h: &Harness<'_, App>, dir: &Path| -> Vec<String> {
+            let tree = h.state().ws.tree();
+            let nodes = match dir == top {
+                true => &tree[..],
+                false => crate::docs::find(&tree, dir).unwrap(),
+            };
+            nodes.iter().map(|n| leaf_name(n.path())).collect()
+        };
+        assert_eq!(order(&h, &api), ["b", "c"], "{}", h.state().status);
+        assert_eq!(order(&h, &top), ["api", "a", "d"]);
+        assert!(h.state().tree_picked.is_empty());
+        // Both again, then their menu deletes the two.
+        click(&mut h, "b", Modifiers::NONE);
+        click(&mut h, "c", Modifiers::COMMAND);
+        h.get_all_by_label("c").next().unwrap().click_secondary();
+        h.run();
+        h.get_by_label("Delete 2 items").click();
+        h.run();
+        shot(&mut h, "53-tree-delete-picked");
+        // The heading, then the button.
+        h.get_all_by_label("Delete").last().unwrap().click();
+        h.run();
+        assert!(order(&h, &api).is_empty(), "{}", h.state().status);
+        assert_eq!(order(&h, &top), ["api", "a", "d"]);
+        // Their tabs went with them.
+        assert!(
+            h.state()
+                .tabs
+                .iter()
+                .all(|t| t.path.starts_with(&top) && !t.path.starts_with(&api))
+        );
+    }
+
+    /// The bottom request of a long tree reaches a folder at the top: held near the tree's
+    /// top edge, the tree scrolls up until the folder is in view.
+    #[test]
+    fn a_drag_held_near_the_edge_scrolls_to_a_far_folder() {
+        let ws = workspace("far");
+        let top = ws.collections();
+        let api = ws.create_folder(&top, "api").unwrap();
+        for i in 0..60 {
+            ws.create_request(&top, &format!("r{i:02}")).unwrap();
+        }
+        let mut h = harness(ws);
+        h.run();
+        let rect = |h: &Harness<'_, App>, name: &str| h.get_by_label(name).rect();
+        let filter = h.get_by_role(Role::TextInput).rect();
+        let tree_top = filter.bottom();
+        h.hover_at(rect(&h, "r00").center());
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -5000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        });
+        // Scrolling is animated.
+        for _ in 0..60 {
+            h.step();
+        }
+        let from = rect(&h, "r59").center();
+        assert!(
+            rect(&h, "api").bottom() < tree_top,
+            "the folder starts out of view"
+        );
+        h.drag_at(from);
+        h.run();
+        h.hover_at(from + egui::vec2(0.0, -12.0));
+        h.run();
+        let edge = egui::pos2(from.x, tree_top + 12.0);
+        for _ in 0..400 {
+            if rect(&h, "api").top() >= tree_top {
+                break;
+            }
+            h.hover_at(edge);
+            h.step();
+        }
+        let folder = rect(&h, "api");
+        assert!(
+            folder.top() >= tree_top,
+            "never scrolled to the folder: {folder:?}"
+        );
+        h.hover_at(folder.center());
+        h.step();
+        h.drop_at(folder.center());
+        h.run();
+        assert!(
+            h.state().ws.exists(&api.join("r59.toml")),
+            "{}",
+            h.state().status
+        );
     }
 
     #[test]

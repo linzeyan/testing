@@ -55,6 +55,14 @@ pub const fn n_(en: &'static str) -> &'static str {
 static ZH_TW_MAP: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| ZH_TW.iter().copied().collect());
 
 const ZH_TW: &[(&str, &str)] = &[
+    ("Delete {} items", "刪除 {} 個項目"),
+    ("Delete these {} requests?", "要刪除這 {} 個請求嗎？"),
+    ("{} items", "{} 個項目"),
+    (
+        "Delete these {} items, folders with everything in them?",
+        "要刪除這 {} 個項目嗎？資料夾會連同其中所有內容一起刪除。",
+    ),
+    ("… and {} more", "…還有 {} 個"),
     ("*.corp.com or host:8443", "*.corp.com 或 host:8443"),
     ("+ Certificate for a host", "+ 為主機加入憑證"),
     ("+ File…", "+ 檔案…"),
@@ -841,6 +849,9 @@ mod tests {
         ];
         let mut wrapped = std::collections::BTreeSet::new();
         for src in sources {
+            // As the compiler reads it: a Windows checkout has CRLF, and `\` before CR
+            // wouldn't read as a line continuation.
+            let src = &src.replace("\r\n", "\n");
             let calls =
                 ["t(", "tf(", "n_("].map(|f| src.match_indices(f).map(move |(i, _)| (i, f.len())));
             for (i, len) in calls.into_iter().flatten() {
