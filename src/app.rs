@@ -11295,4 +11295,287 @@ mod ui_tests {
         }
         panic!("timed out waiting for the app");
     }
+
+    /// Every protocol against public servers, through the same Send and Connect as a click:
+    /// local fakes passed while real servers failed (h2 picked by ALPN broke WebSocket).
+    /// They need the internet, so they're ignored; run them with
+    /// `cargo test --lib ui_tests::public -- --ignored`.
+    mod public {
+        use super::*;
+
+        /// Real servers are slower than local fakes.
+        fn wait_for(h: &mut Harness<'_, App>, what: &str, done: impl Fn(&App) -> bool) {
+            for _ in 0..1500 {
+                h.step();
+                if done(h.state()) {
+                    h.step();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let events = (h.state().stream.as_ref())
+                .map(|s| s.events())
+                .unwrap_or_default();
+            panic!("timed out waiting for {what}; events: {events:?}");
+        }
+
+        fn events(app: &App) -> Vec<Event> {
+            let s = app.stream.as_ref();
+            s.map(|s| s.events().into_iter().map(|(_, e)| e).collect())
+                .unwrap_or_default()
+        }
+
+        fn ended(app: &App) -> bool {
+            let ends = |e: &Event| matches!(e, Event::Error(_) | Event::Closed(_));
+            events(app).iter().any(ends)
+        }
+
+        fn set(h: &mut Harness<'_, App>, method: &str, url: &str, body: Body) {
+            let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+            (d.method, d.url, d.body) = (method.into(), url.into(), body);
+            h.state_mut().response = None;
+            h.step();
+        }
+
+        /// Sends and returns status and body, or the error.
+        fn send(h: &mut Harness<'_, App>) -> Result<(u16, String), String> {
+            h.get_by_label("Send").click();
+            let label = format!("{} {}", draft(h).method, draft(h).url);
+            wait_for(h, &label, |app| {
+                app.pending.is_empty() && app.response.is_some()
+            });
+            match &h.state().response.as_ref().unwrap().result {
+                Ok(view) => Ok((view.head.status, view.text.clone())),
+                Err(e) => Err(e.clone()),
+            }
+        }
+
+        /// Err with what happened when it didn't open.
+        fn connect(h: &mut Harness<'_, App>, what: &str) -> Result<(), String> {
+            h.get_by_label("Connect").click();
+            let open = |app: &App| events(app).iter().any(|e| matches!(e, Event::Open(_)));
+            wait_for(h, what, |app| open(app) || ended(app));
+            match ended(h.state()) {
+                true => Err(format!("{what}: {:?}", events(h.state()))),
+                false => Ok(()),
+            }
+        }
+
+        /// Sends `text` and waits for an incoming message holding it.
+        fn echo(h: &mut Harness<'_, App>, what: &str, text: &str) -> Result<(), String> {
+            h.state_mut().stream.as_mut().unwrap().compose = text.into();
+            h.step();
+            h.get_by_label("Send").click();
+            wait_for(h, what, |app| heard(app, text) || ended(app));
+            match heard(h.state(), text) {
+                true => Ok(()),
+                false => Err(format!("{what}: {:?}", events(h.state()))),
+            }
+        }
+
+        /// One failing server shouldn't hide how the others did.
+        fn all_ok(results: Vec<Result<(), String>>) {
+            let failed: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+            assert!(failed.is_empty(), "{}", failed.join("\n"));
+        }
+
+        fn heard(app: &App, text: &str) -> bool {
+            (events(app).iter()).any(|e| matches!(e, Event::In(t) if t.contains(text)))
+        }
+
+        fn disconnect(h: &mut Harness<'_, App>) {
+            if h.state().stream.as_ref().is_some_and(|s| s.live) {
+                h.get_by_label("Disconnect").click();
+                wait_for(h, "disconnect", |app| !app.stream.as_ref().unwrap().live);
+            }
+        }
+
+        fn json(text: &str) -> Body {
+            Body::Json { text: text.into() }
+        }
+
+        #[test]
+        #[ignore = "public servers"]
+        fn http_methods() {
+            let mut h = with_request("pub-http");
+            let echo = "https://postman-echo.com";
+            for m in ["GET", "DELETE"] {
+                let url = format!("{echo}/{}?from=apitool", m.to_lowercase());
+                set(&mut h, m, &url, Body::None);
+                let (status, body) = send(&mut h).unwrap();
+                assert_eq!(status, 200, "{m}: {body}");
+                assert!(body.contains(r#""from": "apitool""#), "{m}: {body}");
+            }
+            for m in ["POST", "PUT", "PATCH"] {
+                let url = format!("{echo}/{}", m.to_lowercase());
+                set(&mut h, m, &url, json(r#"{"name": "ada", "n": 1}"#));
+                let (status, body) = send(&mut h).unwrap();
+                assert_eq!(status, 200, "{m}: {body}");
+                assert!(
+                    body.contains(r#""name": "ada""#),
+                    "{m} echoes the body: {body}"
+                );
+            }
+            for m in ["HEAD", "OPTIONS"] {
+                set(&mut h, m, "https://httpbin.org/get", Body::None);
+                let (status, body) = send(&mut h).unwrap();
+                assert_eq!(status, 200, "{m}: {body}");
+            }
+            // Servers may refuse these, but an answer means they went out well formed.
+            for m in ["TRACE", "QUERY", "CONNECT"] {
+                // hyper refuses a CONNECT with a body before it goes out.
+                let body = if m == "CONNECT" {
+                    Body::None
+                } else {
+                    json("{}")
+                };
+                set(&mut h, m, "https://httpbin.org/anything", body);
+                let (status, body) = send(&mut h).unwrap_or_else(|e| panic!("{m}: {e}"));
+                assert!((200..500).contains(&status), "{m}: {status} {body}");
+            }
+        }
+
+        #[test]
+        #[ignore = "public servers"]
+        fn graphql_schema_and_query() {
+            let mut h = with_request("pub-graphql");
+            let body = Body::GraphQL {
+                query: r#"{ country(code: "TW") { name capital } }"#.into(),
+                variables: String::new(),
+            };
+            set(
+                &mut h,
+                "GRAPHQL",
+                "https://countries.trevorblades.com/",
+                body,
+            );
+            h.state_mut().req_tab = ReqTab::Body;
+            h.run();
+            h.get_by_label("Fetch schema").click();
+            wait_for(&mut h, "the schema", |app| !app.explorer.loading);
+            let schema = h.state().explorer.schema.as_ref().unwrap();
+            assert!(schema.is_ok(), "{:?}", schema.as_ref().err());
+            let (status, body) = send(&mut h).unwrap();
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains("Taiwan"), "{body}");
+        }
+
+        #[test]
+        #[ignore = "public servers"]
+        fn websockets() {
+            let mut h = with_request("pub-ws");
+            let mut results = Vec::new();
+            for url in ["wss://ws.postman-echo.com/raw", "wss://echo.websocket.org"] {
+                set(&mut h, "WS", url, Body::None);
+                results.push(connect(&mut h, url).and_then(|()| echo(&mut h, url, "hi apitool")));
+                disconnect(&mut h);
+            }
+            // The one from the report: behind Cloudflare, which picks h2 when offered.
+            let url = "wss://sports-api.polymarket.com/ws";
+            set(&mut h, "WS", url, Body::None);
+            results.push(connect(&mut h, url));
+            disconnect(&mut h);
+            all_ok(results);
+        }
+
+        #[test]
+        #[ignore = "public servers"]
+        fn socketio() {
+            let mut h = with_request("pub-socketio");
+            // The echo is in the /socketio namespace; the default one stays silent.
+            let url = "https://ws.postman-echo.com/socketio";
+            set(&mut h, "SOCKETIO", url, Body::None);
+            connect(&mut h, "socket.io").unwrap();
+            echo(&mut h, "socket.io", r#"message "hi apitool""#).unwrap();
+            disconnect(&mut h);
+        }
+
+        #[test]
+        #[ignore = "public servers"]
+        fn sse() {
+            let mut h = with_request("pub-sse");
+            let url = "https://postman-echo.com/server-events/3";
+            set(&mut h, "SSE", url, Body::None);
+            h.get_by_label("Connect").click();
+            wait_for(&mut h, "the stream to end", ended);
+            let got = events(h.state());
+            let messages = got.iter().filter(|e| matches!(e, Event::In(_))).count();
+            assert_eq!(messages, 3, "{got:?}");
+        }
+
+        #[test]
+        #[ignore = "public servers"]
+        fn grpc_reflection_unary_and_server_stream() {
+            let mut h = with_request("pub-grpc");
+            for url in ["http://grpcb.in:9000", "https://grpcb.in:9001"] {
+                set(&mut h, "GRPC", url, json(r#"{"greeting": "apitool"}"#));
+                let source = crate::grpc::source("", url);
+                h.get_by_label("↻").click();
+                let listed = |app: &App| {
+                    crate::grpc::methods(&source).is_ok_and(|m| !m.is_empty())
+                        || app.status.contains("rror")
+                };
+                wait_for(&mut h, url, listed);
+                let methods = crate::grpc::methods(&source);
+                assert!(methods.is_ok(), "{url}: {} {methods:?}", h.state().status);
+                h.state_mut().open.as_mut().unwrap().draft.rpc =
+                    "hello.HelloService/SayHello".into();
+                h.run();
+                let (status, body) = send(&mut h).unwrap_or_else(|e| panic!("{url}: {e}"));
+                assert_eq!(status, 200, "{url}: {body}");
+                assert!(body.contains("hello apitool"), "{url}: {body}");
+
+                let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+                d.rpc = "grpcbin.GRPCBin/DummyServerStream".into();
+                d.body = json(r#"{"f_string": "x"}"#);
+                h.run();
+                h.get_by_label("Connect").click();
+                wait_for(&mut h, url, ended);
+                let got = events(h.state());
+                let replies = got.iter().filter(|e| matches!(e, Event::In(_))).count();
+                assert_eq!(replies, 10, "{url}: {got:?}");
+            }
+        }
+
+        #[test]
+        #[ignore = "public servers"]
+        fn mqtt_on_every_transport() {
+            let mut h = with_request("pub-mqtt");
+            let brokers = [
+                "mqtt://test.mosquitto.org:1883",
+                // 8886: a public CA's certificate (8883's is mosquitto's own).
+                "mqtts://test.mosquitto.org:8886",
+                "ws://test.mosquitto.org:8080",
+                "wss://test.mosquitto.org:8081",
+                "mqtt://broker.emqx.io:1883",
+                "mqtts://broker.emqx.io:8883",
+                "ws://broker.emqx.io:8083/mqtt",
+                "wss://broker.emqx.io:8084/mqtt",
+            ];
+            let mut results = Vec::new();
+            for (i, url) in brokers.into_iter().enumerate() {
+                let topic = format!("apitool/test/{}/{i}", std::process::id());
+                set(&mut h, "MQTT", url, Body::None);
+                let m = &mut h.state_mut().open.as_mut().unwrap().draft.mqtt;
+                m.topic = topic.clone();
+                m.topics = vec![model::Topic {
+                    filter: topic.clone(),
+                    ..Default::default()
+                }];
+                h.step();
+                let subscribed = |app: &App| {
+                    let sub =
+                        |e: &Event| matches!(e, Event::Info(t) if t.starts_with("subscribed"));
+                    events(app).iter().any(sub) || ended(app)
+                };
+                let result = connect(&mut h, url).and_then(|()| {
+                    wait_for(&mut h, url, subscribed);
+                    echo(&mut h, url, "hi apitool")
+                });
+                results.push(result);
+                disconnect(&mut h);
+            }
+            all_ok(results);
+        }
+    }
 }
