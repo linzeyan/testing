@@ -6,7 +6,7 @@ use eframe::egui;
 use eframe::egui_wgpu::WgpuSetup;
 use eframe::wgpu;
 
-use apitool::{app, store};
+use apitool::{app, appearance, store};
 
 fn main() -> eframe::Result {
     let use_glow = std::env::args().any(|a| a == "--glow");
@@ -52,7 +52,8 @@ fn main() -> eframe::Result {
         "apitool",
         options,
         Box::new(|cc| {
-            let font = install_cjk_font(&cc.egui_ctx).unwrap_or("none: CJK text will not render");
+            // The app installs it with the fonts chosen in Settings.
+            let font = appearance::cjk().map_or("none: CJK text will not render", |(p, _)| p);
             Ok(Box::new(app::App::new(
                 ws,
                 format!("{}\nCJK font: {font}", renderer_info(cc)),
@@ -88,29 +89,4 @@ fn select_adapter(
         .min_by_key(|a| a.get_info().device_type == wgpu::DeviceType::Cpu)
         .cloned()
         .ok_or_else(|| format!("no usable adapter among {} found", adapters.len()))
-}
-
-/// egui's bundled fonts have no CJK glyphs. Borrow the OS font instead of embedding one;
-/// mmap keeps untouched glyph pages out of RSS (msjh.ttc is ~20 MB).
-fn install_cjk_font(ctx: &egui::Context) -> Option<&'static str> {
-    const CANDIDATES: &[&str] = &[
-        r"C:\Windows\Fonts\msjh.ttc",
-        "/System/Library/Fonts/STHeiti Medium.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-    ];
-    let (path, bytes) = CANDIDATES.iter().find_map(|p| {
-        let file = std::fs::File::open(p).ok()?;
-        // SAFETY: system font files are not modified while the app runs.
-        let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-        Some((*p, &**Box::leak(Box::new(map))))
-    })?;
-    let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("cjk".into(), Arc::new(egui::FontData::from_static(bytes)));
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().push("cjk".into());
-    }
-    ctx.set_fonts(fonts);
-    Some(path)
 }

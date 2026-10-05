@@ -9,7 +9,8 @@ use eframe::egui::{self, Color32, FontId, Id, Key, Modifiers, RichText, TextStyl
 
 use crate::model::{self, DYNAMIC};
 
-pub const DEFINED: Color32 = Color32::from_rgb(80, 180, 100);
+// As app.rs GREEN: readable on both themes.
+pub const DEFINED: Color32 = Color32::from_rgb(40, 150, 70);
 pub const UNDEFINED: Color32 = Color32::from_rgb(220, 80, 80);
 const MAX_SUGGESTIONS: usize = 8;
 

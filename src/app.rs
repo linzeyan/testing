@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
+use crate::appearance::Appearance;
 use crate::cookies::Jar;
 use crate::graphql::{self, Operation};
 use crate::http;
@@ -30,12 +31,15 @@ const DUPLICATE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Ke
 const NEW_REQUEST: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
 const FOCUS_URL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::L);
 const SWITCH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::K);
+const SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
 const FILTER_HINT: &str = "Filter by name";
 /// Lines longer than this are clipped in the viewer; JSON is pretty-printed first so
 /// only non-JSON minified bodies hit it.
 const MAX_LINE: usize = 4096;
+// Status colours are shared by both themes: each keeps 3:1 contrast on the dark and the
+// light background alike.
 const RED: Color32 = Color32::from_rgb(220, 80, 80);
-const ORANGE: Color32 = Color32::from_rgb(230, 160, 40);
+const ORANGE: Color32 = Color32::from_rgb(200, 120, 0);
 /// The raw body's languages and the Content-Type each sets; Text sends the default.
 const RAW_TYPES: [(&str, &str); 4] = [
     ("Text", ""),
@@ -653,6 +657,13 @@ pub struct App {
     env_colors: HashMap<String, [u8; 3]>,
     recent_filters: Vec<String>,
     raw_types: Vec<String>,
+    appearance: Appearance,
+    /// What `appearance` was when last applied; differs on the first frame and after a
+    /// change in Settings.
+    applied: Option<Appearance>,
+    settings: bool,
+    /// The system's fonts for the pickers, read when Settings first opens.
+    font_families: Option<Vec<(String, bool)>>,
     mock: Option<MockServer>,
     active_env: Option<String>,
     vars: HashMap<String, String>,
@@ -724,6 +735,10 @@ impl App {
             env_colors: state.env_colors.clone(),
             recent_filters: state.recent_filters.clone(),
             raw_types: state.raw_types.clone(),
+            appearance: state.appearance.clone(),
+            applied: None,
+            settings: false,
+            font_families: None,
             mock: None,
             ws,
             active_env: None,
@@ -888,6 +903,7 @@ impl App {
             env_colors: self.env_colors.clone(),
             recent_filters: self.recent_filters.clone(),
             raw_types: self.raw_types.clone(),
+            appearance: self.appearance.clone(),
         });
     }
 
@@ -2161,6 +2177,12 @@ fn token_color(ui: &egui::Ui, t: Token) -> Color32 {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.applied.as_ref() != Some(&self.appearance) {
+            if let Err(e) = crate::appearance::apply(ui.ctx(), &self.appearance) {
+                self.status = e;
+            }
+            self.applied = Some(self.appearance.clone());
+        }
         self.receive();
         self.tick_repeat(ui.ctx());
         let regained = ui.input(|i| {
@@ -2245,6 +2267,9 @@ impl eframe::App for App {
                 selected: 0,
             });
         }
+        if ui.input_mut(|i| i.consume_shortcut(&SETTINGS)) {
+            self.settings = true;
+        }
         if ui.input_mut(|i| i.consume_shortcut(&FOCUS_URL))
             && let Some(open) = &self.open
         {
@@ -2296,6 +2321,7 @@ impl eframe::App for App {
             ui.memory_mut(|m| m.request_focus(id));
         }
         self.network_editor_ui(ui.ctx());
+        self.settings_ui(ui.ctx());
     }
 }
 
@@ -2303,6 +2329,13 @@ impl App {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
+                let shortcut = ui.ctx().format_shortcut(&SETTINGS);
+                if (ui.small_button("⚙"))
+                    .on_hover_text(format!("Settings ({shortcut})"))
+                    .clicked()
+                {
+                    self.settings = true;
+                }
                 let proxy = match self.network.proxy {
                     ProxyMode::System => "System proxy",
                     ProxyMode::None => "No proxy",
@@ -2313,12 +2346,12 @@ impl App {
                     Some(Ok(c)) => c.note.as_deref(),
                     _ => None,
                 };
-                let mut label = RichText::new(format!("⚙ {proxy}"));
+                let mut label = RichText::new(format!("🌐 {proxy}"));
                 if note.is_some() {
-                    label = RichText::new(format!("⚙ {proxy} · direct")).color(ORANGE);
+                    label = RichText::new(format!("🌐 {proxy} · direct")).color(ORANGE);
                 }
                 if self.network.insecure {
-                    label = RichText::new(format!("⚙ {proxy} · TLS verify OFF")).color(RED);
+                    label = RichText::new(format!("🌐 {proxy} · TLS verify OFF")).color(RED);
                 }
                 if ui
                     .small_button(label)
@@ -4821,6 +4854,70 @@ impl App {
         }
     }
 
+    /// Changes show at once; they're kept when the window closes.
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        use crate::appearance::{DEFAULT_SIZE, SIZES, Theme};
+        if !self.settings {
+            return;
+        }
+        let families = self
+            .font_families
+            .get_or_insert_with(crate::appearance::families);
+        let a = &mut self.appearance;
+        let (mut close, mut network) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Settings");
+            ui.add_space(6.0);
+            egui::Grid::new("appearance")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Theme");
+                    ui.horizontal(|ui| {
+                        for (theme, name) in [
+                            (Theme::System, "System"),
+                            (Theme::Light, "Light"),
+                            (Theme::Dark, "Dark"),
+                        ] {
+                            ui.selectable_value(&mut a.theme, theme, name);
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Interface font");
+                    font_picker(ui, "ui-font", &mut a.ui_font, families.iter().map(|f| &f.0));
+                    ui.end_row();
+                    ui.label("Code font");
+                    let mono = families.iter().filter(|f| f.1).map(|f| &f.0);
+                    font_picker(ui, "code-font", &mut a.code_font, mono);
+                    ui.end_row();
+                    ui.label("Text size");
+                    ui.horizontal(|ui| {
+                        let slider = egui::Slider::new(&mut a.size, SIZES).step_by(0.5);
+                        ui.add(slider.suffix(" pt"));
+                        if a.size != DEFAULT_SIZE && ui.small_button("Reset").clicked() {
+                            a.size = DEFAULT_SIZE;
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Network");
+                    network = ui.button("Proxy and certificates…").clicked();
+                    ui.end_row();
+                });
+            ui.add_space(6.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close = ui.button("Close").clicked();
+            });
+        });
+        if close || network || modal.should_close() {
+            self.settings = false;
+            self.save_state();
+        }
+        if network {
+            self.network_editor = Some(self.network.clone());
+        }
+    }
+
     fn network_editor_ui(&mut self, ctx: &egui::Context) {
         let Some(net) = &mut self.network_editor else {
             return;
@@ -5007,9 +5104,10 @@ enum Action {
     Cookies,
     Sidebar,
     SideBySide,
+    Settings,
 }
 
-const ACTIONS: [(&str, Action); 10] = [
+const ACTIONS: [(&str, Action); 11] = [
     ("New request", Action::NewRequest),
     ("New folder", Action::NewFolder),
     ("New environment", Action::NewEnv),
@@ -5020,6 +5118,7 @@ const ACTIONS: [(&str, Action); 10] = [
     ("Cookies", Action::Cookies),
     ("Show or hide the sidebar", Action::Sidebar),
     ("Side by side or stacked", Action::SideBySide),
+    ("Settings (theme, fonts, text size)", Action::Settings),
 ];
 
 impl App {
@@ -5049,6 +5148,7 @@ impl App {
                 self.side_by_side = !self.side_by_side;
                 self.save_state();
             }
+            Action::Settings => self.settings = true,
         }
     }
 }
@@ -6649,7 +6749,7 @@ fn schema_snippet(body: &str) -> String {
     }
 }
 
-const GREEN: Color32 = Color32::from_rgb(80, 180, 100);
+const GREEN: Color32 = Color32::from_rgb(40, 150, 70);
 
 /// Enter meant for a dialog's OK: pressed in a single-line field (which lets go of focus on
 /// Enter) or with nothing focused. A multi-line editor or a focused button keeps it. Call
@@ -7138,6 +7238,28 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
         "Earlier responses to this request (the last {})",
         store::MAX_RESPONSES
     ));
+}
+
+/// "Default" (empty) or one of `families`.
+fn font_picker<'a>(
+    ui: &mut egui::Ui,
+    id: &str,
+    font: &mut String,
+    families: impl Iterator<Item = &'a String>,
+) {
+    let shown = match font.is_empty() {
+        true => "Default".to_owned(),
+        false => font.clone(),
+    };
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(shown)
+        .width(260.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(font, String::new(), "Default");
+            for f in families {
+                ui.selectable_value(font, f.clone(), f);
+            }
+        });
 }
 
 /// Status, time (hover: where it went), size (hover: headers and body) and version.
@@ -8086,7 +8208,7 @@ fn method_color(m: &str) -> Color32 {
         "PUT" => Color32::from_rgb(70, 140, 230),
         "PATCH" => Color32::from_rgb(170, 110, 220),
         "DELETE" => RED,
-        "QUERY" => Color32::from_rgb(40, 170, 170),
+        "QUERY" => Color32::from_rgb(20, 145, 150),
         "GRAPHQL" => Color32::from_rgb(229, 53, 171),
         _ => Color32::GRAY,
     }
@@ -11294,6 +11416,33 @@ mod ui_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("timed out waiting for the app");
+    }
+
+    /// Settings opens from the status bar, a change shows at once, and it's still there
+    /// after a restart.
+    #[test]
+    fn settings_apply_at_once_and_are_kept() {
+        let ws = workspace("settings");
+        ws.create_request(&ws.collections(), "r").unwrap();
+        let mut h = harness(ws.clone());
+        h.run();
+        h.get_by_label("r").click();
+        h.run();
+        h.get_by_label("⚙").click();
+        h.run();
+        h.get_by_label("Light").click();
+        h.run();
+        let theme = |h: &Harness<'_, App>| h.ctx.options(|o| o.theme_preference);
+        assert_eq!(theme(&h), egui::ThemePreference::Light);
+        shot(&mut h, "80-settings");
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(!h.state().settings);
+        shot(&mut h, "81-light");
+        drop(h);
+        let mut h = harness(ws);
+        h.run();
+        assert_eq!(theme(&h), egui::ThemePreference::Light);
     }
 
     /// Every protocol against public servers, through the same Send and Connect as a click:

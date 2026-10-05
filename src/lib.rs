@@ -1,6 +1,7 @@
 //! Shared by the GUI (`apitool`) and the headless runner (`apitool-cli`).
 
 pub mod app;
+pub mod appearance;
 mod auth;
 pub mod cli;
 mod codegen;

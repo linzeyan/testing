@@ -154,6 +154,7 @@ pub struct State {
     pub recent_filters: Vec<String>,
     /// Content types last switched to Raw: their responses open that way.
     pub raw_types: Vec<String>,
+    pub appearance: crate::appearance::Appearance,
 }
 
 /// Clones share one connection: the GUI's mock server reads from its own thread.
