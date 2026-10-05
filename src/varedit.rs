@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use eframe::egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use eframe::egui::{self, Color32, FontId, Id, Key, Modifiers, RichText, TextStyle};
 
+use crate::i18n::t;
 use crate::model::{self, DYNAMIC};
 
 // As app.rs GREEN: readable on both themes.
@@ -70,7 +71,7 @@ pub fn too_big(ui: &mut egui::Ui, id: Id, text: &mut String) -> Option<egui::Res
                     .monospace()
                     .weak(),
             );
-            ui.button("Clear")
+            ui.button(t("Clear"))
         })
         .inner;
     if response.clicked() {

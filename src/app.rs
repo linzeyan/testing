@@ -9,6 +9,7 @@ use crate::appearance::Appearance;
 use crate::cookies::Jar;
 use crate::graphql::{self, Operation};
 use crate::http;
+use crate::i18n::{n_, t, tf};
 use crate::loadtest::{self, Stats};
 use crate::model::{self, Auth, Body, Example, Folder, Inherited, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
@@ -33,6 +34,7 @@ const NEW_REQUEST: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, 
 const FOCUS_URL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::L);
 const SWITCH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::K);
 const SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
+#[cfg(test)]
 const FILTER_HINT: &str = "Filter by name";
 /// Lines longer than this are clipped in the viewer; JSON is pretty-printed first so
 /// only non-JSON minified bodies hit it.
@@ -49,11 +51,11 @@ const RAW_TYPES: [(&str, &str); 4] = [
     ("JavaScript", "application/javascript"),
 ];
 const ENV_COLORS: [(&str, Color32); 5] = [
-    ("Red", RED),
-    ("Orange", ORANGE),
-    ("Green", Color32::from_rgb(80, 180, 100)),
-    ("Blue", Color32::from_rgb(70, 130, 220)),
-    ("Purple", Color32::from_rgb(160, 100, 220)),
+    (n_("Red"), RED),
+    (n_("Orange"), ORANGE),
+    (n_("Green"), Color32::from_rgb(80, 180, 100)),
+    (n_("Blue"), Color32::from_rgb(70, 130, 220)),
+    (n_("Purple"), Color32::from_rgb(160, 100, 220)),
 ];
 
 enum Msg {
@@ -1348,7 +1350,7 @@ impl App {
         match self.ws.save_request(&open.path, &open.draft) {
             Ok(()) => {
                 open.saved = open.draft.clone();
-                self.status = format!("Saved {}", open.name());
+                self.status = tf("Saved {}", &[&open.name()]);
                 self.tree = self.ws.tree(); // method badge may have changed
                 true
             }
@@ -1554,7 +1556,7 @@ impl App {
         let path = self.open.as_ref().map(|o| &o.path);
         if let Some(i) = self.pending.iter().position(|p| Some(&p.path) == path) {
             self.pending.remove(i).abort.abort();
-            self.status = "Request cancelled".into();
+            self.status = t("Request cancelled").into();
         }
     }
 
@@ -1625,7 +1627,7 @@ impl App {
             self.save_tokens();
             if !outcome.tests.is_empty() {
                 let passed = outcome.tests.iter().filter(|t| t.passed).count();
-                self.status = format!("Tests: {passed}/{} passed", outcome.tests.len());
+                self.status = tf("Tests: {}/{} passed", &[&passed, &outcome.tests.len()]);
             }
             let failed = outcome.response.is_err() || outcome.tests.iter().any(|t| !t.passed);
             let to_tests = failed && !outcome.tests.is_empty();
@@ -1816,9 +1818,9 @@ fn leaf_name(path: &Path) -> String {
 /// works in a clone on another machine.
 fn browse(ui: &mut egui::Ui, path: &mut String, filters: &[(&str, &[&str])], save: bool) -> bool {
     let hint = if save {
-        "Choose where to save"
+        t("Choose where to save")
     } else {
-        "Choose a file"
+        t("Choose a file")
     };
     if !ui.button("…").on_hover_text(hint).clicked() {
         return false;
@@ -1966,7 +1968,7 @@ fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView, recent: &mut Vec<Strin
             remember(recent, path);
         }
         if !recent.is_empty() {
-            ui.menu_button("Recent", |ui| {
+            ui.menu_button(t("Recent"), |ui| {
                 for r in recent.iter() {
                     if ui.button(RichText::new(r).monospace()).clicked() {
                         view.filter = r.clone();
@@ -1975,10 +1977,10 @@ fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView, recent: &mut Vec<Strin
                 }
             })
             .response
-            .on_hover_text("Filters used before");
+            .on_hover_text(t("Filters used before"));
         }
         if !view.filter.is_empty()
-            && ui.small_button("×").on_hover_text("Show the whole body").clicked()
+            && ui.small_button("×").on_hover_text(t("Show the whole body")).clicked()
         {
             view.filter.clear();
             view.apply_filter();
@@ -1986,7 +1988,7 @@ fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView, recent: &mut Vec<Strin
         if !view.filter_error.is_empty() {
             ui.colored_label(ORANGE, view.filter_error.as_str());
         } else if view.filter != view.applied {
-            ui.weak("Enter to apply");
+            ui.weak(t("Enter to apply"));
         }
     });
 }
@@ -2178,6 +2180,7 @@ fn token_color(ui: &egui::Ui, t: Token) -> Color32 {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        crate::i18n::set(self.appearance.language);
         if self.applied.as_ref() != Some(&self.appearance) {
             if let Err(e) = crate::appearance::apply(ui.ctx(), &self.appearance) {
                 self.status = e;
@@ -2332,16 +2335,16 @@ impl App {
             ui.horizontal(|ui| {
                 let shortcut = ui.ctx().format_shortcut(&SETTINGS);
                 let gear = ui.small_button(icon::GEAR_SIX);
-                if (named(gear, "App settings", None))
-                    .on_hover_text(format!("Settings ({shortcut})"))
+                if (named(gear, t("App settings"), None))
+                    .on_hover_text(tf("Settings ({})", &[&shortcut]))
                     .clicked()
                 {
                     self.settings = true;
                 }
                 let proxy = match self.network.proxy {
-                    ProxyMode::System => "System proxy",
-                    ProxyMode::None => "No proxy",
-                    ProxyMode::Manual => "Manual proxy",
+                    ProxyMode::System => t("System proxy"),
+ ProxyMode::None => t("No proxy"),
+ ProxyMode::Manual => t("Manual proxy"),
                     ProxyMode::Pac => "PAC",
                 };
                 let note = match self.client.get() {
@@ -2350,14 +2353,14 @@ impl App {
                 };
                 let mut label = RichText::new(format!("{} {proxy}", icon::GLOBE));
                 if note.is_some() {
-                    label = RichText::new(format!("{} {proxy} · direct", icon::GLOBE)).color(ORANGE);
+                    label = RichText::new(format!("{} {proxy} · {}", icon::GLOBE, t("direct"))).color(ORANGE);
                 }
                 if self.network.insecure {
-                    label = RichText::new(format!("{} {proxy} · TLS verify OFF", icon::GLOBE)).color(RED);
+                    label = RichText::new(format!("{} {proxy} · {}", icon::GLOBE, t("TLS verify OFF"))).color(RED);
                 }
                 if ui
                     .small_button(label)
-                    .on_hover_text(note.unwrap_or("Network settings"))
+                    .on_hover_text(note.unwrap_or(t("Network settings")))
                     .clicked()
                 {
                     self.network_editor = Some(self.network.clone());
@@ -2366,8 +2369,8 @@ impl App {
                 let mut sidebar = !self.hide_sidebar;
                 let shown = sidebar;
                 let toggle = ui.toggle_value(&mut sidebar, icon::SIDEBAR_SIMPLE);
-                if (named(toggle, "Sidebar", Some(shown)))
-                    .on_hover_text("Show or hide collections and history, for more room")
+                if (named(toggle, t("Sidebar"), Some(shown)))
+                    .on_hover_text(t("Show or hide collections and history, for more room"))
                     .changed()
                 {
                     self.hide_sidebar = !sidebar;
@@ -2380,7 +2383,7 @@ impl App {
                 };
                 let on = self.side_by_side;
                 let toggle = ui.toggle_value(&mut self.side_by_side, icon::COLUMNS);
-                if (named(toggle, "Side by side", Some(on)))
+                if (named(toggle, t("Side by side"), Some(on)))
                     .on_hover_text(hint)
                     .changed()
                 {
@@ -2402,7 +2405,7 @@ impl App {
                         ui.ctx().copy_text(m.url.clone());
                         self.status = "Copied the mock server URL".into();
                     }
-                    stop_mock = ui.small_button("Stop").clicked();
+                    stop_mock = ui.small_button(t("Stop")).clicked();
                     ui.separator();
                 }
                 if stop_mock {
@@ -2430,17 +2433,17 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.strong("Environment");
+            ui.strong(t("Environment"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if named(ui.small_button(icon::PLUS), "New environment", None)
-                    .on_hover_text("New environment")
+                if named(ui.small_button(icon::PLUS), t("New environment"), None)
+                    .on_hover_text(t("New environment"))
                     .clicked()
                 {
                     self.dialog = Some(Dialog::name(NameKind::NewEnv, ""));
                 }
                 if ui
-                    .small_button("Globals")
-                    .on_hover_text("Variables available in every environment")
+                    .small_button(t("Globals"))
+                    .on_hover_text(t("Variables available in every environment"))
                     .clicked()
                 {
                     self.open_env_editor(None, &[]);
@@ -2451,7 +2454,7 @@ impl App {
             let mut label = RichText::new(
                 self.active_env
                     .clone()
-                    .unwrap_or_else(|| "No environment".into()),
+                    .unwrap_or_else(|| t("No environment").into()),
             );
             if let Some(color) = self.env_color() {
                 label = label.color(color).strong();
@@ -2462,7 +2465,7 @@ impl App {
                 .width(150.0)
                 .show_ui(ui, |ui| {
                     if ui
-                        .selectable_label(self.active_env.is_none(), "No environment")
+                        .selectable_label(self.active_env.is_none(), t("No environment"))
                         .clicked()
                     {
                         chosen = Some(None);
@@ -2495,38 +2498,38 @@ impl App {
                     for (label, c) in ENV_COLORS {
                         pick(
                             ui,
-                            RichText::new(format!("● {label}")).color(c),
+                            RichText::new(format!("● {}", t(label))).color(c),
                             Some([c.r(), c.g(), c.b()]),
                         );
                     }
-                    pick(ui, RichText::new("None"), None);
+                    pick(ui, RichText::new(t("None")), None);
                 })
                 .response
-                .on_hover_text("Colour this environment, e.g. prod in red");
+                .on_hover_text(t("Colour this environment, e.g. prod in red"));
             }
             if let Some(name) = self.active_env.clone()
-                && named(ui.small_button(icon::PENCIL_SIMPLE), "Edit", None)
-                    .on_hover_text("Edit this environment's variables")
+                && named(ui.small_button(icon::PENCIL_SIMPLE), t("Edit"), None)
+                    .on_hover_text(t("Edit this environment's variables"))
                     .clicked()
             {
                 self.open_env_editor(Some(name), &[]);
             }
             let on = self.quick_look;
             let look = ui.toggle_value(&mut self.quick_look, icon::EYE);
-            named(look, "Quick look", Some(on))
-                .on_hover_text("Quick look: every variable in scope");
+            named(look, t("Quick look"), Some(on))
+                .on_hover_text(t("Quick look: every variable in scope"));
         });
         ui.separator();
         ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.show_history,
                 false,
-                RichText::new("Collections").strong(),
+                RichText::new(t("Collections")).strong(),
             );
             ui.selectable_value(
                 &mut self.show_history,
                 true,
-                RichText::new("History").strong(),
+                RichText::new(t("History")).strong(),
             );
         });
         if self.show_history {
@@ -2536,36 +2539,36 @@ impl App {
         ui.horizontal(|ui| {
             let root = self.ws.collections();
             let shortcut = ui.ctx().format_shortcut(&NEW_REQUEST);
-            if named(ui.small_button(icon::FILE_PLUS), "New request", None)
-                .on_hover_text(format!("New request ({shortcut})"))
+            if named(ui.small_button(icon::FILE_PLUS), t("New request"), None)
+                .on_hover_text(tf("New request ({})", &[&shortcut]))
                 .clicked()
             {
                 self.dialog = Some(Dialog::name(NameKind::NewRequest(root.clone()), ""));
             }
-            let folder = named(ui.small_button(icon::FOLDER_PLUS), "New folder", None);
-            if folder.on_hover_text("New folder").clicked() {
+            let folder = named(ui.small_button(icon::FOLDER_PLUS), t("New folder"), None);
+            if folder.on_hover_text(t("New folder")).clicked() {
                 self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
             }
             let more = ui
                 .menu_button(icon::DOTS_THREE, |ui| {
-                    if ui.button("Copy docs as Markdown").clicked() {
+                    if ui.button(t("Copy docs as Markdown")).clicked() {
                         self.copy_docs(&root, ui.ctx());
                         ui.close();
                     }
-                    if ui.button("Copy as Postman collection").clicked() {
+                    if ui.button(t("Copy as Postman collection")).clicked() {
                         self.copy_postman(&root, ui.ctx());
                         ui.close();
                     }
-                    if ui.button("Start mock server").clicked() {
+                    if ui.button(t("Start mock server")).clicked() {
                         self.start_mock(root.clone(), ui.ctx());
                         ui.close();
                     }
                     ui.separator();
                     if ui
-                        .button("Import…")
-                        .on_hover_text(
+                        .button(t("Import…"))
+                        .on_hover_text(t(
                             "A Postman collection or environment, or an OpenAPI/Swagger spec",
-                        )
+                        ))
                         .clicked()
                     {
                         self.dialog = Some(Dialog::Paste {
@@ -2574,27 +2577,27 @@ impl App {
                         });
                         ui.close();
                     }
-                    let export = ui.button("Export to files").on_hover_text(
+                    let export = ui.button(t("Export to files")).on_hover_text(t(
                         "Writes collections/, environments/ and globals.toml into the workspace \
                      folder, for git. Secrets, history and cookies stay out.",
-                    );
+                    ));
                     if export.clicked() {
                         self.export();
                         ui.close();
                     }
                     let import = ui
-                        .button("Import from files…")
-                        .on_hover_text("Reads those files back, e.g. after a git pull");
+                        .button(t("Import from files…"))
+                        .on_hover_text(t("Reads those files back, e.g. after a git pull"));
                     if import.clicked() {
                         self.dialog = Some(Dialog::Import);
                         ui.close();
                     }
                 })
                 .response
-                .on_hover_text("The whole collection");
-            named(more, "More", None);
-            if named(ui.small_button(icon::PLAY), "Run", None)
-                .on_hover_text("Run the whole collection")
+                .on_hover_text(t("The whole collection"));
+            named(more, t("More"), None);
+            if named(ui.small_button(icon::PLAY), t("Run"), None)
+                .on_hover_text(t("Run the whole collection"))
                 .clicked()
             {
                 self.open_runner(root);
@@ -2604,17 +2607,17 @@ impl App {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let clear = !self.tree_filter.is_empty()
-                        && ui.small_button("×").on_hover_text("Clear").clicked();
+                        && ui.small_button("×").on_hover_text(t("Clear")).clicked();
                     let filter = ui.add(
                         egui::TextEdit::singleline(&mut self.tree_filter)
                             // Not an auto id: the × appearing would change it and drop focus.
                             .id(egui::Id::new("tree-filter"))
-                            .hint_text(FILTER_HINT)
+                            .hint_text(t("Filter by name"))
                             .desired_width(f32::INFINITY),
                     );
                     let switch = ui.ctx().format_shortcut(&SWITCH);
                     let filter = filter
-                        .on_hover_text(format!("{switch} jumps to any request or environment"));
+                        .on_hover_text(tf("{} jumps to any request or environment", &[&switch]));
                     // Escape leaves the box, and clears it like a search field.
                     if clear || (filter.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape))) {
                         self.tree_filter.clear();
@@ -2639,12 +2642,12 @@ impl App {
             .auto_shrink(false)
             .show(ui, |ui| {
                 if self.tree.is_empty() {
-                    ui.weak(format!(
+                    ui.weak(tf(
                         "No requests yet. Click {} to add one.",
-                        icon::FILE_PLUS
+                        &[&icon::FILE_PLUS],
                     ));
                 } else if nodes.is_empty() {
-                    ui.weak("Nothing matches.");
+                    ui.weak(t("Nothing matches."));
                 }
                 tree_ui(ui, nodes, selected, &self.statuses, &expand, &mut actions);
                 // The empty space under the tree takes a drop to the top level.
@@ -2872,8 +2875,8 @@ impl App {
     fn history_ui(&mut self, ui: &mut egui::Ui) {
         let mut restore = None;
         ui.horizontal(|ui| {
-            ui.weak("Click to load what was sent.");
-            if !self.history.is_empty() && ui.small_button("Clear").clicked() {
+            ui.weak(t("Click to load what was sent."));
+            if !self.history.is_empty() && ui.small_button(t("Clear")).clicked() {
                 match self.ws.clear_history() {
                     Ok(()) => self.history.clear(),
                     Err(e) => self.status = e,
@@ -2884,7 +2887,7 @@ impl App {
             .auto_shrink(false)
             .show(ui, |ui| {
                 if self.history.is_empty() {
-                    ui.weak("Requests you send show up here.");
+                    ui.weak(t("Requests you send show up here."));
                 }
                 for (i, e) in self.history.iter().enumerate().rev() {
                     let method = &e.request.method;
@@ -2973,28 +2976,28 @@ impl App {
                     label.context_menu(|ui| {
                         let ctx = ui.ctx().clone();
                         let shortcut = |s| ctx.format_shortcut(s);
-                        let item =
-                            egui::Button::new("Duplicate Tab").shortcut_text(shortcut(&DUPLICATE));
+                        let item = egui::Button::new(t("Duplicate Tab"))
+                            .shortcut_text(shortcut(&DUPLICATE));
                         if ui.add(item).clicked() {
                             menu = Some((i, Menu::Duplicate));
                         }
                         ui.separator();
                         let item =
-                            egui::Button::new("Close Tab").shortcut_text(shortcut(&CLOSE_TAB));
+                            egui::Button::new(t("Close Tab")).shortcut_text(shortcut(&CLOSE_TAB));
                         if ui.add(item).clicked() {
                             close = Some(tab.path.clone());
                         }
                         for (label, action) in [
-                            ("Close Other Tabs", Menu::Others),
-                            ("Close Tabs to the Right", Menu::Right),
-                            ("Close All Tabs", Menu::All),
+                            (t("Close Other Tabs"), Menu::Others),
+                            (t("Close Tabs to the Right"), Menu::Right),
+                            (t("Close All Tabs"), Menu::All),
                         ] {
                             if ui.button(label).clicked() {
                                 menu = Some((i, action));
                             }
                         }
                         ui.separator();
-                        let item = egui::Button::new("Reopen Closed Tab")
+                        let item = egui::Button::new(t("Reopen Closed Tab"))
                             .shortcut_text(shortcut(&REOPEN_TAB));
                         if ui.add_enabled(!self.closed.is_empty(), item).clicked() {
                             menu = Some((i, Menu::Reopen));
@@ -3002,7 +3005,7 @@ impl App {
                     });
                     let x = ui
                         .small_button("×")
-                        .on_hover_text(format!("Close ({})", ui.ctx().format_shortcut(&CLOSE_TAB)));
+                        .on_hover_text(tf("Close ({})", &[&ui.ctx().format_shortcut(&CLOSE_TAB)]));
                     if x.clicked() || label.middle_clicked() {
                         close = Some(tab.path.clone());
                     }
@@ -3045,9 +3048,9 @@ impl App {
         let all_vars = self.all_vars();
         let Some(open) = &mut self.open else {
             ui.centered_and_justified(|ui| {
-                ui.weak(format!(
+                ui.weak(tf(
                     "Select a request on the left, or create one with {}.",
-                    icon::FILE_PLUS
+                    &[&icon::FILE_PLUS],
                 ))
             });
             return;
@@ -3118,25 +3121,22 @@ impl App {
                                 }
                             });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("✕").on_hover_text("Close").clicked() {
+                            if ui.button("✕").on_hover_text(t("Close")).clicked() {
                                 self.code = false;
                             }
                             if let Ok(code) = &code
-                                && ui.add(primary("Copy")).clicked()
+                                && ui.add(primary(t("Copy"))).clicked()
                             {
                                 ui.ctx().copy_text(code.clone());
                                 self.status = format!("Copied {} snippet", self.code_lang);
                             }
                         });
                     });
-                    ui.weak("Variables are filled in; scripts don't run.");
+                    ui.weak(t("Variables are filled in; scripts don't run."));
                     ui.separator();
                     match code {
                         Ok(code) if code.len() > crate::varedit::MAX_EDIT => {
-                            ui.weak(format!(
-                                "This snippet is {}: too big to show here. Copy still copies all of it.",
-                                human_size(code.len())
-                            ));
+                            ui.weak(tf("This snippet is {}: too big to show here. Copy still copies all of it.", &[&human_size(code.len())]));
                         }
                         Ok(code) => {
                             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
@@ -3174,43 +3174,43 @@ impl App {
                         .id(egui::Id::new("save-more"))
                         .show(|ui| {
                             save_as = ui
-                                .button("Save as…")
-                                .on_hover_text(
+                                .button(t("Save as…"))
+                                .on_hover_text(t(
                                     "Save these edits as a new request; this one stays as saved",
-                                )
+                                ))
                                 .clicked();
                         });
                     save = ui
-                        .add_enabled(open.dirty(), egui::Button::new("Save"))
+                        .add_enabled(open.dirty(), egui::Button::new(t("Save")))
                         .on_hover_text(ui.ctx().format_shortcut(&SAVE))
                         .clicked();
                     if !streaming {
                         let on = self.load.is_some();
                         let load = ui.selectable_label(on, icon::GAUGE);
-                        toggle_load = named(load, "Load test", Some(on))
-                            .on_hover_text("Load test: many virtual users sending this request")
+                        toggle_load = named(load, t("Load test"), Some(on))
+                            .on_hover_text(t("Load test: many virtual users sending this request"))
                             .clicked();
                     }
                     let on = self.cookie_manager;
                     let cookies = ui.toggle_value(&mut self.cookie_manager, icon::COOKIE);
-                    named(cookies, "Cookies", Some(on))
-                        .on_hover_text("Cookies the server set, sent back automatically");
+                    named(cookies, t("Cookies"), Some(on))
+                        .on_hover_text(t("Cookies the server set, sent back automatically"));
                     let on = self.code;
                     let code = ui.toggle_value(&mut self.code, icon::CODE);
-                    named(code, "Code", Some(on))
-                        .on_hover_text("This request as curl, Python, Go, … to copy");
+                    named(code, t("Code"), Some(on))
+                        .on_hover_text(t("This request as curl, Python, Go, … to copy"));
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                         for (name, dir) in &crumbs {
                             let link = ui.link(RichText::new(name).weak());
-                            if link.on_hover_text("Folder settings").clicked() {
+                            if link.on_hover_text(t("Folder settings")).clicked() {
                                 folder_clicked = Some(dir.clone());
                             }
                             ui.weak("›");
                         }
                         if open.dirty() {
                             ui.colored_label(ORANGE, "●")
-                                .on_hover_text("Unsaved changes");
+                                .on_hover_text(t("Unsaved changes"));
                         }
                         let name = RichText::new(open.name()).heading();
                         ui.add(egui::Label::new(name).truncate())
@@ -3291,18 +3291,18 @@ impl App {
                 }
                 if half_close {
                     cancel = ui
-                        .add_sized(button, egui::Button::new("End stream"))
-                        .on_hover_text("Stop sending; the server can still reply")
+                        .add_sized(button, egui::Button::new(t("End stream")))
+                        .on_hover_text(t("Stop sending; the server can still reply"))
                         .clicked();
                 } else if pending.is_some() || live {
-                    let label = if live { "Disconnect" } else { "Cancel" };
+                    let label = if live { t("Disconnect") } else { t("Cancel") };
                     cancel = ui.add_sized(button, egui::Button::new(label)).clicked();
                 } else if let Some(every) = repeating {
-                    stop_repeat = (ui.add_sized(button, egui::Button::new("Stop repeat")))
-                        .on_hover_text(format!("Sending every {every} s"))
+                    stop_repeat = (ui.add_sized(button, egui::Button::new(t("Stop repeat"))))
+                        .on_hover_text(tf("Sending every {} s", &[&every]))
                         .clicked();
                 } else {
-                    let label = RichText::new(if streaming { "Connect" } else { "Send" })
+                    let label = RichText::new(if streaming { t("Connect") } else { t("Send") })
                         .strong()
                         .color(Color32::WHITE);
                     send |= ui
@@ -3322,14 +3322,16 @@ impl App {
                         .id(egui::Id::new("send-more"))
                         .show(|ui| {
                             download = ui
-                                .button("Send and download…")
-                                .on_hover_text("Save the response straight to a file, for big ones")
+                                .button(t("Send and download…"))
+                                .on_hover_text(t(
+                                    "Save the response straight to a file, for big ones",
+                                ))
                                 .clicked();
                             ui.horizontal(|ui| {
-                                start_repeat = (ui.button("Repeat every"))
-                                    .on_hover_text(
+                                start_repeat = (ui.button(t("Repeat every")))
+                                    .on_hover_text(t(
                                         "Send now and again at this interval, until stopped",
-                                    )
+                                    ))
                                     .clicked();
                                 let secs = egui::DragValue::new(&mut self.repeat_secs);
                                 ui.add(secs.range(1..=3600).suffix(" s"));
@@ -3352,10 +3354,10 @@ impl App {
                 || !open.draft.inherited.pre_request.is_empty();
             if !missing.is_empty() && !scripted {
                 ui.horizontal(|ui| {
-                    ui.colored_label(ORANGE, format!("Undefined: {}", missing.join(", ")));
+                    ui.colored_label(ORANGE, tf("Undefined: {}", &[&missing.join(", ")]));
                     // Without an environment, Globals is where a value works right away.
-                    let target = self.active_env.as_deref().unwrap_or("Globals");
-                    if ui.small_button(format!("Define in {target}…")).clicked() {
+                    let target = self.active_env.as_deref().unwrap_or(t("Globals"));
+                    if ui.small_button(tf("Define in {}…", &[&target])).clicked() {
                         define = Some(missing.clone());
                     }
                 });
@@ -3391,11 +3393,11 @@ impl App {
                 if mqtt {
                     let topics = open.draft.mqtt.topics.iter();
                     let on = topics.filter(|t| t.enabled && !t.filter.is_empty()).count();
-                    ui.selectable_value(&mut self.req_tab, ReqTab::Topics, tab(on, "Topics"));
+                    ui.selectable_value(&mut self.req_tab, ReqTab::Topics, tab(on, t("Topics")));
                     ui.selectable_value(
                         &mut self.req_tab,
                         ReqTab::Properties,
-                        tab(count(&open.draft.mqtt.user_properties), "Properties"),
+                        tab(count(&open.draft.mqtt.user_properties), t("Properties")),
                     );
                 } else {
                     ui.selectable_value(
@@ -3403,21 +3405,21 @@ impl App {
                         ReqTab::Params,
                         tab(
                             count(&open.draft.params) + count(&open.draft.path_vars),
-                            "Params",
+                            t("Params"),
                         ),
                     );
                     ui.selectable_value(
                         &mut self.req_tab,
                         ReqTab::Headers,
-                        tab(count(&open.draft.headers), "Headers"),
+                        tab(count(&open.draft.headers), t("Headers")),
                     );
                     ui.selectable_value(
                         &mut self.req_tab,
                         ReqTab::Body,
                         if open.draft.method == "GRAPHQL" {
-                            "Query".to_owned()
+                            t("Query").to_owned()
                         } else {
-                            dot(matches!(open.draft.body, Body::None), "Body")
+                            dot(matches!(open.draft.body, Body::None), t("Body"))
                         },
                     );
                 }
@@ -3426,7 +3428,7 @@ impl App {
                     ReqTab::Auth,
                     dot(
                         matches!(open.draft.effective_auth(), Auth::None | Auth::Inherit),
-                        "Auth",
+                        t("Auth"),
                     ),
                 );
                 let no_scripts =
@@ -3434,12 +3436,12 @@ impl App {
                 ui.selectable_value(
                     &mut self.req_tab,
                     ReqTab::Scripts,
-                    dot(no_scripts, "Scripts"),
+                    dot(no_scripts, t("Scripts")),
                 );
                 ui.selectable_value(
                     &mut self.req_tab,
                     ReqTab::Asserts,
-                    tab(count(&open.draft.asserts), "Asserts"),
+                    tab(count(&open.draft.asserts), t("Asserts")),
                 );
                 // How a single HTTP exchange goes out, or MQTT's connection; other
                 // streams and gRPC have none.
@@ -3460,7 +3462,7 @@ impl App {
                     ui.selectable_value(
                         &mut self.req_tab,
                         ReqTab::Settings,
-                        dot(default, "Settings"),
+                        dot(default, t("Settings")),
                     );
                 } else if self.req_tab == ReqTab::Settings {
                     self.req_tab = ReqTab::Params;
@@ -3468,14 +3470,14 @@ impl App {
                 ui.selectable_value(
                     &mut self.req_tab,
                     ReqTab::Docs,
-                    dot(open.draft.description.trim().is_empty(), "Docs"),
+                    dot(open.draft.description.trim().is_empty(), t("Docs")),
                 );
                 let examples = open.draft.examples.len();
                 if examples > 0 {
                     ui.selectable_value(
                         &mut self.req_tab,
                         ReqTab::Examples,
-                        tab(examples, "Examples"),
+                        tab(examples, t("Examples")),
                     );
                 } else if self.req_tab == ReqTab::Examples {
                     self.req_tab = ReqTab::Params;
@@ -3589,7 +3591,7 @@ impl App {
             if let Some(p) = pending {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(format!("Sending… {:.1} s", p.started.elapsed().as_secs_f32()));
+                    ui.label(tf("Sending… {} s", &[&format!("{:.1}", p.started.elapsed().as_secs_f32())]));
                 });
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
                 return;
@@ -3606,13 +3608,13 @@ impl App {
                         }
                     }
                     None if open.draft.method == "MQTT" => {
-                        ui.weak("Press Connect to reach the broker; it subscribes to the topics in the Topics tab. Scripts don't run for MQTT.");
+                        ui.weak(t("Press Connect to reach the broker; it subscribes to the topics in the Topics tab. Scripts don't run for MQTT."));
                     }
                     None if open.draft.method == "GRPC" => {
-                        ui.weak("Press Connect to start the call. The body is the first message (for a client stream, an array is several, empty is none). Scripts don't run for streams.");
+                        ui.weak(t("Press Connect to start the call. The body is the first message (for a client stream, an array is several, empty is none). Scripts don't run for streams."));
                     }
                     None => {
-                        ui.weak("Press Connect to open the stream. Scripts don't run for WebSocket/SSE.");
+                        ui.weak(t("Press Connect to open the stream. Scripts don't run for WebSocket/SSE."));
                     }
                 }
                 return;
@@ -3620,7 +3622,7 @@ impl App {
             match &mut self.response {
                 None => {
                     ui.horizontal(|ui| {
-                        ui.weak(format!("Press Send or {} to see the response.", ui.ctx().format_shortcut(&SEND)));
+                        ui.weak(tf("Press Send or {} to see the response.", &[&ui.ctx().format_shortcut(&SEND)]));
                         past_menu(ui, &mut past, None);
                     });
                     shortcut_list(ui);
@@ -3920,7 +3922,7 @@ impl App {
                         let shown = (folders.iter())
                             .find(|(_, p)| p == folder)
                             .map_or("", |(label, _)| label.as_str());
-                        egui::ComboBox::from_label("Folder")
+                        egui::ComboBox::from_label(t("Folder"))
                             .selected_text(shown)
                             .width(280.0)
                             .show_ui(ui, |ui| {
@@ -3931,7 +3933,7 @@ impl App {
                     }
                     let edit = ui.add(
                         egui::TextEdit::singleline(name)
-                            .hint_text("Name")
+                            .hint_text(t("Name"))
                             .desired_width(f32::INFINITY),
                     );
                     // Before refocusing: Enter is what made the field let go of focus.
@@ -3946,20 +3948,23 @@ impl App {
                         if ui.add(primary("OK")).clicked() || enter {
                             then = Some(Box::new(|app, _| app.submit_name()));
                         }
-                        cancel = ui.button("Cancel").clicked();
+                        cancel = ui.button(t("Cancel")).clicked();
                     });
                 }
                 Dialog::Delete(path) => {
-                    ui.heading("Delete");
+                    ui.heading(t("Delete"));
                     let what = if !crate::store::is_request(path) {
-                        "folder and everything in it"
+                        tf(
+                            "Delete the folder \"{}\" and everything in it?",
+                            &[&leaf_name(path)],
+                        )
                     } else {
-                        "request"
+                        tf("Delete the request \"{}\"?", &[&leaf_name(path)])
                     };
-                    ui.label(format!("Delete {what} \"{}\"?", leaf_name(path)));
+                    ui.label(what);
                     ui.horizontal(|ui| {
                         let delete = egui::Button::new(
-                            RichText::new("Delete").strong().color(Color32::WHITE),
+                            RichText::new(t("Delete")).strong().color(Color32::WHITE),
                         )
                         .fill(RED);
                         if ui.add(delete).clicked() || enter_pressed(ui) {
@@ -3987,18 +3992,18 @@ impl App {
                                 app.reload();
                             }));
                         }
-                        cancel = ui.button("Cancel").clicked();
+                        cancel = ui.button(t("Cancel")).clicked();
                     });
                 }
                 Dialog::Unsaved(next) => {
                     let quit = matches!(next, Next::Quit);
-                    ui.heading("Unsaved changes");
+                    ui.heading(t("Unsaved changes"));
                     let names = if quit { &unsaved } else { &open_name };
-                    ui.label(format!("Save changes to \"{names}\"?"));
+                    ui.label(tf("Save changes to \"{}\"?", &[&names]));
                     ui.horizontal(|ui| {
-                        let save = ui.add(primary("Save")).clicked() || enter_pressed(ui);
-                        let discard = ui.button("Discard").clicked();
-                        cancel = ui.button("Cancel").clicked();
+                        let save = ui.add(primary(t("Save"))).clicked() || enter_pressed(ui);
+                        let discard = ui.button(t("Discard")).clicked();
+                        cancel = ui.button(t("Cancel")).clicked();
                         if save || discard {
                             then = Some(Box::new(move |app, ctx| {
                                 if save && !(if quit { app.save_all() } else { app.save() }) {
@@ -4033,7 +4038,9 @@ impl App {
                         false => "Save response body",
                     });
                     if *download {
-                        ui.weak("A successful response goes straight to this file, however big.");
+                        ui.weak(t(
+                            "A successful response goes straight to this file, however big.",
+                        ));
                     }
                     let edit = ui
                         .horizontal(|ui| {
@@ -4041,7 +4048,7 @@ impl App {
                                 browse(ui, path, &[], true);
                                 ui.add(
                                     egui::TextEdit::singleline(path)
-                                        .hint_text("File path")
+                                        .hint_text(t("File path"))
                                         .desired_width(f32::INFINITY),
                                 )
                             })
@@ -4056,15 +4063,15 @@ impl App {
                         ui.colored_label(RED, error.as_str());
                     }
                     ui.horizontal(|ui| {
-                        let label = if *download { "Send" } else { "Save" };
+                        let label = if *download { t("Send") } else { t("Save") };
                         if ui.add(primary(label)).clicked() || enter {
                             then = Some(Box::new(|app, ctx| app.save_body(ctx)));
                         }
-                        cancel = ui.button("Cancel").clicked();
+                        cancel = ui.button(t("Cancel")).clicked();
                     });
                 }
                 Dialog::Prompt { values, .. } => {
-                    ui.heading("Values for this request");
+                    ui.heading(t("Values for this request"));
                     let mut enter = false;
                     egui::Grid::new("prompts").num_columns(2).show(ui, |ui| {
                         for (i, (name, value)) in values.iter_mut().enumerate() {
@@ -4078,9 +4085,11 @@ impl App {
                             ui.end_row();
                         }
                     });
-                    ui.weak("Asked by {{?name}}; kept until apitool closes, never saved.");
+                    ui.weak(t(
+                        "Asked by {{?name}}; kept until apitool closes, never saved.",
+                    ));
                     ui.horizontal(|ui| {
-                        if ui.add(primary("Send")).clicked() || enter {
+                        if ui.add(primary(t("Send"))).clicked() || enter {
                             then = Some(Box::new(|app, ctx| {
                                 let Some(Dialog::Prompt { values, download }) = app.dialog.take()
                                 else {
@@ -4091,7 +4100,7 @@ impl App {
                                 app.send(ctx, download);
                             }));
                         }
-                        cancel = ui.button("Cancel").clicked();
+                        cancel = ui.button(t("Cancel")).clicked();
                     });
                 }
                 Dialog::Switch { query, selected } => {
@@ -4106,7 +4115,7 @@ impl App {
                     });
                     let edit = ui.add(
                         egui::TextEdit::singleline(query)
-                            .hint_text("Go to a request, folder, environment or action")
+                            .hint_text(t("Go to a request, folder, environment or action"))
                             .desired_width(f32::INFINITY),
                     );
                     let enter = enter_pressed(ui);
@@ -4138,7 +4147,7 @@ impl App {
                         }
                     }
                     if hits.is_empty() {
-                        ui.weak("Nothing matches.");
+                        ui.weak(t("Nothing matches."));
                     }
                     if let Some(go) = go {
                         then = Some(Box::new(move |app, _| {
@@ -4159,29 +4168,30 @@ impl App {
                     }
                 }
                 Dialog::Import => {
-                    ui.heading("Import from files");
-                    ui.label(format!(
-                        "Read collections/, environments/ and globals.toml in {root}? \
+                    ui.heading(t("Import from files"));
+                    ui.label(tf(
+                        "Read collections/, environments/ and globals.toml in {}? \
                          Requests, folder settings and shared variables of the same name are \
-                         replaced. Nothing is deleted, and secrets stay."
+                         replaced. Nothing is deleted, and secrets stay.",
+                        &[&root],
                     ));
                     ui.horizontal(|ui| {
-                        if ui.add(primary("Import")).clicked() || enter_pressed(ui) {
+                        if ui.add(primary(t("Import"))).clicked() || enter_pressed(ui) {
                             then = Some(Box::new(|app, _| {
                                 app.dialog = None;
                                 app.import();
                             }));
                         }
-                        cancel = ui.button("Cancel").clicked();
+                        cancel = ui.button(t("Cancel")).clicked();
                     });
                 }
                 Dialog::Paste { text, note } => {
-                    ui.heading("Import a collection or spec");
-                    ui.label(
+                    ui.heading(t("Import a collection or spec"));
+                    ui.label(t(
                         "A Postman collection (v2.1) or environment, or an OpenAPI 3 / Swagger 2 \
                          spec (JSON or YAML): choose the file, paste it or its path, or drop \
                          the file here. Nothing already here is replaced.",
-                    );
+                    ));
                     // An exported collection is often past MAX_EDIT once pasted.
                     let id = egui::Id::new("postman-text");
                     let edit = match crate::varedit::too_big(ui, id, text) {
@@ -4193,7 +4203,7 @@ impl App {
                                     ui.add(
                                         egui::TextEdit::multiline(text)
                                             .id(id)
-                                            .hint_text("JSON, YAML or a path")
+                                            .hint_text(t("JSON, YAML or a path"))
                                             .code_editor()
                                             .desired_rows(4)
                                             .desired_width(f32::INFINITY),
@@ -4215,9 +4225,9 @@ impl App {
                     });
                     ui.horizontal(|ui| {
                         let typed = !text.trim().is_empty();
-                        let import = ui.add_enabled(typed, primary("Import")).clicked();
-                        let chosen = (ui.button("Choose file…"))
-                            .on_hover_text("Pick the exported file instead of pasting it")
+                        let import = ui.add_enabled(typed, primary(t("Import"))).clicked();
+                        let chosen = (ui.button(t("Choose file…")))
+                            .on_hover_text(t("Pick the exported file instead of pasting it"))
                             .clicked()
                             .then(|| {
                                 let kinds: &[&str] = &["json", "yaml", "yml", "har"];
@@ -4228,7 +4238,7 @@ impl App {
                         if let Some(input) = input {
                             then = Some(Box::new(move |app, _| app.submit_import(&input)));
                         }
-                        cancel = ui.button("Close").clicked();
+                        cancel = ui.button(t("Close")).clicked();
                     });
                 }
             }
@@ -4251,22 +4261,20 @@ impl App {
         egui::Modal::new(egui::Id::new("env-editor")).show(ctx, |ui| {
             ui.set_width(620.0);
             match &ed.env {
-                Some(name) => ui.heading(format!("Environment: {name}")),
-                None => ui.heading("Globals"),
+                Some(name) => ui.heading(tf("Environment: {}", &[&name])),
+                None => ui.heading(t("Globals")),
             };
             if ed.env.is_none() {
-                ui.weak("Available in every environment; an environment variable with the same name wins.");
+                ui.weak(t("Available in every environment; an environment variable with the same name wins."));
             }
             egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                ui.label(RichText::new("Shared").strong());
-                ui.weak(format!("Saved to {file}.toml and committed to git."));
+                ui.label(RichText::new(t("Shared")).strong());
+                ui.weak(tf("Saved to {}.toml and committed to git.", &[&file]));
                 kv_table(ui, "env-shared", &mut ed.shared, &HashMap::new(), false);
                 ui.add_space(10.0);
-                ui.label(RichText::new("Secret").strong());
-                ui.weak(format!(
-                    "Saved to {file}.secret.toml, which is gitignored. Overrides shared values; \
-                     values set by scripts land here."
-                ));
+                ui.label(RichText::new(t("Secret")).strong());
+                ui.weak(tf("Saved to {}.secret.toml, which is gitignored. Overrides shared values; \
+                     values set by scripts land here.", &[&file]));
                 kv_table(ui, "env-secret", &mut ed.secret, &HashMap::new(), false);
             });
             if !ed.error.is_empty() {
@@ -4275,26 +4283,26 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| {
                 save = ui
-                    .add(primary("Save"))
+                    .add(primary(t("Save")))
                     .on_hover_text(ui.ctx().format_shortcut(&SAVE))
                     .clicked()
                     || enter_pressed(ui);
                 let close_label = if ed.confirm_discard {
-                    RichText::new("Discard changes").color(RED)
+                    RichText::new(t("Discard changes")).color(RED)
                 } else {
-                    RichText::new("Close")
+                    RichText::new(t("Close"))
                 };
                 close = ui.button(close_label).clicked() || escape_pressed(ui);
                 if ed.env.is_some() {
                     duplicate = ui
-                        .button("Duplicate…")
-                        .on_hover_text("Save, then copy into a new environment (e.g. dev → prod)")
+                        .button(t("Duplicate…"))
+                        .on_hover_text(t("Save, then copy into a new environment (e.g. dev → prod)"))
                         .clicked();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let label = if ed.confirm_delete {
-                            "Click again to delete"
+                            t("Click again to delete")
                         } else {
-                            "Delete environment"
+                            t("Delete environment")
                         };
                         if ui.button(RichText::new(label).color(RED)).clicked() {
                             delete = ed.confirm_delete;
@@ -4388,11 +4396,11 @@ impl App {
         // Like the environment editor: only explicit buttons close it.
         egui::Modal::new(egui::Id::new("folder-editor")).show(ctx, |ui| {
             ui.set_width(620.0);
-            ui.heading(format!("Folder: {}", ed.name));
-            ui.weak(
+            ui.heading(tf("Folder: {}", &[&ed.name]));
+            ui.weak(t(
                 "Shared by every request in this folder and its subfolders. \
                  Saved to .folder.toml and committed to git.",
-            );
+            ));
             ui.horizontal(|ui| {
                 let f = &ed.folder;
                 let n = f
@@ -4402,18 +4410,18 @@ impl App {
                     .count();
                 let vars_label = match n {
                     0 => "Variables".to_owned(),
-                    n => format!("Variables ({n})"),
+                    n => tf("Variables ({})", &[&n]),
                 };
                 let dot = |set: bool, name: &str| match set {
                     true => format!("{name} ●"),
                     false => name.to_owned(),
                 };
                 let scripts = !f.pre_request.trim().is_empty() || !f.tests.trim().is_empty();
-                let auth = dot(f.auth != Auth::Inherit, "Auth");
+                let auth = dot(f.auth != Auth::Inherit, t("Auth"));
                 ui.selectable_value(&mut ed.tab, FolderTab::Vars, vars_label);
                 ui.selectable_value(&mut ed.tab, FolderTab::Auth, auth);
-                ui.selectable_value(&mut ed.tab, FolderTab::Scripts, dot(scripts, "Scripts"));
-                let docs = dot(!f.description.trim().is_empty(), "Docs");
+                ui.selectable_value(&mut ed.tab, FolderTab::Scripts, dot(scripts, t("Scripts")));
+                let docs = dot(!f.description.trim().is_empty(), t("Docs"));
                 ui.selectable_value(&mut ed.tab, FolderTab::Docs, docs);
             });
             ui.separator();
@@ -4421,10 +4429,10 @@ impl App {
                 .max_height(420.0)
                 .show(ui, |ui| match ed.tab {
                     FolderTab::Vars => {
-                        ui.weak(
+                        ui.weak(t(
                             "Below environments: an environment variable with the same name \
                              wins. Keep secrets in a secret environment.",
-                        );
+                        ));
                         kv_table(
                             ui,
                             "folder-vars",
@@ -4436,7 +4444,7 @@ impl App {
                     FolderTab::Auth => {
                         let parent = ed.parent.auth.as_ref();
                         auth_editor(ui, &mut ed.folder.auth, &vars, parent);
-                        ui.weak("Requests set to \"Inherit from parent\" use this.");
+                        ui.weak(t("Requests set to \"Inherit from parent\" use this."));
                     }
                     FolderTab::Scripts => scripts_editor(
                         ui,
@@ -4455,14 +4463,14 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| {
                 save = ui
-                    .add(primary("Save"))
+                    .add(primary(t("Save")))
                     .on_hover_text(ui.ctx().format_shortcut(&SAVE))
                     .clicked()
                     || enter_pressed(ui);
                 let close_label = if ed.confirm_discard {
-                    RichText::new("Discard changes").color(RED)
+                    RichText::new(t("Discard changes")).color(RED)
                 } else {
-                    RichText::new("Close")
+                    RichText::new(t("Close"))
                 };
                 close = ui.button(close_label).clicked() || escape_pressed(ui);
             });
@@ -4498,15 +4506,17 @@ impl App {
         }
         let rows = self.cookies.rows();
         let (mut open, mut remove, mut clear) = (true, None, false);
-        egui::Window::new("Cookies")
+        egui::Window::new(t("Cookies"))
             .open(&mut open)
             .default_width(560.0)
             .show(ctx, |ui| {
                 if rows.is_empty() {
-                    ui.weak("No cookies yet. Set-Cookie responses fill the jar.");
+                    ui.weak(t("No cookies yet. Set-Cookie responses fill the jar."));
                     return;
                 }
-                ui.weak("Sent back to matching URLs, unless a request sets its own Cookie header.");
+                ui.weak(t(
+                    "Sent back to matching URLs, unless a request sets its own Cookie header.",
+                ));
                 egui::ScrollArea::vertical()
                     .max_height(400.0)
                     .show(ui, |ui| {
@@ -4517,8 +4527,8 @@ impl App {
                                 domain = &r.domain;
                             }
                             ui.horizontal(|ui| {
-                                if named(ui.small_button(icon::TRASH), "Delete", None)
-                                    .on_hover_text("Delete")
+                                if named(ui.small_button(icon::TRASH), t("Delete"), None)
+                                    .on_hover_text(t("Delete"))
                                     .clicked()
                                 {
                                     remove = Some(i);
@@ -4529,7 +4539,7 @@ impl App {
                             });
                         }
                     });
-                clear = ui.button("Clear all").clicked();
+                clear = ui.button(t("Clear all")).clicked();
             });
         if let Some(i) = remove {
             self.cookies.remove(&rows[i]);
@@ -4550,7 +4560,7 @@ impl App {
         }
         let mut edit = None;
         let mut open = true;
-        egui::Window::new("Variables in scope")
+        egui::Window::new(t("Variables in scope"))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -4561,7 +4571,9 @@ impl App {
                 let mut names: Vec<_> = self.all_vars().into_keys().collect();
                 names.sort_by_key(|n| n.to_lowercase());
                 if names.is_empty() {
-                    ui.weak("No variables yet. Add some to an environment or to Globals.");
+                    ui.weak(t(
+                        "No variables yet. Add some to an environment or to Globals.",
+                    ));
                 }
                 egui::ScrollArea::vertical()
                     .max_height(360.0)
@@ -4572,8 +4584,8 @@ impl App {
                                 let (value, source) =
                                     match (self.vars.get(name), folder.and_then(|f| f.get(name))) {
                                         (Some(v), _) => (v, env.clone().unwrap_or_default()),
-                                        (None, Some(v)) => (v, "Folder".to_owned()),
-                                        _ => (&self.globals[name], "Globals".to_owned()),
+                                        (None, Some(v)) => (v, t("Folder").to_owned()),
+                                        _ => (&self.globals[name], t("Globals").to_owned()),
                                     };
                                 ui.monospace(name);
                                 ui.label(RichText::new(clip(value, 60)).monospace())
@@ -4586,19 +4598,19 @@ impl App {
                 ui.separator();
                 ui.horizontal(|ui| {
                     if let Some(name) = &env
-                        && ui.button(format!("Edit {name}")).clicked()
+                        && ui.button(tf("Edit {}", &[&name])).clicked()
                     {
                         edit = Some(Some(name.clone()));
                     }
-                    if ui.button("Edit Globals").clicked() {
+                    if ui.button(t("Edit Globals")).clicked() {
                         edit = Some(None);
                     }
                 });
                 // 120 names don't fit a line: name the common ones, autocomplete has the rest.
-                ui.weak(format!(
+                ui.weak(tf(
                     "Always available: $guid, $timestamp, $randomInt, $randomEmail… \
-                     ({} in all; type {{{{$ for the list)",
-                    model::DYNAMIC.len()
+                     ({} in all; type {{$ for the list)",
+                    &[&model::DYNAMIC.len()],
                 ));
             });
         self.quick_look = open;
@@ -4620,7 +4632,7 @@ impl App {
             return;
         }
         let title = if scope == self.ws.collections() {
-            "Whole collection".to_owned()
+            t("Whole collection").to_owned()
         } else {
             self.ws.display_name(&scope)
         };
@@ -4749,29 +4761,29 @@ impl App {
         let running = view.run.as_ref().is_some_and(RunState::running);
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.heading(format!("Run: {}", view.title));
+            ui.heading(tf("Run: {}", &[&view.title]));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                close = ui.button("Close").clicked();
+                close = ui.button(t("Close")).clicked();
             });
         });
         ui.add_enabled_ui(!running, |ui| {
             egui::Grid::new("runner-settings").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Data file");
+                ui.label(t("Data file"));
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut view.data_path)
-                            .hint_text("Optional CSV (with header row) or JSON array; one iteration per row")
+                            .hint_text(t("Optional CSV (with header row) or JSON array; one iteration per row"))
                             .desired_width(480.0),
                     );
                     browse(ui, &mut view.data_path, &[("CSV or JSON", &["csv", "json"])], false);
                 });
                 ui.end_row();
-                ui.label("Iterations");
+                ui.label(t("Iterations"));
                 let has_data = !view.data_path.trim().is_empty();
                 ui.add_enabled(!has_data, egui::DragValue::new(&mut view.iterations).range(1..=10_000))
-                    .on_disabled_hover_text("Set by the number of data rows");
+                    .on_disabled_hover_text(t("Set by the number of data rows"));
                 ui.end_row();
-                ui.label("Delay");
+                ui.label(t("Delay"));
                 ui.add(egui::DragValue::new(&mut view.delay_ms).range(0..=60_000).suffix(" ms"));
                 ui.end_row();
             });
@@ -4781,19 +4793,19 @@ impl App {
         }
         ui.horizontal(|ui| {
             if running {
-                if ui.button("Cancel").clicked() {
+                if ui.button(t("Cancel")).clicked() {
                     let run = view.run.as_mut().expect("running");
                     run.abort.abort();
                     run.finished = Some(run.started.elapsed());
                     self.status = "Run cancelled; variable changes from it were discarded.".into();
                 }
             } else {
-                let label = RichText::new("▶ Run").strong().color(Color32::WHITE);
+                let label = RichText::new(t("▶ Run")).strong().color(Color32::WHITE);
                 start = ui
                     .add(egui::Button::new(label).fill(Color32::from_rgb(40, 110, 200)))
                     .clicked();
             }
-            ui.checkbox(&mut view.only_failures, "Failures only");
+            ui.checkbox(&mut view.only_failures, t("Failures only"));
         });
         ui.separator();
 
@@ -4809,7 +4821,7 @@ impl App {
                 ui.separator();
                 ui.colored_label(
                     if failed == 0 { GREEN } else { RED },
-                    format!("{failed} failed requests"),
+                    tf("{} failed requests", &[&failed]),
                 );
                 ui.separator();
                 let color = if tests_passed == tests_total {
@@ -4817,10 +4829,10 @@ impl App {
                 } else {
                     RED
                 };
-                ui.colored_label(color, format!("Tests {tests_passed}/{tests_total}"));
+                ui.colored_label(color, tf("Tests {}/{}", &[&tests_passed, &tests_total]));
                 if run.finished.is_some() && done < run.total {
                     ui.separator();
-                    ui.colored_label(ORANGE, "cancelled");
+                    ui.colored_label(ORANGE, t("cancelled"));
                 }
             });
             if running {
@@ -4828,9 +4840,10 @@ impl App {
             }
             ui.separator();
             if done > run.items.len() {
-                ui.weak(format!(
-                    "Showing {} of {done}: failures and the latest passes.",
-                    run.items.len()
+                let shown = run.items.len();
+                ui.weak(tf(
+                    "Showing {} of {}: failures and the latest passes.",
+                    &[&shown, &done],
                 ));
             }
             egui::ScrollArea::vertical()
@@ -4847,7 +4860,9 @@ impl App {
                     }
                 });
         } else {
-            ui.weak("Requests run in the order shown on the left, with the selected environment.");
+            ui.weak(t(
+                "Requests run in the order shown on the left, with the selected environment.",
+            ));
         }
 
         if close {
@@ -4878,46 +4893,53 @@ impl App {
         let (mut close, mut network) = (false, false);
         let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
             ui.set_width(460.0);
-            ui.heading("Settings");
+            ui.heading(t("Settings"));
             ui.add_space(6.0);
             egui::Grid::new("appearance")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Theme");
+                    ui.label(t("Language"));
+                    ui.horizontal(|ui| {
+                        use crate::i18n::Lang;
+                        ui.selectable_value(&mut a.language, Lang::English, "English");
+                        ui.selectable_value(&mut a.language, Lang::ZhTw, "繁體中文");
+                    });
+                    ui.end_row();
+                    ui.label(t("Theme"));
                     ui.horizontal(|ui| {
                         for (theme, name) in [
-                            (Theme::System, "System"),
-                            (Theme::Light, "Light"),
-                            (Theme::Dark, "Dark"),
+                            (Theme::System, t("System")),
+                            (Theme::Light, t("Light")),
+                            (Theme::Dark, t("Dark")),
                         ] {
                             ui.selectable_value(&mut a.theme, theme, name);
                         }
                     });
                     ui.end_row();
-                    ui.label("Interface font");
+                    ui.label(t("Interface font"));
                     font_picker(ui, "ui-font", &mut a.ui_font, families.iter().map(|f| &f.0));
                     ui.end_row();
-                    ui.label("Code font");
+                    ui.label(t("Code font"));
                     let mono = families.iter().filter(|f| f.1).map(|f| &f.0);
                     font_picker(ui, "code-font", &mut a.code_font, mono);
                     ui.end_row();
-                    ui.label("Text size");
+                    ui.label(t("Text size"));
                     ui.horizontal(|ui| {
                         let slider = egui::Slider::new(&mut a.size, SIZES).step_by(0.5);
                         ui.add(slider.suffix(" pt"));
-                        if a.size != DEFAULT_SIZE && ui.small_button("Reset").clicked() {
+                        if a.size != DEFAULT_SIZE && ui.small_button(t("Reset")).clicked() {
                             a.size = DEFAULT_SIZE;
                         }
                     });
                     ui.end_row();
-                    ui.label("Network");
-                    network = ui.button("Proxy and certificates…").clicked();
+                    ui.label(t("Network"));
+                    network = ui.button(t("Proxy and certificates…")).clicked();
                     ui.end_row();
                 });
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                close = ui.button("Close").clicked();
+                close = ui.button(t("Close")).clicked();
             });
         });
         if close || network || modal.should_close() {
@@ -4936,79 +4958,82 @@ impl App {
         let (mut apply, mut cancel) = (false, false);
         egui::Modal::new(egui::Id::new("network")).show(ctx, |ui| {
             ui.set_width(560.0);
-            ui.heading("Network");
-            ui.weak("Stored on this machine only (in apitool.db), never exported.");
+            ui.heading(t("Network"));
+            ui.weak(t("Stored on this machine only (in apitool.db), never exported."));
             ui.add_space(6.0);
             let field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
                 ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(f32::INFINITY));
             };
+            // In a row: right to left on its own, it took all the height left.
             let file_field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    browse(ui, text, &[], false);
-                    field(ui, text, hint);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        browse(ui, text, &[], false);
+                        field(ui, text, hint);
+                    });
                 });
             };
 
-            ui.label(RichText::new("Proxy").strong());
+            ui.label(RichText::new(t("Proxy")).strong());
             ui.horizontal(|ui| {
-                ui.radio_value(&mut net.proxy, ProxyMode::System, "System");
-                ui.radio_value(&mut net.proxy, ProxyMode::None, "None");
-                ui.radio_value(&mut net.proxy, ProxyMode::Manual, "Manual");
-                ui.radio_value(&mut net.proxy, ProxyMode::Pac, "PAC script");
+                ui.radio_value(&mut net.proxy, ProxyMode::System, t("System"));
+                ui.radio_value(&mut net.proxy, ProxyMode::None, t("None"));
+                ui.radio_value(&mut net.proxy, ProxyMode::Manual, t("Manual"));
+                ui.radio_value(&mut net.proxy, ProxyMode::Pac, t("PAC script"));
             });
             match net.proxy {
                 ProxyMode::System => match net::system_auto_config() {
                     (Some(url), _) => {
-                        ui.weak(format!("Windows is configured with a PAC script, which will be used:\n{url}"));
+                        ui.weak(tf("Windows is configured with a PAC script, which will be used:\n{}", &[&url]));
                     }
                     (None, true) => {
                         ui.weak(
-                            "Windows has \"Automatically detect settings\" on: the PAC script is \
+                            t("Windows has \"Automatically detect settings\" on: the PAC script is \
                              looked up via WPAD (DHCP, then DNS) before the first request. If \
-                             what it finds isn't a usable script, requests go out directly.",
+                             what it finds isn't a usable script, requests go out directly."),
                         );
                     }
                     (None, false) => {
-                        ui.weak("Uses the OS proxy settings and HTTP(S)_PROXY / NO_PROXY variables.");
+                        ui.weak(t("Uses the OS proxy settings and HTTP(S)_PROXY / NO_PROXY variables."));
                     }
                 },
                 ProxyMode::None => {
-                    ui.weak("Connect directly, ignoring OS settings.");
+                    ui.weak(t("Connect directly, ignoring OS settings."));
                 }
                 ProxyMode::Manual => {
-                    field(ui, &mut net.proxy_url, "http://user:pass@proxy.corp:8080 or socks5h://host:1080");
-                    field(ui, &mut net.no_proxy, "Bypass: localhost,127.0.0.1,.corp.local");
+                    field(ui, &mut net.proxy_url, t("http://user:pass@proxy.corp:8080 or socks5h://host:1080"));
+                    field(ui, &mut net.no_proxy, t("Bypass: localhost,127.0.0.1,.corp.local"));
                 }
                 ProxyMode::Pac => {
-                    field(ui, &mut net.pac_url, r"http://wpad/proxy.pac  or  C:\path\proxy.pac");
+                    field(ui, &mut net.pac_url, t("http://wpad/proxy.pac  or  C:\\path\\proxy.pac"));
                 }
             }
 
             ui.add_space(8.0);
-            ui.label(RichText::new("Certificates").strong());
-            ui.weak("The OS certificate store is always trusted; these are added on top.");
-            file_field(ui, &mut net.ca_file, "Extra CA bundle (PEM file path)");
+            ui.label(RichText::new(t("Certificates")).strong());
+            ui.weak(t("The OS certificate store is always trusted; these are added on top."));
+            file_field(ui, &mut net.ca_file, t("Extra CA bundle (PEM file path)"));
             let pfx = |path: &str| path.to_lowercase().ends_with(".pfx") || path.to_lowercase().ends_with(".p12");
-            file_field(ui, &mut net.client_cert, "Client certificate (.pem with key, or .pfx / .p12)");
+            file_field(ui, &mut net.client_cert, t("Client certificate (.pem with key, or .pfx / .p12)"));
             if pfx(&net.client_cert) {
                 ui.add(
                     egui::TextEdit::singleline(&mut net.client_cert_password)
                         .password(true)
-                        .hint_text("PFX password")
+                        .hint_text(t("PFX password"))
                         .desired_width(f32::INFINITY),
                 );
             }
             let mut removed = None;
             for (i, c) in net.host_certs.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut c.host).hint_text("*.corp.com or host:8443").desired_width(150.0));
+                    ui.add(egui::TextEdit::singleline(&mut c.host).hint_text(t("*.corp.com or host:8443")).desired_width(150.0));
                     let width = if pfx(&c.cert) { 220.0 } else { 330.0 };
-                    ui.add(egui::TextEdit::singleline(&mut c.cert).hint_text("Certificate; empty sends none").desired_width(width));
+                    ui.add(egui::TextEdit::singleline(&mut c.cert).hint_text(t("Certificate; empty sends none")).desired_width(width));
                     browse(ui, &mut c.cert, &[], false);
                     if pfx(&c.cert) {
-                        ui.add(egui::TextEdit::singleline(&mut c.password).password(true).hint_text("PFX password").desired_width(100.0));
+                        ui.add(egui::TextEdit::singleline(&mut c.password).password(true).hint_text(t("PFX password")).desired_width(100.0));
                     }
-                    if named(ui.small_button(icon::TRASH), "Remove", None).on_hover_text("Remove").clicked() {
+                    if named(ui.small_button(icon::TRASH), t("Remove"), None).on_hover_text(t("Remove")).clicked() {
                         removed = Some(i);
                     }
                 });
@@ -5016,23 +5041,23 @@ impl App {
             if let Some(i) = removed {
                 net.host_certs.remove(i);
             }
-            if ui.button("+ Certificate for a host").on_hover_text("Checked in order before the one above").clicked() {
+            if ui.button(t("+ Certificate for a host")).on_hover_text(t("Checked in order before the one above")).clicked() {
                 net.host_certs.push(Default::default());
             }
-            ui.checkbox(&mut net.insecure, "Skip TLS certificate verification");
+            ui.checkbox(&mut net.insecure, t("Skip TLS certificate verification"));
             if net.insecure {
-                ui.colored_label(RED, "Any server certificate is accepted. Use only to diagnose CA problems.");
+                ui.colored_label(RED, t("Any server certificate is accepted. Use only to diagnose CA problems."));
             }
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label("Timeout");
+                ui.label(t("Timeout"));
                 ui.add(egui::DragValue::new(&mut net.timeout_secs).range(1..=3600).suffix(" s"));
             });
             ui.separator();
             ui.horizontal(|ui| {
-                apply = ui.add(primary("Apply")).clicked() || enter_pressed(ui);
-                cancel = ui.button("Cancel").clicked() || escape_pressed(ui);
+                apply = ui.add(primary(t("Apply"))).clicked() || enter_pressed(ui);
+                cancel = ui.button(t("Cancel")).clicked() || escape_pressed(ui);
             });
         });
         if apply {
@@ -5069,7 +5094,7 @@ fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
             } else {
                 RED
             };
-            ui.colored_label(color, format!("{passed}/{} tests", item.tests.len()));
+            ui.colored_label(color, tf("{}/{} tests", &[&passed, &item.tests.len()]));
         }
     });
     let indent = 28.0;
@@ -5114,17 +5139,20 @@ enum Action {
 }
 
 const ACTIONS: [(&str, Action); 11] = [
-    ("New request", Action::NewRequest),
-    ("New folder", Action::NewFolder),
-    ("New environment", Action::NewEnv),
-    ("Edit globals", Action::Globals),
-    ("Run collection", Action::RunCollection),
-    ("Import (Postman, OpenAPI, Swagger)", Action::ImportAny),
-    ("Network settings (proxy, certificates)", Action::Network),
-    ("Cookies", Action::Cookies),
-    ("Show or hide the sidebar", Action::Sidebar),
-    ("Side by side or stacked", Action::SideBySide),
-    ("Settings (theme, fonts, text size)", Action::Settings),
+    (n_("New request"), Action::NewRequest),
+    (n_("New folder"), Action::NewFolder),
+    (n_("New environment"), Action::NewEnv),
+    (n_("Edit globals"), Action::Globals),
+    (n_("Run collection"), Action::RunCollection),
+    (n_("Import (Postman, OpenAPI, Swagger)"), Action::ImportAny),
+    (
+        n_("Network settings (proxy, certificates)"),
+        Action::Network,
+    ),
+    (n_("Cookies"), Action::Cookies),
+    (n_("Show or hide the sidebar"), Action::Sidebar),
+    (n_("Side by side or stacked"), Action::SideBySide),
+    (n_("Settings (theme, fonts, text size)"), Action::Settings),
 ];
 
 impl App {
@@ -5187,7 +5215,7 @@ fn switch_targets(nodes: &[Node], root: &Path, envs: &[String]) -> Vec<(String, 
     walk(nodes, root, &mut out);
     out.extend((envs.iter()).map(|e| (e.clone(), "ENV".to_owned(), Go::Env(e.clone()))));
     out.extend(
-        (ACTIONS.iter()).map(|(label, a)| ((*label).to_owned(), "CMD".to_owned(), Go::Action(*a))),
+        (ACTIONS.iter()).map(|(label, a)| (t(label).to_owned(), "CMD".to_owned(), Go::Action(*a))),
     );
     out
 }
@@ -5280,7 +5308,7 @@ fn tree_ui(
                             let text = RichText::new(status.to_string())
                                 .small()
                                 .color(status_color(status));
-                            ui.label(text).on_hover_text("Last response");
+                            ui.label(text).on_hover_text(t("Last response"));
                         }
                         row
                     })
@@ -5311,51 +5339,55 @@ fn folder_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<Tre
     let path = path.to_path_buf();
     item(
         ui,
-        "New request",
+        t("New request"),
         dialog(NameKind::NewRequest(path.clone())),
     );
-    item(ui, "New folder", dialog(NameKind::NewFolder(path.clone())));
-    let rename = Dialog::name(NameKind::Rename(path.clone()), name);
-    item(ui, "Rename", TreeAction::Dialog(rename));
-    item(ui, "Duplicate", TreeAction::Duplicate(path.clone()));
     item(
         ui,
-        "Delete",
+        t("New folder"),
+        dialog(NameKind::NewFolder(path.clone())),
+    );
+    let rename = Dialog::name(NameKind::Rename(path.clone()), name);
+    item(ui, t("Rename"), TreeAction::Dialog(rename));
+    item(ui, t("Duplicate"), TreeAction::Duplicate(path.clone()));
+    item(
+        ui,
+        t("Delete"),
         TreeAction::Dialog(Dialog::Delete(path.clone())),
     );
     ui.separator();
     item(
         ui,
-        "Folder settings…",
+        t("Folder settings…"),
         TreeAction::FolderSettings(path.clone()),
     );
     item(
         ui,
-        "Copy docs as Markdown",
+        t("Copy docs as Markdown"),
         TreeAction::CopyDocs(path.clone()),
     );
     item(
         ui,
-        "Copy as Postman collection",
+        t("Copy as Postman collection"),
         TreeAction::CopyPostman(path.clone()),
     );
-    item(ui, "Start mock server", TreeAction::Mock(path.clone()));
-    item(ui, "Run folder", TreeAction::Run(path));
+    item(ui, t("Start mock server"), TreeAction::Mock(path.clone()));
+    item(ui, t("Run folder"), TreeAction::Run(path));
 }
 
 fn request_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<TreeAction>) {
-    if ui.button("Rename").clicked() {
+    if ui.button(t("Rename")).clicked() {
         let rename = Dialog::name(NameKind::Rename(path.to_path_buf()), name);
         actions.push(TreeAction::Dialog(rename));
         ui.close();
     }
     let duplicate =
-        egui::Button::new("Duplicate").shortcut_text(ui.ctx().format_shortcut(&DUPLICATE));
+        egui::Button::new(t("Duplicate")).shortcut_text(ui.ctx().format_shortcut(&DUPLICATE));
     if ui.add(duplicate).clicked() {
         actions.push(TreeAction::Duplicate(path.to_path_buf()));
         ui.close();
     }
-    if ui.button("Delete").clicked() {
+    if ui.button(t("Delete")).clicked() {
         actions.push(TreeAction::Dialog(Dialog::Delete(path.to_path_buf())));
         ui.close();
     }
@@ -5380,7 +5412,7 @@ fn more_button(
     let rect = egui::Rect::from_min_size(egui::pos2(line.right() - size.x, line.top()), size);
     let button = named(
         ui.put(rect, egui::Button::new(icon::DOTS_THREE).small()),
-        "More",
+        t("More"),
         None,
     );
     egui::Popup::menu(&button).id(id).show(menu);
@@ -5463,7 +5495,7 @@ fn auto_headers_ui(ui: &mut egui::Ui, auto: Vec<(String, String, &str)>) {
         return;
     }
     ui.add_space(6.0);
-    let title = RichText::new(format!("{} added on Send", auto.len())).weak();
+    let title = RichText::new(tf("{} added on Send", &[&auto.len()])).weak();
     egui::CollapsingHeader::new(title)
         .id_salt("auto-headers")
         .show(ui, |ui| {
@@ -5474,7 +5506,7 @@ fn auto_headers_ui(ui: &mut egui::Ui, auto: Vec<(String, String, &str)>) {
                     for (name, value, from) in auto {
                         ui.weak(name);
                         ui.weak(clip(&value, 80)).on_hover_text(value);
-                        ui.weak(format!("from {from}"));
+                        ui.weak(tf("from {}", &[&from]));
                         ui.end_row();
                     }
                 });
@@ -5502,9 +5534,9 @@ fn kv_table(
         let mut bulk: Option<String> = ui.data(|d| d.get_temp(bulk_id));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
             let label = if bulk.is_some() {
-                "Key-Value Edit"
+                t("Key-Value Edit")
             } else {
-                "Bulk Edit"
+                t("Bulk Edit")
             };
             if ui.small_button(label).clicked() {
                 bulk = match bulk {
@@ -5576,7 +5608,7 @@ fn kv_table(
                 style.clone(),
                 false,
                 if headers { HEADER_NAMES } else { &[] },
-                |e| e.hint_text("Key").desired_width(key_width),
+                |e| e.hint_text(t("Key")).desired_width(key_width),
             );
             var_edit(
                 ui,
@@ -5589,19 +5621,19 @@ fn kv_table(
                     true => CONTENT_TYPES,
                     false => &[],
                 },
-                |e| e.hint_text("Value").desired_width(value_width),
+                |e| e.hint_text(t("Value")).desired_width(value_width),
             );
             if describe {
                 ui.add(
                     egui::TextEdit::singleline(&mut row.description)
                         .id(egui::Id::new((id, i, 2)))
-                        .hint_text("Description")
+                        .hint_text(t("Description"))
                         .desired_width(desc_width),
                 );
             }
             if real
-                && named(ui.small_button(icon::TRASH), "Remove", None)
-                    .on_hover_text("Remove")
+                && named(ui.small_button(icon::TRASH), t("Remove"), None)
+                    .on_hover_text(t("Remove"))
                     .clicked()
             {
                 remove = Some(i);
@@ -5624,7 +5656,7 @@ fn path_vars_table(ui: &mut egui::Ui, rows: &mut [KeyValue], vars: &HashMap<Stri
         return;
     }
     ui.add_space(6.0);
-    ui.strong("Path Variables");
+    ui.strong(t("Path Variables"));
     // Narrower in a side-by-side pane, so the value keeps most of the room.
     let key_width = (ui.available_width() * 0.25).clamp(100.0, 200.0);
     let rest = (ui.available_width() - key_width - 90.0).max(120.0);
@@ -5641,12 +5673,12 @@ fn path_vars_table(ui: &mut egui::Ui, rows: &mut [KeyValue], vars: &HashMap<Stri
                 egui::TextStyle::Body,
                 false,
                 &[],
-                |e| e.hint_text("Value").desired_width(rest * 0.6),
+                |e| e.hint_text(t("Value")).desired_width(rest * 0.6),
             );
             ui.add(
                 egui::TextEdit::singleline(&mut row.description)
                     .id(egui::Id::new(("path_vars", i, 2)))
-                    .hint_text("Description")
+                    .hint_text(t("Description"))
                     .desired_width(rest * 0.4 - ui.spacing().item_spacing.x),
             );
         });
@@ -5700,15 +5732,15 @@ fn body_editor(
         // Built on a click only: the text moves over instead of being cloned every frame.
         type Make = fn(String) -> Body;
         let options: [(&str, Make); 7] = [
-            ("None", |_| Body::None),
+            (t("None"), |_| Body::None),
             ("JSON", |text| Body::Json { text }),
-            ("Text", |text| Body::Text { text }),
-            ("Form", |_| Body::Form { fields: Vec::new() }),
-            ("Multipart", |_| Body::Multipart { parts: Vec::new() }),
-            ("Binary", |_| Body::File {
+            (t("Text"), |text| Body::Text { text }),
+            (t("Form"), |_| Body::Form { fields: Vec::new() }),
+            (t("Multipart"), |_| Body::Multipart { parts: Vec::new() }),
+            (t("Binary"), |_| Body::File {
                 path: String::new(),
             }),
-            ("GraphQL", |_| Body::GraphQL {
+            (t("GraphQL"), |_| Body::GraphQL {
                 query: String::new(),
                 variables: String::new(),
             }),
@@ -5732,11 +5764,11 @@ fn body_editor(
     ui.add_space(4.0);
     match body {
         Body::None => {
-            ui.weak("This request has no body.");
+            ui.weak(t("This request has no body."));
         }
         Body::Json { text } => {
             ui.horizontal(|ui| {
-                if ui.small_button("Beautify").clicked()
+                if ui.small_button(t("Beautify")).clicked()
                     && let Some(pretty) = http::pretty_json(text)
                 {
                     *text = pretty;
@@ -5747,7 +5779,7 @@ fn body_editor(
                     && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(text)
                 {
                     // Only a hint: `{{var}}` placeholders legitimately make the raw text invalid.
-                    ui.colored_label(ORANGE, format!("Not valid JSON: {e}"));
+                    ui.colored_label(ORANGE, tf("Not valid JSON: {}", &[&e]));
                 }
             });
             code_editor(ui, "body", text, vars);
@@ -5776,9 +5808,9 @@ fn body_editor(
                         }
                     })
                     .response
-                    .on_hover_text("Sets the Content-Type header");
+                    .on_hover_text(t("Sets the Content-Type header"));
                 if shown == "XML"
-                    && ui.small_button("Beautify").clicked()
+                    && ui.small_button(t("Beautify")).clicked()
                     && let Some(pretty) = http::pretty_xml(text)
                 {
                     *text = pretty;
@@ -5790,11 +5822,11 @@ fn body_editor(
             kv_table(ui, "form", fields, vars, true);
         }
         Body::Multipart { parts } => {
-            ui.weak("A value starting with @ uploads that file, e.g. @files/photo.png (relative to the workspace). Or drop files here.");
+            ui.weak(t("A value starting with @ uploads that file, e.g. @files/photo.png (relative to the workspace). Or drop files here."));
             let mut files = dropped_files(ui);
             if ui
-                .small_button("+ File…")
-                .on_hover_text("Add a file part")
+                .small_button(t("+ File…"))
+                .on_hover_text(t("Add a file part"))
                 .clicked()
                 && let Some(file) = pick_file("", &[], false)
             {
@@ -5814,30 +5846,32 @@ fn body_editor(
                     && !file.contains("{{")
                     && !Path::new(file).is_file()
                 {
-                    ui.colored_label(ORANGE, format!("File not found: {file}"));
+                    ui.colored_label(ORANGE, tf("File not found: {}", &[&file]));
                 }
             }
         }
         Body::File { path } => {
-            ui.weak("The file's bytes are the body, as they are. Content-Type comes from the extension unless set under Headers. Or drop a file here.");
+            ui.weak(t("The file's bytes are the body, as they are. Content-Type comes from the extension unless set under Headers. Or drop a file here."));
             if let Some(dropped) = dropped_files(ui).pop() {
                 *path = dropped.display().to_string();
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                browse(ui, path, &[], false);
-                var_edit(
-                    ui,
-                    egui::Id::new("body-file"),
-                    path,
-                    vars,
-                    egui::TextStyle::Monospace,
-                    false,
-                    &[],
-                    |e| {
-                        e.hint_text("path/to/file (relative to the workspace)")
-                            .desired_width(f32::INFINITY)
-                    },
-                );
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    browse(ui, path, &[], false);
+                    var_edit(
+                        ui,
+                        egui::Id::new("body-file"),
+                        path,
+                        vars,
+                        egui::TextStyle::Monospace,
+                        false,
+                        &[],
+                        |e| {
+                            e.hint_text(t("path/to/file (relative to the workspace)"))
+                                .desired_width(f32::INFINITY)
+                        },
+                    );
+                });
             });
             if !path.trim().is_empty() && !path.contains("{{") {
                 match std::fs::metadata(&*path) {
@@ -5846,7 +5880,7 @@ fn body_editor(
                         ui.weak(format!("{} · {mime}", human_size(m.len() as usize)));
                     }
                     _ => {
-                        ui.colored_label(ORANGE, format!("File not found: {path}"));
+                        ui.colored_label(ORANGE, tf("File not found: {}", &[&path]));
                     }
                 }
             }
@@ -5891,7 +5925,7 @@ fn graphql_editor(
     let mut insert = None;
     ui.columns(2, |cols| {
         let ui = &mut cols[0];
-        ui.label("Query");
+        ui.label(t("Query"));
         var_edit(
             ui,
             egui::Id::new("gql-query"),
@@ -5902,17 +5936,19 @@ fn graphql_editor(
             &[],
             |e| {
                 e.code_editor()
-                    .hint_text("Fetch the schema and click a field →\nor type a query here.")
+                    .hint_text(t(
+                        "Fetch the schema and click a field →\nor type a query here.",
+                    ))
                     .desired_rows(8)
                     .desired_width(f32::INFINITY)
             },
         );
         ui.horizontal(|ui| {
-            ui.label("Variables (JSON)");
+            ui.label(t("Variables (JSON)"));
             if !variables.trim().is_empty()
                 && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(variables)
             {
-                ui.colored_label(ORANGE, format!("Not valid JSON: {e}"));
+                ui.colored_label(ORANGE, tf("Not valid JSON: {}", &[&e]));
             }
         });
         var_edit(
@@ -5933,33 +5969,33 @@ fn graphql_editor(
 
         let ui = &mut cols[1];
         ui.horizontal(|ui| {
-            ui.strong("Schema");
+            ui.strong(t("Schema"));
             if ex.loading {
                 ui.spinner();
             } else {
                 let label = if ex.schema.is_some() {
-                    "Refresh"
+                    t("Refresh")
                 } else {
-                    "Fetch schema"
+                    t("Fetch schema")
                 };
                 fetch = ui
                     .small_button(label)
-                    .on_hover_text("Introspect using this request's URL, headers and auth")
+                    .on_hover_text(t("Introspect using this request's URL, headers and auth"))
                     .clicked();
             }
         });
         match &ex.schema {
             None => {
-                ui.weak("Fetch the schema to browse its queries and mutations.");
+                ui.weak(t("Fetch the schema to browse its queries and mutations."));
             }
             Some(Err(e)) => {
                 ui.colored_label(RED, e.as_str());
             }
             Some(Ok(schema)) => {
-                ui.weak(format!("from {}", ex.url));
+                ui.weak(tf("from {}", &[&ex.url]));
                 ui.add(
                     egui::TextEdit::singleline(&mut ex.filter)
-                        .hint_text("Filter fields")
+                        .hint_text(t("Filter fields"))
                         .desired_width(f32::INFINITY),
                 );
                 let filter = ex.filter.to_lowercase();
@@ -5967,8 +6003,8 @@ fn graphql_editor(
                     .id_salt("gql-schema")
                     .show(ui, |ui| {
                         for (title, op, fields) in [
-                            ("Query", Operation::Query, &schema.query),
-                            ("Mutation", Operation::Mutation, &schema.mutation),
+                            (t("Query"), Operation::Query, &schema.query),
+                            (t("Mutation"), Operation::Mutation, &schema.mutation),
                         ] {
                             if fields.is_empty() {
                                 continue;
@@ -5995,9 +6031,9 @@ fn graphql_editor(
                                         if !hover.is_empty() {
                                             hover.push_str("\n\n");
                                         }
-                                        hover.push_str(
+                                        hover.push_str(t(
                                             "Click to replace the query with this field.",
-                                        );
+                                        ));
                                         if ui
                                             .add(
                                                 egui::Label::new(RichText::new(label).monospace())
@@ -6055,35 +6091,35 @@ fn auth_editor(
 ) {
     let (user, pass) = (String::new, String::new);
     let kinds = [
-        ("Inherit from parent", Auth::Inherit),
-        ("No auth", Auth::None),
-        ("Bearer token", Auth::Bearer { token: user() }),
+        (t("Inherit from parent"), Auth::Inherit),
+        (t("No auth"), Auth::None),
+        (t("Bearer token"), Auth::Bearer { token: user() }),
         (
-            "Basic auth",
+            t("Basic auth"),
             Auth::Basic {
                 username: user(),
                 password: pass(),
             },
         ),
         (
-            "Digest auth",
+            t("Digest auth"),
             Auth::Digest {
                 username: user(),
                 password: pass(),
             },
         ),
-        ("OAuth 2.0", Auth::OAuth2(model::OAuth2::default())),
+        (t("OAuth 2.0"), Auth::OAuth2(model::OAuth2::default())),
         (
-            "API key",
+            t("API key"),
             Auth::ApiKey {
                 key: user(),
                 value: pass(),
                 in_query: false,
             },
         ),
-        ("AWS Signature", Auth::AwsV4(model::AwsV4::default())),
+        (t("AWS Signature"), Auth::AwsV4(model::AwsV4::default())),
         (
-            "OAuth 1.0",
+            t("OAuth 1.0"),
             Auth::OAuth1(model::OAuth1 {
                 signature_method: "HMAC-SHA1".into(),
                 consumer_key: user(),
@@ -6092,7 +6128,7 @@ fn auth_editor(
             }),
         ),
         (
-            "JWT Bearer",
+            t("JWT Bearer"),
             Auth::Jwt(model::Jwt {
                 algorithm: "HS256".into(),
                 secret: pass(),
@@ -6147,25 +6183,25 @@ fn auth_editor(
         .spacing([8.0, 6.0])
         .show(ui, |ui| match auth {
             Auth::Inherit | Auth::None => {}
-            Auth::Bearer { token } => text(ui, "Token", token, "{{token}}"),
+            Auth::Bearer { token } => text(ui, t("Token"), token, "{{token}}"),
             Auth::Basic { username, password } | Auth::Digest { username, password } => {
-                text(ui, "Username", username, "");
-                secret(ui, "Password", password);
+                text(ui, t("Username"), username, "");
+                secret(ui, t("Password"), password);
             }
             Auth::AwsV4(a) => {
-                text(ui, "Access key", &mut a.access_key, "{{aws_access_key}}");
-                secret(ui, "Secret key", &mut a.secret_key);
-                text(ui, "Region", &mut a.region, "us-east-1");
-                text(ui, "Service", &mut a.service, "execute-api, s3, lambda…");
+                text(ui, t("Access key"), &mut a.access_key, "{{aws_access_key}}");
+                secret(ui, t("Secret key"), &mut a.secret_key);
+                text(ui, t("Region"), &mut a.region, "us-east-1");
+                text(ui, t("Service"), &mut a.service, "execute-api, s3, lambda…");
                 text(
                     ui,
-                    "Session token",
+                    t("Session token"),
                     &mut a.session_token,
-                    "temporary credentials only",
+                    t("temporary credentials only"),
                 );
             }
             Auth::OAuth1(o) => {
-                ui.label("Signature");
+                ui.label(t("Signature"));
                 egui::ComboBox::from_id_salt("oauth1-method")
                     .selected_text(o.signature_method.as_str())
                     .show_ui(ui, |ui| {
@@ -6174,23 +6210,28 @@ fn auth_editor(
                         }
                     });
                 ui.end_row();
-                text(ui, "Consumer key", &mut o.consumer_key, "");
+                text(ui, t("Consumer key"), &mut o.consumer_key, "");
                 if o.signature_method.starts_with("RSA") {
                     text(
                         ui,
-                        "Private key",
+                        t("Private key"),
                         &mut o.consumer_secret,
                         "{{private_key}} (PEM)",
                     );
                 } else {
-                    secret(ui, "Consumer secret", &mut o.consumer_secret);
+                    secret(ui, t("Consumer secret"), &mut o.consumer_secret);
                 }
-                text(ui, "Access token", &mut o.token, "empty for two-legged");
-                secret(ui, "Token secret", &mut o.token_secret);
-                text(ui, "Realm", &mut o.realm, "optional");
+                text(
+                    ui,
+                    t("Access token"),
+                    &mut o.token,
+                    t("empty for two-legged"),
+                );
+                secret(ui, t("Token secret"), &mut o.token_secret);
+                text(ui, t("Realm"), &mut o.realm, t("optional"));
             }
             Auth::Jwt(j) => {
-                ui.label("Algorithm");
+                ui.label(t("Algorithm"));
                 egui::ComboBox::from_id_salt("jwt-alg")
                     .selected_text(j.algorithm.as_str())
                     .show_ui(ui, |ui| {
@@ -6200,9 +6241,9 @@ fn auth_editor(
                     });
                 ui.end_row();
                 if j.algorithm.starts_with("HS") {
-                    secret(ui, "Secret", &mut j.secret);
+                    secret(ui, t("Secret"), &mut j.secret);
                 } else {
-                    ui.label("Private key");
+                    ui.label(t("Private key"));
                     var_edit(
                         ui,
                         egui::Id::new(("auth", "jwt-key")),
@@ -6212,14 +6253,14 @@ fn auth_editor(
                         true,
                         &[],
                         |e| {
-                            e.hint_text("{{private_key}} or -----BEGIN PRIVATE KEY-----…")
+                            e.hint_text(t("{{private_key}} or -----BEGIN PRIVATE KEY-----…"))
                                 .desired_rows(3)
                                 .desired_width(420.0)
                         },
                     );
                     ui.end_row();
                 }
-                ui.label("Payload");
+                ui.label(t("Payload"));
                 var_edit(
                     ui,
                     egui::Id::new(("auth", "jwt-payload")),
@@ -6237,31 +6278,31 @@ fn auth_editor(
                 value,
                 in_query,
             } => {
-                text(ui, "Key", key, "X-API-Key");
-                text(ui, "Value", value, "{{api_key}}");
-                ui.label("Add to");
+                text(ui, t("Key"), key, "X-API-Key");
+                text(ui, t("Value"), value, "{{api_key}}");
+                ui.label(t("Add to"));
                 ui.horizontal(|ui| {
-                    ui.selectable_value(in_query, false, "Header");
-                    ui.selectable_value(in_query, true, "Query params");
+                    ui.selectable_value(in_query, false, t("Header"));
+                    ui.selectable_value(in_query, true, t("Query params"));
                 });
                 ui.end_row();
             }
             Auth::OAuth2(o) => {
-                ui.label("Grant");
+                ui.label(t("Grant"));
                 ui.horizontal(|ui| {
                     use model::Grant;
                     ui.selectable_value(
                         &mut o.grant,
                         Grant::ClientCredentials,
-                        "Client credentials",
+                        t("Client credentials"),
                     );
-                    ui.selectable_value(&mut o.grant, Grant::Password, "Password");
+                    ui.selectable_value(&mut o.grant, Grant::Password, t("Password"));
                     ui.selectable_value(
                         &mut o.grant,
                         Grant::AuthorizationCode,
-                        "Authorization code",
+                        t("Authorization code"),
                     );
-                    ui.selectable_value(&mut o.grant, Grant::Implicit, "Implicit");
+                    ui.selectable_value(&mut o.grant, Grant::Implicit, t("Implicit"));
                 });
                 ui.end_row();
                 let browser = matches!(
@@ -6272,7 +6313,7 @@ fn auth_editor(
                 if browser {
                     text(
                         ui,
-                        "Auth URL",
+                        t("Auth URL"),
                         &mut o.auth_url,
                         "https://login.example.com/oauth2/authorize",
                     );
@@ -6281,26 +6322,26 @@ fn auth_editor(
                 if !implicit {
                     text(
                         ui,
-                        "Token URL",
+                        t("Token URL"),
                         &mut o.token_url,
                         "https://login.example.com/oauth2/token",
                     );
                 }
-                text(ui, "Client ID", &mut o.client_id, "");
+                text(ui, t("Client ID"), &mut o.client_id, "");
                 if !implicit {
-                    secret(ui, "Client secret", &mut o.client_secret);
+                    secret(ui, t("Client secret"), &mut o.client_secret);
                 }
-                text(ui, "Scope", &mut o.scope, "optional, space separated");
+                text(ui, t("Scope"), &mut o.scope, t("optional, space separated"));
                 if o.grant == model::Grant::Password {
-                    text(ui, "Username", &mut o.username, "");
-                    secret(ui, "Password", &mut o.password);
+                    text(ui, t("Username"), &mut o.username, "");
+                    secret(ui, t("Password"), &mut o.password);
                 }
                 if browser {
                     text(
                         ui,
-                        "Redirect URI",
+                        t("Redirect URI"),
                         &mut o.redirect_uri,
-                        "http://127.0.0.1:<any free port>/callback",
+                        t("http://127.0.0.1:<any free port>/callback"),
                     );
                 }
             }
@@ -6308,63 +6349,65 @@ fn auth_editor(
     match auth {
         Auth::Inherit => {
             ui.weak(match inherited {
-                Some((folder, a)) => format!("Uses {} from folder \"{folder}\".", label_of(a)),
-                None => "No folder above sets auth, so none is sent.".to_owned(),
+                Some((folder, a)) => tf("Uses {} from folder \"{}\".", &[&label_of(a), &folder]),
+                None => t("No folder above sets auth, so none is sent.").to_owned(),
             });
         }
         Auth::None => {}
         Auth::OAuth2(o) if o.grant == model::Grant::AuthorizationCode => {
-            ui.weak(
+            ui.weak(t(
                 "Send opens your browser to sign in (with PKCE); the token is then reused until \
                  it expires or is rejected. Register the redirect URI with the provider; the \
                  client secret is only for confidential clients.",
-            );
+            ));
         }
         Auth::OAuth2(o) if o.grant == model::Grant::Implicit => {
-            ui.weak(
+            ui.weak(t(
                 "Send opens your browser to sign in; the provider hands the token straight back \
                  to this machine. It is reused until it expires or is rejected, then you sign in \
                  again (the implicit grant has no refresh tokens).",
-            );
+            ));
         }
         Auth::OAuth2(_) => {
-            ui.weak("The token is fetched on Send and reused until it expires or is rejected.");
+            ui.weak(t(
+                "The token is fetched on Send and reused until it expires or is rejected.",
+            ));
         }
         Auth::OAuth1(_) => {
-            ui.weak(
+            ui.weak(t(
                 "Each Send is signed over its method, URL, query and form body with a fresh \
                  nonce and timestamp. Get the access token from the provider's sign-in flow \
                  first and paste it here.",
-            );
+            ));
         }
         Auth::Jwt(_) => {
-            ui.weak(
+            ui.weak(t(
                 "Signed on each Send and sent as Authorization: Bearer. Variables work in the \
                  payload ({{$timestamp}} for iat); keep the secret in a secret environment.",
-            );
+            ));
         }
         Auth::AwsV4(_) => {
-            ui.weak(
+            ui.weak(t(
                 "Each Send is signed over its URL, headers and body. A signature lasts 15 \
                  minutes, so a copied snippet stops working after that. A body streamed from a \
                  file is sent as UNSIGNED-PAYLOAD, which S3 accepts.",
-            );
+            ));
         }
         _ => {
-            ui.weak(
+            ui.weak(t(
                 "Tip: use {{variables}} from a secret environment so credentials never reach git.",
-            );
+            ));
         }
     }
 }
 
 fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
-    ui.weak(
+    ui.weak(t(
         "Markdown, for the docs a folder's right-click menu copies (\"Copy docs as Markdown\").",
-    );
+    ));
     ui.add(
         egui::TextEdit::multiline(description)
-            .hint_text("What this is for, when to use it, what comes back…")
+            .hint_text(t("What this is for, when to use it, what comes back…"))
             .desired_rows(12)
             .desired_width(f32::INFINITY),
     );
@@ -6382,7 +6425,7 @@ fn qos_box(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, qos: &
             }
         })
         .response
-        .on_hover_text("0: at most once · 1: at least once · 2: exactly once");
+        .on_hover_text(t("0: at most once · 1: at least once · 2: exactly once"));
     *qos != before
 }
 
@@ -6402,8 +6445,8 @@ fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) 
         ui.horizontal(|ui| {
             done |= ui.checkbox(&mut t.enabled, "").changed();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if named(ui.small_button(icon::TRASH), "Remove", None)
-                    .on_hover_text("Remove")
+                if named(ui.small_button(icon::TRASH), crate::i18n::t("Remove"), None)
+                    .on_hover_text(crate::i18n::t("Remove"))
                     .clicked()
                 {
                     remove = Some(i);
@@ -6424,7 +6467,7 @@ fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) 
         topics.remove(i);
         done = true;
     }
-    if ui.small_button("+ Topic").clicked() {
+    if ui.small_button(t("+ Topic")).clicked() {
         topics.push(model::Topic::default());
     }
     done
@@ -6435,7 +6478,7 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
         .num_columns(3)
         .spacing([16.0, 10.0])
         .show(ui, |ui| {
-            ui.label("Version");
+            ui.label(t("Version"));
             egui::ComboBox::from_id_salt("mqtt-version")
                 .width(80.0)
                 .selected_text(if m.v5 { "5.0" } else { "3.1.1" })
@@ -6443,33 +6486,39 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
                     ui.selectable_value(&mut m.v5, false, "3.1.1");
                     ui.selectable_value(&mut m.v5, true, "5.0");
                 });
-            ui.weak("5.0 says why a broker refuses or hangs up, and has user properties");
+            ui.weak(t(
+                "5.0 says why a broker refuses or hangs up, and has user properties",
+            ));
             ui.end_row();
 
-            ui.label("Client ID");
+            ui.label(t("Client ID"));
             ui.add(
                 egui::TextEdit::singleline(&mut m.client_id)
-                    .hint_text("random")
+                    .hint_text(t("random"))
                     .desired_width(240.0),
             );
-            ui.weak("A broker drops the older of two connections with the same ID");
+            ui.weak(t(
+                "A broker drops the older of two connections with the same ID",
+            ));
             ui.end_row();
 
-            ui.label("Keep alive");
+            ui.label(t("Keep alive"));
             ui.add(
                 egui::DragValue::new(&mut m.keep_alive_secs)
                     .range(0..=3600)
                     .suffix(" s"),
             );
-            ui.weak("0 sends no pings");
+            ui.weak(t("0 sends no pings"));
             ui.end_row();
 
-            ui.label("Clean session");
+            ui.label(t("Clean session"));
             ui.checkbox(&mut m.clean_session, "");
-            ui.weak("Off: the broker keeps subscriptions and queued messages for this client ID");
+            ui.weak(t(
+                "Off: the broker keeps subscriptions and queued messages for this client ID",
+            ));
             ui.end_row();
 
-            ui.label("Last will");
+            ui.label(t("Last will"));
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut m.will_topic)
@@ -6478,12 +6527,14 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
                         .desired_width(240.0),
                 );
                 qos_box(ui, "will-qos", &mut m.will_qos);
-                ui.checkbox(&mut m.will_retain, "Retain");
+                ui.checkbox(&mut m.will_retain, t("Retain"));
             });
-            ui.weak("The broker publishes it if the connection drops without a goodbye");
+            ui.weak(t(
+                "The broker publishes it if the connection drops without a goodbye",
+            ));
             ui.end_row();
 
-            ui.label("Will message");
+            ui.label(t("Will message"));
             ui.add_enabled(
                 !m.will_topic.trim().is_empty(),
                 egui::TextEdit::singleline(&mut m.will_payload)
@@ -6493,7 +6544,7 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
             ui.end_row();
         });
     ui.add_space(8.0);
-    ui.weak("Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// use the certificate settings in Network settings, and the connection goes through its proxy.");
+    ui.weak(t("Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// use the certificate settings in Network settings, and the connection goes through its proxy."));
 }
 
 fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_secs: u64) {
@@ -6502,7 +6553,7 @@ fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_s
         .num_columns(3)
         .spacing([16.0, 10.0])
         .show(ui, |ui| {
-            ui.label("HTTP version");
+            ui.label(t("HTTP version"));
             let name = |v: HttpVersion| match v {
                 HttpVersion::Auto => "Auto",
                 HttpVersion::Http1 => "HTTP/1.1",
@@ -6515,37 +6566,37 @@ fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_s
                         ui.selectable_value(&mut s.http_version, v, name(v));
                     }
                 });
-            ui.weak("Auto uses HTTP/2 when an https server offers it");
+            ui.weak(t("Auto uses HTTP/2 when an https server offers it"));
             ui.end_row();
 
-            ui.label("Follow redirects");
+            ui.label(t("Follow redirects"));
             ui.checkbox(&mut s.follow_redirects, "");
-            ui.weak("Off shows the 3xx response itself");
+            ui.weak(t("Off shows the 3xx response itself"));
             ui.end_row();
 
-            ui.label("Maximum redirects");
+            ui.label(t("Maximum redirects"));
             ui.add_enabled(
                 s.follow_redirects,
                 egui::DragValue::new(&mut s.max_redirects).range(1..=50),
             );
             ui.end_row();
 
-            ui.label("Verify TLS certificate");
+            ui.label(t("Verify TLS certificate"));
             ui.checkbox(&mut s.verify_tls, "");
             if s.verify_tls {
-                ui.weak("Off accepts any certificate, for this request only");
+                ui.weak(t("Off accepts any certificate, for this request only"));
             } else {
-                ui.colored_label(RED, "Any server certificate is accepted");
+                ui.colored_label(RED, t("Any server certificate is accepted"));
             }
             ui.end_row();
 
-            ui.label("Cookie jar");
+            ui.label(t("Cookie jar"));
             ui.checkbox(&mut s.cookies, "");
-            ui.weak("Send stored cookies and keep the ones the server sets");
+            ui.weak(t("Send stored cookies and keep the ones the server sets"));
             ui.end_row();
 
-            ui.label("Timeout");
-            let default = format!("Default ({default_timeout_secs} s)");
+            ui.label(t("Timeout"));
+            let default = tf("Default ({} s)", &[&default_timeout_secs]);
             ui.add(
                 egui::DragValue::new(&mut s.timeout_ms)
                     .range(0..=3_600_000)
@@ -6556,12 +6607,12 @@ fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_s
                     })
                     .custom_parser(|t| t.trim().trim_end_matches("ms").trim().parse().ok()),
             );
-            ui.weak("0 uses the network settings' timeout");
+            ui.weak(t("0 uses the network settings' timeout"));
             ui.end_row();
         });
     ui.add_space(8.0);
     if ui
-        .add_enabled(!s.is_default(), egui::Button::new("Reset to defaults"))
+        .add_enabled(!s.is_default(), egui::Button::new(t("Reset to defaults")))
         .clicked()
     {
         *s = model::Settings::default();
@@ -6604,54 +6655,54 @@ const ASSERTS_HINT: &str = "Key: what to check, e.g. res.status, res.body.items.
 
 const PRE_SNIPPETS: &[(&str, &str)] = &[
     (
-        "Set a request header",
+        n_("Set a request header"),
         "pm.request.headers.upsert({ key: \"X-Request-Id\", value: Date.now() });\n",
     ),
     (
-        "Set an environment variable",
+        n_("Set an environment variable"),
         "pm.environment.set(\"timestamp\", Date.now());\n",
     ),
     (
-        "Log a variable",
+        n_("Log a variable"),
         "console.log(pm.environment.get(\"host\"));\n",
     ),
     (
-        "Put a cookie in the jar",
+        n_("Put a cookie in the jar"),
         "pm.cookies.jar().set(\"https://\" + pm.environment.get(\"host\"), \"session\", \"abc\");\n",
     ),
     (
-        "Fetch a token first",
+        n_("Fetch a token first"),
         "pm.sendRequest({\n    url: pm.variables.replaceIn(\"{{baseUrl}}/token\"),\n    method: \"POST\",\n    body: { mode: \"raw\", raw: { id: pm.environment.get(\"clientId\") }, options: { raw: { language: \"json\" } } }\n}, function (err, res) {\n    if (err) throw err;\n    pm.environment.set(\"token\", res.json().token);\n});\n",
     ),
 ];
 
 const POST_SNIPPETS: &[(&str, &str)] = &[
     (
-        "Status code is 200",
+        n_("Status code is 200"),
         "pm.test(\"Status code is 200\", function () {\n    pm.response.to.have.status(200);\n});\n",
     ),
     (
-        "Response time is below 500 ms",
+        n_("Response time is below 500 ms"),
         "pm.test(\"Response time is below 500 ms\", function () {\n    pm.expect(pm.response.responseTime).to.be.below(500);\n});\n",
     ),
     (
-        "JSON body has a property",
+        n_("JSON body has a property"),
         "pm.test(\"Body has id\", function () {\n    const json = pm.response.json();\n    pm.expect(json).to.have.property(\"id\");\n});\n",
     ),
     (
-        "Body matches a JSON schema",
+        n_("Body matches a JSON schema"),
         "const schema = {\n    type: \"object\",\n    required: [\"id\"],\n    properties: {\n        id: { type: \"integer\" }\n    }\n};\npm.test(\"Body matches the schema\", function () {\n    pm.response.to.have.jsonSchema(schema);\n});\n",
     ),
     (
-        "Header is present",
+        n_("Header is present"),
         "pm.test(\"Content-Type is present\", function () {\n    pm.response.to.have.header(\"Content-Type\");\n});\n",
     ),
     (
-        "Cookie is set",
+        n_("Cookie is set"),
         "pm.test(\"Session cookie is set\", function () {\n    pm.expect(pm.cookies.has(\"session\")).to.be.true;\n});\n",
     ),
     (
-        "Save a JSON value to the environment",
+        n_("Save a JSON value to the environment"),
         "pm.environment.set(\"token\", pm.response.json().token);\n",
     ),
 ];
@@ -6674,17 +6725,17 @@ fn scripts_editor(
                 format!("{name} ●")
             }
         };
-        ui.selectable_value(tab, ScriptTab::Pre, label("Pre-request", pre_request));
-        ui.selectable_value(tab, ScriptTab::Post, label("Post-response", tests));
+        ui.selectable_value(tab, ScriptTab::Pre, label(t("Pre-request"), pre_request));
+        ui.selectable_value(tab, ScriptTab::Post, label(t("Post-response"), tests));
         ui.separator();
         let snippets = if *tab == ScriptTab::Pre {
             PRE_SNIPPETS
         } else {
             POST_SNIPPETS
         };
-        ui.menu_button("Snippets", |ui| {
+        ui.menu_button(t("Snippets"), |ui| {
             for (name, code) in snippets {
-                if ui.button(*name).clicked() {
+                if ui.button(t(name)).clicked() {
                     insert = Some((*code).to_owned());
                     ui.close();
                 }
@@ -6695,7 +6746,7 @@ fn scripts_editor(
                 && let Some(body) = json_response
             {
                 ui.separator();
-                if ui.button("Response matches its schema").clicked() {
+                if ui.button(t("Response matches its schema")).clicked() {
                     insert = Some(schema_snippet(body));
                     ui.close();
                 }
@@ -6708,7 +6759,7 @@ fn scripts_editor(
     };
     if !above.is_empty() {
         let folders: Vec<&str> = above.iter().map(|(f, _)| f.as_str()).collect();
-        ui.weak(format!("Folder scripts run first: {}", folders.join(", ")));
+        ui.weak(tf("Folder scripts run first: {}", &[&folders.join(", ")]));
     }
     let (text, hint, id) = match tab {
         ScriptTab::Pre => (
@@ -6819,10 +6870,10 @@ fn grpc_bar(
     let (mut error, mut ask) = (None, false);
     let reflection = source.starts_with(crate::grpc::REFLECTION);
     ui.horizontal(|ui| {
-        ui.label("Proto");
+        ui.label(t("Proto"));
         ui.add(
             egui::TextEdit::singleline(&mut req.proto)
-                .hint_text("protos/service.proto, or empty to ask the server")
+                .hint_text(t("protos/service.proto, or empty to ask the server"))
                 .desired_width(260.0),
         );
         browse(
@@ -6831,7 +6882,7 @@ fn grpc_bar(
             &[("Protocol Buffers", &["proto"])],
             false,
         );
-        let reload = named(ui.small_button(icon::ARROWS_CLOCKWISE), "Reload", None)
+        let reload = named(ui.small_button(icon::ARROWS_CLOCKWISE), t("Reload"), None)
             .on_hover_text(match reflection {
                 true => "Ask the server for its methods (gRPC reflection)",
                 false => "Reload .proto",
@@ -6845,7 +6896,7 @@ fn grpc_bar(
         match list {
             Ok(list) => {
                 let shown = if req.rpc.is_empty() {
-                    "Select method"
+                    t("Select method")
                 } else {
                     &req.rpc
                 };
@@ -6865,8 +6916,8 @@ fn grpc_bar(
                         }
                     });
                 if ui
-                    .add_enabled(!req.rpc.is_empty(), egui::Button::new("Fill body"))
-                    .on_hover_text("Replace the body with an empty request message")
+                    .add_enabled(!req.rpc.is_empty(), egui::Button::new(t("Fill body")))
+                    .on_hover_text(t("Replace the body with an empty request message"))
                     .clicked()
                 {
                     match crate::grpc::template(source, &req.rpc) {
@@ -6895,16 +6946,16 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
         .is_some_and(|s| s.lock().unwrap().finished.is_none());
     let mut start = false;
     ui.horizontal(|ui| {
-        ui.strong("Load test");
+        ui.strong(t("Load test"));
         ui.separator();
         ui.add_enabled_ui(!running, |ui| {
-            ui.label("Virtual users");
+            ui.label(t("Virtual users"));
             ui.add(egui::DragValue::new(&mut view.vus).range(1..=500));
-            ui.label("Duration (s)");
+            ui.label(t("Duration (s)"));
             ui.add(egui::DragValue::new(&mut view.secs).range(1..=3600));
         });
         if running {
-            if ui.button("Stop").clicked()
+            if ui.button(t("Stop")).clicked()
                 && let Some(a) = view.abort.take()
             {
                 a.abort();
@@ -6914,10 +6965,12 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
                 }
             }
         } else {
-            start = ui.button("▶ Start").clicked();
+            start = ui.button(t("▶ Start")).clicked();
         }
     });
-    ui.weak("Sends the current draft (variables resolved once). Scripts are skipped.");
+    ui.weak(t(
+        "Sends the current draft (variables resolved once). Scripts are skipped.",
+    ));
     ui.separator();
     let Some(stats) = &view.stats else {
         return start;
@@ -6935,9 +6988,9 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
             ui.monospace(v);
             ui.end_row();
         };
-        row("Requests", s.count.to_string());
+        row(t("Requests"), s.count.to_string());
         row(
-            "Throughput",
+            t("Throughput"),
             format!("{:.1} req/s", s.count as f64 / elapsed.max(0.001)),
         );
         let pct = if s.count > 0 {
@@ -6945,21 +6998,21 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
         } else {
             0.0
         };
-        row("Errors", format!("{errors} ({pct:.1}%)"));
+        row(t("Errors"), format!("{errors} ({pct:.1}%)"));
         if s.count > 0 {
             row(
-                "Mean",
+                t("Mean"),
                 format!("{:.1} ms", s.sum_us as f64 / s.count as f64 / 1000.0),
             );
             for p in [50.0, 90.0, 95.0, 99.0] {
                 row(&format!("p{p}"), format!("{:.1} ms", s.percentile_ms(p)));
             }
-            row("Max", format!("{:.1} ms", s.max_us as f64 / 1000.0));
+            row(t("Max"), format!("{:.1} ms", s.max_us as f64 / 1000.0));
         }
     });
     if !s.statuses.is_empty() {
         ui.add_space(6.0);
-        ui.strong("Status codes");
+        ui.strong(t("Status codes"));
         for (code, n) in &s.statuses {
             ui.horizontal(|ui| {
                 ui.colored_label(status_color(*code), code.to_string());
@@ -6969,7 +7022,7 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
     }
     if !s.errors.is_empty() {
         ui.add_space(6.0);
-        ui.strong("Errors");
+        ui.strong(t("Errors"));
         for (msg, n) in &s.errors {
             ui.horizontal(|ui| {
                 ui.monospace(n.to_string());
@@ -7057,15 +7110,13 @@ fn stream_ui(
     ui.horizontal(|ui| {
         if s.live {
             ui.spinner();
-            ui.label(format!(
-                "Connected {:.0} s",
-                s.started.elapsed().as_secs_f32()
-            ));
+            let secs = format!("{:.0}", s.started.elapsed().as_secs_f32());
+            ui.label(tf("Connected {} s", &[&secs]));
         } else {
-            ui.weak("Not connected");
+            ui.weak(t("Not connected"));
         }
-        ui.weak(format!("· {} events", s.log.lock().unwrap().events.len()));
-        if ui.small_button("Clear").clicked() {
+        ui.weak(tf("· {} events", &[&s.log.lock().unwrap().events.len()]));
+        if ui.small_button(t("Clear")).clicked() {
             s.log.lock().unwrap().clear();
             s.selected = None;
         }
@@ -7073,7 +7124,7 @@ fn stream_ui(
     if matches!(s.outgoing, Some(Outgoing::Mqtt(_))) {
         // Part of the request, as in Postman, so it's there next time.
         ui.horizontal(|ui| {
-            ui.label("Publish to");
+            ui.label(t("Publish to"));
             ui.add(
                 egui::TextEdit::singleline(&mut mqtt.topic)
                     .hint_text("devices/42/cmd")
@@ -7081,8 +7132,8 @@ fn stream_ui(
                     .desired_width(240.0),
             );
             qos_box(ui, "publish-qos", &mut mqtt.qos);
-            ui.checkbox(&mut mqtt.retain, "Retain")
-                .on_hover_text("The broker keeps it for whoever subscribes later");
+            ui.checkbox(&mut mqtt.retain, t("Retain"))
+                .on_hover_text(t("The broker keeps it for whoever subscribes later"));
         });
     }
     if s.outgoing.is_some() {
@@ -7100,7 +7151,7 @@ fn stream_ui(
                 );
             }
             if ui
-                .add_sized([send_w, 22.0], egui::Button::new("Send"))
+                .add_sized([send_w, 22.0], egui::Button::new(t("Send")))
                 .on_hover_text(ui.ctx().format_shortcut(&SEND))
                 .clicked()
             {
@@ -7122,7 +7173,7 @@ fn stream_ui(
             .default_size(160.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.small_button("Copy").clicked() {
+                    if ui.small_button(t("Copy")).clicked() {
                         ui.ctx().copy_text(text.clone());
                     }
                     ui.weak(human_size(text.len()));
@@ -7180,7 +7231,7 @@ fn stream_ui(
                             .truncate()
                             .sense(egui::Sense::click()),
                     );
-                    if row.on_hover_text("Click to see it whole").clicked() {
+                    if row.on_hover_text(t("Click to see it whole")).clicked() {
                         clicked = Some((n, text));
                     }
                 });
@@ -7212,9 +7263,12 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
     let (text, label) = match past.list.iter().find(|m| Some(m.id) == shown) {
         Some(m) => (
             format!("{} {}", icon::CLOCK_COUNTER_CLOCKWISE, ago(m.at)),
-            format!("History: {}", ago(m.at)),
+            tf("History: {}", &[&ago(m.at)]),
         ),
-        None => (icon::CLOCK_COUNTER_CLOCKWISE.to_owned(), "History".into()),
+        None => (
+            icon::CLOCK_COUNTER_CLOCKWISE.to_owned(),
+            t("History").into(),
+        ),
     };
     let menu = ui.menu_button(text, |ui| {
         for m in &past.list {
@@ -7234,7 +7288,7 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
                 }
                 if ui
                     .small_button("×")
-                    .on_hover_text("Delete this response")
+                    .on_hover_text(t("Delete this response"))
                     .clicked()
                 {
                     past.delete = Some(m.id);
@@ -7242,13 +7296,13 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
             });
         }
         ui.separator();
-        if ui.button("Clear history").clicked() {
+        if ui.button(t("Clear history")).clicked() {
             past.clear = true;
         }
     });
-    named(menu.response, &label, None).on_hover_text(format!(
+    named(menu.response, &label, None).on_hover_text(tf(
         "Earlier responses to this request (the last {})",
-        store::MAX_RESPONSES
+        &[&store::MAX_RESPONSES],
     ));
 }
 
@@ -7267,7 +7321,7 @@ fn font_picker<'a>(
         .selected_text(shown)
         .width(260.0)
         .show_ui(ui, |ui| {
-            ui.selectable_value(font, String::new(), "Default");
+            ui.selectable_value(font, String::new(), t("Default"));
             for f in families {
                 ui.selectable_value(font, f.clone(), f);
             }
@@ -7287,8 +7341,8 @@ fn status_line(ui: &mut egui::Ui, view: &ResponseView) {
     if let Some(waited) = h.sent.waited {
         let hops = match h.sent.hops.len() {
             0 => String::new(),
-            1 => ", the redirect included".into(),
-            n => format!(", {n} redirects included"),
+            1 => t(", the redirect included").into(),
+            n => tf(", {} redirects included", &[&n]),
         };
         let connect = match h.sent.connect {
             Some(c) => {
@@ -7305,27 +7359,30 @@ fn status_line(ui: &mut egui::Ui, view: &ResponseView) {
                     line("TLS", tls)
                 )
             }
-            None => "Reused an open connection\n".into(),
+            None => t("Reused an open connection\n").into(),
         };
         let connected = waited.saturating_sub(h.sent.connect.unwrap_or_default());
-        ms.on_hover_text(format!(
-            "{connect}Waiting (TTFB) {} ms{hops}\nDownload {} ms",
-            connected.as_millis(),
-            h.elapsed.saturating_sub(waited).as_millis()
+        ms.on_hover_text(tf(
+            "{}Waiting (TTFB) {} ms{}\nDownload {} ms",
+            &[
+                &connect,
+                &connected.as_millis(),
+                &hops,
+                &h.elapsed.saturating_sub(waited).as_millis(),
+            ],
         ));
     }
     // As received, before any re-indenting for display.
     let headers: usize = (h.headers.iter()).map(|(k, v)| k.len() + v.len() + 4).sum();
-    let sizes = format!(
+    let sizes = tf(
         "Headers {}\nBody {}",
-        human_size(headers),
-        human_size(view.raw_size)
+        &[&human_size(headers), &human_size(view.raw_size)],
     );
     if h.truncated {
-        ui.colored_label(ORANGE, format!("{} (cut)", human_size(view.raw_size)))
-            .on_hover_text(format!(
-                "{sizes}\nOnly the first {} were kept, to save memory.",
-                human_size(view.raw_size)
+        ui.colored_label(ORANGE, tf("{} (cut)", &[&human_size(view.raw_size)]))
+            .on_hover_text(tf(
+                "{}\nOnly the first {} were kept, to save memory.",
+                &[&sizes, &human_size(view.raw_size)],
             ));
     } else {
         ui.weak(human_size(view.raw_size)).on_hover_text(sizes);
@@ -7357,7 +7414,7 @@ fn response_ui(
         match &shown.result {
             Ok(view) => status_line(ui, view),
             Err(_) => {
-                ui.colored_label(RED, "Request failed");
+                ui.colored_label(RED, t("Request failed"));
             }
         }
         let actions = egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true);
@@ -7366,12 +7423,12 @@ fn response_ui(
                 let timeline = *tab == RespTab::Timeline;
                 let binary = view.head.bytes.is_some();
                 let what = if timeline {
-                    "Copy the timeline"
+                    t("Copy the timeline")
                 } else {
-                    "Copy body"
+                    t("Copy body")
                 };
                 if (timeline || !binary)
-                    && named(ui.small_button(icon::COPY), "Copy", None)
+                    && named(ui.small_button(icon::COPY), t("Copy"), None)
                         .on_hover_text(what)
                         .clicked()
                 {
@@ -7381,8 +7438,8 @@ fn response_ui(
                     };
                     ui.ctx().copy_text(text);
                 }
-                if named(ui.small_button(icon::DOWNLOAD_SIMPLE), "Save…", None)
-                    .on_hover_text("Save the body to a file, as received")
+                if named(ui.small_button(icon::DOWNLOAD_SIMPLE), t("Save…"), None)
+                    .on_hover_text(t("Save the body to a file, as received"))
                     .clicked()
                 {
                     *save_file = true;
@@ -7390,10 +7447,10 @@ fn response_ui(
                 if external_type(&view.head).is_some()
                     && named(
                         ui.small_button(icon::ARROW_SQUARE_OUT),
-                        "Open in browser",
+                        t("Open in browser"),
                         None,
                     )
-                    .on_hover_text("Show it in your browser, or the system's PDF viewer")
+                    .on_hover_text(t("Show it in your browser, or the system's PDF viewer"))
                     .clicked()
                 {
                     *open_external = true;
@@ -7402,10 +7459,10 @@ fn response_ui(
                 if !binary
                     && named(
                         ui.small_button(icon::BOOKMARK_SIMPLE),
-                        "Save as example",
+                        t("Save as example"),
                         None,
                     )
-                    .on_hover_text("Save as example: keep this response with the request")
+                    .on_hover_text(t("Save as example: keep this response with the request"))
                     .clicked()
                 {
                     let h = &view.head;
@@ -7435,8 +7492,8 @@ fn response_ui(
             {
                 let svg = external_type(&view.head) == Some("svg");
                 if !view.preview
-                    && (ui.selectable_label(*wrap, "Wrap"))
-                        .on_hover_text("Wrap long lines")
+                    && (ui.selectable_label(*wrap, t("Wrap")))
+                        .on_hover_text(t("Wrap long lines"))
                         .clicked()
                 {
                     *wrap = !*wrap;
@@ -7444,20 +7501,20 @@ fn response_ui(
                 // Right to left: Raw is added first to sit on the right. An SVG that
                 // isn't valid XML has no Pretty, but Raw still leaves the preview.
                 if (view.other.is_some() || svg)
-                    && (ui.selectable_label(!view.pretty && !view.preview, "Raw"))
-                        .on_hover_text("As received")
+                    && (ui.selectable_label(!view.pretty && !view.preview, t("Raw")))
+                        .on_hover_text(t("As received"))
                         .clicked()
                 {
                     view.preview = false;
                     view.set_pretty(false);
                 }
                 if view.other.is_some()
-                    && (ui.selectable_label(view.pretty && !view.preview, "Pretty")).clicked()
+                    && (ui.selectable_label(view.pretty && !view.preview, t("Pretty"))).clicked()
                 {
                     view.preview = false;
                     view.set_pretty(true);
                 }
-                if svg && ui.selectable_label(view.preview, "Preview").clicked() {
+                if svg && ui.selectable_label(view.preview, t("Preview")).clicked() {
                     view.preview = true;
                     view.find.close();
                 }
@@ -7465,10 +7522,10 @@ fn response_ui(
                 if !view.preview
                     && named(
                         ui.selectable_label(view.find.open, icon::MAGNIFYING_GLASS),
-                        "Find",
+                        t("Find"),
                         Some(view.find.open),
                     )
-                    .on_hover_text(format!("Find ({shortcut})"))
+                    .on_hover_text(tf("Find ({})", &[&shortcut]))
                     .clicked()
                 {
                     match view.find.open {
@@ -7483,29 +7540,29 @@ fn response_ui(
                 match &shown.result {
                     Ok(view) => {
                         let h = &view.head;
-                        ui.selectable_value(tab, RespTab::Body, "Body");
+                        ui.selectable_value(tab, RespTab::Body, t("Body"));
                         ui.selectable_value(
                             tab,
                             RespTab::Headers,
-                            format!("Headers ({})", h.headers.len()),
+                            tf("Headers ({})", &[&h.headers.len()]),
                         );
                         let cookies = crate::cookies::from_response(&h.headers).len();
                         if cookies > 0 {
                             ui.selectable_value(
                                 tab,
                                 RespTab::Cookies,
-                                format!("Cookies ({cookies})"),
+                                tf("Cookies ({})", &[&cookies]),
                             )
-                            .on_hover_text("What this response's Set-Cookie headers set");
+                            .on_hover_text(t("What this response's Set-Cookie headers set"));
                         }
                         // gRPC goes out its own way and isn't recorded.
                         if !h.sent.method.is_empty() {
-                            ui.selectable_value(tab, RespTab::Timeline, "Timeline")
-                                .on_hover_text("What was sent, redirects, and what came back");
+                            ui.selectable_value(tab, RespTab::Timeline, t("Timeline"))
+                                .on_hover_text(t("What was sent, redirects, and what came back"));
                         }
                     }
                     Err(_) => {
-                        ui.selectable_value(tab, RespTab::Body, "Error");
+                        ui.selectable_value(tab, RespTab::Body, t("Error"));
                     }
                 }
                 if !shown.tests.is_empty() {
@@ -7514,7 +7571,7 @@ fn response_ui(
                     } else {
                         RED
                     };
-                    let label = RichText::new(format!("Tests ({passed}/{})", shown.tests.len()))
+                    let label = RichText::new(tf("Tests ({}/{})", &[&passed, &shown.tests.len()]))
                         .color(color);
                     ui.selectable_value(tab, RespTab::Tests, label);
                 }
@@ -7522,7 +7579,7 @@ fn response_ui(
                     ui.selectable_value(
                         tab,
                         RespTab::Console,
-                        format!("Console ({})", shown.logs.len()),
+                        tf("Console ({})", &[&shown.logs.len()]),
                     );
                 }
             });
@@ -7566,9 +7623,9 @@ fn response_ui(
             let passed = shown.tests.iter().filter(|t| t.passed).count();
             let failed = shown.tests.len() - passed;
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut only, None, format!("All ({})", shown.tests.len()));
-                ui.selectable_value(&mut only, Some(true), format!("Passed ({passed})"));
-                ui.selectable_value(&mut only, Some(false), format!("Failed ({failed})"));
+                ui.selectable_value(&mut only, None, tf("All ({})", &[&shown.tests.len()]));
+                ui.selectable_value(&mut only, Some(true), tf("Passed ({})", &[&passed]));
+                ui.selectable_value(&mut only, Some(false), tf("Failed ({})", &[&failed]));
             });
             ui.data_mut(|d| d.insert_temp(id, only));
             egui::ScrollArea::vertical()
@@ -7635,7 +7692,9 @@ fn response_ui(
                         .num_columns(5)
                         .striped(true)
                         .show(ui, |ui| {
-                            for title in ["Name", "Value", "Domain", "Path", "Expires"] {
+                            for title in
+                                [t("Name"), t("Value"), t("Domain"), t("Path"), t("Expires")]
+                            {
                                 ui.strong(title);
                             }
                             ui.end_row();
@@ -7662,15 +7721,15 @@ fn response_ui(
         (_, Ok(view)) if view.head.bytes.is_some() || view.preview => binary_body(ui, view),
         (_, Ok(view)) if view.held.is_some() => {
             ui.add_space(8.0);
-            ui.label(format!(
+            ui.label(tf(
                 "This body is {}: showing it takes a moment and a lot of memory.",
-                human_size(view.raw_size)
+                &[&human_size(view.raw_size)],
             ));
             ui.horizontal(|ui| {
-                if ui.button("Show anyway").clicked() {
+                if ui.button(t("Show anyway")).clicked() {
                     view.reveal();
                 }
-                if ui.button("Save to file…").clicked() {
+                if ui.button(t("Save to file…")).clicked() {
                     *save_file = true;
                 }
             });
@@ -7797,8 +7856,8 @@ fn response_ui(
                             };
                             if opens {
                                 let (arrow, what) = match view.folds.contains_key(&(at - 1)) {
-                                    true => ("⏵", "Unfold"),
-                                    false => ("⏷", "Fold"),
+                                    true => ("⏵", t("Unfold")),
+                                    false => ("⏷", t("Fold")),
                                 };
                                 click.widget_info(|| {
                                     egui::WidgetInfo::labeled(egui::WidgetType::Button, true, what)
@@ -7853,12 +7912,12 @@ fn examples_editor(ui: &mut egui::Ui, examples: &mut Vec<Example>) {
             .id_salt(("example", i))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Name");
+                    ui.label(t("Name"));
                     ui.text_edit_singleline(&mut ex.name);
-                    ui.label("Status");
+                    ui.label(t("Status"));
                     ui.add(egui::DragValue::new(&mut ex.status).range(100..=599));
-                    if named(ui.small_button(icon::TRASH), "Delete example", None)
-                        .on_hover_text("Delete example")
+                    if named(ui.small_button(icon::TRASH), t("Delete example"), None)
+                        .on_hover_text(t("Delete example"))
                         .clicked()
                     {
                         remove = Some(i);
@@ -7892,7 +7951,7 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     let edit = ui.add(
         egui::TextEdit::singleline(&mut find.query)
             .id(egui::Id::new("find"))
-            .hint_text("Find")
+            .hint_text(t("Find"))
             .desired_width(220.0),
     );
     let (enter, escape) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
@@ -7902,12 +7961,12 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     if enter || std::mem::take(&mut find.focus) {
         edit.request_focus(); // keep typing / pressing Enter for the next hit
     }
-    ui.toggle_value(&mut find.case, "Aa")
-        .on_hover_text("Match case");
+    ui.toggle_value(&mut find.case, t("Aa"))
+        .on_hover_text(t("Match case"));
     ui.toggle_value(&mut find.word, "W")
-        .on_hover_text("Whole word");
+        .on_hover_text(t("Whole word"));
     ui.toggle_value(&mut find.regex, ".*")
-        .on_hover_text("Regular expression");
+        .on_hover_text(t("Regular expression"));
     let wanted = (find.query.clone(), find.case, find.word, find.regex);
     if wanted != find.searched {
         // Searched in place: lowercasing a copy of a 16 MiB body per keystroke was a
@@ -7943,7 +8002,7 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     }
     let n = find.hits.len();
     if let Some(e) = &find.error {
-        ui.colored_label(RED, "bad pattern").on_hover_text(e);
+        ui.colored_label(RED, t("bad pattern")).on_hover_text(e);
     } else if !find.query.is_empty() {
         let more = if n == MAX_HITS { "+" } else { "" };
         ui.weak(format!(
@@ -7952,11 +8011,14 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
         ));
     }
     let prev = ui
-        .small_button("Prev")
+        .small_button(t("Prev"))
         .on_hover_text("Shift+Enter")
         .clicked();
-    let next = ui.small_button("Next").on_hover_text("Enter").clicked();
-    let close = ui.small_button("×").on_hover_text("Close (Esc)").clicked();
+    let next = ui.small_button(t("Next")).on_hover_text("Enter").clicked();
+    let close = ui
+        .small_button("×")
+        .on_hover_text(t("Close (Esc)"))
+        .clicked();
     if n > 0 {
         let shift = ui.input(|i| i.modifiers.shift);
         if next || (enter && !shift) {
@@ -7994,12 +8056,12 @@ fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
         ui.horizontal(|ui| {
             let (page, pages) = (view.page, view.pages);
             let back = ui.add_enabled(page > 0, egui::Button::new("‹"));
-            if back.on_hover_text("Previous page").clicked() {
+            if back.on_hover_text(t("Previous page")).clicked() {
                 (view.page, view.image) = (page - 1, None);
             }
-            ui.label(format!("Page {} of {pages}", page + 1));
+            ui.label(tf("Page {} of {}", &[&(page + 1), &pages]));
             let next = ui.add_enabled(page + 1 < pages, egui::Button::new("›"));
-            if next.on_hover_text("Next page").clicked() {
+            if next.on_hover_text(t("Next page")).clicked() {
                 (view.page, view.image) = (page + 1, None);
             }
         });
@@ -8045,14 +8107,16 @@ fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
             }));
         }
         Err(e) if view.head.bytes.is_none() => {
-            ui.weak(format!(
-                "This SVG can't be drawn ({e}). Raw shows its text."
+            ui.weak(tf(
+                "This SVG can't be drawn ({}). Raw shows its text.",
+                &[&e],
             ));
         }
         Err(e) => {
             let size = human_size(view.raw_size);
-            ui.weak(format!(
-                "{size} of binary data, not shown ({e}). Save… keeps it as received."
+            ui.weak(tf(
+                "{} of binary data, not shown ({}). Save… keeps it as received.",
+                &[&size, &e],
             ));
         }
     }
@@ -8324,10 +8388,10 @@ fn ago(unix_secs: u64) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     match now.saturating_sub(unix_secs) {
-        s if s < 60 => "just now".into(),
-        s if s < 3600 => format!("{} min ago", s / 60),
-        s if s < 86400 => format!("{} h ago", s / 3600),
-        s => format!("{} d ago", s / 86400),
+        s if s < 60 => t("just now").into(),
+        s if s < 3600 => tf("{} min ago", &[&(s / 60)]),
+        s if s < 86400 => tf("{} h ago", &[&(s / 3600)]),
+        s => tf("{} d ago", &[&(s / 86400)]),
     }
 }
 
@@ -11525,6 +11589,23 @@ mod ui_tests {
         panic!("timed out waiting for the app");
     }
 
+    /// A path field with its file button takes one row: laid out right to left on its own,
+    /// it took all the height left and pushed what follows to the bottom.
+    #[test]
+    fn a_file_field_takes_one_row() {
+        let mut h = harness(workspace("file-field"));
+        h.state_mut().network_editor = Some(Network::default());
+        h.run();
+        let field = |h: &Harness<'_, App>, hint: &str| {
+            let mut fields = h.get_all_by_role(Role::TextInput);
+            let n = fields.find(|n| n.accesskit_node().placeholder() == Some(hint));
+            n.unwrap().rect()
+        };
+        let ca = field(&h, "Extra CA bundle (PEM file path)");
+        let cert = field(&h, "Client certificate (.pem with key, or .pfx / .p12)");
+        assert!(cert.top() - ca.bottom() < 40.0, "{ca:?} then {cert:?}");
+    }
+
     /// Settings opens from the status bar, a change shows at once, and it's still there
     /// after a restart.
     #[test]
@@ -11550,6 +11631,34 @@ mod ui_tests {
         let mut h = harness(ws);
         h.run();
         assert_eq!(theme(&h), egui::ThemePreference::Light);
+    }
+
+    /// Choosing 繁體中文 translates what's on screen at once, not after a restart, and the
+    /// choice is kept.
+    #[test]
+    fn the_language_switches_at_once_and_is_kept() {
+        let ws = workspace("language");
+        ws.create_request(&ws.collections(), "r").unwrap();
+        let mut h = harness(ws.clone());
+        h.run();
+        h.get_by_label("r").click();
+        h.run();
+        h.get_by_label("Send");
+        h.get_by_label("App settings").click();
+        h.run();
+        h.get_by_label("繁體中文").click();
+        h.run();
+        h.get_by_label("語言");
+        h.get_by_label("關閉").click();
+        h.run();
+        h.get_by_label("傳送");
+        assert!(h.query_by_label("Send").is_none());
+        shot(&mut h, "82-zh-tw");
+        drop(h);
+        // The request reopens with its tab.
+        let mut h = harness(ws);
+        h.run();
+        h.get_by_label("傳送");
     }
 
     /// Every protocol against public servers, through the same Send and Connect as a click:

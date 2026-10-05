@@ -18,6 +18,7 @@ pub struct Appearance {
     pub code_font: String,
     /// Body text in points; headings and small text keep their proportion to it.
     pub size: f32,
+    pub language: crate::i18n::Lang,
 }
 
 impl Default for Appearance {
@@ -27,6 +28,7 @@ impl Default for Appearance {
             ui_font: String::new(),
             code_font: String::new(),
             size: DEFAULT_SIZE,
+            language: crate::i18n::Lang::English,
         }
     }
 }

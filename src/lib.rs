@@ -13,6 +13,7 @@ mod graphql;
 mod grpc;
 mod har;
 mod http;
+mod i18n;
 mod import;
 mod insomnia;
 mod jsonpath;
