@@ -32,6 +32,7 @@ mod script;
 mod sigv4;
 pub mod store;
 mod stream;
+mod syntax;
 mod varedit;
 mod vault;
 mod xpath;

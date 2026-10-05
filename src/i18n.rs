@@ -56,6 +56,7 @@ static ZH_TW_MAP: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| ZH_TW.iter().
 
 const ZH_TW: &[(&str, &str)] = &[
     ("Delete {} items", "刪除 {} 個項目"),
+    ("Types ({})", "型別 ({})"),
     ("Delete these {} requests?", "要刪除這 {} 個請求嗎？"),
     ("{} items", "{} 個項目"),
     (
@@ -522,8 +523,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Reopen Closed Tab", "重新開啟已關閉的分頁"),
     ("Repeat every", "每隔一段時間重送"),
     (
-        "Replace the body with an empty request message",
-        "以空白的請求訊息取代內容",
+        "Replace the body with a request message, each field a random value of its type",
+        "以請求訊息取代內容，每個欄位依其型別填入隨機值",
     ),
     ("Request cancelled", "已取消請求"),
     ("Request failed", "請求失敗"),

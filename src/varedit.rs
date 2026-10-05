@@ -4,11 +4,12 @@
 
 use std::collections::HashMap;
 
-use eframe::egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
+use eframe::egui::text::{CCursor, CCursorRange, LayoutJob};
 use eframe::egui::{self, Color32, FontId, Id, Key, Modifiers, RichText, TextStyle};
 
 use crate::i18n::t;
 use crate::model::{self, DYNAMIC};
+use crate::syntax::{self, Lang};
 
 // As app.rs GREEN: readable on both themes.
 pub const DEFINED: Color32 = Color32::from_rgb(40, 150, 70);
@@ -90,7 +91,7 @@ pub fn is_known(name: &str, vars: &HashMap<String, String>) -> bool {
 
 /// `configure` adds hint text, width, rows… to the TextEdit; `id` must be stable across
 /// frames because the autocomplete state is keyed by it. `words` complete the whole field
-/// outside `{{` (header names).
+/// outside `{{` (header names). `lang` colours the text as code under the `{{var}}`s.
 // A builder for one function would be more code than the long argument list.
 #[allow(clippy::too_many_arguments)]
 pub fn var_edit(
@@ -100,6 +101,7 @@ pub fn var_edit(
     vars: &HashMap<String, String>,
     style: TextStyle,
     multiline: bool,
+    lang: Option<Lang>,
     words: &[(&str, &str)],
     configure: impl FnOnce(egui::TextEdit<'_>) -> egui::TextEdit<'_>,
 ) -> egui::Response {
@@ -127,9 +129,8 @@ pub fn var_edit(
     }
 
     let font = style.resolve(ui.style());
-    let normal = ui.visuals().text_color();
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-        let mut job = highlight(buf.as_str(), vars, &font, normal);
+        let mut job = highlight(buf.as_str(), vars, &font, lang, ui.visuals());
         job.wrap.max_width = wrap_width;
         ui.painter().layout_job(job)
     };
@@ -242,27 +243,28 @@ fn highlight(
     text: &str,
     vars: &HashMap<String, String>,
     font: &FontId,
-    normal: Color32,
+    lang: Option<Lang>,
+    visuals: &egui::Visuals,
 ) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    let format = |color| TextFormat::simple(font.clone(), color);
-    let mut rest = text;
-    while let Some(open) = rest.find("{{") {
-        job.append(&rest[..open], 0.0, format(normal));
-        let after = &rest[open + 2..];
-        let Some(close) = after.find("}}") else {
+    let mut colors = vec![visuals.text_color(); text.len()];
+    if let Some(lang) = lang {
+        syntax::paint(&mut colors, text, lang, visuals);
+    }
+    // Variables over the code: `"{{token}}"` reads as a variable, not as a string.
+    let mut at = 0;
+    while let Some(open) = text[at..].find("{{").map(|n| at + n) {
+        let Some(close) = text[open + 2..].find("}}").map(|n| open + 2 + n) else {
             break;
         };
-        let color = if is_known(after[..close].trim(), vars) {
+        let color = if is_known(text[open + 2..close].trim(), vars) {
             DEFINED
         } else {
             UNDEFINED
         };
-        job.append(&rest[open..open + close + 4], 0.0, format(color));
-        rest = &after[close + 2..];
+        colors[open..close + 2].fill(color);
+        at = close + 2;
     }
-    job.append(rest, 0.0, format(normal));
-    job
+    syntax::job(text, &colors, font)
 }
 
 /// When the cursor (a char index) sits inside an unfinished `{{name`, returns
@@ -360,6 +362,45 @@ mod tests {
             completion_context("名稱{{to", 6),
             Some((6, 10, "to".into()))
         );
+    }
+
+    /// A variable inside a JSON string shows as a variable, defined or not, with the
+    /// string's colour on either side of it; an unclosed `{{` is just text.
+    #[test]
+    fn variables_are_coloured_over_the_code() {
+        let vars = HashMap::from([("v".to_owned(), "1".to_owned())]);
+        let visuals = egui::Visuals::dark();
+        let text = r#"{"a":"x{{v}}y{{w}}","b":"{{"}"#;
+        let job = highlight(
+            text,
+            &vars,
+            &FontId::monospace(12.0),
+            Some(Lang::Json),
+            &visuals,
+        );
+        let runs: Vec<(&str, Color32)> = (job.sections.iter())
+            .map(|s| {
+                (
+                    &text[s.byte_range.start.0..s.byte_range.end.0],
+                    s.format.color,
+                )
+            })
+            .collect();
+        let str = syntax::color(syntax::Kind::Str, &visuals);
+        let key = syntax::color(syntax::Kind::Key, &visuals);
+        assert_eq!(
+            runs[1..8],
+            [
+                ("\"a\"", key),
+                (":", visuals.weak_text_color()),
+                ("\"x", str),
+                ("{{v}}", DEFINED),
+                ("y", str),
+                ("{{w}}", UNDEFINED),
+                ("\"", str),
+            ]
+        );
+        assert_eq!(runs[runs.len() - 2], ("\"{{\"", str));
     }
 
     #[test]

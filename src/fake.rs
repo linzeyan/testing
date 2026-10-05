@@ -892,7 +892,7 @@ fn u64() -> u64 {
 }
 
 /// 0..n (n > 0). The modulo bias is irrelevant for test data.
-fn below(n: u64) -> u64 {
+pub(crate) fn below(n: u64) -> u64 {
     u64() % n
 }
 

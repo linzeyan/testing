@@ -1,10 +1,11 @@
 //! GraphQL schema introspection and operation generation for the schema explorer.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-/// Only what the explorer shows: root fields, argument types and object fields.
+/// Only what the explorer shows: root fields, argument types, and every type's fields,
+/// input fields and enum values.
 pub const INTROSPECTION: &str = "query IntrospectionQuery {
   __schema {
     queryType { name }
@@ -18,6 +19,8 @@ pub const INTROSPECTION: &str = "query IntrospectionQuery {
         args { name type { ...TypeRef } }
         type { ...TypeRef }
       }
+      inputFields { name description type { ...TypeRef } }
+      enumValues(includeDeprecated: false) { name description }
     }
   }
 }
@@ -46,18 +49,28 @@ pub struct Field {
     pub name: String,
     pub description: String,
     pub args: Vec<(String, String)>,
-    /// As written in SDL, e.g. `[User!]!`.
+    /// As written in SDL, e.g. `[User!]!`; empty for an enum value.
     pub ty: String,
     /// The named type inside the wrappers, e.g. `User`.
     pub base: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Type {
+    /// `OBJECT`, `INTERFACE`, `INPUT_OBJECT` or `ENUM`.
+    pub kind: String,
+    /// Its fields, an input's fields, or an enum's values.
+    pub fields: Vec<Field>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Schema {
     pub query: Vec<Field>,
     pub mutation: Vec<Field>,
-    /// Fields of every object/interface type, for building selection sets.
-    objects: HashMap<String, Vec<Field>>,
+    /// Every named type that has fields or values, by name.
+    types: BTreeMap<String, Type>,
+    /// The query and mutation types: their fields are `query` and `mutation`.
+    roots: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -77,31 +90,41 @@ pub fn parse(body: &str) -> Result<Schema, String> {
             "no schema in the response (is introspection disabled?) {errors}"
         ));
     }
-    let mut objects = HashMap::new();
+    let mut types = BTreeMap::new();
     for t in schema["types"].as_array().into_iter().flatten() {
-        let (Some(name), Some(fields)) = (t["name"].as_str(), t["fields"].as_array()) else {
+        let Some(name) = t["name"].as_str().filter(|n| !n.starts_with("__")) else {
             continue;
         };
-        if name.starts_with("__") {
+        let Some(fields) =
+            (["fields", "inputFields", "enumValues"].iter()).find_map(|key| t[*key].as_array())
+        else {
             continue;
-        }
-        objects.insert(name.to_owned(), fields.iter().map(field).collect());
+        };
+        let kind = t["kind"].as_str().unwrap_or_default().to_owned();
+        let fields = fields.iter().map(field).collect();
+        types.insert(name.to_owned(), Type { kind, fields });
     }
+    let roots: Vec<String> = (["queryType", "mutationType"].iter())
+        .filter_map(|key| schema[*key]["name"].as_str().map(str::to_owned))
+        .collect();
     let root = |key: &str| {
-        schema[key]["name"]
-            .as_str()
-            .and_then(|n| objects.get(n).cloned())
-            .unwrap_or_default()
+        let name = schema[key]["name"].as_str();
+        (name.and_then(|n| types.get(n))).map_or_else(Vec::new, |t| t.fields.clone())
     };
     Ok(Schema {
         query: root("queryType"),
         mutation: root("mutationType"),
-        objects,
+        types,
+        roots,
     })
 }
 
 fn field(v: &Value) -> Field {
-    let (ty, base) = type_ref(&v["type"]);
+    // An enum value has no type.
+    let (ty, base) = match v["type"].is_null() {
+        true => Default::default(),
+        false => type_ref(&v["type"]),
+    };
     Field {
         name: v["name"].as_str().unwrap_or_default().to_owned(),
         description: v["description"].as_str().unwrap_or_default().to_owned(),
@@ -138,6 +161,26 @@ fn type_ref(t: &Value) -> (String, String) {
 }
 
 impl Schema {
+    /// The fields (or values) of the named type, if it has any.
+    pub fn fields_of(&self, name: &str) -> Option<&[Field]> {
+        (self.types.get(name))
+            .map(|t| &t.fields[..])
+            .filter(|f| !f.is_empty())
+    }
+
+    /// The types to browse, by name: all but the query and mutation types.
+    pub fn listed(&self) -> impl Iterator<Item = (&str, &Type)> {
+        let roots = &self.roots;
+        (self.types.iter())
+            .filter(move |(name, _)| !roots.contains(name))
+            .map(|(name, t)| (name.as_str(), t))
+    }
+
+    /// Whether a selection goes inside a field of this type.
+    fn composite(&self, name: &str) -> bool {
+        (self.types.get(name)).is_some_and(|t| matches!(t.kind.as_str(), "OBJECT" | "INTERFACE"))
+    }
+
     /// An operation calling `f` with every argument as a variable, selecting the scalar
     /// fields of its result (one level of nesting is enough to start editing from).
     /// Returns (query text, variables as a JSON object).
@@ -167,11 +210,11 @@ impl Schema {
                 vars,
             )
         };
-        let selection = match self.objects.get(&f.base) {
-            Some(fields) => {
+        let selection = match self.types.get(&f.base).filter(|_| self.composite(&f.base)) {
+            Some(Type { fields, .. }) => {
                 let scalars: Vec<_> = fields
                     .iter()
-                    .filter(|sub| !self.objects.contains_key(&sub.base) && sub.args.is_empty())
+                    .filter(|sub| !self.composite(&sub.base) && sub.args.is_empty())
                     .map(|sub| format!("    {}", sub.name))
                     .collect();
                 // An object with only nested objects still needs a valid selection.
@@ -225,7 +268,15 @@ pub(crate) mod tests {
                 { "kind": "OBJECT", "name": "User", "fields": [
                     { "name": "id", "args": [], "type": id },
                     { "name": "name", "args": [], "type": named("SCALAR", "String") },
+                    { "name": "role", "args": [], "type": named("ENUM", "Role") },
                     { "name": "friends", "args": [], "type": users }
+                ]},
+                { "kind": "ENUM", "name": "Role", "fields": null, "enumValues": [
+                    { "name": "ADMIN", "description": "Can do anything" },
+                    { "name": "GUEST" }
+                ]},
+                { "kind": "INPUT_OBJECT", "name": "UserInput", "fields": null, "inputFields": [
+                    { "name": "name", "type": wrap("NON_NULL", named("SCALAR", "String")) }
                 ]},
                 { "kind": "SCALAR", "name": "String", "fields": null },
                 { "kind": "OBJECT", "name": "__Type", "fields": [] }
@@ -257,11 +308,49 @@ pub(crate) mod tests {
         let (text, vars) = schema.operation(Operation::Query, &schema.query[1]);
         assert_eq!(
             text,
-            "query User($id: ID!) {\n  user(id: $id) {\n    id\n    name\n  }\n}\n"
+            "query User($id: ID!) {\n  user(id: $id) {\n    id\n    name\n    role\n  }\n}\n"
         );
         assert_eq!(Value::Object(vars), serde_json::json!({ "id": null }));
-        // Scalar results take no selection set; nested object fields are left out.
+        // Scalar results take no selection set; nested object fields are left out, enums
+        // (leaves too) are in.
         let (text, _) = schema.operation(Operation::Query, &schema.query[2]);
         assert_eq!(text, "query Version {\n  version\n}\n");
+    }
+
+    /// Every type's fields can be looked at, not only the root ones: an object's fields,
+    /// an input's fields and an enum's values; the root types aren't listed twice.
+    #[test]
+    fn every_type_shows_its_fields_or_values() {
+        let schema = parse(&sample()).unwrap();
+        let names = |fields: &[Field]| -> Vec<String> {
+            fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, f.ty))
+                .collect()
+        };
+        let listed: Vec<_> = schema.listed().map(|(n, t)| (n, t.kind.as_str())).collect();
+        assert_eq!(
+            listed,
+            [
+                ("Role", "ENUM"),
+                ("User", "OBJECT"),
+                ("UserInput", "INPUT_OBJECT")
+            ]
+        );
+        assert_eq!(
+            names(schema.fields_of("User").unwrap()),
+            ["id: ID!", "name: String", "role: Role", "friends: [User!]!"]
+        );
+        assert_eq!(
+            names(schema.fields_of("UserInput").unwrap()),
+            ["name: String!"]
+        );
+        let role = schema.fields_of("Role").unwrap();
+        assert_eq!(names(role), ["ADMIN: ", "GUEST: "]);
+        assert_eq!(role[0].description, "Can do anything");
+        assert!(
+            schema.fields_of("String").is_none(),
+            "a scalar has nothing to open"
+        );
     }
 }

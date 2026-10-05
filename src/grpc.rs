@@ -7,7 +7,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use http_body_util::BodyExt;
 use prost::Message;
-use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor, SerializeOptions};
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, MethodDescriptor,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -117,16 +119,117 @@ fn method(proto: &str, rpc: &str) -> Result<MethodDescriptor, String> {
     Ok(method)
 }
 
-/// JSON skeleton of the request message with every field present, so users see the shape.
+/// The request message with every field set to a random value of its type, so it goes out
+/// as is and shows its shape (zeros and empty strings showed the shape but tested nothing):
+/// a field's name picks the kind of string (an email, an id, a URL…), an enum takes one of
+/// its values, a list or map one entry, a oneof its first member.
 pub fn template(proto: &str, rpc: &str) -> Result<String, String> {
-    let msg = DynamicMessage::new(method(proto, rpc)?.input());
-    let mut out = serde_json::Serializer::pretty(Vec::new());
-    msg.serialize_with_options(
-        &mut out,
-        &SerializeOptions::new().skip_default_fields(false),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8(out.into_inner()).unwrap_or_default())
+    let value = sample(&method(proto, rpc)?.input(), 0);
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+}
+
+/// Nested messages are filled this deep: one that holds itself would go on forever.
+const SAMPLE_DEPTH: usize = 3;
+
+fn sample(msg: &MessageDescriptor, depth: usize) -> Value {
+    let fields = msg.fields().filter(|f| match f.containing_oneof() {
+        // A proto3 `optional` is a oneof of its own.
+        Some(o) if !o.is_synthetic() => o.fields().next().is_some_and(|x| x.number() == f.number()),
+        _ => true,
+    });
+    let fields = fields.map(|f| {
+        let value = match f.kind() {
+            Kind::Message(entry) if f.is_map() => {
+                let key = match sample_one(&entry.map_entry_key_field(), depth) {
+                    Value::String(key) => key,
+                    key => key.to_string(),
+                };
+                let value = sample_one(&entry.map_entry_value_field(), depth);
+                Value::Object([(key, value)].into_iter().collect())
+            }
+            _ if f.is_list() => Value::Array(vec![sample_one(&f, depth)]),
+            _ => sample_one(&f, depth),
+        };
+        (f.json_name().to_owned(), value)
+    });
+    Value::Object(fields.collect())
+}
+
+fn sample_one(f: &FieldDescriptor, depth: usize) -> Value {
+    use crate::fake::below;
+    use base64::Engine;
+    match f.kind() {
+        Kind::Double | Kind::Float => Value::from(below(100_000) as f64 / 100.0),
+        Kind::Bool => Value::Bool(below(2) == 1),
+        Kind::String => Value::String(text_for(f.name())),
+        Kind::Bytes => {
+            let bytes = text_for(f.name());
+            Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        Kind::Enum(e) => {
+            let values: Vec<_> = e.values().collect();
+            let pick = values.get(below(values.len().max(1) as u64) as usize);
+            pick.map_or(Value::Null, |v| Value::String(v.name().to_owned()))
+        }
+        Kind::Message(m) => match m.full_name() {
+            // Well-known types have JSON forms of their own.
+            "google.protobuf.Timestamp" => {
+                Value::String(crate::fake::value("$isoTimestamp").unwrap_or_default())
+            }
+            "google.protobuf.Duration" => Value::String(format!("{}s", below(3600))),
+            "google.protobuf.Struct" | "google.protobuf.Empty" => Value::Object(Default::default()),
+            "google.protobuf.ListValue" => Value::Array(Vec::new()),
+            "google.protobuf.Value" => Value::String(text_for("value")),
+            "google.protobuf.FieldMask" => Value::String(String::new()),
+            // Needs a type URL the pool can resolve; left out.
+            "google.protobuf.Any" => Value::Null,
+            // StringValue, Int32Value…: the value itself.
+            name if name.starts_with("google.protobuf.") && name.ends_with("Value") => {
+                (m.fields().next()).map_or(Value::Null, |inner| sample_one(&inner, depth))
+            }
+            _ if depth < SAMPLE_DEPTH => sample(&m, depth + 1),
+            _ => Value::Null,
+        },
+        // Every integer kind.
+        _ => Value::from(below(1000)),
+    }
+}
+
+/// A string that suits a field named so: the dynamic variable for the first word of the
+/// name that has one (`user_id` is an id, `home_city` a city), else a word.
+fn text_for(name: &str) -> String {
+    const BY_WORD: &[(&str, &str)] = &[
+        ("first_name", "$randomFirstName"),
+        ("last_name", "$randomLastName"),
+        ("email", "$randomEmail"),
+        ("id", "$randomUUID"),
+        ("uuid", "$randomUUID"),
+        ("url", "$randomUrl"),
+        ("uri", "$randomUrl"),
+        ("phone", "$randomPhoneNumber"),
+        ("username", "$randomUserName"),
+        ("name", "$randomFullName"),
+        ("city", "$randomCity"),
+        ("country", "$randomCountry"),
+        ("address", "$randomStreetAddress"),
+        ("company", "$randomCompanyName"),
+        ("ip", "$randomIP"),
+        ("color", "$randomColor"),
+        ("description", "$randomLoremSentence"),
+        ("message", "$randomLoremSentence"),
+        ("text", "$randomLoremSentence"),
+    ];
+    let name = name.to_lowercase();
+    let words: Vec<&str> = name.split('_').collect();
+    let hit = |(word, _): &&(&str, &str)| match word.contains('_') {
+        true => name.contains(word),
+        false => words.contains(word),
+    };
+    let var = BY_WORD
+        .iter()
+        .find(hit)
+        .map_or("$randomWord", |(_, var)| var);
+    crate::fake::value(var).unwrap_or_default()
 }
 
 /// Length-prefixed message: 1 byte "compressed" flag + u32 big-endian length.
@@ -812,6 +915,69 @@ pub(crate) mod tests {
         format!("http://{addr}")
     }
 
+    /// Fill body gives every field a random value of its type, and the message goes out
+    /// as is: zeros and empty strings showed the shape but tested nothing.
+    #[test]
+    fn a_filled_body_has_a_value_of_each_type_and_goes_out_as_is() {
+        const KINDS: &str = r#"syntax = "proto3";
+package kinds;
+import "google/protobuf/timestamp.proto";
+enum Color { COLOR_UNSPECIFIED = 0; RED = 1; GREEN = 2; }
+message Address { string city = 1; }
+message Node { string label = 1; Node child = 2; }
+message Order {
+  string email = 1;
+  string user_id = 2;
+  int32 count = 3;
+  int64 big = 4;
+  double price = 5;
+  bool paid = 6;
+  bytes blob = 7;
+  Color color = 8;
+  repeated string tags = 9;
+  map<string, int32> scores = 10;
+  Address address = 11;
+  oneof pick { string first = 12; int32 second = 13; }
+  google.protobuf.Timestamp at = 14;
+  Node tree = 15;
+  optional string note = 16;
+}
+service Shop { rpc Place(Order) returns (Order); }
+"#;
+        let dir = std::env::temp_dir().join(format!("apitool-grpc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kinds.proto");
+        std::fs::write(&path, KINDS).unwrap();
+        let proto = path.to_string_lossy().into_owned();
+        let rpc = "kinds.Shop/Place";
+        let text = template(&proto, rpc).unwrap();
+        check(&proto, rpc, &text).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert!(v["email"].as_str().unwrap().contains('@'), "{text}");
+        assert_eq!(
+            v["userId"].as_str().unwrap().len(),
+            36,
+            "an id is a UUID: {text}"
+        );
+        assert!(v["count"].is_u64() && v["big"].is_u64(), "{text}");
+        assert!(v["price"].is_f64() && v["paid"].is_boolean(), "{text}");
+        let color = v["color"].as_str().unwrap();
+        assert!(["COLOR_UNSPECIFIED", "RED", "GREEN"].contains(&color));
+        assert_eq!(v["tags"].as_array().unwrap().len(), 1);
+        assert_eq!(v["scores"].as_object().unwrap().len(), 1);
+        assert!(!v["address"]["city"].as_str().unwrap().is_empty());
+        assert!(
+            v.get("first").is_some() && v.get("second").is_none(),
+            "one of a oneof"
+        );
+        assert!(v["at"].as_str().unwrap().contains('T'), "{text}");
+        assert!(v.get("note").is_some(), "a proto3 optional is filled too");
+        // A message that holds itself stops a few levels down.
+        assert!(v["tree"]["child"]["child"].is_object());
+        assert!(v["tree"]["child"]["child"]["child"].is_null());
+        assert_ne!(text, template(&proto, rpc).unwrap(), "different each time");
+    }
+
     /// No .proto at hand: the server says what it has. Calls work from what it said, and
     /// the picker lists its methods (not reflection's own).
     #[test]
@@ -863,7 +1029,8 @@ pub(crate) mod tests {
         assert!(rpcs[1].client_streaming && rpcs[1].server_streaming);
         let tpl: serde_json::Value =
             serde_json::from_str(&template(&proto, "greet.v1.Greeter/Hello").unwrap()).unwrap();
-        assert_eq!(tpl, serde_json::json!({"name": "", "times": 0}));
+        assert!(tpl["name"].as_str().is_some_and(|n| !n.is_empty()), "{tpl}");
+        assert!(tpl["times"].is_u64(), "{tpl}");
 
         let url = server(pool(&proto).unwrap());
         let rt = tokio::runtime::Builder::new_current_thread()

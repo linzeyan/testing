@@ -17,6 +17,7 @@ use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
 use crate::store::{self, HistoryEntry, Node, State, Workspace};
 use crate::stream::{self, Event};
+use crate::syntax::{Kind, Lang};
 use crate::varedit::{clip, var_edit};
 use egui_phosphor::regular as icon;
 
@@ -2124,20 +2125,10 @@ fn wrap_rows(text: &str, line_starts: &[usize], cols: usize) -> Vec<Row> {
     rows
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Token {
-    Key,
-    Str,
-    Num,
-    /// true, false, null
-    Lit,
-    Punct,
-}
-
 /// JSON tokens on one row as (end byte, kind), for colouring. Works a row at a time, so
 /// it never looks past what's on screen; a string that runs on past the row counts as a
 /// value, since the colon that would make it a key isn't in sight.
-fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Token)> {
+fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Kind)> {
     let b = row.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -2149,7 +2140,7 @@ fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Token)> {
     };
     if in_string {
         i = string_end(0);
-        out.push((i, Token::Str));
+        out.push((i, Kind::Str));
     }
     while i < b.len() {
         let (end, kind) = match b[i] {
@@ -2159,9 +2150,9 @@ fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Token)> {
                 (
                     end,
                     if rest.starts_with(':') {
-                        Token::Key
+                        Kind::Key
                     } else {
-                        Token::Str
+                        Kind::Str
                     },
                 )
             }
@@ -2169,17 +2160,17 @@ fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Token)> {
                 let n = b[i..]
                     .iter()
                     .position(|c| !matches!(c, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'));
-                (n.map_or(b.len(), |n| i + n), Token::Num)
+                (n.map_or(b.len(), |n| i + n), Kind::Num)
             }
             b't' | b'f' | b'n' => {
                 let n = b[i..].iter().position(|c| !c.is_ascii_alphabetic());
-                (n.map_or(b.len(), |n| i + n), Token::Lit)
+                (n.map_or(b.len(), |n| i + n), Kind::Lit)
             }
             _ => {
                 let n = b[i..]
                     .iter()
                     .position(|c| matches!(c, b'"' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n'));
-                (n.map_or(b.len(), |n| i + n), Token::Punct)
+                (n.map_or(b.len(), |n| i + n), Kind::Punct)
             }
         };
         // Never stall on a byte none of the arms consumed.
@@ -2191,21 +2182,6 @@ fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Token)> {
         i = end;
     }
     out
-}
-
-fn token_color(ui: &egui::Ui, t: Token) -> Color32 {
-    let dark = ui.visuals().dark_mode;
-    match (t, dark) {
-        (Token::Key, true) => Color32::from_rgb(156, 210, 254),
-        (Token::Key, false) => Color32::from_rgb(4, 81, 165),
-        (Token::Str, true) => Color32::from_rgb(206, 145, 120),
-        (Token::Str, false) => Color32::from_rgb(163, 21, 21),
-        (Token::Num, true) => Color32::from_rgb(181, 206, 168),
-        (Token::Num, false) => Color32::from_rgb(9, 134, 88),
-        (Token::Lit, true) => Color32::from_rgb(86, 156, 214),
-        (Token::Lit, false) => Color32::from_rgb(0, 0, 255),
-        (Token::Punct, _) => ui.visuals().weak_text_color(),
-    }
 }
 
 impl eframe::App for App {
@@ -3238,10 +3214,13 @@ impl App {
                             ui.weak(tf("This snippet is {}: too big to show here. Copy still copies all of it.", &[&human_size(code.len())]));
                         }
                         Ok(code) => {
+                            let lang = crate::syntax::of_target(&self.code_lang);
+                            let mut layouter = crate::syntax::layouter(lang);
                             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
                                 ui.add(
                                     egui::TextEdit::multiline(&mut code.as_str())
                                         .code_editor()
+                                        .layouter(&mut layouter)
                                         .desired_width(f32::INFINITY),
                                 );
                             });
@@ -3364,6 +3343,7 @@ impl App {
                     &all_vars,
                     egui::TextStyle::Monospace,
                     false,
+                    None,
                     &[],
                     |e| e.hint_text(hint).desired_width(width),
                 );
@@ -5941,6 +5921,7 @@ fn kv_table(
                 vars,
                 style.clone(),
                 false,
+                None,
                 if headers { HEADER_NAMES } else { &[] },
                 |e| e.hint_text(t("Key")).desired_width(key_width),
             );
@@ -5951,6 +5932,7 @@ fn kv_table(
                 vars,
                 style,
                 false,
+                None,
                 match headers && row.key.trim().eq_ignore_ascii_case("content-type") {
                     true => CONTENT_TYPES,
                     false => &[],
@@ -6006,6 +5988,7 @@ fn path_vars_table(ui: &mut egui::Ui, rows: &mut [KeyValue], vars: &HashMap<Stri
                 vars,
                 egui::TextStyle::Body,
                 false,
+                None,
                 &[],
                 |e| e.hint_text(t("Value")).desired_width(rest * 0.6),
             );
@@ -6116,7 +6099,7 @@ fn body_editor(
                     ui.colored_label(ORANGE, tf("Not valid JSON: {}", &[&e]));
                 }
             });
-            code_editor(ui, "body", text, vars);
+            code_editor(ui, "body", text, vars, Some(Lang::Json));
         }
         Body::Text { text } => {
             // The language is the Content-Type header row, as Postman imports come in: one
@@ -6150,7 +6133,12 @@ fn body_editor(
                     *text = pretty;
                 }
             });
-            code_editor(ui, "body", text, vars);
+            let lang = match shown {
+                "XML" | "HTML" => Some(Lang::Xml),
+                "JavaScript" => Some(Lang::JavaScript),
+                _ => None,
+            };
+            code_editor(ui, "body", text, vars, lang);
         }
         Body::Form { fields } => {
             kv_table(ui, "form", fields, vars, true);
@@ -6199,6 +6187,7 @@ fn body_editor(
                         vars,
                         egui::TextStyle::Monospace,
                         false,
+                        None,
                         &[],
                         |e| {
                             e.hint_text(t("path/to/file (relative to the workspace)"))
@@ -6246,6 +6235,61 @@ fn dropped_files(ui: &egui::Ui) -> Vec<PathBuf> {
     })
 }
 
+/// One schema field; when its type has fields (or values) of its own, a ▸ opens them, as
+/// deep as wanted. With `click` saying what a click does, returns whether it was clicked.
+fn schema_field(
+    ui: &mut egui::Ui,
+    schema: &crate::graphql::Schema,
+    f: &crate::graphql::Field,
+    id: egui::Id,
+    click: Option<&str>,
+) -> bool {
+    let args: Vec<_> = f.args.iter().map(|(n, t)| format!("{n}: {t}")).collect();
+    let args = match args.is_empty() {
+        true => String::new(),
+        false => format!("({})", args.join(", ")),
+    };
+    // An enum value has no type.
+    let label = match f.ty.is_empty() {
+        true => f.name.clone(),
+        false => format!("{}{args}: {}", f.name, f.ty),
+    };
+    let mut hover = f.description.clone();
+    if let Some(click) = click {
+        if !hover.is_empty() {
+            hover.push_str("\n\n");
+        }
+        hover.push_str(click);
+    }
+    let sense = match click {
+        Some(_) => egui::Sense::click(),
+        None => egui::Sense::hover(),
+    };
+    let line = |ui: &mut egui::Ui| {
+        let line = ui.add(egui::Label::new(RichText::new(label).monospace()).sense(sense));
+        match hover.is_empty() {
+            true => line,
+            false => line.on_hover_text(hover),
+        }
+    };
+    let Some(fields) = schema.fields_of(&f.base) else {
+        // Where a ▸ would be, so the names line up.
+        let row = ui.horizontal(|ui| {
+            ui.add_space(ui.spacing().indent);
+            line(ui)
+        });
+        return row.inner.clicked();
+    };
+    let state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    let (_, header, _) = state.show_header(ui, line).body(|ui| {
+        for sub in fields {
+            schema_field(ui, schema, sub, id.with(&sub.name), None);
+        }
+    });
+    header.inner.clicked()
+}
+
 /// Query and variables on the left, schema explorer on the right. Returns true when
 /// the user asked to fetch the schema.
 fn graphql_editor(
@@ -6267,6 +6311,7 @@ fn graphql_editor(
             vars,
             egui::TextStyle::Monospace,
             true,
+            Some(Lang::GraphQl),
             &[],
             |e| {
                 e.code_editor()
@@ -6292,6 +6337,7 @@ fn graphql_editor(
             vars,
             egui::TextStyle::Monospace,
             true,
+            Some(Lang::Json),
             &[],
             |e| {
                 e.code_editor()
@@ -6350,37 +6396,47 @@ fn graphql_editor(
                                         .iter()
                                         .filter(|f| f.name.to_lowercase().contains(&filter))
                                     {
-                                        let args: Vec<_> = f
-                                            .args
-                                            .iter()
-                                            .map(|(n, t)| format!("{n}: {t}"))
-                                            .collect();
-                                        let args = if args.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!("({})", args.join(", "))
-                                        };
-                                        let label = format!("{}{args}: {}", f.name, f.ty);
-                                        let mut hover = f.description.clone();
-                                        if !hover.is_empty() {
-                                            hover.push_str("\n\n");
-                                        }
-                                        hover.push_str(t(
-                                            "Click to replace the query with this field.",
-                                        ));
-                                        if ui
-                                            .add(
-                                                egui::Label::new(RichText::new(label).monospace())
-                                                    .sense(egui::Sense::click()),
-                                            )
-                                            .on_hover_text(hover)
-                                            .clicked()
-                                        {
+                                        let id =
+                                            egui::Id::new(("gql", op == Operation::Query, &f.name));
+                                        let click =
+                                            t("Click to replace the query with this field.");
+                                        if schema_field(ui, schema, f, id, Some(click)) {
                                             insert = Some((op, f.clone()));
                                         }
                                     }
                                 });
                         }
+                        let hit = |name: &str| name.to_lowercase().contains(&filter);
+                        let types: Vec<_> = (schema.listed())
+                            .filter(|(name, ty)| {
+                                hit(name) || ty.fields.iter().any(|f| hit(&f.name))
+                            })
+                            .collect();
+                        if types.is_empty() {
+                            return;
+                        }
+                        egui::CollapsingHeader::new(tf("Types ({})", &[&types.len()]))
+                            .id_salt("gql-types")
+                            .show(ui, |ui| {
+                                for (name, ty) in types {
+                                    // As SDL writes them.
+                                    let kind = match ty.kind.as_str() {
+                                        "INPUT_OBJECT" => "input",
+                                        "ENUM" => "enum",
+                                        "INTERFACE" => "interface",
+                                        _ => "type",
+                                    };
+                                    let title = RichText::new(format!("{kind} {name}")).monospace();
+                                    egui::CollapsingHeader::new(title)
+                                        .id_salt(("gql-type", name))
+                                        .show(ui, |ui| {
+                                            for f in &ty.fields {
+                                                let id = egui::Id::new(("gql-type", name, &f.name));
+                                                schema_field(ui, schema, f, id, None);
+                                            }
+                                        });
+                                }
+                            });
                     });
             }
         }
@@ -6399,7 +6455,13 @@ fn graphql_editor(
     fetch
 }
 
-fn code_editor(ui: &mut egui::Ui, id: &str, text: &mut String, vars: &HashMap<String, String>) {
+fn code_editor(
+    ui: &mut egui::Ui,
+    id: &str,
+    text: &mut String,
+    vars: &HashMap<String, String>,
+    lang: Option<Lang>,
+) {
     var_edit(
         ui,
         egui::Id::new(id),
@@ -6407,6 +6469,7 @@ fn code_editor(ui: &mut egui::Ui, id: &str, text: &mut String, vars: &HashMap<St
         vars,
         egui::TextStyle::Monospace,
         true,
+        lang,
         &[],
         |e| {
             e.code_editor()
@@ -6498,6 +6561,7 @@ fn auth_editor(
             vars,
             egui::TextStyle::Body,
             false,
+            None,
             &[],
             |e| e.hint_text(hint).desired_width(420.0),
         );
@@ -6585,6 +6649,7 @@ fn auth_editor(
                         vars,
                         egui::TextStyle::Monospace,
                         true,
+                        None,
                         &[],
                         |e| {
                             e.hint_text(t("{{private_key}} or -----BEGIN PRIVATE KEY-----…"))
@@ -6602,6 +6667,7 @@ fn auth_editor(
                     vars,
                     egui::TextStyle::Monospace,
                     true,
+                    Some(Lang::Json),
                     &[],
                     |e| e.desired_rows(4).desired_width(420.0),
                 );
@@ -7121,10 +7187,12 @@ fn scripts_editor(
     if crate::varedit::too_big(ui, id, text).is_some() {
         return;
     }
+    let mut layouter = crate::syntax::layouter(Some(Lang::JavaScript));
     ui.add(
         egui::TextEdit::multiline(text)
             .id(id)
             .code_editor()
+            .layouter(&mut layouter)
             .hint_text(hint)
             .desired_rows(12)
             .desired_width(f32::INFINITY),
@@ -7251,7 +7319,7 @@ fn grpc_bar(
                     });
                 if ui
                     .add_enabled(!req.rpc.is_empty(), egui::Button::new(t("Fill body")))
-                    .on_hover_text(t("Replace the body with an empty request message"))
+                    .on_hover_text(t("Replace the body with a request message, each field a random value of its type"))
                     .clicked()
                 {
                     match crate::grpc::template(source, &req.rpc) {
@@ -8567,7 +8635,7 @@ fn highlighted(
     if !view.json && no_hits {
         return RichText::new(&text[line]).monospace().into();
     }
-    let tokens: Vec<(usize, Option<Token>)> = match view.json {
+    let tokens: Vec<(usize, Option<Kind>)> = match view.json {
         true => (json_tokens(&text[line.clone()], in_string).into_iter())
             .map(|(end, t)| (end, Some(t)))
             .collect(),
@@ -8585,7 +8653,9 @@ fn highlighted(
     let mut pos = line.start;
     for (end, token) in tokens {
         let end = line.start + end;
-        let color = token.map_or(ui.visuals().text_color(), |t| token_color(ui, t));
+        let color = token.map_or(ui.visuals().text_color(), |t| {
+            crate::syntax::color(t, ui.visuals())
+        });
         while pos < end {
             match find.hits.get(hit) {
                 Some(h) if h.start < end && h.end > pos => {
@@ -11264,8 +11334,27 @@ mod ui_tests {
         type_into(&mut h, 0, &url);
         h.get_by_label("Fetch schema").click();
         wait(&mut h, |app| !app.explorer.loading);
+        // A field's ▸ opens the fields of what it returns, and theirs in turn.
+        let open = |h: &mut Harness<'_, App>, label: &str| {
+            let line = h.get_all_by_label(label).last().unwrap().rect();
+            let toggle = line.left_center() - egui::vec2(9.0, 0.0);
+            h.drag_at(toggle);
+            h.drop_at(toggle);
+            h.run();
+        };
+        assert!(h.query_by_label("role: Role").is_none());
+        open(&mut h, "users(first: Int): [User!]!");
+        open(&mut h, "role: Role");
+        h.get_by_label("ADMIN");
         shot(&mut h, "30-graphql-schema");
-        h.get_by_label("user(id: ID!): User").click();
+        // Every type is there to look at, inputs and enums too. Below the fold of the
+        // short pane, so not by pointer.
+        h.get_by_label("Types (3)").click_accesskit();
+        h.run();
+        h.get_by_label("input UserInput").click_accesskit();
+        h.run();
+        h.get_by_label("name: String!");
+        h.get_by_label("user(id: ID!): User").click_accesskit();
         h.run();
         shot(&mut h, "31-graphql-inserted");
         let Body::GraphQL { query, variables } = &draft(&h).body else {
@@ -11324,9 +11413,9 @@ mod ui_tests {
     /// string doesn't end it, and a row that starts inside a string continues it.
     #[test]
     fn json_rows_are_tokenized_for_colour() {
-        use Token::*;
+        use Kind::*;
         let row = r#"  "k\"ey": "v,1", "n": -1.5e3, "t": [true, null]"#;
-        let kinds: Vec<(&str, Token)> = {
+        let kinds: Vec<(&str, Kind)> = {
             let mut at = 0;
             (json_tokens(row, false).into_iter())
                 .map(|(end, t)| (std::mem::replace(&mut at, end), end, t))
