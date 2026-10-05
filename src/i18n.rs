@@ -55,15 +55,6 @@ pub const fn n_(en: &'static str) -> &'static str {
 static ZH_TW_MAP: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| ZH_TW.iter().copied().collect());
 
 const ZH_TW: &[(&str, &str)] = &[
-    ("Delete {} items", "刪除 {} 個項目"),
-    ("Types ({})", "型別 ({})"),
-    ("Delete these {} requests?", "要刪除這 {} 個請求嗎？"),
-    ("{} items", "{} 個項目"),
-    (
-        "Delete these {} items, folders with everything in them?",
-        "要刪除這 {} 個項目嗎？資料夾會連同其中所有內容一起刪除。",
-    ),
-    ("… and {} more", "…還有 {} 個"),
     ("*.corp.com or host:8443", "*.corp.com 或 host:8443"),
     ("+ Certificate for a host", "+ 為主機加入憑證"),
     ("+ File…", "+ 檔案…"),
@@ -110,6 +101,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Add to", "加入到"),
     ("Algorithm", "演算法"),
     ("All ({})", "全部 ({})"),
+    ("All collections", "所有集合"),
     (
         "Always available: $guid, $timestamp, $randomInt, $randomEmail… ({} in all; type {{$ for the list)",
         "隨時可用：$guid、$timestamp、$randomInt、$randomEmail…（共 {} 個；輸入 {{$ 可看清單）",
@@ -236,7 +228,13 @@ const ZH_TW: &[(&str, &str)] = &[
         "要刪除資料夾「{}」及其中所有內容嗎？",
     ),
     ("Delete the request \"{}\"?", "要刪除請求「{}」嗎？"),
+    (
+        "Delete these {} items, folders with everything in them?",
+        "要刪除這 {} 個項目嗎？資料夾會連同其中所有內容一起刪除。",
+    ),
+    ("Delete these {} requests?", "要刪除這 {} 個請求嗎？"),
     ("Delete this response", "刪除此回應"),
+    ("Delete {} items", "刪除 {} 個項目"),
     ("Description", "說明"),
     ("Digest auth", "Digest 驗證"),
     ("direct", "直接連線"),
@@ -246,6 +244,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Docs", "文件"),
     ("Domain", "網域"),
     ("Duplicate", "複製一份"),
+    ("Duplicate environment", "複製環境"),
     ("Duplicate Tab", "複製分頁"),
     ("Duplicate…", "複製一份…"),
     ("Duration (s)", "時長 (秒)"),
@@ -275,7 +274,6 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Errors", "錯誤"),
     ("Examples", "範例"),
     ("Expires", "到期"),
-    ("Export to files", "匯出成檔案"),
     (
         "Extra CA bundle (PEM file path)",
         "額外的 CA 憑證（PEM 檔案路徑）",
@@ -344,8 +342,6 @@ const ZH_TW: &[(&str, &str)] = &[
         "匯入（Postman、OpenAPI、Swagger）",
     ),
     ("Import a collection or spec", "匯入集合或規格"),
-    ("Import from files", "從檔案匯入"),
-    ("Import from files…", "從檔案匯入…"),
     ("Import…", "匯入…"),
     ("Inherit from parent", "繼承上層"),
     ("Interface font", "介面字型"),
@@ -359,6 +355,11 @@ const ZH_TW: &[(&str, &str)] = &[
     ("just now", "剛剛"),
     ("JWT Bearer", "JWT Bearer"),
     ("Keep alive", "保持連線"),
+    ("Keep this workspace", "保留此工作區"),
+    (
+        "Kept on this machine only (in apitool.db), never written to the files. Overrides shared values; values set by scripts land here.",
+        "只存在這台電腦（apitool.db），不會寫入檔案。會覆蓋共用的值；指令碼設定的值也存在這裡。",
+    ),
     ("Key", "鍵"),
     ("Key-Value Edit", "鍵值編輯"),
     ("Language", "語言"),
@@ -390,6 +391,11 @@ const ZH_TW: &[(&str, &str)] = &[
     (
         "Network settings (proxy, certificates)",
         "網路設定（代理伺服器、憑證）",
+    ),
+    ("New collection", "新增集合"),
+    (
+        "New collection: requests with their own variables, auth and scripts",
+        "新增集合：一組請求，有自己的變數、驗證與指令碼",
     ),
     ("New environment", "新增環境"),
     ("New folder", "新增資料夾"),
@@ -502,14 +508,6 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("random", "隨機"),
     ("Raw", "原始"),
-    (
-        "Read collections/, environments/ and globals.toml in {}? Requests, folder settings and shared variables of the same name are replaced. Nothing is deleted, and secrets stay.",
-        "要讀取 {} 中的 collections/、environments/ 與 globals.toml 嗎？同名的請求、資料夾設定與共用變數會被取代。不會刪除任何東西，秘密也會保留。",
-    ),
-    (
-        "Reads those files back, e.g. after a git pull",
-        "讀回這些檔案，例如 git pull 之後",
-    ),
     ("Realm", "Realm"),
     ("Recent", "最近"),
     ("Red", "紅"),
@@ -548,12 +546,12 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Retain", "保留"),
     ("Reused an open connection\n", "沿用已開啟的連線\n"),
     ("Run", "執行"),
-    ("Run collection", "執行集合"),
+    ("Run all collections", "執行所有集合"),
     ("Run folder", "執行資料夾"),
-    ("Run the whole collection", "執行整個集合"),
     ("Run: {}", "執行：{}"),
     ("Save", "儲存"),
     ("Save a JSON value to the environment", "將 JSON 值存入環境"),
+    ("Save as", "另存為"),
     ("Save as example", "存為範例"),
     (
         "Save as example: keep this response with the request",
@@ -577,14 +575,6 @@ const ZH_TW: &[(&str, &str)] = &[
     (
         "Save, then copy into a new environment (e.g. dev → prod)",
         "儲存後複製成新環境（例如 dev → prod）",
-    ),
-    (
-        "Saved to {}.secret.toml, which is gitignored. Overrides shared values; values set by scripts land here.",
-        "儲存在 {}.secret.toml（已列入 gitignore）。會覆蓋共用的值；指令碼設定的值也存在這裡。",
-    ),
-    (
-        "Saved to {}.toml and committed to git.",
-        "儲存在 {}.toml，並提交至 git。",
     ),
     ("Saved {}", "已儲存 {}"),
     ("Save…", "儲存…"),
@@ -640,8 +630,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Settings ({})", "設定 ({})"),
     ("Shared", "共用"),
     (
-        "Shared by every request in this folder and its subfolders. Saved to .folder.toml and committed to git.",
-        "此資料夾與其子資料夾中的所有請求共用。儲存在 .folder.toml，並提交至 git。",
+        "Shared by every request in this folder and its subfolders. Written to its .folder.toml, for git.",
+        "此資料夾與其子資料夾中的所有請求共用。寫入其 .folder.toml，供 git 使用。",
     ),
     ("Show anyway", "仍然顯示"),
     (
@@ -703,6 +693,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "檔案的位元組原封不動作為內容。除非在標頭裡設定，Content-Type 依副檔名決定。也可以把檔案拖到這裡。",
     ),
     (
+        "The files in {} changed outside apitool (a git pull?), and so did this workspace since they were last in step. Which one should stay? The other one's changes are lost, unless git has them.",
+        "{} 中的檔案在 apitool 之外被修改了（git pull？），此工作區自上次同步後也有變更。要保留哪一邊？另一邊的變更會遺失，除非 git 裡還留著。",
+    ),
+    (
         "The OS certificate store is always trusted; these are added on top.",
         "一律信任作業系統的憑證存放區；這些是額外加入的。",
     ),
@@ -710,7 +704,6 @@ const ZH_TW: &[(&str, &str)] = &[
         "The token is fetched on Send and reused until it expires or is rejected.",
         "傳送時取得權杖，並重複使用到過期或被拒絕為止。",
     ),
-    ("The whole collection", "整個集合"),
     ("Theme", "主題"),
     (
         "This body is {}: showing it takes a moment and a lot of memory.",
@@ -741,9 +734,11 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Token secret", "權杖密鑰"),
     ("Token URL", "權杖網址"),
     ("Topics", "主題"),
+    ("Types ({})", "型別 ({})"),
     ("Undefined: {}", "未定義：{}"),
     ("Unfold", "展開"),
     ("Unsaved changes", "尚未儲存的變更"),
+    ("Use the files", "使用檔案"),
     ("Username", "使用者名稱"),
     (
         "Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// use the certificate settings in Network settings, and the connection goes through its proxy.",
@@ -796,25 +791,23 @@ const ZH_TW: &[(&str, &str)] = &[
         "Windows is configured with a PAC script, which will be used:\n{}",
         "Windows 已設定 PAC 指令碼，將會使用：\n{}",
     ),
+    ("Workspace files changed", "工作區檔案已變更"),
     ("Wrap", "自動換行"),
     ("Wrap long lines", "長行自動換行"),
     (
-        "Writes collections/, environments/ and globals.toml into the workspace folder, for git. Secrets, history and cookies stay out.",
-        "將 collections/、environments/ 與 globals.toml 寫入工作區資料夾，供 git 使用。秘密、歷史紀錄與 cookie 不會寫出。",
+        "Written to {} in the workspace folder, for git.",
+        "寫入工作區資料夾中的 {}，供 git 使用。",
     ),
     (
         "{{private_key}} or -----BEGIN PRIVATE KEY-----…",
         "{{private_key}} 或 -----BEGIN PRIVATE KEY-----…",
-    ),
-    (
-        "{}\nOnly the first {} were kept, to save memory.",
-        "{}\n為了節省記憶體，只保留前 {}。",
     ),
     ("{} (cut)", "{} (已截斷)"),
     ("{} added on Send", "傳送時加入 {} 個"),
     ("{} d ago", "{} 天前"),
     ("{} failed requests", "{} 個請求失敗"),
     ("{} h ago", "{} 小時前"),
+    ("{} items", "{} 個項目"),
     (
         "{} jumps to any request or environment",
         "{} 可跳到任一請求或環境",
@@ -826,10 +819,15 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("{}/{} tests", "{}/{} 項測試"),
     (
+        "{}\nOnly the first {} were kept, to save memory.",
+        "{}\n為了節省記憶體，只保留前 {}。",
+    ),
+    (
         "{}Waiting (TTFB) {} ms{}\nDownload {} ms",
         "{}等待（TTFB）{} ms{}\n下載 {} ms",
     ),
     ("· {} events", "· {} 個事件"),
+    ("… and {} more", "…還有 {} 個"),
     ("▶ Run", "▶ 執行"),
     ("▶ Start", "▶ 開始"),
 ];

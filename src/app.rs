@@ -15,7 +15,7 @@ use crate::model::{self, Auth, Body, Example, Folder, Inherited, KeyValue, METHO
 use crate::net::{self, Network, ProxyMode};
 use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
-use crate::store::{self, HistoryEntry, Node, State, Workspace};
+use crate::store::{self, HistoryEntry, Node, State, Synced, Workspace};
 use crate::stream::{self, Event};
 use crate::syntax::{Kind, Lang};
 use crate::varedit::{clip, var_edit};
@@ -493,8 +493,8 @@ enum Dialog {
     /// Requests and folders, none inside another.
     Delete(Vec<PathBuf>),
     Unsaved(Next),
-    /// Confirmed first: it replaces what was edited here since the last export.
-    Import,
+    /// The workspace files and the database both changed since they were last in step.
+    Sync,
     /// Pasted JSON or a file path; `note` says what went wrong or didn't come over.
     Paste {
         text: String,
@@ -793,6 +793,7 @@ impl App {
             rx,
             renderer,
         };
+        app.sync();
         let env = state.active_env.filter(|e| app.envs.contains(e));
         app.set_env(env);
         let tabs = state.tabs.into_iter().filter(|p| app.ws.exists(p));
@@ -1011,23 +1012,20 @@ impl App {
         self.envs = self.ws.env_names();
     }
 
-    fn export(&mut self) {
-        let root = self.ws.root.clone();
-        self.status = match self.ws.export(&root) {
-            Ok(n) => format!("Exported {n} requests to {}", root.display()),
-            Err(e) => format!("Export failed: {e}"),
-        };
-    }
-
-    fn import(&mut self) {
-        let root = self.ws.root.clone();
-        match self.ws.import(&root, false) {
-            Ok(n) => {
-                self.status = format!("Imported {n} requests from {}", root.display());
+    /// The workspace folder's files and the database into step (`Workspace::sync`): on
+    /// start, on leaving the window (about to commit) and coming back (maybe pulled), on
+    /// close.
+    fn sync(&mut self) {
+        match self.ws.sync() {
+            Ok(Synced::Imported) => {
+                self.status = "Read the changed workspace files".into();
                 // May replace the status: an open request with unsaved edits is flagged.
                 self.refresh_from_disk();
             }
-            Err(e) => self.status = format!("Import failed: {e}"),
+            // Never over another dialog; the next look asks again.
+            Ok(Synced::Conflict) if self.dialog.is_none() => self.dialog = Some(Dialog::Sync),
+            Ok(_) => {}
+            Err(e) => self.status = format!("Workspace files not in step: {e}"),
         }
     }
 
@@ -2195,13 +2193,17 @@ impl eframe::App for App {
         }
         self.receive();
         self.tick_repeat(ui.ctx());
-        let regained = ui.input(|i| {
-            i.events
-                .iter()
-                .any(|e| matches!(e, egui::Event::WindowFocused(true)))
+        let focus = ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::WindowFocused(focused) => Some(*focused),
+                _ => None,
+            })
         });
-        if regained {
-            self.refresh_from_disk();
+        if let Some(regained) = focus {
+            self.sync();
+            if regained {
+                self.refresh_from_disk();
+            }
         }
         // Consume shortcuts before widgets see them, so Ctrl+Enter doesn't also insert a newline.
         if ui.input_mut(|i| i.consume_shortcut(&SAVE)) {
@@ -2294,13 +2296,14 @@ impl eframe::App for App {
             // selection when it draws.
             ui.memory_mut(|m| m.request_focus(id));
         }
-        if ui.input(|i| i.viewport().close_requested())
-            && !self.allow_close
-            && !self.unsaved().is_empty()
-        {
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.dialog = Some(Dialog::Unsaved(Next::Quit));
+        if ui.input(|i| i.viewport().close_requested()) {
+            if !self.allow_close && !self.unsaved().is_empty() {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.dialog = Some(Dialog::Unsaved(Next::Quit));
+            } else {
+                self.sync();
+            }
         }
 
         // The active environment's colour across the top: hard to miss when it's prod.
@@ -2551,8 +2554,15 @@ impl App {
             {
                 self.dialog = Some(Dialog::name(NameKind::NewRequest(root.clone()), ""));
             }
-            let folder = named(ui.small_button(icon::FOLDER_PLUS), t("New folder"), None);
-            if folder.on_hover_text(t("New folder")).clicked() {
+            // A collection is a top-level folder: its settings, Run, mock and Postman copy
+            // are a collection's, and a Postman import lands as one.
+            let collection = named(ui.small_button(icon::STACK_PLUS), t("New collection"), None);
+            if collection
+                .on_hover_text(t(
+                    "New collection: requests with their own variables, auth and scripts",
+                ))
+                .clicked()
+            {
                 self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
             }
             let more = ui
@@ -2583,27 +2593,12 @@ impl App {
                         });
                         ui.close();
                     }
-                    let export = ui.button(t("Export to files")).on_hover_text(t(
-                        "Writes collections/, environments/ and globals.toml into the workspace \
-                     folder, for git. Secrets, history and cookies stay out.",
-                    ));
-                    if export.clicked() {
-                        self.export();
-                        ui.close();
-                    }
-                    let import = ui
-                        .button(t("Import from files…"))
-                        .on_hover_text(t("Reads those files back, e.g. after a git pull"));
-                    if import.clicked() {
-                        self.dialog = Some(Dialog::Import);
-                        ui.close();
-                    }
                 })
                 .response
-                .on_hover_text(t("The whole collection"));
+                .on_hover_text(t("All collections"));
             named(more, t("More"), None);
             if named(ui.small_button(icon::PLAY), t("Run"), None)
-                .on_hover_text(t("Run the whole collection"))
+                .on_hover_text(t("Run all collections"))
                 .clicked()
             {
                 self.open_runner(root);
@@ -2656,7 +2651,9 @@ impl App {
                 } else if nodes.is_empty() {
                     ui.weak(t("Nothing matches."));
                 }
+                let collections = self.ws.collections();
                 let view = TreeView {
+                    root: &collections,
                     open: open.as_deref(),
                     picked: &self.tree_picked,
                     statuses: &self.statuses,
@@ -3956,6 +3953,7 @@ impl App {
         };
         let open_name = self.open.as_ref().map(Open::name).unwrap_or_default();
         let root = self.ws.root.display().to_string();
+        let collections = self.ws.collections();
         let mut cancel = false;
         let mut then: Option<Then> = None;
         let targets = match dialog {
@@ -3990,12 +3988,13 @@ impl App {
             match dialog {
                 Dialog::Name { kind, name, error } => {
                     ui.heading(match kind {
-                        NameKind::NewRequest(_) => "New request",
-                        NameKind::NewFolder(_) => "New folder",
-                        NameKind::Rename(_) => "Rename",
-                        NameKind::SaveAs { .. } => "Save as",
-                        NameKind::NewEnv => "New environment",
-                        NameKind::DuplicateEnv(_) => "Duplicate environment",
+                        NameKind::NewRequest(_) => t("New request"),
+                        NameKind::NewFolder(dir) if *dir == collections => t("New collection"),
+                        NameKind::NewFolder(_) => t("New folder"),
+                        NameKind::Rename(_) => t("Rename"),
+                        NameKind::SaveAs { .. } => t("Save as"),
+                        NameKind::NewEnv => t("New environment"),
+                        NameKind::DuplicateEnv(_) => t("Duplicate environment"),
                     });
                     if let NameKind::SaveAs { folder, .. } = kind {
                         let shown = (folders.iter())
@@ -4267,20 +4266,30 @@ impl App {
                         }));
                     }
                 }
-                Dialog::Import => {
-                    ui.heading(t("Import from files"));
+                Dialog::Sync => {
+                    ui.heading(t("Workspace files changed"));
                     ui.label(tf(
-                        "Read collections/, environments/ and globals.toml in {}? \
-                         Requests, folder settings and shared variables of the same name are \
-                         replaced. Nothing is deleted, and secrets stay.",
+                        "The files in {} changed outside apitool (a git pull?), and so did \
+                         this workspace since they were last in step. Which one should stay? \
+                         The other one's changes are lost, unless git has them.",
                         &[&root],
                     ));
                     ui.horizontal(|ui| {
-                        if ui.add(primary(t("Import"))).clicked() || enter_pressed(ui) {
-                            then = Some(Box::new(|app, _| {
-                                app.dialog = None;
-                                app.import();
-                            }));
+                        for (label, use_files) in [
+                            (t("Use the files"), true),
+                            (t("Keep this workspace"), false),
+                        ] {
+                            if ui.button(label).clicked() {
+                                then = Some(Box::new(move |app, _| {
+                                    app.dialog = None;
+                                    match app.ws.resolve(use_files) {
+                                        Ok(()) => app.refresh_from_disk(),
+                                        Err(e) => {
+                                            app.status = format!("Workspace files not in step: {e}")
+                                        }
+                                    }
+                                }));
+                            }
                         }
                         cancel = ui.button(t("Cancel")).clicked();
                     });
@@ -4356,7 +4365,8 @@ impl App {
             return;
         };
         let (mut save, mut delete, mut close, mut duplicate) = (false, false, false, false);
-        let file = ed.env.clone().unwrap_or_else(|| "globals".into());
+        let file =
+            (ed.env.as_ref()).map_or("globals.toml".into(), |n| format!("environments/{n}.toml"));
         // Only explicit buttons close this one: a stray click outside must not drop edits.
         egui::Modal::new(egui::Id::new("env-editor")).show(ctx, |ui| {
             ui.set_width(620.0);
@@ -4369,12 +4379,12 @@ impl App {
             }
             egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                 ui.label(RichText::new(t("Shared")).strong());
-                ui.weak(tf("Saved to {}.toml and committed to git.", &[&file]));
+                ui.weak(tf("Written to {} in the workspace folder, for git.", &[&file]));
                 kv_table(ui, "env-shared", &mut ed.shared, &HashMap::new(), false);
                 ui.add_space(10.0);
                 ui.label(RichText::new(t("Secret")).strong());
-                ui.weak(tf("Saved to {}.secret.toml, which is gitignored. Overrides shared values; \
-                     values set by scripts land here.", &[&file]));
+                ui.weak(t("Kept on this machine only (in apitool.db), never written to the files. \
+                     Overrides shared values; values set by scripts land here."));
                 kv_table(ui, "env-secret", &mut ed.secret, &HashMap::new(), false);
             });
             if !ed.error.is_empty() {
@@ -4499,7 +4509,7 @@ impl App {
             ui.heading(tf("Folder: {}", &[&ed.name]));
             ui.weak(t(
                 "Shared by every request in this folder and its subfolders. \
-                 Saved to .folder.toml and committed to git.",
+                 Written to its .folder.toml, for git.",
             ));
             ui.horizontal(|ui| {
                 let f = &ed.folder;
@@ -5240,10 +5250,10 @@ enum Action {
 
 const ACTIONS: [(&str, Action); 11] = [
     (n_("New request"), Action::NewRequest),
-    (n_("New folder"), Action::NewFolder),
+    (n_("New collection"), Action::NewFolder),
     (n_("New environment"), Action::NewEnv),
     (n_("Edit globals"), Action::Globals),
-    (n_("Run collection"), Action::RunCollection),
+    (n_("Run all collections"), Action::RunCollection),
     (n_("Import (Postman, OpenAPI, Swagger)"), Action::ImportAny),
     (
         n_("Network settings (proxy, certificates)"),
@@ -5378,6 +5388,8 @@ enum DropAt {
 
 /// What the tree is drawn with, besides its nodes.
 struct TreeView<'a> {
+    /// Its folders are collections.
+    root: &'a Path,
     /// The open request: highlighted while nothing is picked.
     open: Option<&'a Path>,
     /// Picked with Ctrl or Shift+click, to move or delete together.
@@ -5422,8 +5434,14 @@ fn tree_ui(
                 } else {
                     icon::CARET_RIGHT
                 };
+                let collection = path.parent() == Some(view.root);
                 let lead = |ui: &mut egui::Ui| {
                     ui.add(egui::Label::new(RichText::new(caret).weak()).selectable(false));
+                    if collection {
+                        ui.add(
+                            egui::Label::new(RichText::new(icon::STACK).weak()).selectable(false),
+                        );
+                    }
                 };
                 let picked = view.picked.contains(path);
                 let row = tree_row(ui, path, name, picked, lead, None);
@@ -8938,7 +8956,7 @@ mod ui_tests {
         assert!(h.state().env_editor.is_none());
         assert_eq!(h.state().vars.get("host"), Some(&host));
 
-        h.get_by_label("New folder").click();
+        h.get_by_label("New collection").click();
         h.run();
         h.key_press(Key::Escape);
         h.run();
@@ -9297,27 +9315,68 @@ mod ui_tests {
         &h.state().open.as_ref().unwrap().draft
     }
 
-    /// The git round trip: export, a teammate's change arrives with a pull, import.
+    /// "Create a collection" was asked for by name: the sidebar's button makes a top-level
+    /// folder, which is what a collection is here, and the dialog calls it that.
     #[test]
-    fn export_and_import_go_through_the_collection_menu() {
-        let mut h = with_request("export");
-        let file = h.state().ws.root.join("collections/r.toml");
-        // The collection's ⋯, drawn before the hovered tree row's.
-        h.get_all_by_label("More").next().unwrap().click();
+    fn new_collection_makes_a_top_level_folder() {
+        let mut h = harness(workspace("collection"));
         h.run();
-        h.get_by_label("Export to files").click();
+        h.get_by_label("New collection").click();
         h.run();
-        assert!(file.exists(), "{}", h.state().status);
+        assert_eq!(
+            h.get_all_by_label("New collection").count(),
+            2,
+            "button and heading"
+        );
+        type_into(&mut h, 0, "Shop");
+        h.key_press(Key::Enter);
+        h.run();
+        let shop = h.state().ws.collections().join("Shop");
+        let tree = &h.state().tree;
+        assert!(matches!(&tree[..], [Node::Folder { path, .. }] if *path == shop));
+        shot(&mut h, "collection");
+    }
+
+    /// The git round trip with nothing to click: leaving the window (to commit) writes
+    /// the workspace files, coming back reads what a pull changed, and when both sides
+    /// changed the user picks.
+    #[test]
+    fn the_workspace_files_follow_the_window_in_and_out() {
+        let mut h = with_request("sync");
+        let root = h.state().ws.root.clone();
+        let (file, env) = (
+            root.join("collections/r.toml"),
+            root.join("environments/dev.toml"),
+        );
+        let read = || std::fs::read_to_string(&file).unwrap();
+        let focus = |h: &mut Harness<'_, App>, regained: bool| {
+            h.event(egui::Event::WindowFocused(regained));
+            h.run();
+        };
+        assert!(file.exists() && env.exists(), "written on start");
+
+        type_into(&mut h, 0, "http://mine.test");
+        h.state_mut().save();
+        focus(&mut h, false);
+        assert!(read().contains("http://mine.test"));
 
         std::fs::write(&file, "url = 'http://pulled.test'\n").unwrap();
-        h.get_all_by_label("More").next().unwrap().click();
-        h.run();
-        h.get_by_label("Import from files…").click();
-        h.run();
-        assert_eq!(draft(&h).url, "", "nothing changes before the confirmation");
-        h.get_by_label("Import").click();
-        h.run();
+        std::fs::remove_file(&env).unwrap();
+        focus(&mut h, true);
         assert_eq!(draft(&h).url, "http://pulled.test");
+        assert!(h.state().envs.is_empty(), "deleted by the pull");
+
+        std::fs::write(&file, "url = 'http://theirs.test'\n").unwrap();
+        type_into(&mut h, 0, "/ours");
+        h.state_mut().save();
+        focus(&mut h, false);
+        assert!(
+            read().contains("theirs"),
+            "nothing moves until the user picks"
+        );
+        h.get_by_label("Use the files").click();
+        h.run();
+        assert_eq!(draft(&h).url, "http://theirs.test");
         assert!(h.state().dialog.is_none());
     }
 

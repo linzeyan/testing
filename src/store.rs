@@ -9,7 +9,8 @@
 //!   environments/<name>.toml      shared variables
 //!   globals.toml                  workspace-wide shared variables
 //! A directory with the tree and no database yet (a fresh clone, or a workspace from before
-//! the database) is imported when opened. Secrets, history, cookies and UI state are never
+//! the database) is imported when opened; after that `sync` keeps the tree and the database
+//! in step, either way. Secrets, history, cookies and UI state are never
 //! exported; workspaces from before the database kept them in `*.secret.toml`,
 //! `.history.jsonl`, `.cookies.json` and `.state.toml`, which are read in that first import.
 
@@ -287,7 +288,10 @@ impl Workspace {
                 root: root.clone(),
                 db: Arc::new(Mutex::new(connect(&new)?)),
             };
-            let imported = ws.import(&root, true);
+            let imported = ws.import(&root, true).and_then(|_| {
+                // In step with what was just read, so the first `sync` doesn't ask.
+                ws.put(SYNCED, &fingerprint(&root, &tree_files(&root)?))
+            });
             drop(ws); // Windows can't rename an open file.
             if let Err(e) = imported {
                 let _ = fs::remove_file(&new);
@@ -1010,11 +1014,11 @@ impl Workspace {
         }
     }
 
-    /// Reads the TOML tree under `dir` (see the module docs), replacing requests, folders
-    /// and shared variables of the same name and keeping everything else, local secrets
-    /// included. `first` also reads what workspaces from before the database kept per
-    /// machine. Returns how many requests were read.
-    pub fn import(&self, dir: &Path, first: bool) -> Result<usize, String> {
+    /// Reads the TOML tree under `dir` (see the module docs) in place of the requests,
+    /// folders and environments here: what it doesn't have is deleted, except the globals
+    /// when there's no globals.toml. Secrets stay. `first` also reads what workspaces from
+    /// before the database kept per machine. Returns how many requests were read.
+    fn import(&self, dir: &Path, first: bool) -> Result<usize, String> {
         let mut folders = Vec::new();
         let mut requests = Vec::new();
         read_tree(&dir.join("collections"), "", &mut folders, &mut requests)?;
@@ -1030,6 +1034,7 @@ impl Workspace {
                 envs.push((stem.to_owned(), path.clone()));
             }
         }
+        let env_names: HashSet<String> = envs.iter().map(|(name, _)| name.clone()).collect();
         let mut vars = Vec::new();
         for (name, path) in envs {
             let shared = read_vars(&path)?;
@@ -1055,10 +1060,41 @@ impl Workspace {
             let env = Some(name.as_str()).filter(|n| !n.is_empty());
             self.save_env(env, &shared, &secret)?;
         }
+        let folder_keys = folders.iter().map(|(k, _)| k.clone()).collect();
+        let request_keys = requests.iter().map(|(k, _)| k.clone()).collect();
+        self.keep_only(&folder_keys, &request_keys, &env_names)?;
         if first {
             self.import_local(dir)?;
         }
         Ok(requests.len())
+    }
+
+    /// Deletes the folders, requests and environments not named: they were deleted where
+    /// the tree came from. The root folder and the globals always stay.
+    fn keep_only(
+        &self,
+        folders: &HashSet<String>,
+        requests: &HashSet<String>,
+        envs: &HashSet<String>,
+    ) -> Result<(), String> {
+        let mut db = self.db();
+        let tx = sql(db.transaction())?;
+        for (table, column, keep) in [
+            ("folders", "path", folders),
+            ("requests", "path", requests),
+            ("envs", "name", envs),
+        ] {
+            let rows: Vec<String> = {
+                let mut q = sql(tx.prepare(&format!("SELECT {column} FROM {table}")))?;
+                let rows = sql(q.query_map([], |r| r.get(0)))?;
+                sql(rows.collect())?
+            };
+            for row in rows.iter().filter(|r| !r.is_empty() && !keep.contains(*r)) {
+                let delete = format!("DELETE FROM {table} WHERE {column} = ?1");
+                sql(tx.execute(&delete, [row]))?;
+            }
+        }
+        sql(tx.commit())
     }
 
     /// Folders (settings as JSON, "" for none) and requests, all or none.
@@ -1149,11 +1185,59 @@ impl Workspace {
         Ok(())
     }
 
+    /// Brings the database and the TOML tree in the workspace folder into step, so the
+    /// folder can go through git: whichever side changed since they last were in step wins,
+    /// the database by writing the tree, the files (a git pull) by being read in. When both
+    /// changed, nothing is touched and `resolve` takes the user's pick.
+    pub fn sync(&self) -> Result<Synced, String> {
+        let plan = self.plan(&self.root)?;
+        let files = tree_files(&self.root)?;
+        let mine = fingerprint(&self.root, &plan.files);
+        let disk = fingerprint(&self.root, &files);
+        // Never in step before: an empty folder takes the database, a tree it doesn't
+        // match has to be asked about.
+        let last = self
+            .get(SYNCED)
+            .unwrap_or_else(|| fingerprint(&self.root, &[]));
+        let synced = if mine == disk {
+            Synced::Same
+        } else if disk == last || files.is_empty() {
+            // A tree gone altogether is a folder deleted or moved by mistake far more
+            // often than everything deleted on purpose elsewhere: write it again.
+            self.write(&self.root, &plan)?;
+            Synced::Exported
+        } else if mine == last {
+            self.import(&self.root, false)?;
+            // In the tree's own layout, so the next look finds both sides the same.
+            self.export(&self.root)?;
+            Synced::Imported
+        } else {
+            return Ok(Synced::Conflict);
+        };
+        self.put(SYNCED, &fingerprint(&self.root, &tree_files(&self.root)?))?;
+        Ok(synced)
+    }
+
+    /// After `Synced::Conflict`: the files replace the database, or the other way round.
+    pub fn resolve(&self, use_files: bool) -> Result<(), String> {
+        if use_files {
+            self.import(&self.root, false)?;
+        }
+        self.export(&self.root)?;
+        self.put(SYNCED, &fingerprint(&self.root, &tree_files(&self.root)?))
+    }
+
     /// Writes the TOML tree (see the module docs) under `dir`, for git: no secrets, history,
     /// cookies or UI state. Request, folder and environment files the database no longer
     /// has are removed so the tree matches it; other files (a .proto, a data file) stay.
     /// Returns how many requests were written.
-    pub fn export(&self, dir: &Path) -> Result<usize, String> {
+    fn export(&self, dir: &Path) -> Result<usize, String> {
+        let plan = self.plan(dir)?;
+        self.write(dir, &plan)?;
+        Ok(plan.requests)
+    }
+
+    fn plan(&self, dir: &Path) -> Result<Plan, String> {
         let mut files: Vec<(PathBuf, String)> = Vec::new();
         let mut folders: HashSet<PathBuf> = HashSet::new();
         let collections = dir.join("collections");
@@ -1213,8 +1297,19 @@ impl Workspace {
             };
             files.push((path, text));
         }
+        Ok(Plan {
+            files,
+            folders,
+            requests: request_rows.len(),
+        })
+    }
+
+    fn write(&self, dir: &Path, plan: &Plan) -> Result<(), String> {
+        let Plan { files, folders, .. } = plan;
+        let collections = dir.join("collections");
+        let env_dir = dir.join("environments");
         let wanted: HashSet<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
-        prune(&collections, &wanted, &folders)?;
+        prune(&collections, &wanted, folders)?;
         for entry in fs::read_dir(&env_dir).into_iter().flatten().flatten() {
             let path = entry.path();
             let secret = path
@@ -1224,15 +1319,95 @@ impl Workspace {
                 fs::remove_file(&path).map_err(|e| format!("delete {}: {e}", path.display()))?;
             }
         }
-        for dir in &folders {
+        for dir in folders {
             fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         }
         fs::create_dir_all(&env_dir).map_err(|e| format!("create {}: {e}", env_dir.display()))?;
-        for (path, text) in &files {
+        for (path, text) in files {
+            // Unchanged files keep their time stamp, and git sees nothing to look at.
+            if fs::read_to_string(path).is_ok_and(|old| old.replace("\r\n", "\n") == *text) {
+                continue;
+            }
             write_atomic(path, text)?;
         }
-        Ok(request_rows.len())
+        Ok(())
     }
+}
+
+/// What `export` writes: each file with its text, and the folders, empty ones included.
+struct Plan {
+    files: Vec<(PathBuf, String)>,
+    folders: HashSet<PathBuf>,
+    requests: usize,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Synced {
+    Same,
+    Exported,
+    Imported,
+    /// Both changed since they were last in step.
+    Conflict,
+}
+
+/// The kv entry holding the tree's `fingerprint` when it last matched the database.
+const SYNCED: &str = "synced";
+
+/// The tree files under `root` that `export` writes and prunes, with their text.
+fn tree_files(root: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), String> {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out)?;
+            } else if is_request(&path) {
+                out.push((path.clone(), read_text(&path)?));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(&root.join("collections"), &mut out)?;
+    for entry in fs::read_dir(root.join("environments"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        let secret =
+            (path.file_stem()).is_some_and(|s| s.to_string_lossy().ends_with(SECRET_SUFFIX));
+        if is_request(&path) && !secret {
+            out.push((path.clone(), read_text(&path)?));
+        }
+    }
+    let globals = root.join("globals.toml");
+    if globals.exists() {
+        out.push((globals.clone(), read_text(&globals)?));
+    }
+    Ok(out)
+}
+
+fn read_text(path: &Path) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))
+}
+
+/// One value for a set of tree files, whatever order they're listed in. Line endings don't
+/// count: git may check files out with CRLF.
+fn fingerprint(root: &Path, files: &[(PathBuf, String)]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut files: Vec<(String, String)> = (files.iter())
+        .map(|(path, text)| {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            (rel, text.replace("\r\n", "\n"))
+        })
+        .collect();
+    files.sort();
+    // ponytail: SipHash with fixed keys, stable within a Rust release; a new one may
+    // change it, which only reads the unchanged tree back in once.
+    let mut hasher = std::hash::DefaultHasher::new();
+    files.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Folders and requests under `dir`, whose tree path is `key`.
@@ -1943,6 +2118,74 @@ mod tests {
             ("h2", "s3cret")
         );
         assert_eq!(ws.env_vars(None).unwrap()["g"], "1");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The workspace folder goes through git, so it follows the database, and a pull
+    /// comes back into it, deletions included. Changes on both sides wait for the user.
+    #[test]
+    fn sync_carries_changes_either_way_and_asks_when_both_changed() {
+        let root = fresh("sync");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let dir = ws.create_folder(&ws.collections(), "a").unwrap();
+        let r = ws.create_request(&dir, "r").unwrap();
+        ws.save_env(Some("dev"), &[KeyValue::new("host", "h")], &[])
+            .unwrap();
+        let file = root.join("collections/a/r.toml");
+        let read = || fs::read_to_string(&file).unwrap();
+        let url = |url: &str| Request {
+            url: url.into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ws.sync().unwrap(),
+            Synced::Exported,
+            "an empty folder takes it all"
+        );
+        assert!(root.join("environments/dev.toml").exists());
+        assert_eq!(ws.sync().unwrap(), Synced::Same);
+        ws.save_request(&r, &url("http://mine")).unwrap();
+        assert_eq!(ws.sync().unwrap(), Synced::Exported);
+        assert!(read().contains("http://mine"));
+
+        // A pull changes the request and deletes the environment.
+        fs::write(&file, "url = 'http://pulled'\n").unwrap();
+        fs::remove_file(root.join("environments/dev.toml")).unwrap();
+        assert_eq!(ws.sync().unwrap(), Synced::Imported);
+        assert_eq!(ws.load_request(&r).unwrap().url, "http://pulled");
+        assert!(ws.env_names().is_empty());
+        assert_eq!(
+            ws.sync().unwrap(),
+            Synced::Same,
+            "the pulled file in our layout"
+        );
+
+        fs::write(&file, "url = 'http://theirs'\n").unwrap();
+        ws.save_request(&r, &url("http://ours")).unwrap();
+        assert_eq!(ws.sync().unwrap(), Synced::Conflict);
+        assert!(
+            read().contains("theirs"),
+            "nothing moves until the user picks"
+        );
+        assert_eq!(ws.load_request(&r).unwrap().url, "http://ours");
+        ws.resolve(true).unwrap();
+        assert_eq!(ws.load_request(&r).unwrap().url, "http://theirs");
+        assert_eq!(ws.sync().unwrap(), Synced::Same);
+
+        // The whole tree gone is written again, not read as everything deleted.
+        fs::remove_dir_all(root.join("collections")).unwrap();
+        assert_eq!(ws.sync().unwrap(), Synced::Exported);
+        assert!(read().contains("theirs"));
+
+        // A fresh clone, written by hand: in step on open, so nothing to ask.
+        let clone = root.join("clone");
+        fs::create_dir_all(clone.join("collections")).unwrap();
+        fs::write(clone.join("collections/x.toml"), "url='http://x'").unwrap();
+        let cloned = Workspace::open(clone.clone()).unwrap();
+        assert_eq!(cloned.sync().unwrap(), Synced::Exported);
+        let x = fs::read_to_string(clone.join("collections/x.toml")).unwrap();
+        assert!(x.contains("url = \"http://x\""), "{x}");
         let _ = fs::remove_dir_all(&root);
     }
 
