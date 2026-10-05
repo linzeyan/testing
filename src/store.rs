@@ -164,6 +164,8 @@ pub struct State {
 pub struct Workspace {
     pub root: PathBuf,
     db: Arc<Mutex<Connection>>,
+    /// The tree files' sizes and times as `disk` last read them, and their fingerprint.
+    seen: Arc<Mutex<Option<(u64, String)>>>,
 }
 
 /// Opens the workspace (`dir`, else `APITOOL_WORKSPACE`, else `workspace/` next to the exe:
@@ -288,10 +290,11 @@ impl Workspace {
             let ws = Self {
                 root: root.clone(),
                 db: Arc::new(Mutex::new(connect(&new)?)),
+                seen: Default::default(),
             };
             let imported = ws.import(&root, true).and_then(|_| {
                 // In step with what was just read, so the first `sync` doesn't ask.
-                ws.put(SYNCED, &fingerprint(&root, &tree_files(&root)?))
+                ws.put(SYNCED, &ws.disk(&tree_stats(&root))?)
             });
             drop(ws); // Windows can't rename an open file.
             if let Err(e) = imported {
@@ -303,10 +306,31 @@ impl Workspace {
         let ws = Self {
             db: Arc::new(Mutex::new(connect(&path)?)),
             root,
+            seen: Default::default(),
         };
         ws.ignore()?;
         ws.seal_secrets();
+        ws.tidy();
         Ok(ws)
+    }
+
+    /// A request deleted outside the app (git, the file manager) leaves its past responses
+    /// behind, and SQLite keeps the file at its largest size until it is vacuumed. Best
+    /// effort: the other process (`apitool-cli mcp`) may hold the file.
+    fn tidy(&self) {
+        let db = self.db();
+        let pragma = |p: &str| db.query_row(&format!("PRAGMA {p}"), [], |r| r.get::<_, i64>(0));
+        let orphans = "DELETE FROM responses WHERE path NOT IN (SELECT path FROM requests)";
+        let tidied = (db.execute(orphans, []))
+            .and_then(|_| Ok((pragma("freelist_count")?, pragma("page_count")?)))
+            // Rewriting the whole file pays off once a quarter of it is free.
+            .and_then(|(free, all)| match free * 4 > all {
+                true => db.execute_batch("VACUUM"),
+                false => Ok(()),
+            });
+        if let Err(e) = tidied {
+            eprintln!("tidying the workspace: {e}");
+        }
     }
 
     /// Seals secrets stored plain: from before sealing, or from a system without it. A
@@ -1192,17 +1216,22 @@ impl Workspace {
     /// changed, nothing is touched and `resolve` takes the user's pick.
     pub fn sync(&self) -> Result<Synced, String> {
         let plan = self.plan(&self.root)?;
-        let files = tree_files(&self.root)?;
+        let files = tree_stats(&self.root);
         let mine = fingerprint(&self.root, &plan.files);
-        let disk = fingerprint(&self.root, &files);
+        let disk = self.disk(&files)?;
         // Never in step before: an empty folder takes the database, a tree it doesn't
         // match has to be asked about.
         let last = self
             .get(SYNCED)
             .unwrap_or_else(|| fingerprint(&self.root, &[]));
-        let synced = if mine == disk {
-            Synced::Same
-        } else if disk == last || files.is_empty() {
+        if mine == disk {
+            // Runs on every focus change: nothing to write, not even the fingerprint again.
+            return match disk == last {
+                true => Ok(Synced::Same),
+                false => self.put(SYNCED, &disk).map(|_| Synced::Same),
+            };
+        }
+        let synced = if disk == last || files.is_empty() {
             // A tree gone altogether is a folder deleted or moved by mistake far more
             // often than everything deleted on purpose elsewhere: write it again.
             self.write(&self.root, &plan)?;
@@ -1215,7 +1244,7 @@ impl Workspace {
         } else {
             return Ok(Synced::Conflict);
         };
-        self.put(SYNCED, &fingerprint(&self.root, &tree_files(&self.root)?))?;
+        self.put(SYNCED, &self.disk(&tree_stats(&self.root))?)?;
         Ok(synced)
     }
 
@@ -1225,7 +1254,33 @@ impl Workspace {
             self.import(&self.root, false)?;
         }
         self.export(&self.root)?;
-        self.put(SYNCED, &fingerprint(&self.root, &tree_files(&self.root)?))
+        self.put(SYNCED, &self.disk(&tree_stats(&self.root))?)
+    }
+
+    /// The `fingerprint` of the tree files, read only when one changed size or time since
+    /// the last look: `sync` runs on every focus change, and reading a thousand requests
+    /// from a network folder took over a second each time.
+    // ponytail: an edit that keeps the size within one time step of the file system (2 s
+    // on FAT) is missed until the next change; hash the files' contents if that bites.
+    fn disk(&self, files: &[(PathBuf, fs::Metadata)]) -> Result<String, String> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        for (path, meta) in files {
+            (path, meta.len(), meta.modified().ok()).hash(&mut hasher);
+        }
+        let stamp = hasher.finish();
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, known)) = &*seen
+            && *at == stamp
+        {
+            return Ok(known.clone());
+        }
+        let texts: Vec<(PathBuf, String)> = (files.iter())
+            .map(|(path, _)| Ok((path.clone(), read_text(path)?)))
+            .collect::<Result<_, String>>()?;
+        let known = fingerprint(&self.root, &texts);
+        *seen = Some((stamp, known.clone()));
+        Ok(known)
     }
 
     /// Writes the TOML tree (see the module docs) under `dir`, for git: no secrets, history,
@@ -1354,38 +1409,51 @@ pub enum Synced {
 /// The kv entry holding the tree's `fingerprint` when it last matched the database.
 const SYNCED: &str = "synced";
 
-/// The tree files under `root` that `export` writes and prunes, with their text.
-fn tree_files(root: &Path) -> Result<Vec<(PathBuf, String)>, String> {
-    fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), String> {
-        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out)?;
+/// The tree files under `root` that `export` writes and prunes, unread.
+fn tree_stats(root: &Path) -> Vec<(PathBuf, fs::Metadata)> {
+    // Windows hands a folder's metadata over with its listing; asking per file would cost a
+    // round trip each in a network folder. Links are followed, as `is_dir` did.
+    fn stat(entry: fs::DirEntry) -> Option<(PathBuf, fs::Metadata)> {
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) if m.is_symlink() => fs::metadata(&path),
+            m => m,
+        };
+        meta.ok().map(|m| (path, m))
+    }
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, fs::Metadata)>) {
+        for (path, meta) in fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(stat)
+        {
+            if meta.is_dir() {
+                walk(&path, out);
             } else if is_request(&path) {
-                out.push((path.clone(), read_text(&path)?));
+                out.push((path, meta));
             }
         }
-        Ok(())
     }
     let mut out = Vec::new();
-    walk(&root.join("collections"), &mut out)?;
-    for entry in fs::read_dir(root.join("environments"))
+    walk(&root.join("collections"), &mut out);
+    for (path, meta) in fs::read_dir(root.join("environments"))
         .into_iter()
         .flatten()
         .flatten()
+        .filter_map(stat)
     {
-        let path = entry.path();
         let secret =
             (path.file_stem()).is_some_and(|s| s.to_string_lossy().ends_with(SECRET_SUFFIX));
         if is_request(&path) && !secret {
-            out.push((path.clone(), read_text(&path)?));
+            out.push((path, meta));
         }
     }
     let globals = root.join("globals.toml");
-    if globals.exists() {
-        out.push((globals.clone(), read_text(&globals)?));
+    if let Ok(meta) = fs::metadata(&globals) {
+        out.push((globals, meta));
     }
-    Ok(out)
+    out
 }
 
 fn read_text(path: &Path) -> Result<String, String> {
@@ -1924,6 +1992,69 @@ mod tests {
             ws.responses(&again).is_empty(),
             "a new request starts fresh"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_reads_the_files_only_when_their_sizes_or_times_change() {
+        let root = fresh("stat");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let path = ws.create_request(&ws.collections(), "r").unwrap();
+        let url = |url: &str| Request {
+            url: url.into(),
+            ..Default::default()
+        };
+        ws.save_request(&path, &url("http://aaaa")).unwrap();
+        assert_eq!(ws.sync().unwrap(), Synced::Exported);
+        let touch = |at| {
+            let file = fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(at).unwrap();
+        };
+        // Same size, time put back: proof the file isn't read when nothing says it changed.
+        let at = fs::metadata(&path).unwrap().modified().unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, text.replace("aaaa", "bbbb")).unwrap();
+        touch(at);
+        assert_eq!(ws.sync().unwrap(), Synced::Same);
+        // A real edit moves the time.
+        touch(at + Duration::from_secs(1));
+        assert_eq!(ws.sync().unwrap(), Synced::Imported);
+        assert_eq!(ws.load_request(&path).unwrap().url, "http://bbbb");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reopening_drops_orphaned_responses_and_gives_the_space_back() {
+        let root = fresh("tidy");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let gone = ws.create_request(&ws.collections(), "gone").unwrap();
+        let kept = ws.create_request(&ws.collections(), "kept").unwrap();
+        let resp = crate::http::Response {
+            status: 200,
+            reason: String::new(),
+            version: "HTTP/1.1".into(),
+            elapsed: std::time::Duration::from_millis(7),
+            headers: Vec::new(),
+            body: "x".repeat(MAX_RESPONSE_BODY),
+            truncated: false,
+            sent: Default::default(),
+            bytes: None,
+        };
+        for _ in 0..MAX_RESPONSES {
+            ws.add_response(&gone, &resp).unwrap();
+        }
+        ws.add_response(&kept, &resp).unwrap();
+        ws.sync().unwrap();
+        // A git pull deletes the request; its responses stay with nothing leading to them.
+        fs::remove_file(&gone).unwrap();
+        assert_eq!(ws.sync().unwrap(), Synced::Imported);
+        let size = || fs::metadata(root.join(DB)).unwrap().len();
+        let before = size();
+        drop(ws);
+        let ws = Workspace::open(root.clone()).unwrap();
+        assert!(ws.responses(&gone).is_empty());
+        assert_eq!(ws.responses(&kept).len(), 1);
+        assert!(size() < before / 2, "{before} -> {} bytes", size());
         let _ = fs::remove_dir_all(&root);
     }
 

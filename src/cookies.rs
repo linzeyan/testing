@@ -57,8 +57,9 @@ impl Jar {
     }
 
     /// Missing or unreadable JSON is an empty jar: cookies are a cache the server refills.
+    /// Expired cookies are left out, so the next save stops carrying them.
     pub fn from_json(json: &str) -> Self {
-        let store = cookie_store::serde::json::load_all(json.as_bytes()).unwrap_or_default();
+        let store = cookie_store::serde::json::load(json.as_bytes()).unwrap_or_default();
         Self(RwLock::new(store))
     }
 
@@ -161,5 +162,31 @@ impl reqwest::cookie::CookieStore for Jar {
             t.cookie.get_or_insert_with(|| value.clone());
         });
         HeaderValue::from_str(&value).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_cookies_are_not_carried_forever() {
+        let url = Url::parse("https://example.com/").unwrap();
+        let jar = Jar::default();
+        let headers = [
+            // 1 Jan is a Monday in both years, so the date stays valid after the move below.
+            HeaderValue::from_static("old=1; Expires=Mon, 01 Jan 2035 00:00:00 GMT"),
+            HeaderValue::from_static("session=2"),
+        ];
+        reqwest::cookie::CookieStore::set_cookies(&jar, &mut headers.iter(), &url);
+        // Time passes: the saved expiry moves into the past.
+        let saved = jar.to_json().unwrap().replace("2035", "2001");
+        assert!(saved.contains("old=1"));
+        let next = Jar::from_json(&saved).to_json().unwrap();
+        assert!(!next.contains("old=1"), "{next}");
+        assert!(
+            next.contains("session=2"),
+            "a session cookie survives a restart"
+        );
     }
 }
