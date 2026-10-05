@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::model::{Body, Example, Folder, KeyValue, Request};
 use crate::postman::Import;
-use crate::store::{copy_name, safe_name};
+use crate::store::{copy_name, escape_name};
 
 pub fn is_har(v: &Value) -> bool {
     v["log"]["entries"].is_array() || is_entry_request(v)
@@ -41,13 +41,13 @@ pub fn import(root: &Value) -> Import {
             warnings.push(format!("entry {}: URL \"{url}\" left out", i + 1));
             continue;
         };
-        let folder = safe_name(parsed.host_str().unwrap_or("untitled"));
+        let folder = escape_name(parsed.host_str().unwrap_or("untitled"));
         if !folders.iter().any(|(k, _)| *k == folder) {
             folders.push((folder.clone(), Folder::default()));
         }
         let method = str_of(&r["method"]).to_uppercase();
         let path = parsed.path().trim_matches('/').replace('/', " ");
-        let name = safe_name(&format!("{method} {path}"));
+        let name = escape_name(&format!("{method} {path}"));
         let key = std::iter::once(name.clone())
             .chain((1..).map(|n| copy_name(&name, n)))
             .map(|n| format!("{folder}/{n}"))

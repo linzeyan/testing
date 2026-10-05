@@ -604,6 +604,67 @@ mod tests {
         );
     }
 
+    /// Servers behind Cloudflare (wss://sports-api.polymarket.com/ws) offer h2 by ALPN: a
+    /// client offering it too gets HTTP/2, and the upgrade fails with "the server responded
+    /// with a different http version". The WebSocket client offers only HTTP/1.1.
+    #[test]
+    fn a_websocket_over_tls_stays_on_http_1_1_when_the_server_offers_h2() {
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(own.signing_key.serialize_der());
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![own.cert.der().clone()], key.unwrap())
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let config = std::sync::Arc::new(config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+                // A client that took h2 sends its preface, not a handshake: this fails.
+                if let Ok(mut ws) = tungstenite::accept(rustls::StreamOwned::new(conn, s)) {
+                    ws.send(tungstenite::Message::text("hello")).unwrap();
+                    let _ = ws.read();
+                }
+            }
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            insecure: true,
+            ..Default::default()
+        };
+        let clients = rt.block_on(crate::net::build_client(net)).unwrap();
+        let req = Request {
+            method: "WS".into(),
+            url: format!("wss://{addr}/ws"),
+            ..Default::default()
+        };
+        let first_event = |client: reqwest::Client| {
+            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            let tx = std::sync::Mutex::new(Some(tx));
+            let events = std::sync::Mutex::new(Vec::new());
+            rt.block_on(websocket(client, req.clone(), rx, |e| {
+                drop(tx.lock().unwrap().take()); // hang up after the first event
+                events.lock().unwrap().push(e);
+            }));
+            events.into_inner().unwrap().remove(0)
+        };
+        // The everyday client does take h2 here (this server then hangs up on its preface;
+        // a real one answers in HTTP/2), so the test does reach the failure.
+        let plain = first_event(clients.http.clone());
+        assert!(matches!(&plain, Event::Error(_)), "{plain:?}");
+        let ws = clients.websocket_for(&req.url).unwrap();
+        assert_eq!(first_event(ws), Event::Open("connected".into()));
+    }
+
     /// The handshake against a server that insists on its subprotocol: init, ack,
     /// subscribe with the query and variables, results until it completes; a ping
     /// mid-stream is answered or the server would drop the connection. Run against both

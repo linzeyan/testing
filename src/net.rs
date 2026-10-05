@@ -201,6 +201,17 @@ impl Clients {
         self.variant(Variant { cert, ..s.into() })
     }
 
+    /// The client for a WebSocket handshake to `url` (WebSocket, Socket.IO, GraphQL
+    /// subscriptions). The handshake is an HTTP/1.1 upgrade: offered h2 as well, a server
+    /// such as Cloudflare picks it, and the upgrade then fails.
+    pub fn websocket_for(&self, url: &str) -> Result<reqwest::Client, String> {
+        let settings = Settings {
+            http_version: HttpVersion::Http1,
+            ..Default::default()
+        };
+        self.for_settings(&settings, url)
+    }
+
     /// The HTTP/2 client for a gRPC call to `url`.
     pub fn grpc_for(&self, url: &str) -> Result<reqwest::Client, String> {
         let cert = self.variants.net.host_cert(url);

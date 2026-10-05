@@ -1363,6 +1363,40 @@ pub(crate) mod tests {
         rt.block_on(execute(client(rt), req)).unwrap()
     }
 
+    /// QUERY (a GET with a body), TRACE and CONNECT go out as themselves; CONNECT in the
+    /// authority form a proxy expects.
+    #[test]
+    fn query_trace_and_connect_go_out_as_written() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let url = echo_server();
+        let host = url.trim_end_matches("/users").to_owned();
+        let send = |method: &str| {
+            let req = Request {
+                method: method.into(),
+                url: url.clone(),
+                body: Body::Json {
+                    text: r#"{"q":1}"#.into(),
+                },
+                ..Default::default()
+            };
+            rt.block_on(execute(client(&rt), req)).unwrap()
+        };
+        let query = send("QUERY");
+        assert!(
+            query.body.starts_with("QUERY /users HTTP/1.1"),
+            "{}",
+            query.body
+        );
+        assert!(query.body.ends_with(r#"{"q":1}"#), "{}", query.body);
+        assert!(send("TRACE").body.starts_with("TRACE /users HTTP/1.1"));
+        // A 2xx turns a CONNECT into a tunnel, so the echo isn't read back: the request line
+        // is in what was sent.
+        let connect = send("CONNECT");
+        assert_eq!(connect.status, 200);
+        assert_eq!(connect.sent.method, "CONNECT");
+        assert!(connect.timeline().contains(&host), "{}", connect.timeline());
+    }
+
     /// A body past MAX_BODY keeps its start and says so, instead of taking whatever the
     /// server sends into a machine with under 1 GB free.
     #[test]

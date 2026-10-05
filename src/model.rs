@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// QUERY is the safe, body-carrying GET of draft-ietf-httpbis-safe-method-w-body.
 pub const METHODS: &[&str] = &[
-    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "GRAPHQL", "WS", "SSE", "GRPC",
-    "MQTT", "SOCKETIO",
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY", "TRACE", "CONNECT",
+    "GRAPHQL", "WS", "SSE", "GRPC", "MQTT", "SOCKETIO",
 ];
 
 /// Methods whose response is a stream of messages rather than one body.

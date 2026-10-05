@@ -10,7 +10,7 @@ use crate::model::{
     self, Auth, AwsV4, Body, Example, Folder, Grant, Jwt, KeyValue, OAuth1, OAuth2, Request,
     Settings,
 };
-use crate::store::{Node, Workspace, folder_name, safe_name};
+use crate::store::{Node, Workspace, escape_name, folder_name, safe_name, unescape_name};
 
 const SCHEMA: &str = "https://schema.getpostman.com/json/collection/v2.1.0/collection.json";
 
@@ -46,7 +46,7 @@ pub fn from_value(v: &Value) -> Result<Import, String> {
     let mut c = Reader::default();
     c.group("", &v, &v["info"]["description"]);
     Ok(Import::Collection {
-        name: safe_name(str_of(&v["info"]["name"])),
+        name: escape_name(str_of(&v["info"]["name"])),
         folders: c.folders,
         requests: c.requests,
         warnings: c.warnings,
@@ -92,7 +92,7 @@ impl Reader {
         // tell case apart on macOS and Windows.
         let mut taken = HashSet::new();
         for item in v["item"].as_array().into_iter().flatten() {
-            let base = safe_name(str_of(&item["name"]));
+            let base = escape_name(str_of(&item["name"]));
             let name = (1..)
                 .map(|n| match n {
                     1 => base.clone(),
@@ -441,7 +441,7 @@ pub fn collection(ws: &Workspace, dir: &Path) -> Result<(String, usize, usize), 
             let name = dir.file_name().unwrap_or_default().to_string_lossy();
             let nodes = crate::docs::find(&tree, dir)
                 .ok_or_else(|| format!("no folder at {}", folder_name(&root, dir)))?;
-            (name.into_owned(), nodes)
+            (unescape_name(&name), nodes)
         }
     };
     let mut counts = (0, 0);
@@ -824,8 +824,8 @@ mod tests {
             panic!("not a collection");
         };
         assert_eq!(
-            name, "Shop- API",
-            "a name that can't be a file name is cleaned up"
+            name, "Shop%3A API",
+            "a name that can't be a file name is escaped, not changed"
         );
         let folders: HashMap<_, _> = folders.into_iter().collect();
         // The author's order, not the tree's alphabetical one.
@@ -860,8 +860,9 @@ mod tests {
         let r: HashMap<_, _> = requests.into_iter().collect();
         let mut keys: Vec<_> = r.keys().map(String::as_str).collect();
         keys.sort();
-        // Same name twice (case aside) and a '/' in a name: neither may clobber another.
-        let expected = ["binary", "create", "feed", "login", "me", "upload-avatar"];
+        // Same name twice (case aside) and a '/' in a name: neither may clobber another,
+        // and the '/' is kept (escaped in the key), not a folder.
+        let expected = ["binary", "create", "feed", "login", "me", "upload%2Favatar"];
         assert_eq!(&keys[..6], expected);
         assert_eq!(&keys[6..], ["users/Get User 2", "users/get user"]);
 
@@ -921,7 +922,7 @@ mod tests {
             Auth::ApiKey { in_query: true, .. }
         ));
 
-        let upload = &r["upload-avatar"];
+        let upload = &r["upload%2Favatar"];
         let parts = vec![
             KeyValue::new("note", "hi"),
             KeyValue::new("file", "@/tmp/a.png"),

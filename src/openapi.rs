@@ -9,10 +9,10 @@ use serde_json::{Map, Value, json};
 
 use crate::model::{Auth, Body, Example, Folder, Grant, KeyValue, OAuth2, Request};
 use crate::postman::Import;
-use crate::store::{copy_name, safe_name};
+use crate::store::{copy_name, escape_name};
 
 const METHODS: &[&str] = &[
-    "get", "put", "post", "delete", "options", "head", "patch", "trace",
+    "get", "put", "post", "delete", "options", "head", "patch", "trace", "query",
 ];
 /// Schemas may refer to themselves (a tree node's children); samples stop this deep.
 const MAX_DEPTH: usize = 8;
@@ -47,7 +47,7 @@ pub fn import(root: &Value) -> Import {
     let mut folders = vec![(String::new(), top)];
     let mut tags = HashSet::new();
     for tag in root["tags"].as_array().into_iter().flatten() {
-        let name = safe_name(str_of(&tag["name"]));
+        let name = escape_name(str_of(&tag["name"]));
         if tags.insert(name.clone()) {
             let description = str_of(&tag["description"]).to_owned();
             folders.push((
@@ -68,7 +68,7 @@ pub fn import(root: &Value) -> Import {
             if !op.is_object() {
                 continue;
             }
-            let folder = op["tags"][0].as_str().map(safe_name).unwrap_or_default();
+            let folder = op["tags"][0].as_str().map(escape_name).unwrap_or_default();
             if !folder.is_empty() && tags.insert(folder.clone()) {
                 folders.push((folder.clone(), Folder::default()));
             }
@@ -87,14 +87,14 @@ pub fn import(root: &Value) -> Import {
                     },
                     str::to_owned,
                 );
-            let key = s.unique(&folder, &safe_name(&name));
+            let key = s.unique(&folder, &escape_name(&name));
             let req = s.request(method, path, item, op, &key);
             requests.push((key, req));
         }
     }
     let name = match str_of(&root["info"]["title"]).trim() {
         "" => "API".to_owned(),
-        t => safe_name(t),
+        t => escape_name(t),
     };
     Import::Collection {
         name,

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Auth, AwsV4, Body, Folder, Grant, KeyValue, OAuth1, OAuth2, Request};
 use crate::postman::Import;
-use crate::store::safe_name;
+use crate::store::{escape_name, safe_name};
 
 pub fn is_insomnia(v: &Value) -> bool {
     (v["__export_format"] == 4 && v["resources"].is_array())
@@ -65,7 +65,7 @@ pub fn import(root: &Value) -> Import {
     Import::Collection {
         name: match name.trim() {
             "" => "Insomnia".to_owned(),
-            n => safe_name(n),
+            n => escape_name(n),
         },
         folders: r.folders,
         requests: r.requests,
@@ -153,7 +153,7 @@ impl Reader {
         let mut order = Vec::new();
         let mut taken = HashSet::new();
         for child in v["children"].as_array().into_iter().flatten() {
-            let base = safe_name(str_of(&child["name"]));
+            let base = escape_name(str_of(&child["name"]));
             let name = (1..)
                 .map(|n| match n {
                     1 => base.clone(),

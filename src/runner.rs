@@ -285,14 +285,16 @@ pub async fn run_collection(
             globals.extend(out.globals);
             let mut tests = out.tests;
             // Postman matches the request's name; a folder path works too, for names that
-            // repeat across folders.
+            // repeat across folders. Names may hold '/' themselves ("/api/v1/users"),
+            // so the name is the end of the path rather than its last segment.
             match out.next {
                 None => {}
                 Some(None) => at = plan.requests.len(),
                 Some(Some(next)) => {
-                    let found = plan.requests.iter().position(|(key, _)| {
-                        key == &next || key.rsplit('/').next() == Some(next.as_str())
-                    });
+                    let found = plan
+                        .requests
+                        .iter()
+                        .position(|(key, _)| key == &next || key.ends_with(&format!("/{next}")));
                     at = found.unwrap_or_else(|| {
                         tests.push(TestResult {
                             name: "setNextRequest".into(),

@@ -122,11 +122,7 @@ struct Open {
 
 impl Open {
     fn name(&self) -> String {
-        self.path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
+        leaf_name(&self.path)
     }
     fn dirty(&self) -> bool {
         self.saved != self.draft
@@ -464,8 +460,11 @@ enum NameKind {
     NewRequest(PathBuf),
     NewFolder(PathBuf),
     Rename(PathBuf),
-    /// The open request's draft, saved under a `folder/name`.
-    SaveAs(PathBuf),
+    /// The open request's draft, saved under a new name in `folder`.
+    SaveAs {
+        old: PathBuf,
+        folder: PathBuf,
+    },
     NewEnv,
     DuplicateEnv(String),
 }
@@ -1279,7 +1278,8 @@ impl App {
             Ok(r) => (r.status, r.elapsed),
             Err(_) => (0, sent.started.elapsed()),
         };
-        let path = self.ws.display_name(&sent.path);
+        // The key, not the name as shown: it has to lead back to the request.
+        let path = self.ws.key(&sent.path);
         let entry = HistoryEntry::new(path, status, elapsed.as_millis() as u64, sent.request);
         if let Err(e) = self.ws.append_history(&entry) {
             self.status = e;
@@ -1457,13 +1457,20 @@ impl App {
                     crate::grpc::stream(client, req, out_rx, emit).await
                 }
                 // Streams keep the default settings; only the host's certificate varies.
-                Ok(client) => match client.for_settings(&Default::default(), &req.url) {
-                    Ok(http) if is_ws => stream::websocket(http, req, out_rx, emit).await,
-                    Ok(http) if socketio => stream::socketio(http, req, out_rx, emit).await,
-                    Ok(http) if subscribes(&req) => stream::graphql(http, req, emit).await,
-                    Ok(http) => stream::sse(http, req, emit).await,
-                    Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
-                },
+                Ok(client) => {
+                    let upgrades = is_ws || socketio || subscribes(&req);
+                    let http = match upgrades {
+                        true => client.websocket_for(&req.url),
+                        false => client.for_settings(&Default::default(), &req.url),
+                    };
+                    match http {
+                        Ok(http) if is_ws => stream::websocket(http, req, out_rx, emit).await,
+                        Ok(http) if socketio => stream::socketio(http, req, out_rx, emit).await,
+                        Ok(http) if upgrades => stream::graphql(http, req, emit).await,
+                        Ok(http) => stream::sse(http, req, emit).await,
+                        Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
+                    }
+                }
                 Err(e) => emit(Event::Error(format!("Network settings: {e}"))),
             }
         });
@@ -1706,8 +1713,8 @@ impl App {
 
     /// Like Postman: the original keeps what was saved, and this tab, response included,
     /// becomes the new request.
-    fn save_as(&mut self, old: &Path, name: &str) -> Result<PathBuf, String> {
-        let new = self.ws.request_path(name)?;
+    fn save_as(&mut self, old: &Path, folder: &Path, name: &str) -> Result<PathBuf, String> {
+        let new = store::request_in(folder, name)?;
         if self.ws.exists(&new) {
             return Err(format!("\"{}\" already exists", self.ws.display_name(&new)));
         }
@@ -1749,9 +1756,9 @@ impl App {
                     None
                 })
             }
-            NameKind::SaveAs(old) => {
-                let old = old.clone();
-                self.save_as(&old, &name).map(|_| None)
+            NameKind::SaveAs { old, folder } => {
+                let (old, folder) = (old.clone(), folder.clone());
+                self.save_as(&old, &folder, &name).map(|_| None)
             }
         };
         let Some(Dialog::Name { kind, error, .. }) = &mut self.dialog else {
@@ -1775,6 +1782,55 @@ impl App {
             }
         }
     }
+}
+
+/// A request's or folder's name as people read it, from its path.
+fn leaf_name(path: &Path) -> String {
+    let leaf = match store::is_request(path) {
+        true => path.file_stem(),
+        // A dot in a folder name is not an extension.
+        false => path.file_name(),
+    };
+    store::unescape_name(&leaf.unwrap_or_default().to_string_lossy())
+}
+
+/// A "…" button that fills `path` from the system's file dialog; `save` asks where to
+/// write instead. A file inside the workspace comes back relative to it, so the path still
+/// works in a clone on another machine.
+fn browse(ui: &mut egui::Ui, path: &mut String, filters: &[(&str, &[&str])], save: bool) -> bool {
+    let hint = if save {
+        "Choose where to save"
+    } else {
+        "Choose a file"
+    };
+    if !ui.button("…").on_hover_text(hint).clicked() {
+        return false;
+    }
+    let chosen = pick_file(path, filters, save);
+    if let Some(p) = &chosen {
+        *path = p.clone();
+    }
+    chosen.is_some()
+}
+
+fn pick_file(current: &str, filters: &[(&str, &[&str])], save: bool) -> Option<String> {
+    let mut dialog = rfd::FileDialog::new();
+    for (name, exts) in filters {
+        dialog = dialog.add_filter(*name, exts);
+    }
+    let current = Path::new(current.trim());
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let dir = current.parent().map(|d| cwd.join(d)).filter(|d| d.is_dir());
+    dialog = dialog.set_directory(dir.unwrap_or_else(|| cwd.clone()));
+    if let Some(name) = current.file_name() {
+        dialog = dialog.set_file_name(name.to_string_lossy());
+    }
+    let chosen = match save {
+        true => dialog.save_file(),
+        false => dialog.pick_file(),
+    }?;
+    let shown = chosen.strip_prefix(&cwd).unwrap_or(&chosen);
+    Some(shown.display().to_string())
 }
 
 /// "application/json" from "application/json; charset=utf-8".
@@ -2562,7 +2618,7 @@ impl App {
             ui.ctx().layer_painter(layer).text(
                 pos + egui::vec2(14.0, 0.0),
                 egui::Align2::LEFT_CENTER,
-                path.file_stem().unwrap_or_default().to_string_lossy(),
+                leaf_name(&path),
                 egui::TextStyle::Body.resolve(ui.style()),
                 ui.visuals().strong_text_color(),
             );
@@ -2807,7 +2863,7 @@ impl App {
                                 .color(status_color(e.status)),
                         );
                         ui.add(
-                            egui::Label::new(e.path.as_str())
+                            egui::Label::new(store::unescape_path(&e.path))
                                 .truncate()
                                 .sense(egui::Sense::click()),
                         )
@@ -2831,7 +2887,10 @@ impl App {
                     self.runner = None;
                     self.restore(path, draft);
                 }
-                _ => self.status = format!("\"{}\" no longer exists", e.path),
+                _ => {
+                    let name = store::unescape_path(&e.path);
+                    self.status = format!("\"{name}\" no longer exists");
+                }
             }
         }
     }
@@ -2860,10 +2919,10 @@ impl App {
                         let badge = RichText::new(short_method(m)).monospace().small();
                         ui.label(badge.color(method_color(m)));
                     }
-                    let name = tab.path.file_stem().unwrap_or_default().to_string_lossy();
+                    let name = leaf_name(&tab.path);
                     let mut text = RichText::new(match open.is_some_and(Open::dirty) {
                         true => format!("{name} ●"),
-                        false => name.into_owned(),
+                        false => name,
                     });
                     if tab.preview {
                         text = text.italics();
@@ -2969,15 +3028,7 @@ impl App {
         let root = self.ws.collections();
         let crumbs: Vec<(String, PathBuf)> = (open.path.ancestors().skip(1))
             .take_while(|d| d.starts_with(&root) && *d != root)
-            .map(|d| {
-                (
-                    d.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    d.to_path_buf(),
-                )
-            })
+            .map(|d| (leaf_name(d), d.to_path_buf()))
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -3073,19 +3124,9 @@ impl App {
         };
         panel.resizable(true).show(ui, |ui| {
             ui.add_space(4.0);
+            // Buttons first, from the right; the name gets what is left and truncates,
+            // instead of running under them.
             ui.horizontal(|ui| {
-                for (name, dir) in &crumbs {
-                    let link = ui.link(RichText::new(name).weak());
-                    if link.on_hover_text("Folder settings").clicked() {
-                        folder_clicked = Some(dir.clone());
-                    }
-                    ui.weak("›");
-                }
-                ui.heading(open.name());
-                if open.dirty() {
-                    ui.colored_label(ORANGE, "●")
-                        .on_hover_text("Unsaved changes");
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Right to left: this lands to the right of Save.
                     let more = ui.button("⏷");
@@ -3112,6 +3153,23 @@ impl App {
                         .on_hover_text("Cookies the server set, sent back automatically");
                     ui.toggle_value(&mut self.code, "</> Code")
                         .on_hover_text("This request as curl, Python, Go, … to copy");
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
+                        for (name, dir) in &crumbs {
+                            let link = ui.link(RichText::new(name).weak());
+                            if link.on_hover_text("Folder settings").clicked() {
+                                folder_clicked = Some(dir.clone());
+                            }
+                            ui.weak("›");
+                        }
+                        if open.dirty() {
+                            ui.colored_label(ORANGE, "●")
+                                .on_hover_text("Unsaved changes");
+                        }
+                        let name = RichText::new(open.name()).heading();
+                        ui.add(egui::Label::new(name).truncate())
+                            .on_hover_text(open.name());
+                    });
                 });
             });
             ui.horizontal(|ui| {
@@ -3122,6 +3180,8 @@ impl App {
                             .strong(),
                     )
                     .width(90.0)
+                    // All 16 at once: at the default height the stream types scrolled away.
+                    .height(f32::INFINITY)
                     .show_ui(ui, |ui| {
                         for m in METHODS {
                             let text = RichText::new(*m).color(method_color(m));
@@ -3254,7 +3314,8 @@ impl App {
                 });
             }
             ui.add_space(2.0);
-            ui.horizontal(|ui| {
+            // Wraps: a narrow pane cut the last tabs off.
+            ui.horizontal_wrapped(|ui| {
                 let count =
                     |kv: &[KeyValue]| kv.iter().filter(|p| p.enabled && !p.key.is_empty()).count();
                 let tab = |n: usize, name: &str| {
@@ -3617,8 +3678,11 @@ impl App {
             self.ask_download();
         }
         if save_as && let Some(open) = &self.open {
-            let copy = format!("{} copy", self.ws.display_name(&open.path));
-            self.dialog = Some(Dialog::name(NameKind::SaveAs(open.path.clone()), copy));
+            let kind = NameKind::SaveAs {
+                old: open.path.clone(),
+                folder: open.path.parent().map(Path::to_path_buf).unwrap_or(root),
+            };
+            self.dialog = Some(Dialog::name(kind, format!("{} copy", open.name())));
         }
         if reflect {
             self.reflect(ui.ctx());
@@ -3770,6 +3834,22 @@ impl App {
             Dialog::Switch { .. } => switch_targets(&self.tree, &self.ws.collections(), &self.envs),
             _ => Vec::new(),
         };
+        let folders: Vec<(String, PathBuf)> = match dialog {
+            Dialog::Name {
+                kind: NameKind::SaveAs { .. },
+                ..
+            } => {
+                let root = self.ws.collections();
+                let mut found = vec![("(top level)".to_owned(), root.clone())];
+                let all = switch_targets(&self.tree, &root, &[]).into_iter();
+                found.extend(all.filter_map(|(label, _, go)| match go {
+                    Go::Folder(dir) => Some((label, dir)),
+                    _ => None,
+                }));
+                found
+            }
+            _ => Vec::new(),
+        };
         let mut modal = egui::Modal::new(egui::Id::new("dialog"));
         if let Dialog::Switch { .. } = dialog {
             // Pinned to the top: centred, it would jump as the list grows and shrinks.
@@ -3785,12 +3865,22 @@ impl App {
                         NameKind::NewRequest(_) => "New request",
                         NameKind::NewFolder(_) => "New folder",
                         NameKind::Rename(_) => "Rename",
-                        NameKind::SaveAs(_) => "Save as",
+                        NameKind::SaveAs { .. } => "Save as",
                         NameKind::NewEnv => "New environment",
                         NameKind::DuplicateEnv(_) => "Duplicate environment",
                     });
-                    if let NameKind::SaveAs(_) = kind {
-                        ui.weak("A folder in front puts it there: users/get user");
+                    if let NameKind::SaveAs { folder, .. } = kind {
+                        let shown = (folders.iter())
+                            .find(|(_, p)| p == folder)
+                            .map_or("", |(label, _)| label.as_str());
+                        egui::ComboBox::from_label("Folder")
+                            .selected_text(shown)
+                            .width(280.0)
+                            .show_ui(ui, |ui| {
+                                for (label, path) in &folders {
+                                    ui.selectable_value(folder, path.clone(), label);
+                                }
+                            });
                     }
                     let edit = ui.add(
                         egui::TextEdit::singleline(name)
@@ -3819,10 +3909,7 @@ impl App {
                     } else {
                         "request"
                     };
-                    ui.label(format!(
-                        "Delete {what} \"{}\"?",
-                        path.file_stem().unwrap_or_default().to_string_lossy()
-                    ));
+                    ui.label(format!("Delete {what} \"{}\"?", leaf_name(path)));
                     ui.horizontal(|ui| {
                         let delete = egui::Button::new(
                             RichText::new("Delete").strong().color(Color32::WHITE),
@@ -3901,11 +3988,19 @@ impl App {
                     if *download {
                         ui.weak("A successful response goes straight to this file, however big.");
                     }
-                    let edit = ui.add(
-                        egui::TextEdit::singleline(path)
-                            .hint_text("File path")
-                            .desired_width(f32::INFINITY),
-                    );
+                    let edit = ui
+                        .horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                browse(ui, path, &[], true);
+                                ui.add(
+                                    egui::TextEdit::singleline(path)
+                                        .hint_text("File path")
+                                        .desired_width(f32::INFINITY),
+                                )
+                            })
+                            .inner
+                        })
+                        .inner;
                     let enter = enter_pressed(ui);
                     if !enter && ui.memory(|m| m.focused().is_none()) {
                         edit.request_focus();
@@ -4043,8 +4138,8 @@ impl App {
                     ui.heading("Import a collection or spec");
                     ui.label(
                         "A Postman collection (v2.1) or environment, or an OpenAPI 3 / Swagger 2 \
-                         spec (JSON or YAML): paste it or the file's path, or drop the file \
-                         here. Nothing already here is replaced.",
+                         spec (JSON or YAML): choose the file, paste it or its path, or drop \
+                         the file here. Nothing already here is replaced.",
                     );
                     // An exported collection is often past MAX_EDIT once pasted.
                     let id = egui::Id::new("postman-text");
@@ -4080,7 +4175,16 @@ impl App {
                     ui.horizontal(|ui| {
                         let typed = !text.trim().is_empty();
                         let import = ui.add_enabled(typed, primary("Import")).clicked();
-                        if let Some(input) = dropped.or(import.then(|| text.clone())) {
+                        let chosen = (ui.button("Choose file…"))
+                            .on_hover_text("Pick the exported file instead of pasting it")
+                            .clicked()
+                            .then(|| {
+                                let kinds: &[&str] = &["json", "yaml", "yml", "har"];
+                                pick_file("", &[("Collection, spec or HAR", kinds)], false)
+                            })
+                            .flatten();
+                        let input = dropped.or(chosen).or(import.then(|| text.clone()));
+                        if let Some(input) = input {
                             then = Some(Box::new(move |app, _| app.submit_import(&input)));
                         }
                         cancel = ui.button("Close").clicked();
@@ -4609,11 +4713,14 @@ impl App {
         ui.add_enabled_ui(!running, |ui| {
             egui::Grid::new("runner-settings").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Data file");
-                ui.add(
-                    egui::TextEdit::singleline(&mut view.data_path)
-                        .hint_text("Optional CSV (with header row) or JSON array; one iteration per row")
-                        .desired_width(480.0),
-                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut view.data_path)
+                            .hint_text("Optional CSV (with header row) or JSON array; one iteration per row")
+                            .desired_width(480.0),
+                    );
+                    browse(ui, &mut view.data_path, &[("CSV or JSON", &["csv", "json"])], false);
+                });
                 ui.end_row();
                 ui.label("Iterations");
                 let has_data = !view.data_path.trim().is_empty();
@@ -4722,10 +4829,16 @@ impl App {
         egui::Modal::new(egui::Id::new("network")).show(ctx, |ui| {
             ui.set_width(560.0);
             ui.heading("Network");
-            ui.weak("Stored on this machine only (.state.toml), never committed.");
+            ui.weak("Stored on this machine only (in apitool.db), never exported.");
             ui.add_space(6.0);
             let field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
                 ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(f32::INFINITY));
+            };
+            let file_field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    browse(ui, text, &[], false);
+                    field(ui, text, hint);
+                });
             };
 
             ui.label(RichText::new("Proxy").strong());
@@ -4766,9 +4879,9 @@ impl App {
             ui.add_space(8.0);
             ui.label(RichText::new("Certificates").strong());
             ui.weak("The OS certificate store is always trusted; these are added on top.");
-            field(ui, &mut net.ca_file, "Extra CA bundle (PEM file path)");
+            file_field(ui, &mut net.ca_file, "Extra CA bundle (PEM file path)");
             let pfx = |path: &str| path.to_lowercase().ends_with(".pfx") || path.to_lowercase().ends_with(".p12");
-            field(ui, &mut net.client_cert, "Client certificate (.pem with key, or .pfx / .p12)");
+            file_field(ui, &mut net.client_cert, "Client certificate (.pem with key, or .pfx / .p12)");
             if pfx(&net.client_cert) {
                 ui.add(
                     egui::TextEdit::singleline(&mut net.client_cert_password)
@@ -4783,6 +4896,7 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut c.host).hint_text("*.corp.com or host:8443").desired_width(150.0));
                     let width = if pfx(&c.cert) { 220.0 } else { 330.0 };
                     ui.add(egui::TextEdit::singleline(&mut c.cert).hint_text("Certificate; empty sends none").desired_width(width));
+                    browse(ui, &mut c.cert, &[], false);
                     if pfx(&c.cert) {
                         ui.add(egui::TextEdit::singleline(&mut c.password).password(true).hint_text("PFX password").desired_width(100.0));
                     }
@@ -4944,8 +5058,12 @@ impl App {
 fn switch_targets(nodes: &[Node], root: &Path, envs: &[String]) -> Vec<(String, String, Go)> {
     fn walk(nodes: &[Node], root: &Path, out: &mut Vec<(String, String, Go)>) {
         let label = |path: &Path| {
-            let rel = path.strip_prefix(root).unwrap_or(path).with_extension("");
-            rel.to_string_lossy().replace('\\', "/")
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            let rel = match store::is_request(path) {
+                true => rel.with_extension(""),
+                false => rel.to_owned(),
+            };
+            store::unescape_path(&rel.to_string_lossy().replace('\\', "/"))
         };
         for node in nodes {
             match node {
@@ -5565,7 +5683,16 @@ fn body_editor(
         }
         Body::Multipart { parts } => {
             ui.weak("A value starting with @ uploads that file, e.g. @files/photo.png (relative to the workspace). Or drop files here.");
-            for path in dropped_files(ui) {
+            let mut files = dropped_files(ui);
+            if ui
+                .small_button("+ File…")
+                .on_hover_text("Add a file part")
+                .clicked()
+                && let Some(file) = pick_file("", &[], false)
+            {
+                files.push(PathBuf::from(file));
+            }
+            for path in files {
                 let key = path
                     .file_stem()
                     .unwrap_or_default()
@@ -5588,19 +5715,22 @@ fn body_editor(
             if let Some(dropped) = dropped_files(ui).pop() {
                 *path = dropped.display().to_string();
             }
-            var_edit(
-                ui,
-                egui::Id::new("body-file"),
-                path,
-                vars,
-                egui::TextStyle::Monospace,
-                false,
-                &[],
-                |e| {
-                    e.hint_text("path/to/file (relative to the workspace)")
-                        .desired_width(f32::INFINITY)
-                },
-            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                browse(ui, path, &[], false);
+                var_edit(
+                    ui,
+                    egui::Id::new("body-file"),
+                    path,
+                    vars,
+                    egui::TextStyle::Monospace,
+                    false,
+                    &[],
+                    |e| {
+                        e.hint_text("path/to/file (relative to the workspace)")
+                            .desired_width(f32::INFINITY)
+                    },
+                );
+            });
             if !path.trim().is_empty() && !path.contains("{{") {
                 match std::fs::metadata(&*path) {
                     Ok(m) if m.is_file() => {
@@ -6158,27 +6288,27 @@ fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) 
     });
     let mut done = false;
     let mut remove = None;
-    egui::Grid::new("topics")
-        .num_columns(4)
-        .spacing([8.0, 6.0])
-        .show(ui, |ui| {
-            for (i, t) in topics.iter_mut().enumerate() {
-                done |= ui.checkbox(&mut t.enabled, "").changed();
+    // Rows rather than a Grid: a grid cell is as wide as last frame's column, so the
+    // filter never grew past its first few characters.
+    for (i, t) in topics.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            done |= ui.checkbox(&mut t.enabled, "").changed();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("🗑").on_hover_text("Remove").clicked() {
+                    remove = Some(i);
+                }
+                done |= qos_box(ui, ("topic-qos", i), &mut t.qos);
                 done |= ui
                     .add(
                         egui::TextEdit::singleline(&mut t.filter)
                             .hint_text("sensors/+/temperature")
                             .font(egui::TextStyle::Monospace)
-                            .desired_width(320.0),
+                            .desired_width(f32::INFINITY),
                     )
                     .lost_focus();
-                done |= qos_box(ui, ("topic-qos", i), &mut t.qos);
-                if ui.small_button("🗑").on_hover_text("Remove").clicked() {
-                    remove = Some(i);
-                }
-                ui.end_row();
-            }
+            });
         });
+    }
     if let Some(i) = remove {
         topics.remove(i);
         done = true;
@@ -6583,6 +6713,12 @@ fn grpc_bar(
             egui::TextEdit::singleline(&mut req.proto)
                 .hint_text("protos/service.proto, or empty to ask the server")
                 .desired_width(260.0),
+        );
+        browse(
+            ui,
+            &mut req.proto,
+            &[("Protocol Buffers", &["proto"])],
+            false,
         );
         let reload = ui
             .small_button("↻")
@@ -7004,6 +7140,65 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
     ));
 }
 
+/// Status, time (hover: where it went), size (hover: headers and body) and version.
+fn status_line(ui: &mut egui::Ui, view: &ResponseView) {
+    let h = &view.head;
+    ui.label(
+        RichText::new(format!("{} {}", h.status, h.reason))
+            .strong()
+            .color(status_color(h.status)),
+    )
+    .on_hover_text(status_meaning(h.status));
+    let ms = ui.weak(format!("{} ms", h.elapsed.as_millis()));
+    if let Some(waited) = h.sent.waited {
+        let hops = match h.sent.hops.len() {
+            0 => String::new(),
+            1 => ", the redirect included".into(),
+            n => format!(", {n} redirects included"),
+        };
+        let connect = match h.sent.connect {
+            Some(c) => {
+                let (dns, tls) = (h.sent.dns, h.sent.tls);
+                let tcp = (c.saturating_sub(dns.unwrap_or_default()))
+                    .saturating_sub(tls.unwrap_or_default());
+                let line = |name, d: Option<Duration>| {
+                    d.map_or(String::new(), |d| format!("{name} {} ms\n", d.as_millis()))
+                };
+                format!(
+                    "{}{}{}",
+                    line("DNS", dns),
+                    line("TCP", Some(tcp)),
+                    line("TLS", tls)
+                )
+            }
+            None => "Reused an open connection\n".into(),
+        };
+        let connected = waited.saturating_sub(h.sent.connect.unwrap_or_default());
+        ms.on_hover_text(format!(
+            "{connect}Waiting (TTFB) {} ms{hops}\nDownload {} ms",
+            connected.as_millis(),
+            h.elapsed.saturating_sub(waited).as_millis()
+        ));
+    }
+    // As received, before any re-indenting for display.
+    let headers: usize = (h.headers.iter()).map(|(k, v)| k.len() + v.len() + 4).sum();
+    let sizes = format!(
+        "Headers {}\nBody {}",
+        human_size(headers),
+        human_size(view.raw_size)
+    );
+    if h.truncated {
+        ui.colored_label(ORANGE, format!("{} (cut)", human_size(view.raw_size)))
+            .on_hover_text(format!(
+                "{sizes}\nOnly the first {} were kept, to save memory.",
+                human_size(view.raw_size)
+            ));
+    } else {
+        ui.weak(human_size(view.raw_size)).on_hover_text(sizes);
+    }
+    ui.weak(&h.version);
+}
+
 /// Returns an example to save when the user asked for one.
 /// `wrap` is the word-wrap switch; `save_file` and `open_external` are set when the user asks
 /// to save the body or see it in a browser.
@@ -7022,110 +7217,18 @@ fn response_ui(
 ) -> Option<Example> {
     let mut example = None;
     let passed = shown.tests.iter().filter(|t| t.passed).count();
+    // Two rows, so a narrow pane wraps them instead of drawing one control over another.
+    // The status comes first: it matters more than the actions, which wrap at the right.
     ui.horizontal(|ui| {
         match &shown.result {
-            Ok(view) => {
-                let h = &view.head;
-                ui.label(
-                    RichText::new(format!("{} {}", h.status, h.reason))
-                        .strong()
-                        .color(status_color(h.status)),
-                )
-                .on_hover_text(status_meaning(h.status));
-                let ms = ui.weak(format!("{} ms", h.elapsed.as_millis()));
-                if let Some(waited) = h.sent.waited {
-                    let hops = match h.sent.hops.len() {
-                        0 => String::new(),
-                        1 => ", the redirect included".into(),
-                        n => format!(", {n} redirects included"),
-                    };
-                    let connect = match h.sent.connect {
-                        Some(c) => {
-                            let (dns, tls) = (h.sent.dns, h.sent.tls);
-                            let tcp = (c.saturating_sub(dns.unwrap_or_default()))
-                                .saturating_sub(tls.unwrap_or_default());
-                            let line = |name, d: Option<Duration>| {
-                                d.map_or(String::new(), |d| {
-                                    format!("{name} {} ms\n", d.as_millis())
-                                })
-                            };
-                            format!(
-                                "{}{}{}",
-                                line("DNS", dns),
-                                line("TCP", Some(tcp)),
-                                line("TLS", tls)
-                            )
-                        }
-                        None => "Reused an open connection\n".into(),
-                    };
-                    let connected = waited.saturating_sub(h.sent.connect.unwrap_or_default());
-                    ms.on_hover_text(format!(
-                        "{connect}Waiting (TTFB) {} ms{hops}\nDownload {} ms",
-                        connected.as_millis(),
-                        h.elapsed.saturating_sub(waited).as_millis()
-                    ));
-                }
-                // As received, before any re-indenting for display.
-                let headers: usize = (h.headers.iter()).map(|(k, v)| k.len() + v.len() + 4).sum();
-                let sizes = format!(
-                    "Headers {}\nBody {}",
-                    human_size(headers),
-                    human_size(view.raw_size)
-                );
-                if h.truncated {
-                    ui.colored_label(ORANGE, format!("{} (cut)", human_size(view.raw_size)))
-                        .on_hover_text(format!(
-                            "{sizes}\nOnly the first {} were kept, to save memory.",
-                            human_size(view.raw_size)
-                        ));
-                } else {
-                    ui.weak(human_size(view.raw_size)).on_hover_text(sizes);
-                }
-                ui.weak(&h.version);
-                ui.separator();
-                ui.selectable_value(tab, RespTab::Body, "Body");
-                ui.selectable_value(
-                    tab,
-                    RespTab::Headers,
-                    format!("Headers ({})", h.headers.len()),
-                );
-                let cookies = crate::cookies::from_response(&h.headers).len();
-                if cookies > 0 {
-                    ui.selectable_value(tab, RespTab::Cookies, format!("Cookies ({cookies})"))
-                        .on_hover_text("What this response's Set-Cookie headers set");
-                }
-                // gRPC goes out its own way and isn't recorded.
-                if !h.sent.method.is_empty() {
-                    ui.selectable_value(tab, RespTab::Timeline, "Timeline")
-                        .on_hover_text("What was sent, redirects, and what came back");
-                }
-            }
+            Ok(view) => status_line(ui, view),
             Err(_) => {
                 ui.colored_label(RED, "Request failed");
-                ui.separator();
-                ui.selectable_value(tab, RespTab::Body, "Error");
             }
         }
-        if !shown.tests.is_empty() {
-            let color = if passed == shown.tests.len() {
-                GREEN
-            } else {
-                RED
-            };
-            let label =
-                RichText::new(format!("Tests ({passed}/{})", shown.tests.len())).color(color);
-            ui.selectable_value(tab, RespTab::Tests, label);
-        }
-        if !shown.logs.is_empty() {
-            ui.selectable_value(
-                tab,
-                RespTab::Console,
-                format!("Console ({})", shown.logs.len()),
-            );
-        }
-        past_menu(ui, past, shown.past);
-        if let Ok(view) = &mut shown.result {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let actions = egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true);
+        ui.with_layout(actions, |ui| {
+            if let Ok(view) = &mut shown.result {
                 let timeline = *tab == RespTab::Timeline;
                 let binary = view.head.bytes.is_some();
                 let what = if timeline {
@@ -7174,50 +7277,107 @@ fn response_ui(
                         body: view.unfiltered.clone().unwrap_or_else(|| view.text.clone()),
                     });
                 }
-                if *tab == RespTab::Body && !binary && view.held.is_none() {
-                    ui.separator();
-                    let svg = external_type(&view.head) == Some("svg");
-                    if !view.preview
-                        && (ui.selectable_label(*wrap, "Wrap"))
-                            .on_hover_text("Wrap long lines")
-                            .clicked()
-                    {
-                        *wrap = !*wrap;
-                    }
-                    // Right to left: Raw is added first to sit on the right. An SVG that
-                    // isn't valid XML has no Pretty, but Raw still leaves the preview.
-                    if (view.other.is_some() || svg)
-                        && (ui.selectable_label(!view.pretty && !view.preview, "Raw"))
-                            .on_hover_text("As received")
-                            .clicked()
-                    {
-                        view.preview = false;
-                        view.set_pretty(false);
-                    }
-                    if view.other.is_some()
-                        && (ui.selectable_label(view.pretty && !view.preview, "Pretty")).clicked()
-                    {
-                        view.preview = false;
-                        view.set_pretty(true);
-                    }
-                    if svg && ui.selectable_label(view.preview, "Preview").clicked() {
-                        view.preview = true;
-                        view.find.close();
-                    }
-                    let shortcut = ui.ctx().format_shortcut(&FIND);
-                    if !view.preview
-                        && (ui.selectable_label(view.find.open, "Find"))
-                            .on_hover_text(shortcut)
-                            .clicked()
-                    {
-                        match view.find.open {
-                            true => view.find.close(),
-                            false => (view.find.open, view.find.focus) = (true, true),
-                        }
+            }
+            past_menu(ui, past, shown.past);
+        });
+    });
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Ok(view) = &mut shown.result
+                && *tab == RespTab::Body
+                && view.head.bytes.is_none()
+                && view.held.is_none()
+            {
+                let svg = external_type(&view.head) == Some("svg");
+                if !view.preview
+                    && (ui.selectable_label(*wrap, "Wrap"))
+                        .on_hover_text("Wrap long lines")
+                        .clicked()
+                {
+                    *wrap = !*wrap;
+                }
+                // Right to left: Raw is added first to sit on the right. An SVG that
+                // isn't valid XML has no Pretty, but Raw still leaves the preview.
+                if (view.other.is_some() || svg)
+                    && (ui.selectable_label(!view.pretty && !view.preview, "Raw"))
+                        .on_hover_text("As received")
+                        .clicked()
+                {
+                    view.preview = false;
+                    view.set_pretty(false);
+                }
+                if view.other.is_some()
+                    && (ui.selectable_label(view.pretty && !view.preview, "Pretty")).clicked()
+                {
+                    view.preview = false;
+                    view.set_pretty(true);
+                }
+                if svg && ui.selectable_label(view.preview, "Preview").clicked() {
+                    view.preview = true;
+                    view.find.close();
+                }
+                let shortcut = ui.ctx().format_shortcut(&FIND);
+                if !view.preview
+                    && (ui.selectable_label(view.find.open, "Find"))
+                        .on_hover_text(shortcut)
+                        .clicked()
+                {
+                    match view.find.open {
+                        true => view.find.close(),
+                        false => (view.find.open, view.find.focus) = (true, true),
                     }
                 }
+                ui.separator();
+            }
+            let tabs = egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true);
+            ui.with_layout(tabs, |ui| {
+                match &shown.result {
+                    Ok(view) => {
+                        let h = &view.head;
+                        ui.selectable_value(tab, RespTab::Body, "Body");
+                        ui.selectable_value(
+                            tab,
+                            RespTab::Headers,
+                            format!("Headers ({})", h.headers.len()),
+                        );
+                        let cookies = crate::cookies::from_response(&h.headers).len();
+                        if cookies > 0 {
+                            ui.selectable_value(
+                                tab,
+                                RespTab::Cookies,
+                                format!("Cookies ({cookies})"),
+                            )
+                            .on_hover_text("What this response's Set-Cookie headers set");
+                        }
+                        // gRPC goes out its own way and isn't recorded.
+                        if !h.sent.method.is_empty() {
+                            ui.selectable_value(tab, RespTab::Timeline, "Timeline")
+                                .on_hover_text("What was sent, redirects, and what came back");
+                        }
+                    }
+                    Err(_) => {
+                        ui.selectable_value(tab, RespTab::Body, "Error");
+                    }
+                }
+                if !shown.tests.is_empty() {
+                    let color = if passed == shown.tests.len() {
+                        GREEN
+                    } else {
+                        RED
+                    };
+                    let label = RichText::new(format!("Tests ({passed}/{})", shown.tests.len()))
+                        .color(color);
+                    ui.selectable_value(tab, RespTab::Tests, label);
+                }
+                if !shown.logs.is_empty() {
+                    ui.selectable_value(
+                        tab,
+                        RespTab::Console,
+                        format!("Console ({})", shown.logs.len()),
+                    );
+                }
             });
-        }
+        });
     });
     // A row of its own: in the bar it squeezed out the tabs left of it.
     if *tab == RespTab::Body
@@ -7913,6 +8073,7 @@ fn short_method(m: &str) -> &str {
     match m {
         "DELETE" => "DEL",
         "OPTIONS" => "OPT",
+        "CONNECT" => "CONN",
         "GRAPHQL" => "GQL",
         m => m,
     }
@@ -7925,6 +8086,7 @@ fn method_color(m: &str) -> Color32 {
         "PUT" => Color32::from_rgb(70, 140, 230),
         "PATCH" => Color32::from_rgb(170, 110, 220),
         "DELETE" => RED,
+        "QUERY" => Color32::from_rgb(40, 170, 170),
         "GRAPHQL" => Color32::from_rgb(229, 53, 171),
         _ => Color32::GRAY,
     }
@@ -9097,11 +9259,16 @@ mod ui_tests {
         h.run();
         h.get_by_label("Save as…").click();
         h.run();
-        let Some(Dialog::Name { name, .. }) = &mut h.state_mut().dialog else {
+        let Some(Dialog::Name { name, kind, .. }) = &mut h.state_mut().dialog else {
             panic!("the save-as dialog should be open");
         };
         assert_eq!(name, "r copy", "free by default, next to the original");
-        *name = "team/r v2".into();
+        let NameKind::SaveAs { folder, .. } = kind else {
+            panic!("save as")
+        };
+        assert_eq!(*folder, ws.collections(), "in the original's folder");
+        *folder = team.clone();
+        *name = "r v2".into();
         h.key_press(Key::Enter);
         h.run();
         shot(&mut h, "61-saved-as");
@@ -9122,7 +9289,10 @@ mod ui_tests {
         h.run();
         h.get_by_label("Save as…").click();
         h.run();
-        if let Some(Dialog::Name { name, .. }) = &mut h.state_mut().dialog {
+        if let Some(Dialog::Name { name, kind, .. }) = &mut h.state_mut().dialog
+            && let NameKind::SaveAs { folder, .. } = kind
+        {
+            *folder = ws.collections();
             *name = "r".into();
         }
         h.key_press(Key::Enter);

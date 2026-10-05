@@ -350,8 +350,9 @@ impl Workspace {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// "users/get user" for a request, "users" for a folder, "" for the root.
-    fn key(&self, path: &Path) -> String {
+    /// "users/get user" for a request, "users" for a folder, "" for the root: segments
+    /// escaped (`escape_name`), so it goes back through `request_path` unchanged.
+    pub fn key(&self, path: &Path) -> String {
         let rel = path.strip_prefix(self.collections()).unwrap_or(path);
         let rel = match is_request(path) {
             true => rel.with_extension(""),
@@ -523,10 +524,10 @@ impl Workspace {
         self.root.join("collections")
     }
 
-    /// "folder/request" as shown in runner results.
+    /// "folder/request" as people read it (runner results, the status bar); `key` is the
+    /// form that goes back through `request_path`.
     pub fn display_name(&self, path: &Path) -> String {
-        let rel = path.strip_prefix(self.collections()).unwrap_or(path);
-        rel.with_extension("").to_string_lossy().replace('\\', "/")
+        unescape_path(&self.key(path))
     }
 
     /// Whether a request (`….toml`) or folder is in the workspace.
@@ -609,7 +610,7 @@ impl Workspace {
         requests: &[(String, String)],
         orders: &HashMap<String, Vec<String>>,
     ) -> Vec<Node> {
-        let leaf = |key: &str| key.rsplit('/').next().unwrap_or(key).to_owned();
+        let leaf = |key: &str| unescape_name(key.rsplit('/').next().unwrap_or(key));
         let mut subfolders: Vec<Node> = folders
             .iter()
             .filter(|(key, _)| parent_of(key) == parent)
@@ -758,17 +759,18 @@ impl Workspace {
         sql(tx.commit())
     }
 
-    /// `folder/name` (as shown by `display_name`) → its path. Every segment must be a valid
-    /// name, which also keeps `..` out.
+    /// `folder/name` (a `key`, or typed with plain names) → its path. Segments are escaped
+    /// as needed, which also keeps `..` out.
     pub fn request_path(&self, name: &str) -> Result<PathBuf, String> {
         let name = name.trim().trim_matches('/');
         let name = name.strip_suffix(".toml").unwrap_or(name);
         let (dirs, file) = name.rsplit_once('/').unwrap_or(("", name));
         let mut path = self.collections();
+        let normal = |s: &str| segment(&unescape_name(s));
         for dir in dirs.split('/').filter(|d| !d.is_empty()) {
-            path.push(valid_name(dir)?);
+            path.push(normal(dir)?);
         }
-        Ok(path.join(format!("{}.toml", valid_name(file)?)))
+        Ok(path.join(format!("{}.toml", normal(file)?)))
     }
 
     /// Every request under `scope` (a folder or a single request), in tree order, with
@@ -787,7 +789,7 @@ impl Workspace {
 
     /// Creates `<dir>/<name>`, refusing to overwrite.
     pub fn create_request(&self, dir: &Path, name: &str) -> Result<PathBuf, String> {
-        let path = dir.join(format!("{}.toml", valid_name(name)?));
+        let path = request_in(dir, name)?;
         if self.exists(&path) {
             return Err(format!("\"{name}\" already exists"));
         }
@@ -796,7 +798,7 @@ impl Workspace {
     }
 
     pub fn create_folder(&self, dir: &Path, name: &str) -> Result<PathBuf, String> {
-        let path = dir.join(valid_folder_name(name)?);
+        let path = dir.join(folder_segment(name)?);
         if self.exists(&path) {
             return Err(format!("\"{name}\" already exists"));
         }
@@ -811,8 +813,8 @@ impl Workspace {
     pub fn rename(&self, path: &Path, name: &str) -> Result<PathBuf, String> {
         let request = is_request(path);
         let new = match request {
-            true => path.with_file_name(format!("{}.toml", valid_name(name)?)),
-            false => path.with_file_name(valid_folder_name(name)?),
+            true => path.with_file_name(format!("{}.toml", segment(name)?)),
+            false => path.with_file_name(folder_segment(name)?),
         };
         if self.exists(&new) {
             return Err(format!("\"{}\" already exists", name.trim()));
@@ -1084,14 +1086,15 @@ impl Workspace {
     }
 
     /// Adds a top-level folder `name` ("<name> copy" when taken, so nothing is replaced)
-    /// holding `folders` and `requests`, keyed below it ("" is the folder itself).
+    /// holding `folders` and `requests`, keyed below it ("" is the folder itself) by
+    /// segments made with `escape_name`.
     pub fn add_tree(
         &self,
         name: &str,
         folders: &[(String, Folder)],
         requests: &[(String, Request)],
     ) -> Result<PathBuf, String> {
-        let dir = self.collections().join(valid_folder_name(name)?);
+        let dir = self.collections().join(folder_segment(name)?);
         let dir = match self.exists(&dir) {
             true => self.copy_of(&dir),
             false => dir,
@@ -1099,7 +1102,9 @@ impl Workspace {
         let top = self.key(&dir);
         let under = |key: &str| -> Result<String, String> {
             for part in key.split('/').filter(|p| !p.is_empty()) {
-                valid_name(part)?;
+                if *part != escape_name(&unescape_name(part)) {
+                    return Err(format!("\"{part}\" isn't an escaped name"));
+                }
             }
             Ok(match key.is_empty() {
                 true => top.clone(),
@@ -1310,14 +1315,81 @@ fn prune(dir: &Path, wanted: &HashSet<&Path>, folders: &HashSet<PathBuf>) -> Res
     Ok(())
 }
 
-/// "users/admin"; unlike `display_name`, a dot in a folder name isn't an extension.
+/// "users/admin" as people read it.
 pub fn folder_name(root: &Path, dir: &Path) -> String {
     let rel = dir.strip_prefix(root).unwrap_or(dir);
-    rel.to_string_lossy().replace('\\', "/")
+    unescape_path(&rel.to_string_lossy().replace('\\', "/"))
 }
 
-/// Names become file names in an export, on macOS and Windows alike, so reject rather
-/// than silently mangle.
+/// Characters a file name can't hold on Windows or macOS, plus '%', the escape itself.
+const UNSAFE: &str = r#"<>:"/\|?*%"#;
+
+/// A request or folder name as one segment of its key and of its file name in an export:
+/// what a file name can't hold is %-escaped, so any name (Postman's "/api/v1/users", "a:b")
+/// keeps its exact text. Undone by `unescape_name`.
+pub fn escape_name(name: &str) -> String {
+    let name = name.trim();
+    let last = name.chars().count().saturating_sub(1);
+    let mut out = String::with_capacity(name.len());
+    for (i, c) in name.chars().enumerate() {
+        // A leading dot hides the file, a trailing one Windows drops.
+        let edge_dot = c == '.' && (i == 0 || i == last);
+        if UNSAFE.contains(c) || c.is_control() || edge_dot {
+            for b in c.encode_utf8(&mut [0; 4]).bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The name a key segment stands for, see `escape_name`. A '%' not followed by two hex
+/// digits is kept, so names from before the escaping read as they were.
+pub fn unescape_name(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok());
+        match (bytes[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// "a/b" tree keys (and runner names) as people read them: each segment unescaped.
+pub fn unescape_path(key: &str) -> String {
+    let parts: Vec<String> = key.split('/').map(unescape_name).collect();
+    parts.join("/")
+}
+
+/// Where a request named `name` goes in `dir`.
+pub fn request_in(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    Ok(dir.join(format!("{}.toml", segment(name)?)))
+}
+
+/// A name typed or imported, as a key segment.
+fn segment(name: &str) -> Result<String, String> {
+    match escape_name(name) {
+        s if s.is_empty() => Err("name can't be empty".into()),
+        s => Ok(s),
+    }
+}
+
+/// Environment names become file names in an export, on macOS and Windows alike, so
+/// reject rather than silently mangle.
 fn valid_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
     if name.is_empty() || name.starts_with('.') || name.ends_with('.') {
@@ -1349,8 +1421,8 @@ pub fn safe_name(name: &str) -> String {
 }
 
 /// A folder named like a request file would be read back as one.
-fn valid_folder_name(name: &str) -> Result<&str, String> {
-    let name = valid_name(name)?;
+fn folder_segment(name: &str) -> Result<String, String> {
+    let name = segment(name)?;
     match name.ends_with(".toml") {
         true => Err("a folder name can't end with .toml".into()),
         false => Ok(name),
@@ -1390,8 +1462,8 @@ mod tests {
             "must not overwrite"
         );
         assert!(
-            ws.create_request(&folder, "a/b").is_err(),
-            "path separators are not names"
+            ws.create_request(&folder, " ").is_err(),
+            "a name can't be blank"
         );
 
         let renamed = ws.rename(&path, "Fetch user").unwrap();
@@ -1439,6 +1511,60 @@ mod tests {
         // A second handle (the MCP server next to the app) sees the same data.
         let other = Workspace::open(root.clone()).unwrap();
         assert_eq!(other.env_vars(Some("dev")).unwrap()["token"], "new");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn names_are_escaped_into_keys_and_come_back_unchanged() {
+        for name in [
+            "/api/v1/users",
+            r#"a:b "c" <d> | e? * f\g"#,
+            "50% off",
+            ".hidden.",
+            "é/ü",
+        ] {
+            let seg = escape_name(name);
+            assert!(
+                !seg.contains(['/', '\\', ':', '"', '<', '>', '|', '?', '*']),
+                "{seg}"
+            );
+            assert!(!seg.starts_with('.') && !seg.ends_with('.'), "{seg}");
+            assert_eq!(unescape_name(&seg), name);
+        }
+        // Names from before the escaping read as they were.
+        assert_eq!(unescape_name("100%"), "100%");
+        assert_eq!(unescape_name("a%zz"), "a%zz");
+    }
+
+    /// Postman names hold '/' ("/api/v0/home/feed"): it must neither split the key nor be
+    /// replaced, here, in an export, or in the history that leads back to the request.
+    #[test]
+    fn a_name_with_slashes_survives_the_tree_files_and_history() {
+        let root = fresh("slash-names");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let api = ws.create_folder(&ws.collections(), "v0: api").unwrap();
+        let feed = ws.create_request(&api, "/api/v0/home/feed").unwrap();
+        assert_eq!(feed.parent().unwrap(), api, "one level down, not four");
+        assert_eq!(ws.display_name(&feed), "v0: api//api/v0/home/feed");
+        let tree = ws.tree();
+        let Node::Folder { name, children, .. } = &tree[0] else {
+            panic!("folder")
+        };
+        assert_eq!(name, "v0: api");
+        assert!(matches!(&children[0], Node::Request { name, .. } if name == "/api/v0/home/feed"));
+        // What history keeps leads back to the same request.
+        assert_eq!(ws.request_path(&ws.key(&feed)).unwrap(), feed);
+        let renamed = ws.rename(&feed, "/api/v1/home/feed?x=1").unwrap();
+        assert_eq!(ws.display_name(&renamed), "v0: api//api/v1/home/feed?x=1");
+
+        let out = root.join("export");
+        ws.export(&out).unwrap();
+        let clone = Workspace::open(out).unwrap();
+        let names: Vec<String> = (clone.load_requests_in(&clone.collections()).unwrap())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["v0: api//api/v1/home/feed?x=1"]);
         let _ = fs::remove_dir_all(&root);
     }
 
