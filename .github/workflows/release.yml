@@ -1,17 +1,20 @@
 name: release
 
+# main's run checks, tests, builds and packages each commit, once. A v* tag's run compiles
+# nothing: it waits for main's run of the tagged commit and publishes what that built.
 on:
   push:
-    # A tag's run can only restore caches saved on its own ref or on main, so with tags
-    # alone every release built from scratch. main's runs keep the cache warm.
     branches: [main]
     tags: ["v*"]
 
 permissions:
   contents: write
+  # The tag's run reads main's run and downloads its artifacts.
+  actions: read
 
 jobs:
   build:
+    if: github.ref_type == 'branch'
     strategy:
       fail-fast: true
       matrix:
@@ -39,9 +42,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-          # No later run can read a tag's cache; saving it would only push main's out of
-          # the repository's 10 GB.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         if: matrix.check
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -67,38 +67,63 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
-        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
+        # Named for Cargo.toml's version, as the update check looks for it: the tag that
+        # publishes it isn't pushed yet.
         run: |
-          name="apitool-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          name="apitool-v$version-${{ matrix.target }}"
           dir="target/${{ matrix.target }}/release"
           mkdir dist
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
+          if [[ "$RUNNER_OS" == Windows ]]; then
             7z a "dist/$name.zip" "./$dir/apitool.exe" "./$dir/apitool-cli.exe"
           else
             tar -C "$dir" -czf "dist/$name.tar.gz" apitool apitool-cli
           fi
       - uses: actions/upload-artifact@v7
-        if: startsWith(github.ref, 'refs/tags/')
         with:
           name: ${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
   release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Wait for main's run of this commit
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
+          # The tag is pushed right after main, so main's run may take a moment to show.
+          for _ in $(seq 30); do
+            run=$(gh run list --workflow release.yml --branch main --event push \
+              --commit "$GITHUB_SHA" --limit 1 --json databaseId -q '.[].databaseId')
+            [ -n "$run" ] && break
+            sleep 10
+          done
+          if [ -z "$run" ]; then
+            echo "::error::main has no run of $GITHUB_SHA: push the commit to main before tagging it"
+            exit 1
+          fi
+          while [ "$(gh run view "$run" --json status -q .status)" != completed ]; do
+            sleep 30
+          done
+          if [ "$(gh run view "$run" --json conclusion -q .conclusion)" != success ]; then
+            echo "::error::main's run $run of this commit didn't pass: nothing to publish"
+            exit 1
+          fi
+          echo "RUN=$run" >> "$GITHUB_ENV"
+      - name: Publish
+        run: |
+          gh run download "$RUN" --dir dist
+          # A folder per artifact. A tag that isn't Cargo.toml's version matches nothing.
+          files=(dist/*/apitool-"$GITHUB_REF_NAME"-*)
+          if [ ! -e "${files[0]}" ]; then
+            echo "::error::main built $(ls dist/*/), not $GITHUB_REF_NAME"
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
