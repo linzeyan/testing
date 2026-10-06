@@ -11,6 +11,7 @@ use crate::graphql::{self, Operation};
 use crate::http;
 use crate::i18n::{fill, n_, t, tf};
 use crate::loadtest::{self, Stats};
+use crate::logfile::redact;
 use crate::model::{self, Auth, Body, Example, Folder, Inherited, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
 use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
@@ -40,6 +41,9 @@ const FILTER_HINT: &str = "Filter by name";
 /// Lines longer than this are clipped in the viewer; JSON is pretty-printed first so
 /// only non-JSON minified bodies hit it.
 const MAX_LINE: usize = 4096;
+/// How long what arrives in bulk (stream messages, run results, mock log lines) waits to be
+/// drawn, so a burst is one frame, not one each.
+const BATCHED: Duration = Duration::from_millis(250);
 // Status colours are shared by both themes: each keeps 3:1 contrast on the dark and the
 // light background alike.
 const RED: Color32 = Color32::from_rgb(220, 80, 80);
@@ -258,6 +262,11 @@ impl Log {
         crate::runner::clip(text, MAX_EVENT_TEXT);
         self.bytes += text.len();
         self.ended |= matches!(event, Event::Closed(_) | Event::Error(_));
+        match &event {
+            Event::Open(s) | Event::Closed(s) => log::info!("stream: {}", redact(s)),
+            Event::Error(s) => log::warn!("stream: {}", redact(s)),
+            _ => {}
+        }
         self.events.push_back((at, event));
         while self.events.len() > MAX_EVENTS || self.bytes > MAX_EVENT_BYTES {
             let Some((_, mut gone)) = self.events.pop_front() else {
@@ -729,6 +738,10 @@ pub struct App {
     explorer: Explorer,
     load: Option<LoadView>,
     status: String,
+    /// The status as last logged: the log keeps every message the status bar showed.
+    logged_status: String,
+    /// Frames over 50 ms not logged yet: how many, the worst (s), when last logged.
+    slow_frames: (u32, f32, Option<Instant>),
     dialog: Option<Dialog>,
     env_editor: Option<EnvEditor>,
     folder_editor: Option<FolderEditor>,
@@ -805,6 +818,8 @@ impl App {
             explorer: Explorer::default(),
             load: None,
             status: String::new(),
+            logged_status: String::new(),
+            slow_frames: (0, 0.0, None),
             dialog: None,
             env_editor: None,
             folder_editor: None,
@@ -1460,6 +1475,27 @@ impl App {
     }
 
     /// `download`: stream a successful body to this file instead of keeping it.
+    /// `cpu`: what the last frame took (eframe's measure: the UI, tessellation and drawing,
+    /// which WARP does on the CPU). Slow ones are what the VDI's CPU spikes were made of.
+    fn log_frame(&mut self, cpu: Option<f32>) {
+        if self.status != self.logged_status {
+            if !self.status.is_empty() {
+                log::info!("status: {}", redact(&self.status));
+            }
+            self.logged_status.clone_from(&self.status);
+        }
+        let (count, worst, logged) = &mut self.slow_frames;
+        if let Some(cpu) = cpu.filter(|s| *s > 0.05) {
+            (*count, *worst) = (*count + 1, worst.max(cpu));
+        }
+        // At most a line a second.
+        if *count > 0 && logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            let ms = *worst * 1000.0;
+            log::info!("{count} frames over 50 ms, the slowest {ms:.0} ms");
+            (*count, *worst, *logged) = (0, 0.0, Some(Instant::now()));
+        }
+    }
+
     fn send(&mut self, ctx: &egui::Context, download: Option<PathBuf>) {
         let Some(open) = &self.open else { return };
         if streams(&open.draft, &self.grpc_methods) {
@@ -1533,6 +1569,8 @@ impl App {
     /// Streams skip scripts: pre-request/tests are per-response, a stream has no single response.
     fn connect(&mut self, ctx: &egui::Context) {
         let Some(open) = &self.open else { return };
+        let (method, url) = (&open.draft.method, redact(&open.draft.url));
+        log::info!("connect {method} {url}");
         let (req, _) = open.draft.resolved(&self.all_vars());
         let is_ws = req.method.eq_ignore_ascii_case("WS");
         let socketio = req.method == "SOCKETIO";
@@ -1559,9 +1597,15 @@ impl App {
         );
         let failed = t("Network settings: {}");
         let task = self.rt.spawn(async move {
-            let emit = |e| {
+            // A frame per message kept a core busy on a busy stream (WARP draws on the
+            // CPU): messages show within a quarter second, opening and closing at once.
+            let emit = |e: Event| {
+                let now = matches!(e, Event::Open(_) | Event::Closed(_) | Event::Error(_));
                 task_log.lock().unwrap().push(started.elapsed(), e);
-                ctx.request_repaint();
+                match now {
+                    true => ctx.request_repaint(),
+                    false => ctx.request_repaint_after(BATCHED),
+                }
             };
             let tls = net.0.clone();
             match cell
@@ -1741,6 +1785,14 @@ impl App {
             };
             if let Some(i) = self.pending.iter().position(|p| p.path == path) {
                 let sent = self.pending.remove(i);
+                let (method, url) = (&sent.request.method, redact(&sent.request.url));
+                match &outcome.response {
+                    Ok(r) => {
+                        let (ms, size) = (r.elapsed.as_millis(), r.body.len());
+                        log::info!("{method} {url}: {} in {ms} ms, {size} B", r.status);
+                    }
+                    Err(e) => log::warn!("{method} {url}: {}", redact(e)),
+                }
                 self.record_history(sent, &outcome);
             }
             // Variable writes apply even if the user switched away meanwhile.
@@ -2312,8 +2364,9 @@ fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Kind)> {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         crate::i18n::set(self.appearance.language);
+        self.log_frame(frame.info().cpu_usage);
         if self.applied.as_ref() != Some(&self.appearance) {
             if let Err(e) = crate::appearance::apply(ui.ctx(), &self.appearance) {
                 self.status = e;
@@ -2447,7 +2500,7 @@ impl eframe::App for App {
                 if self.restart
                     && let Err(e) = crate::update::restart()
                 {
-                    eprintln!("restarting: {e}");
+                    log::error!("restarting: {e}");
                 }
             }
         }
@@ -3101,7 +3154,8 @@ impl App {
         let (tx, ctx, logged) = (self.tx.clone(), ctx.clone(), t("Mock: {}"));
         let log = move |line: String| {
             let _ = tx.send(Msg::Status(fill(logged, &[&line])));
-            ctx.request_repaint();
+            // A load test against the mock is thousands of lines a second.
+            ctx.request_repaint_after(BATCHED);
         };
         let task = self
             .rt
@@ -3826,11 +3880,13 @@ impl App {
         };
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(p) = pending {
+                // No spinner: it draws every frame, and on a software renderer (WARP on
+                // the VDI) each frame is CPU. A count of seconds needs one a second.
                 ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(tf("Sending… {} s", &[&format!("{:.1}", p.started.elapsed().as_secs_f32())]));
+                    ui.label(icon::HOURGLASS);
+                    ui.label(tf("Sending… {} s", &[&format!("{:.0}", p.started.elapsed().as_secs_f32())]));
                 });
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
+                ui.ctx().request_repaint_after(Duration::from_secs(1));
                 return;
             }
             if let Some(view) = self.load.as_mut() {
@@ -5016,7 +5072,7 @@ impl App {
             let (item_tx, item_ctx) = (tx.clone(), ctx.clone());
             let (env, globals) = runner::run_collection(client, plan, vars, move |item| {
                 let _ = item_tx.send(Msg::RunItem(id, item));
-                item_ctx.request_repaint();
+                item_ctx.request_repaint_after(BATCHED);
             })
             .await;
             let _ = tx.send(Msg::RunDone(id, env, globals));
@@ -5255,7 +5311,7 @@ impl App {
                                     ui.weak(format!("apitool {}", crate::update::CURRENT));
                                 }
                                 Update::Checking => {
-                                    ui.spinner();
+                                    ui.label(icon::HOURGLASS);
                                 }
                                 Update::UpToDate => {
                                     ui.label(tf(
@@ -5271,7 +5327,7 @@ impl App {
                                     ui.hyperlink_to(t("Release notes"), &r.page);
                                 }
                                 Update::Installing(v) => {
-                                    ui.spinner();
+                                    ui.label(icon::HOURGLASS);
                                     ui.label(tf("Installing {}…", &[v]));
                                 }
                                 Update::Installed(v) => {
@@ -6640,7 +6696,7 @@ fn graphql_editor(
         ui.horizontal(|ui| {
             ui.strong(t("Schema"));
             if ex.loading {
-                ui.spinner();
+                ui.label(icon::HOURGLASS);
             } else {
                 let label = if ex.schema.is_some() {
                     t("Refresh")
@@ -7800,9 +7856,11 @@ fn stream_ui(
     let mut sent = Ok(());
     ui.horizontal(|ui| {
         if s.live {
-            ui.spinner();
+            // A spinner here drew every frame for as long as the connection lasted.
+            dot(ui, GREEN);
             let secs = format!("{:.0}", s.started.elapsed().as_secs_f32());
             ui.label(tf("Connected {} s", &[&secs]));
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
         } else {
             ui.weak(t("Not connected"));
         }
@@ -11710,6 +11768,11 @@ mod ui_tests {
         h.run();
         h.get_by_label("Connect").click();
         wait_live(&mut h, |app| got(app, "[a/1] hello"));
+        // Connected and quiet, it draws a frame a second for its clock: its spinner drew
+        // one after another for as long as the connection lasted, all CPU under WARP.
+        h.step();
+        let delay = h.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(delay >= Duration::from_millis(500), "{delay:?}");
 
         h.state_mut().stream.as_mut().unwrap().compose = "ping".into();
         for (topic, why) in [("", "needs a topic"), ("cmd/#", "subscribing")] {
@@ -12444,6 +12507,160 @@ mod ui_tests {
             assert_eq!(h.state().response.is_some(), kept, "{size} bytes");
             assert_eq!(h.state().status.contains("wasn't kept"), !kept);
             h.state_mut().status.clear();
+        }
+    }
+
+    /// Not a check: prints what one frame costs in the states that look heavy, with the
+    /// pointer moving as it does over a window (each move is a repaint).
+    /// `cargo test --release --lib frame_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn frame_cost() {
+        let time = |h: &mut Harness<'_, App>, what: &str| {
+            h.run();
+            let start = Instant::now();
+            for i in 0..40 {
+                let x = 300.0 + (i % 2) as f32 * 200.0;
+                h.event(egui::Event::PointerMoved(egui::pos2(x, 400.0)));
+                h.step();
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0 / 40.0;
+            println!("{what:<40} {ms:6.2} ms/frame");
+        };
+        let mut h = with_request("frame-cost");
+        time(&mut h, "request open, Params");
+        let json = |n: usize| {
+            let rows: Vec<String> = (0..n)
+                .map(|i| format!(r#"  {{"id": {i}, "name": "item {i}", "ok": true}}"#))
+                .collect();
+            format!("[\n{}\n]", rows.join(",\n"))
+        };
+        // Just under MAX_EDIT: bigger bodies aren't laid out for editing.
+        let body = json(2_400);
+        println!("(body {} KB)", body.len() / 1024);
+        h.state_mut().open.as_mut().unwrap().draft.body = Body::Json { text: body.clone() };
+        h.state_mut().req_tab = ReqTab::Body;
+        time(&mut h, "JSON request body, Body tab");
+        let spent = std::cell::Cell::new(Duration::ZERO);
+        let mut alone = Harness::new_ui(|ui| {
+            let start = Instant::now();
+            crate::syntax::layouter(Some(Lang::Json))(ui, &body.as_str(), 600.0);
+            spent.set(spent.get() + start.elapsed());
+        });
+        alone.run();
+        spent.set(Duration::ZERO);
+        for _ in 0..40 {
+            alone.step();
+        }
+        let ms = spent.get().as_secs_f64() * 1000.0 / 40.0;
+        println!("{:<40} {ms:6.2} ms/frame", "  of which the JSON layouter");
+        h.state_mut().code = true;
+        time(&mut h, "  + code panel");
+        h.state_mut().code = false;
+        h.state_mut().req_tab = ReqTab::Headers;
+        time(&mut h, "Headers tab");
+        h.state_mut().req_tab = ReqTab::Params;
+        show_response(&mut h, "application/json", json(20_000));
+        time(&mut h, "1 MB JSON response");
+        h.state_mut().response = None;
+
+        let ws = workspace("frame-cost-tree");
+        let top = ws.collections();
+        for f in 0..20 {
+            let dir = ws.create_folder(&top, &format!("f{f}")).unwrap();
+            for r in 0..50 {
+                ws.create_request(&dir, &format!("r{r}")).unwrap();
+            }
+        }
+        let mut h = harness(ws);
+        h.run();
+        time(&mut h, "tree: 20 folders x 50, closed");
+        h.state_mut().tree_filter = "r1".into();
+        time(&mut h, "tree filtered (all open)");
+    }
+
+    /// Not a check: RAM after rounds of what the VDI report did (open a request, send,
+    /// close its tab; open a WebSocket, connect, disconnect, close), to tell a leak (up
+    /// every round) from memory the allocator keeps (flat after the first rounds).
+    /// `cargo test --release --lib memory_over_use -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn memory_over_use() {
+        let kb = || memory_stats::memory_stats().unwrap().physical_mem >> 10;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket_addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let Ok(mut ws) = tungstenite::accept(s) else {
+                        return;
+                    };
+                    let _ = ws.send(tungstenite::Message::text("hello"));
+                    while ws.read().is_ok() {}
+                });
+            }
+        });
+        let body = format!("[{}]", vec![r#"{"id": 1, "name": "item"}"#; 400].join(","));
+        let ws = workspace("memory-over-use");
+        let top = ws.collections();
+        let http = ws.create_request(&top, "http").unwrap();
+        let socket = ws.create_request(&top, "socket").unwrap();
+        let url = crate::http::tests::json_server(body);
+        ws.save_request(
+            &http,
+            &Request {
+                url,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let url = format!("ws://{socket_addr}/");
+        let method = "WS".into();
+        (ws.save_request(
+            &socket,
+            &Request {
+                method,
+                url,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        let mut h = harness(ws);
+        h.run();
+        // APITOOL_RENDER=1 also draws every tab before it closes, through wgpu (WARP on a
+        // VM without a GPU, like the VDI), to see whether the renderer's memory grows.
+        let render = std::env::var_os("APITOOL_RENDER").is_some();
+        let close = |h: &mut Harness<'_, App>| {
+            if render {
+                h.render().unwrap();
+            }
+            h.key_press_modifiers(Modifiers::COMMAND, Key::W);
+            h.run();
+            assert!(h.state().open.is_none());
+        };
+        let hello = |app: &App| {
+            let events = app.stream.as_ref().map(|s| s.events()).unwrap_or_default();
+            events.iter().any(|(_, e)| matches!(e, Event::In(_)))
+        };
+        println!("start: {} KB", kb());
+        for round in 1..=10 {
+            for _ in 0..20 {
+                h.state_mut().activate(http.clone(), true);
+                h.run();
+                h.get_by_label("Send").click();
+                wait(&mut h, |app| {
+                    app.pending.is_empty() && app.response.is_some()
+                });
+                close(&mut h);
+                h.state_mut().activate(socket.clone(), true);
+                h.run();
+                h.get_by_label("Connect").click();
+                wait_live(&mut h, hello);
+                h.get_by_label("Disconnect").click();
+                wait(&mut h, |app| app.stream.as_ref().is_some_and(|s| !s.live));
+                close(&mut h);
+            }
+            println!("after {:>3} of each: {} KB", round * 20, kb());
         }
     }
 

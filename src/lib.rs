@@ -19,6 +19,7 @@ mod insomnia;
 mod jsonpath;
 mod jwt;
 mod loadtest;
+pub mod logfile;
 mod mcp;
 mod mock;
 mod model;

@@ -31,6 +31,7 @@ options:
 
 /// Exit code: 0 all passed, 1 something failed, 2 could not run.
 pub fn main() -> i32 {
+    crate::logfile::init(None);
     match run(std::env::args().skip(1).collect()) {
         Ok(true) => 0,
         Ok(false) => 1,

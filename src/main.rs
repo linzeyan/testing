@@ -6,7 +6,7 @@ use eframe::egui;
 use eframe::egui_wgpu::WgpuSetup;
 use eframe::wgpu;
 
-use apitool::{app, appearance, store};
+use apitool::{app, appearance, logfile, store};
 
 fn main() -> eframe::Result {
     let use_glow = std::env::args().any(|a| a == "--glow");
@@ -52,13 +52,37 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
     };
+    logfile::init(Some(ws.root.join("apitool.log")));
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let version = env!("CARGO_PKG_VERSION");
+    log::info!(
+        "apitool {version} on {os} {arch}, workspace {}",
+        ws.root.display()
+    );
+    // On its own thread: an idle window draws no frames, and a leak shows while idle too.
+    std::thread::spawn(|| {
+        loop {
+            if let Some(m) = memory_stats::memory_stats() {
+                let ram = m.physical_mem >> 20;
+                // Private bytes on Windows; elsewhere it's the address space, which says
+                // nothing.
+                match cfg!(windows) {
+                    true => log::info!("memory: RAM {ram} MB, private {} MB", m.virtual_mem >> 20),
+                    false => log::info!("memory: RAM {ram} MB"),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
     eframe::run_native(
         "apitool",
         options,
         Box::new(|cc| {
             // The app installs it with the fonts chosen in Settings.
             let font = appearance::cjk().map_or("none: CJK text will not render", |(p, _)| p);
-            let mut app = app::App::new(ws, format!("{}\nCJK font: {font}", renderer_info(cc)));
+            let renderer = format!("{}\nCJK font: {font}", renderer_info(cc));
+            log::info!("{}", renderer.replace('\n', ", "));
+            let mut app = app::App::new(ws, renderer);
             app.auto_update();
             Ok(Box::new(app))
         }),

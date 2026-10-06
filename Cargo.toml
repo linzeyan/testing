@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.94.0"
+version = "0.95.0"
 edition = "2024"
 
 [dependencies]
@@ -19,6 +19,8 @@ http-body-util = "0.1.5"
 jsonschema = { version = "0.58.3", default-features = false }
 # Already in the tree via jsonschema: find in the response body (case, whole word, pattern).
 regex = "1"
+# Already in the tree (egui, wgpu, reqwest): their warnings reach our log too.
+log = "0.4"
 memmap2 = "0.9.11"
 memory-stats = "1.2.0"
 p12-keystore = "0.3"

@@ -45,7 +45,7 @@ pub fn serve(ws: Workspace, input: impl BufRead, mut out: impl Write) -> Result<
         if crate::auth::grants() != saved {
             saved = crate::auth::grants();
             if let Err(e) = server.ws.save_tokens(&crate::auth::export()) {
-                eprintln!("OAuth tokens not kept: {e}");
+                log::warn!("OAuth tokens not kept: {e}");
             }
         }
     }

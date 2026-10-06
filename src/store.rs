@@ -29,7 +29,7 @@ use crate::model::{Auth, Folder, Inherited, KeyValue, Request};
 const DB: &str = "apitool.db";
 /// The workspace directory may be a git repo of the exported tree; the database and the
 /// per-machine files of older workspaces stay out of it.
-const GITIGNORE: &str = "apitool.db\napitool.db-journal\n*.secret.toml\n.state.toml\n.history.jsonl\n.cookies.json\n*.tmp\n";
+const GITIGNORE: &str = "apitool.db\napitool.db-journal\n*.secret.toml\n.state.toml\n.history.jsonl\n.cookies.json\n*.tmp\napitool.log*\n";
 const SECRET_SUFFIX: &str = ".secret";
 const HISTORY: &str = ".history.jsonl";
 /// Starts with a dot, so it is never taken for a request.
@@ -330,7 +330,7 @@ impl Workspace {
                 false => Ok(()),
             });
         if let Err(e) = tidied {
-            eprintln!("tidying the workspace: {e}");
+            log::warn!("tidying the workspace: {e}");
         }
     }
 
@@ -348,11 +348,11 @@ impl Workspace {
                 Ok(sealed) if sealed != secret => {
                     let update = "UPDATE envs SET secret = ?2 WHERE name = ?1";
                     if let Err(e) = db.execute(update, [&name, &sealed]) {
-                        eprintln!("sealing secrets: {e}");
+                        log::warn!("sealing secrets: {e}");
                     }
                 }
                 Ok(_) => {}
-                Err(e) => return eprintln!("sealing secrets: {e}"),
+                Err(e) => return log::warn!("sealing secrets: {e}"),
             }
         }
     }
@@ -626,7 +626,7 @@ impl Workspace {
                 self.nodes("", &folders, &requests, &orders)
             }
             (Err(e), _) | (_, Err(e)) => {
-                eprintln!("workspace database: {e}");
+                log::error!("workspace database: {e}");
                 Vec::new()
             }
         }
