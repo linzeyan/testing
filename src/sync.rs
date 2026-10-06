@@ -1,20 +1,26 @@
 //! Sync with a private repository on GitHub.com or GitLab.com: the workspace's TOML tree
 //! (collections, environments, globals) goes up and comes down through their REST APIs, so
-//! no git is needed. Secrets, history, cookies and UI state stay on this machine, as they
-//! stay out of git.
+//! no git is needed. Secret values, history, cookies and OAuth tokens stay on this machine
+//! unless Settings ticks them (`Share`); those go along encrypted with a passphrase, in
+//! `.apitool/` in the repository and never in the workspace folder. UI state never goes.
 //!
 //! Each side is compared with the last sync by git blob hashes, without downloading
 //! anything: what changed on one side only follows it, and what changed on both is a
 //! conflict the user settles for all of them at once (the repository's or this machine's).
+//! What goes along encrypted is compared record by record the same way (a variable set,
+//! a history entry, a cookie, a token), so two machines' sends and logins merge.
 //! Files in the repository that aren't the tree (a README) are left alone.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 use reqwest::{Method, Url};
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::store::{Synced, Workspace};
+use crate::model::KeyValue;
+use crate::store::{HistoryEntry, Synced, Workspace};
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Provider {
@@ -47,6 +53,7 @@ pub struct Remote {
     /// `owner/name` (GitLab: `group/subgroup/name`); a pasted URL works too.
     pub repo: String,
     pub branch: String,
+    pub share: Share,
 }
 
 impl Default for Remote {
@@ -55,8 +62,222 @@ impl Default for Remote {
             provider: Provider::GitHub,
             repo: String::new(),
             branch: "main".into(),
+            share: Share::default(),
         }
     }
+}
+
+/// What goes along besides the tree, each only when ticked.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(default)]
+pub struct Share {
+    pub secrets: bool,
+    pub history: bool,
+    pub cookies: bool,
+    pub tokens: bool,
+}
+
+impl Share {
+    pub fn any(self) -> bool {
+        self.secrets || self.history || self.cookies || self.tokens
+    }
+}
+
+/// Record key → its value, for what goes along encrypted.
+type Records = BTreeMap<String, Value>;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    /// Keyed by environment ("" for globals): a variable's value isn't merged on its own.
+    Secrets,
+    /// Keyed by content: entries never change, so two machines' only add up.
+    History,
+    /// Keyed by domain, path and name.
+    Cookies,
+    /// Keyed as `auth` keys them.
+    Tokens,
+}
+
+impl Kind {
+    const ALL: [Kind; 4] = [Kind::Secrets, Kind::History, Kind::Cookies, Kind::Tokens];
+
+    /// Its file in the repository.
+    fn path(self) -> &'static str {
+        match self {
+            Kind::Secrets => ".apitool/secrets.enc",
+            Kind::History => ".apitool/history.enc",
+            Kind::Cookies => ".apitool/cookies.enc",
+            Kind::Tokens => ".apitool/oauth-tokens.enc",
+        }
+    }
+
+    fn on(self, share: Share) -> bool {
+        match self {
+            Kind::Secrets => share.secrets,
+            Kind::History => share.history,
+            Kind::Cookies => share.cookies,
+            Kind::Tokens => share.tokens,
+        }
+    }
+
+    fn read(self, ws: &Workspace) -> Result<Records, String> {
+        let json = |e: serde_json::Error| e.to_string();
+        let mut out = Records::new();
+        match self {
+            Kind::Secrets => {
+                for name in std::iter::once(String::new()).chain(ws.env_names()) {
+                    let env = Some(name.as_str()).filter(|n| !n.is_empty());
+                    let (_, secrets) = ws.load_env(env)?;
+                    if !secrets.is_empty() {
+                        out.insert(name, serde_json::to_value(secrets).map_err(json)?);
+                    }
+                }
+            }
+            Kind::History => {
+                for entry in ws.load_history() {
+                    let value = serde_json::to_value(entry).map_err(json)?;
+                    out.insert(blob_hash(&value.to_string()), value);
+                }
+            }
+            Kind::Cookies => {
+                let jar: Vec<Value> = serde_json::from_str(&ws.load_cookies()).unwrap_or_default();
+                for cookie in jar {
+                    let raw = cookie["raw_cookie"].as_str().unwrap_or_default();
+                    let name = raw.split(['=', ';']).next().unwrap_or_default().trim();
+                    let key = format!("{}\t{}\t{name}", cookie["domain"], cookie["path"]);
+                    out.insert(key, cookie);
+                }
+            }
+            Kind::Tokens => {
+                out = serde_json::from_str(&ws.load_tokens()).unwrap_or_default();
+            }
+        }
+        Ok(out)
+    }
+
+    fn write(self, ws: &Workspace, records: &Records) -> Result<(), String> {
+        let json = |e: serde_json::Error| e.to_string();
+        match self {
+            Kind::Secrets => {
+                // Only into environments this machine has; a sync's tree brings new ones first.
+                for name in std::iter::once(String::new()).chain(ws.env_names()) {
+                    let env = Some(name.as_str()).filter(|n| !n.is_empty());
+                    let (shared, secrets) = ws.load_env(env)?;
+                    let wanted: Vec<KeyValue> = match records.get(&name) {
+                        Some(v) => serde_json::from_value(v.clone()).map_err(json)?,
+                        None => Vec::new(),
+                    };
+                    if wanted != secrets {
+                        ws.save_env(env, &shared, &wanted)?;
+                    }
+                }
+                Ok(())
+            }
+            Kind::History => {
+                let mut entries = (records.values())
+                    .map(|v| serde_json::from_value::<HistoryEntry>(v.clone()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(json)?;
+                entries.sort_by_key(|e| e.at);
+                ws.replace_history(&entries)
+            }
+            Kind::Cookies => {
+                let jar: Vec<&Value> = records.values().collect();
+                ws.save_cookies(&serde_json::to_string(&jar).map_err(json)?)
+            }
+            Kind::Tokens => ws.save_tokens(&serde_json::to_string(records).map_err(json)?),
+        }
+    }
+
+    /// Takes these records from there (none: deleted there) into what's here now.
+    fn apply(self, ws: &Workspace, pulled: &[(String, Option<Value>)]) -> Result<(), String> {
+        let mut now = self.read(ws)?;
+        for (key, value) in pulled {
+            match value {
+                Some(value) => now.insert(key.clone(), value.clone()),
+                None => now.remove(key),
+            };
+        }
+        self.write(ws, &now)
+    }
+}
+
+fn record_hashes(records: &Records) -> Files {
+    (records.iter())
+        .map(|(key, value)| (key.clone(), blob_hash(&value.to_string())))
+        .collect()
+}
+
+/// How a conflict on an environment's secret values is listed.
+fn secrets_of(env: &str) -> String {
+    let name = match env {
+        "" => crate::i18n::t("Globals").to_owned(),
+        env => env.to_owned(),
+    };
+    crate::i18n::tf("Secret values of {}", &[&name])
+}
+
+/// Marks what the passphrase encrypted.
+const ENCRYPTED: &str = "apitool-encrypted-v1:";
+/// PBKDF2-HMAC-SHA256 rounds, as OWASP advises.
+const ROUNDS: u32 = 600_000;
+
+/// The key a passphrase makes, the same on every machine; the repository salts it. Kept
+/// for the process, as making it takes a noticeable part of a second.
+fn passphrase_key(passphrase: &str, repo: &str) -> [u8; 32] {
+    static LAST: Mutex<Option<(String, [u8; 32])>> = Mutex::new(None);
+    let salt = format!("apitool sync {repo}");
+    let id = format!("{salt}\n{passphrase}");
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((was, key)) = &*last
+        && *was == id
+    {
+        return *key;
+    }
+    let mut key = [0u8; 32];
+    let rounds = std::num::NonZeroU32::new(ROUNDS).expect("not zero");
+    let algorithm = ring::pbkdf2::PBKDF2_HMAC_SHA256;
+    ring::pbkdf2::derive(
+        algorithm,
+        rounds,
+        salt.as_bytes(),
+        passphrase.as_bytes(),
+        &mut key,
+    );
+    *last = Some((id, key));
+    key
+}
+
+fn cipher(key: &[u8; 32]) -> LessSafeKey {
+    LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("a 32-byte key"))
+}
+
+fn encrypt(key: &[u8; 32], plain: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
+    let mut sealed = plain.as_bytes().to_vec();
+    let nonce_once = Nonce::assume_unique_for_key(nonce);
+    (cipher(key).seal_in_place_append_tag(nonce_once, Aad::empty(), &mut sealed))
+        .map_err(|_| "encrypting failed".to_owned())?;
+    let blob = [&nonce[..], &sealed].concat();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(blob);
+    Ok(format!("{ENCRYPTED}{b64}\n"))
+}
+
+fn decrypt(key: &[u8; 32], text: &str, path: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    let refused = || crate::i18n::tf("The passphrase doesn't open {} in the repository", &[&path]);
+    let blob = (text.trim().strip_prefix(ENCRYPTED))
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .filter(|blob| blob.len() > NONCE_LEN)
+        .ok_or_else(refused)?;
+    let (nonce, sealed) = blob.split_at(NONCE_LEN);
+    let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| refused())?;
+    let mut sealed = sealed.to_vec();
+    let plain =
+        (cipher(key).open_in_place(nonce, Aad::empty(), &mut sealed)).map_err(|_| refused())?;
+    String::from_utf8(plain.to_vec()).map_err(|e| e.to_string())
 }
 
 impl Remote {
@@ -102,6 +323,27 @@ type Files = BTreeMap<String, String>;
 #[derive(Serialize, Deserialize, Default)]
 struct Base {
     files: Files,
+    /// What went along encrypted, by its file's path.
+    #[serde(default)]
+    carried: BTreeMap<String, Seen>,
+}
+
+/// One kind at the last sync: its file's hash in the repository, and each record's.
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Seen {
+    file: String,
+    records: Files,
+}
+
+/// One kind going along in this sync.
+struct Carried {
+    kind: Kind,
+    /// Record hashes there.
+    there: Files,
+    /// Downloaded only when the file changed there, the only time anything is taken.
+    values: Records,
+    pull: Vec<String>,
+    conflicts: Vec<String>,
 }
 
 /// The hash git gives a file with this text.
@@ -155,15 +397,18 @@ fn decide(local: &Files, remote: &Files, base: &Files) -> (Vec<String>, Vec<Stri
 }
 
 /// Pulls what changed there, pushes what changed here; `resolution` settles what changed
-/// on both. `http` should be the requests' client, for its proxy.
+/// on both. `http` should be the requests' client, for its proxy. `passphrase` encrypts
+/// what `remote.share` ticks.
 pub async fn sync(
     http: &reqwest::Client,
     ws: &Workspace,
     remote: &Remote,
     token: &str,
+    passphrase: &str,
     resolution: Option<Resolution>,
 ) -> Result<Outcome, String> {
-    sync_at(http, ws, remote, token, resolution, remote.provider.api()).await
+    let root = remote.provider.api();
+    sync_at(http, ws, remote, token, passphrase, resolution, root).await
 }
 
 async fn sync_at(
@@ -171,6 +416,7 @@ async fn sync_at(
     ws: &Workspace,
     remote: &Remote,
     token: &str,
+    passphrase: &str,
     resolution: Option<Resolution>,
     root: &str,
 ) -> Result<Outcome, String> {
@@ -179,6 +425,12 @@ async fn sync_at(
             "The workspace folder's files and apitool both changed: settle that first",
         )
         .into());
+    }
+    let kinds: Vec<Kind> = (Kind::ALL.into_iter())
+        .filter(|k| k.on(remote.share))
+        .collect();
+    if !kinds.is_empty() && passphrase.is_empty() {
+        return Err(crate::i18n::t("Give the passphrase in Settings > Sync first").into());
     }
     let api = Api {
         http,
@@ -192,6 +444,10 @@ async fn sync_at(
         Some(head) => api.tree(head).await?,
         None => Files::new(),
     };
+    let tree_there: Files = (there.iter())
+        .filter(|(path, _)| in_tree(path))
+        .map(|(path, hash)| (path.clone(), hash.clone()))
+        .collect();
     let files = |ws: &Workspace| -> Result<BTreeMap<String, String>, String> {
         Ok(ws.tree_files()?.into_iter().collect())
     };
@@ -204,18 +460,62 @@ async fn sync_at(
     let base: Base = (ws.remote_base())
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
-    let (mut pull, _, conflicts) = decide(&here, &there, &base.files);
-    match (conflicts.is_empty(), resolution) {
+    let (mut pull, _, conflicts) = decide(&here, &tree_there, &base.files);
+
+    // Read and opened before anything here changes: a wrong passphrase changes nothing.
+    let key = match kinds.is_empty() {
+        true => [0; 32],
+        false => passphrase_key(passphrase, &api.repo),
+    };
+    let mut carried = Vec::new();
+    for kind in kinds {
+        let seen = base.carried.get(kind.path()).cloned().unwrap_or_default();
+        let (theirs, values) = match there.get(kind.path()) {
+            None => (Files::new(), Records::new()),
+            // Unchanged there: its records are the ones seen at the last sync.
+            Some(hash) if *hash == seen.file => (seen.records.clone(), Records::new()),
+            Some(hash) => {
+                let text = decrypt(&key, &api.blob(hash).await?, kind.path())?;
+                let values: Records =
+                    (serde_json::from_str(&text)).map_err(|e| format!("{}: {e}", kind.path()))?;
+                (record_hashes(&values), values)
+            }
+        };
+        let mine = record_hashes(&kind.read(ws)?);
+        let (pull, _, conflicts) = decide(&mine, &theirs, &seen.records);
+        carried.push(Carried {
+            kind,
+            there: theirs,
+            values,
+            pull,
+            conflicts,
+        });
+    }
+    // Secret values are asked about like files. History can't conflict, and cookies and
+    // tokens changed on both keep this machine's: either side's works.
+    let asked: Vec<String> = (conflicts.iter().cloned())
+        .chain(
+            (carried.iter().filter(|c| c.kind == Kind::Secrets))
+                .flat_map(|c| c.conflicts.iter().map(|e| secrets_of(e))),
+        )
+        .collect();
+    match (asked.is_empty(), resolution) {
         (true, _) | (false, Some(Resolution::KeepLocal)) => {}
-        (false, Some(Resolution::UseRemote)) => pull.extend(conflicts),
-        (false, None) => return Ok(Outcome::Conflicts(conflicts)),
+        (false, Some(Resolution::UseRemote)) => {
+            pull.extend(conflicts);
+            for c in carried.iter_mut().filter(|c| c.kind == Kind::Secrets) {
+                let both = std::mem::take(&mut c.conflicts);
+                c.pull.extend(both);
+            }
+        }
+        (false, None) => return Ok(Outcome::Conflicts(asked)),
     }
     for path in &pull {
         let file = path
             .split('/')
             .fold(ws.root.clone(), |p, part| p.join(part));
         let failed = |e: std::io::Error| format!("{}: {e}", file.display());
-        match there.get(path) {
+        match tree_there.get(path) {
             Some(hash) => {
                 let text = api.blob(hash).await?;
                 if let Some(dir) = file.parent() {
@@ -233,23 +533,56 @@ async fn sync_at(
     if !pull.is_empty() {
         ws.sync()?;
     }
+    let mut pulled = pull.len();
+    for c in carried.iter().filter(|c| !c.pull.is_empty()) {
+        let taken: Vec<(String, Option<Value>)> = (c.pull.iter())
+            .map(|key| (key.clone(), c.values.get(key).cloned()))
+            .collect();
+        c.kind.apply(ws, &taken)?;
+        pulled += 1;
+    }
     // Whatever differs now is this machine's to push: its own changes, the conflicts it
     // keeps, and a pulled file apitool writes differently.
     let texts = files(ws)?;
     let here = hashes(&texts);
-    let changes: Vec<(String, Option<String>)> = (here.keys().chain(there.keys()))
+    let mut changes: Vec<(String, Option<String>)> = (here.keys().chain(tree_there.keys()))
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .filter(|path| here.get(*path) != there.get(*path))
+        .filter(|path| here.get(*path) != tree_there.get(*path))
         .map(|path| (path.clone(), texts.get(path).cloned()))
         .collect();
+    let mut seen = BTreeMap::new();
+    for c in &carried {
+        let path = c.kind.path();
+        // Read again: what was taken, and whatever this machine did meanwhile.
+        let mine = c.kind.read(ws)?;
+        let records = record_hashes(&mine);
+        let file = match (records == c.there, mine.is_empty()) {
+            (true, _) => there.get(path).cloned().unwrap_or_default(),
+            (false, true) => {
+                changes.push((path.to_owned(), None));
+                String::new()
+            }
+            (false, false) => {
+                let json = serde_json::to_string(&mine).map_err(|e| e.to_string())?;
+                let text = encrypt(&key, &json)?;
+                let file = blob_hash(&text);
+                changes.push((path.to_owned(), Some(text)));
+                file
+            }
+        };
+        seen.insert(path.to_owned(), Seen { file, records });
+    }
     if !changes.is_empty() {
         api.commit(head.as_ref(), &there, &changes).await?;
     }
-    let base = serde_json::to_string(&Base { files: here }).map_err(|e| e.to_string())?;
-    ws.set_remote_base(&base)?;
+    let base = Base {
+        files: here,
+        carried: seen,
+    };
+    ws.set_remote_base(&serde_json::to_string(&base).map_err(|e| e.to_string())?)?;
     Ok(Outcome::Synced {
-        pulled: pull.len(),
+        pulled,
         pushed: changes.len(),
     })
 }
@@ -417,7 +750,8 @@ impl Api<'_> {
         let mut keep = |entries: &Value, hash: &str| {
             for e in entries.as_array().into_iter().flatten() {
                 let path = e["path"].as_str().unwrap_or_default();
-                if e["type"] == "blob" && in_tree(path) {
+                let carried = Kind::ALL.iter().any(|k| k.path() == path);
+                if e["type"] == "blob" && (in_tree(path) || carried) {
                     files.insert(
                         path.to_owned(),
                         e[hash].as_str().unwrap_or_default().to_owned(),
@@ -892,7 +1226,7 @@ mod tests {
         let remote = Remote {
             provider,
             repo: "https://github.com/o/r.git".into(),
-            branch: "main".into(),
+            ..Default::default()
         };
         let name = format!("{provider:?}");
         let (a, b) = (
@@ -900,7 +1234,7 @@ mod tests {
             workspace(&format!("{name}-b")),
         );
         let sync = |ws: &Workspace, resolution| {
-            let r = rt.block_on(sync_at(&http, ws, &remote, "t0k", resolution, &root));
+            let r = rt.block_on(sync_at(&http, ws, &remote, "t0k", "", resolution, &root));
             r.unwrap()
         };
         let synced = |pulled, pushed| Outcome::Synced { pulled, pushed };
@@ -978,6 +1312,130 @@ mod tests {
         two_machines_share_a_workspace(Provider::GitLab);
     }
 
+    /// Secret values, history, cookies and OAuth tokens stay home unless ticked. Ticked, they
+    /// go encrypted and reach the other machine, where they merge: sends add up, a cleared
+    /// history clears there too, secret values changed on both are asked about, tokens
+    /// changed on both keep each machine's, and a wrong passphrase changes nothing.
+    fn what_else_goes_along(provider: Provider) {
+        let fake = Arc::new(Mutex::new(Fake::default()));
+        let root = serve(fake.clone(), provider);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        let http = rt.block_on(crate::net::build_client(net)).unwrap().http;
+        let mut remote = Remote {
+            provider,
+            repo: "o/r".into(),
+            ..Default::default()
+        };
+        let name = format!("{provider:?}-carry");
+        let [a, b, c] = ["a", "b", "c"].map(|m| workspace(&format!("{name}-{m}")));
+        let sync = |ws: &Workspace, remote: &Remote, passphrase: &str, resolution| {
+            let sync = sync_at(&http, ws, remote, "t0k", passphrase, resolution, &root);
+            rt.block_on(sync)
+        };
+        let synced = |pulled, pushed| Ok(Outcome::Synced { pulled, pushed });
+        let leaked = || {
+            let fake = fake.lock().unwrap();
+            let marks = ["s3cret", "sent-a", "c00kie", "t0ken-a"];
+            (fake.blobs.values()).any(|t| marks.iter().any(|m| t.contains(m)))
+        };
+        let sent = |url: &str| {
+            let req = Request {
+                url: url.into(),
+                ..Default::default()
+            };
+            HistoryEntry::new("users/list".into(), 200, 5, req)
+        };
+        let urls = |ws: &Workspace| -> BTreeSet<String> {
+            (ws.load_history().into_iter())
+                .map(|e| e.request.url)
+                .collect()
+        };
+        let shared = [KeyValue::new("host", "h.test")];
+        let secret = |ws: &Workspace| ws.load_env(Some("dev")).unwrap().1;
+        let token = |value: &str| {
+            format!(r#"{{"grant":{{"token":"{value}","expires":4102444800,"refresh":null}}}}"#)
+        };
+
+        a.save_env(Some("dev"), &shared, &[KeyValue::new("token", "s3cret")])
+            .unwrap();
+        a.append_history(&sent("http://h.test/sent-a")).unwrap();
+        let jar = crate::cookies::Jar::default();
+        let site = Url::parse("http://h.test/").unwrap();
+        jar.set(&site, "sid", "c00kie").unwrap();
+        a.save_cookies(&jar.to_json().unwrap()).unwrap();
+        a.save_tokens(&token("t0ken-a")).unwrap();
+        assert_eq!(sync(&a, &remote, "", None), synced(0, 1), "the tree alone");
+        assert!(!leaked());
+
+        remote.share = Share {
+            secrets: true,
+            history: true,
+            cookies: true,
+            tokens: true,
+        };
+        let refused = sync(&a, &remote, "", None).unwrap_err();
+        assert!(refused.contains("passphrase"), "{refused}");
+        assert_eq!(sync(&a, &remote, "pass", None), synced(0, 4));
+        assert!(!leaked(), "encrypted");
+        assert_eq!(sync(&a, &remote, "pass", None), synced(0, 0), "nothing new");
+
+        let refused = sync(&c, &remote, "wrong", None).unwrap_err();
+        assert!(refused.contains("passphrase"), "{refused}");
+        assert!(c.env_names().is_empty(), "not even the tree came down");
+
+        assert_eq!(sync(&b, &remote, "pass", None), synced(5, 0));
+        assert_eq!(secret(&b), [KeyValue::new("token", "s3cret")]);
+        assert_eq!(urls(&b), BTreeSet::from(["http://h.test/sent-a".into()]));
+        assert!(b.load_cookies().contains("c00kie"));
+        assert!(b.load_tokens().contains("t0ken-a"));
+
+        // Sends on both add up, and clearing the history clears it there too.
+        b.append_history(&sent("http://h.test/sent-b")).unwrap();
+        a.append_history(&sent("http://h.test/sent-a2")).unwrap();
+        for ws in [&a, &b, &a] {
+            sync(ws, &remote, "pass", None).unwrap();
+        }
+        assert_eq!(urls(&a).len(), 3);
+        assert_eq!(urls(&a), urls(&b));
+        a.clear_history().unwrap();
+        for ws in [&a, &b] {
+            sync(ws, &remote, "pass", None).unwrap();
+        }
+        assert!(urls(&b).is_empty());
+
+        // Secret values changed on both: asked about. Tokens: each keeps its own.
+        a.save_env(Some("dev"), &shared, &[KeyValue::new("token", "a2")])
+            .unwrap();
+        b.save_env(Some("dev"), &shared, &[KeyValue::new("token", "b2")])
+            .unwrap();
+        a.save_tokens(&token("t0ken-a2")).unwrap();
+        b.save_tokens(&token("t0ken-b2")).unwrap();
+        sync(&a, &remote, "pass", None).unwrap();
+        let asked = Ok(Outcome::Conflicts(vec!["Secret values of dev".into()]));
+        assert_eq!(sync(&b, &remote, "pass", None), asked);
+        assert_eq!(secret(&b), [KeyValue::new("token", "b2")]);
+        sync(&b, &remote, "pass", Some(Resolution::UseRemote)).unwrap();
+        assert_eq!(secret(&b), [KeyValue::new("token", "a2")]);
+        assert!(b.load_tokens().contains("t0ken-b2"));
+    }
+
+    #[test]
+    fn what_else_goes_along_on_github() {
+        what_else_goes_along(Provider::GitHub);
+    }
+
+    #[test]
+    fn what_else_goes_along_on_gitlab() {
+        what_else_goes_along(Provider::GitLab);
+    }
+
     /// A push that lands while this one is on its way isn't overwritten.
     #[test]
     fn a_push_made_meanwhile_is_not_overwritten() {
@@ -998,7 +1456,7 @@ mod tests {
         };
         let ws = workspace("raced");
         put(&ws, "a", "http://h.test/a");
-        let sync = |token: &str| rt.block_on(sync_at(&http, &ws, &remote, token, None, &root));
+        let sync = |token: &str| rt.block_on(sync_at(&http, &ws, &remote, token, "", None, &root));
         assert!(sync("t0k").is_ok());
         put(&ws, "a", "http://h.test/a2");
         fake.lock().unwrap().raced = true;

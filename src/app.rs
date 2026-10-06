@@ -780,6 +780,9 @@ pub struct App {
     /// A token typed in Settings, sealed into the workspace when it closes or syncs.
     remote_token: String,
     remote_token_saved: bool,
+    /// Likewise the passphrase for what goes along encrypted.
+    remote_passphrase: String,
+    remote_passphrase_saved: bool,
     syncing: bool,
     /// Word wrap in the response body, kept across restarts.
     wrap_response: bool,
@@ -878,7 +881,9 @@ impl App {
             mcp_client: 0,
             remote: state.remote,
             remote_token: String::new(),
-            remote_token_saved: ws.has_remote_token(),
+            remote_token_saved: ws.has_sync_secret(crate::store::SYNC_TOKEN),
+            remote_passphrase: String::new(),
+            remote_passphrase_saved: ws.has_sync_secret(crate::store::SYNC_PASSPHRASE),
             syncing: false,
             wrap_response: state.wrap_response,
             side_by_side: !state.stacked,
@@ -1155,7 +1160,7 @@ impl App {
         if self.syncing {
             return;
         }
-        let token = match self.ws.remote_token() {
+        let token = match self.ws.sync_secret(crate::store::SYNC_TOKEN) {
             Ok(Some(token)) if self.remote.is_set() => token,
             Ok(_) => {
                 self.status =
@@ -1163,6 +1168,17 @@ impl App {
                 self.settings = true;
                 return;
             }
+            Err(e) => {
+                self.status = tf("Sync: {}", &[&e]);
+                return;
+            }
+        };
+        // None when nothing goes along encrypted; missing when needed, `sync` says so.
+        let passphrase = (self.remote.share.any())
+            .then(|| self.ws.sync_secret(crate::store::SYNC_PASSPHRASE))
+            .transpose();
+        let passphrase = match passphrase {
+            Ok(p) => p.flatten().unwrap_or_default(),
             Err(e) => {
                 self.status = tf("Sync: {}", &[&e]);
                 return;
@@ -1183,7 +1199,11 @@ impl App {
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
                 .await
             {
-                Ok(c) => crate::sync::sync(&c.http, &ws, &remote, &token, resolution).await,
+                Ok(c) => {
+                    let sync =
+                        crate::sync::sync(&c.http, &ws, &remote, &token, &passphrase, resolution);
+                    sync.await
+                }
                 Err(e) => Err(fill(failed, &[&e])),
             };
             let _ = tx.send(Msg::Synced(result));
@@ -2204,6 +2224,10 @@ impl App {
                             );
                             if pulled > 0 {
                                 self.refresh_from_disk();
+                                // The clients hold the jar and `auth` the tokens: both take
+                                // in what the sync merged into the workspace.
+                                self.cookies.reload(&self.ws.load_cookies());
+                                crate::auth::replace(&self.ws.load_tokens());
                             }
                         }
                         Ok(Outcome::Conflicts(paths)) => {
@@ -5696,6 +5720,8 @@ impl App {
         let mut copied = None;
         let (remote, remote_token) = (&mut self.remote, &mut self.remote_token);
         let (token_saved, syncing) = (self.remote_token_saved, self.syncing);
+        let remote_passphrase = &mut self.remote_passphrase;
+        let passphrase_saved = self.remote_passphrase_saved;
         let mut sync_now = false;
         let (mut close, mut network) = (false, false);
         let (mut check, mut install, mut restart) = (false, None, false);
@@ -5901,11 +5927,32 @@ impl App {
                                 .hint_text(hint)
                                 .desired_width(230.0);
                             ui.add(field).on_hover_text(scope);
-                            let ready = remote.is_set() && (token_saved || !remote_token.is_empty());
+                            let ready = remote.is_set()
+                                && (token_saved || !remote_token.is_empty())
+                                && (!remote.share.any() || passphrase_saved || !remote_passphrase.is_empty());
                             sync_now = (ui.add_enabled(!syncing && ready, egui::Button::new(t("Sync now"))))
                                 .clicked();
                         });
-                        ui.weak(t("To a private repository. Secrets, history and cookies stay on this machine."));
+                        ui.horizontal(|ui| {
+                            ui.label(t("Also sync"));
+                            let share = &mut remote.share;
+                            ui.checkbox(&mut share.secrets, t("Secret values"));
+                            ui.checkbox(&mut share.history, t("History"));
+                            ui.checkbox(&mut share.cookies, t("Cookies"));
+                            ui.checkbox(&mut share.tokens, t("OAuth tokens"));
+                        });
+                        if remote.share.any() {
+                            let hint = match passphrase_saved {
+                                true => t("Passphrase kept; type to replace"),
+                                false => t("Passphrase, the same on every machine"),
+                            };
+                            let field = egui::TextEdit::singleline(remote_passphrase)
+                                .password(true)
+                                .hint_text(hint)
+                                .desired_width(230.0);
+                            ui.add(field).on_hover_text(t("What's ticked is encrypted with it before it leaves; another machine opens it with the same one."));
+                        }
+                        ui.weak(t("To a private repository. What isn't ticked stays on this machine."));
                     });
                     ui.end_row();
                 });
@@ -5917,11 +5964,24 @@ impl App {
         if let Some(client) = copied {
             self.status = tf("Copied the setup for {}", &[&client]);
         }
-        if (sync_now || close || network || modal.should_close()) && !self.remote_token.is_empty() {
-            let token = std::mem::take(&mut self.remote_token);
-            match self.ws.set_remote_token(token.trim()) {
-                Ok(()) => self.remote_token_saved = true,
-                Err(e) => self.status = tf("Sync: {}", &[&e]),
+        if sync_now || close || network || modal.should_close() {
+            let typed = [
+                (
+                    crate::store::SYNC_TOKEN,
+                    &mut self.remote_token,
+                    &mut self.remote_token_saved,
+                ),
+                (
+                    crate::store::SYNC_PASSPHRASE,
+                    &mut self.remote_passphrase,
+                    &mut self.remote_passphrase_saved,
+                ),
+            ];
+            for (name, value, saved) in typed.into_iter().filter(|(_, v, _)| !v.is_empty()) {
+                match self.ws.set_sync_secret(name, std::mem::take(value).trim()) {
+                    Ok(()) => *saved = true,
+                    Err(e) => self.status = tf("Sync: {}", &[&e]),
+                }
             }
         }
         if sync_now {
@@ -13269,9 +13329,9 @@ mod ui_tests {
         );
     }
 
-    /// The token is kept by the workspace, not by the window's saved state; a conflict
-    /// asks before anything changes, naming requests as the tree does; and what a sync
-    /// pulled shows at once.
+    /// The token and the passphrase are kept by the workspace, not by the window's saved
+    /// state; a conflict asks before anything changes, naming requests as the tree does;
+    /// and what a sync pulled shows at once, cookies and tokens included.
     #[test]
     fn sync_keeps_its_token_apart_and_asks_about_conflicts() {
         use crate::sync::Outcome;
@@ -13291,15 +13351,35 @@ mod ui_tests {
         h.state_mut().remote_token = "ghp_s3cret".into();
         h.run();
         assert!(!button(&h, "Sync now").accesskit_node().is_disabled());
+        h.get_by_label("Cookies").click();
+        h.run();
+        assert!(
+            button(&h, "Sync now").accesskit_node().is_disabled(),
+            "cookies go encrypted: no passphrase, no sync"
+        );
+        h.state_mut().remote_passphrase = "pa55phrase".into();
+        h.run();
+        assert!(!button(&h, "Sync now").accesskit_node().is_disabled());
         shot(&mut h, "sync-settings");
         button(&h, "Close").click();
         h.run();
-        assert_eq!(ws.remote_token(), Ok(Some("ghp_s3cret".into())));
-        assert!(h.state().remote_token.is_empty());
+        assert_eq!(
+            ws.sync_secret(crate::store::SYNC_TOKEN),
+            Ok(Some("ghp_s3cret".into()))
+        );
+        assert_eq!(
+            ws.sync_secret(crate::store::SYNC_PASSPHRASE),
+            Ok(Some("pa55phrase".into()))
+        );
+        assert!(h.state().remote_token.is_empty() && h.state().remote_passphrase.is_empty());
         let state = ws.load_state();
         assert_eq!(state.remote.path(), "o/r");
+        assert!(state.remote.share.cookies && !state.remote.share.secrets);
         let saved = serde_json::to_string(&state).unwrap();
-        assert!(!saved.contains("s3cret"), "{saved}");
+        assert!(
+            !saved.contains("s3cret") && !saved.contains("pa55"),
+            "{saved}"
+        );
         assert!(h.query(sync_button()).is_some());
 
         let both = vec![
@@ -13319,6 +13399,12 @@ mod ui_tests {
         assert!(h.state().dialog.is_none() && !h.state().syncing);
 
         ws.create_request(&ws.collections(), "pulled").unwrap();
+        let jar = crate::cookies::Jar::default();
+        let site = reqwest::Url::parse("http://h.test/").unwrap();
+        jar.set(&site, "sid", "pulled-c00kie").unwrap();
+        ws.save_cookies(&jar.to_json().unwrap()).unwrap();
+        let token = r#"{"pulled":{"token":"pulled-t0ken","expires":4102444800,"refresh":null}}"#;
+        ws.save_tokens(token).unwrap();
         let synced = Outcome::Synced {
             pulled: 1,
             pushed: 0,
@@ -13331,6 +13417,9 @@ mod ui_tests {
             h.state().status
         );
         h.get_by_label("pulled");
+        let rows = h.state().cookies.rows();
+        assert!(rows.iter().any(|r| r.value == "pulled-c00kie"));
+        assert!(crate::auth::export().contains("pulled-t0ken"));
     }
 
     #[test]

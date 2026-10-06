@@ -111,5 +111,10 @@ and a token (GitHub: fine-grained, Contents read and write on that repository; G
 `api` scope), kept sealed like secret values. The status bar's ↻ then pulls what changed
 there and pushes what changed here in one commit, through the proxy set for requests. A
 request changed on both sides since the last sync is asked about: keep the repository's
-or this machine's. Secret values, history, cookies and OAuth tokens never leave, and other
-files in the repository are left alone.
+or this machine's. Secret values, history, cookies and OAuth tokens stay on the machine
+unless ticked under "Also sync"; ticked ones go encrypted with a passphrase (the same on
+every machine; PBKDF2 and AES-256-GCM) into `.apitool/` in the repository, never into the
+workspace folder, and merge entry by entry: sends on two machines add up, secret values
+changed on both are asked about, and cookies and tokens changed on both keep each
+machine's. Past response bodies and UI state stay. Other files in the repository are left
+alone.

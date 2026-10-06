@@ -433,8 +433,29 @@ const ZH_TW: &[(&str, &str)] = &[
     ("A token with the api scope", "具 api 範圍的 token"),
     ("Sync now", "立即同步"),
     (
-        "To a private repository. Secrets, history and cookies stay on this machine.",
-        "同步到私有儲存庫。機密值、歷史紀錄與 cookie 只留在這台電腦。",
+        "To a private repository. What isn't ticked stays on this machine.",
+        "同步到私有儲存庫。沒勾選的只留在這台電腦。",
+    ),
+    ("Also sync", "一併同步"),
+    ("Secret values", "機密值"),
+    ("OAuth tokens", "OAuth token"),
+    ("Passphrase kept; type to replace", "已保存密語；輸入可取代"),
+    (
+        "Passphrase, the same on every machine",
+        "密語（每台電腦相同）",
+    ),
+    (
+        "What's ticked is encrypted with it before it leaves; another machine opens it with the same one.",
+        "勾選的項目離開前會用它加密；其他電腦要用同一個密語才能打開。",
+    ),
+    ("Secret values of {}", "{} 的機密值"),
+    (
+        "Give the passphrase in Settings > Sync first",
+        "請先在 設定 > 同步 填入密語",
+    ),
+    (
+        "The passphrase doesn't open {} in the repository",
+        "這個密語打不開儲存庫裡的 {}",
     ),
     (
         "Sync: name the repository and give a token in Settings first",

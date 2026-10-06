@@ -63,6 +63,14 @@ impl Jar {
         Self(RwLock::new(store))
     }
 
+    /// In place of what's in the jar, which the clients hold: a sync merged it.
+    pub fn reload(&self, json: &str) {
+        *self.write() = Self::from_json(json)
+            .0
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner());
+    }
+
     /// Session cookies are kept too: in an API client, "logged in" should survive a restart.
     pub fn to_json(&self) -> Result<String, String> {
         let mut out = Vec::new();

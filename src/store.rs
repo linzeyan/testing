@@ -35,6 +35,9 @@ const HISTORY: &str = ".history.jsonl";
 /// Starts with a dot, so it is never taken for a request.
 const FOLDER: &str = ".folder.toml";
 pub const MAX_HISTORY: usize = 200;
+/// The sync's repository token and the passphrase for what goes along encrypted.
+pub const SYNC_TOKEN: &str = "remote-token";
+pub const SYNC_PASSPHRASE: &str = "remote-passphrase";
 /// History is for re-sending, and RAM is tight: bigger bodies are left out.
 const MAX_HISTORY_BODY: usize = 32 * 1024;
 
@@ -482,6 +485,20 @@ impl Workspace {
         .map(drop)
     }
 
+    /// In place of the history, oldest first: a sync merged it.
+    pub fn replace_history(&self, entries: &[HistoryEntry]) -> Result<(), String> {
+        let mut db = self.db();
+        let tx = sql(db.transaction())?;
+        sql(tx.execute("DELETE FROM history", []))?;
+        for entry in &entries[entries.len().saturating_sub(MAX_HISTORY)..] {
+            sql(tx.execute(
+                "INSERT INTO history (entry) VALUES (?1)",
+                [&to_json(entry)?],
+            ))?;
+        }
+        sql(tx.commit())
+    }
+
     pub fn clear_history(&self) -> Result<(), String> {
         sql(self.db().execute("DELETE FROM history", [])).map(drop)
     }
@@ -581,7 +598,6 @@ impl Workspace {
         self.put("cookies", json)
     }
 
-    /// OAuth tokens as `auth::export` wrote them; empty when there are none yet.
     /// The repository's tree at the last sync (`sync::Base`, JSON).
     pub fn remote_base(&self) -> Option<String> {
         self.get("remote-base")
@@ -591,27 +607,24 @@ impl Workspace {
         self.put("remote-base", json)
     }
 
-    /// The sync token, sealed like environment secrets.
-    pub fn remote_token(&self) -> Result<Option<String>, String> {
-        self.get("remote-token")
+    /// What sync keeps sealed like environment secrets (`SYNC_TOKEN`, `SYNC_PASSPHRASE`).
+    pub fn sync_secret(&self, name: &str) -> Result<Option<String>, String> {
+        self.get(name)
             .map(|sealed| crate::vault::open(&sealed))
             .transpose()
     }
 
     /// Without unsealing it (which may ask the OS).
-    pub fn has_remote_token(&self) -> bool {
-        self.get("remote-token").is_some()
+    pub fn has_sync_secret(&self, name: &str) -> bool {
+        self.get(name).is_some()
     }
 
     /// Empty forgets it.
-    pub fn set_remote_token(&self, token: &str) -> Result<(), String> {
-        if token.is_empty() {
-            return sql(self
-                .db()
-                .execute("DELETE FROM kv WHERE key = 'remote-token'", []))
-            .map(drop);
+    pub fn set_sync_secret(&self, name: &str, value: &str) -> Result<(), String> {
+        if value.is_empty() {
+            return sql(self.db().execute("DELETE FROM kv WHERE key = ?1", [name])).map(drop);
         }
-        self.put("remote-token", &crate::vault::seal(token)?)
+        self.put(name, &crate::vault::seal(value)?)
     }
 
     /// The TOML tree as `export` writes it: paths from the workspace folder, with '/',
@@ -626,6 +639,7 @@ impl Workspace {
             .collect())
     }
 
+    /// OAuth tokens as `auth::export` wrote them; empty when there are none yet.
     pub fn load_tokens(&self) -> String {
         self.get("oauth-tokens").unwrap_or_default()
     }

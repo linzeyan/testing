@@ -87,6 +87,12 @@ pub fn import(json: &str) {
     }
 }
 
+/// In place of the tokens here: a sync merged this machine's into `json`.
+pub fn replace(json: &str) {
+    TOKENS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    import(json);
+}
+
 /// Goes up with each token granted; unchanged since the last save means nothing new.
 pub fn grants() -> u64 {
     GRANTS.load(Ordering::Relaxed)
