@@ -83,6 +83,8 @@ pub struct Rpc {
     pub name: String,
     pub client_streaming: bool,
     pub server_streaming: bool,
+    /// The request message's name, without its package (for code snippets).
+    pub input: String,
 }
 
 /// Every method in the file, for the method picker.
@@ -97,6 +99,7 @@ pub fn methods(proto: &str) -> Result<Vec<Rpc>, String> {
                     name: format!("{service}/{}", m.name()),
                     client_streaming: m.is_client_streaming(),
                     server_streaming: m.is_server_streaming(),
+                    input: m.input().name().to_owned(),
                 })
                 .collect::<Vec<_>>()
         })

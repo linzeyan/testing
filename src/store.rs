@@ -169,13 +169,44 @@ pub struct Workspace {
     seen: Arc<Mutex<Option<(u64, String)>>>,
 }
 
-/// Opens the workspace (`dir`, else `APITOOL_WORKSPACE`, else `workspace/` next to the exe:
-/// portable, so the tool can sit in a user folder on a VDI without installation) and makes
-/// it the working directory, so relative paths in requests (.proto, data files) keep
-/// working after a git clone on another machine.
+/// `$var/apitool`, or `~/default/apitool` when `var` isn't set (or is relative, which the
+/// XDG spec says to ignore). None on Windows, where everything stays beside the exe.
+fn xdg(var: &str, default: &str) -> Option<PathBuf> {
+    match cfg!(windows) {
+        true => None,
+        false => xdg_in(|name| std::env::var_os(name), var, default),
+    }
+}
+
+fn xdg_in(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    var: &str,
+    default: &str,
+) -> Option<PathBuf> {
+    let set = env(var).map(PathBuf::from).filter(|p| p.is_absolute());
+    let base = set.or_else(|| env("HOME").map(|home| Path::new(&home).join(default)))?;
+    Some(base.join("apitool"))
+}
+
+/// Where the log goes on macOS and Linux (`$XDG_STATE_HOME/apitool`); None on Windows.
+pub fn state_dir() -> Option<PathBuf> {
+    xdg("XDG_STATE_HOME", ".local/state")
+}
+
+/// For files that may be lost (a response handed to the browser): `$XDG_CACHE_HOME/apitool`
+/// on macOS and Linux, the temp folder on Windows.
+pub fn cache_dir() -> PathBuf {
+    xdg("XDG_CACHE_HOME", ".cache").unwrap_or_else(std::env::temp_dir)
+}
+
+/// Opens the workspace and makes it the working directory, so relative paths in requests
+/// (.proto, data files) keep working after a git clone on another machine. It is `dir`,
+/// else `APITOOL_WORKSPACE`, else `$XDG_DATA_HOME/apitool` on macOS and Linux, else
+/// `workspace/` next to the exe: on Windows the tool is portable, so it can sit in a user
+/// folder on a VDI without installation.
 pub fn open_workspace(dir: Option<PathBuf>) -> Result<Workspace, String> {
-    let dir = dir
-        .or_else(|| std::env::var_os("APITOOL_WORKSPACE").map(PathBuf::from))
+    let dir = (dir.or_else(|| std::env::var_os("APITOOL_WORKSPACE").map(PathBuf::from)))
+        .or_else(|| xdg("XDG_DATA_HOME", ".local/share"))
         .unwrap_or_else(|| {
             let exe = std::env::current_exe().unwrap_or_default();
             exe.parent().unwrap_or(Path::new(".")).join("workspace")
@@ -1686,6 +1717,22 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The XDG variable when it's an absolute path, else its default under home.
+    #[test]
+    fn xdg_directories_follow_the_spec() {
+        fn dir(vars: &[(&str, &str)]) -> Option<PathBuf> {
+            let env = |name: &str| (vars.iter().find(|(n, _)| *n == name)).map(|(_, v)| v.into());
+            xdg_in(env, "XDG_DATA_HOME", ".local/share")
+        }
+        let home = ("HOME", "/home/u");
+        assert_eq!(dir(&[home]), Some("/home/u/.local/share/apitool".into()));
+        let set = [home, ("XDG_DATA_HOME", "/data")];
+        assert_eq!(dir(&set), Some("/data/apitool".into()));
+        let relative = [home, ("XDG_DATA_HOME", "data")];
+        assert_eq!(dir(&relative), Some("/home/u/.local/share/apitool".into()));
+        assert_eq!(dir(&[]), None);
+    }
 
     // ponytail: teardown is best-effort (`let _ = remove_dir_all`): Windows won't delete
     // apitool.db while the test's Workspace still holds it, so a Windows run leaves its

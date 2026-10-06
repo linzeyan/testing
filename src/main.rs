@@ -52,7 +52,8 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
     };
-    logfile::init(Some(ws.root.join("apitool.log")));
+    let logs = store::state_dir().unwrap_or_else(|| ws.root.clone());
+    logfile::init(Some(logs.join("apitool.log")));
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
     let version = env!("CARGO_PKG_VERSION");
     log::info!(

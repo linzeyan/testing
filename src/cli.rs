@@ -21,7 +21,8 @@ test fails.
 `mock` answers HTTP calls with the saved examples (default port 3000, localhost only).
 
 options:
-  --workspace <dir>      workspace (default: $APITOOL_WORKSPACE, else workspace/ next to the exe)
+  --workspace <dir>      workspace (default: $APITOOL_WORKSPACE, else $XDG_DATA_HOME/apitool
+                         on macOS and Linux, workspace/ next to the exe on Windows)
   -e, --env <name>       environment to use
   -d, --data <file>      CSV or JSON data file; one iteration per row
   -n, --iterations <n>   iterations without a data file (default 1)

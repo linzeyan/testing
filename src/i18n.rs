@@ -392,6 +392,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Edit", "編輯"),
     ("Edit Globals", "編輯全域變數"),
+    ("Edit environment", "編輯環境"),
     ("Edit globals", "編輯全域變數"),
     ("Edit this environment's variables", "編輯此環境的變數"),
     ("Edit {}", "編輯 {}"),
@@ -458,6 +459,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "Gateway Timeout：代理或閘道沒有及時收到上游的回應。",
     ),
     ("Globals", "全域變數"),
+    ("Go to tab 1–8, the last", "跳到第 1–8 個分頁、最後一個"),
     (
         "Go to a request, folder or action",
         "前往請求、資料夾或動作",
@@ -625,6 +627,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("New request ({})", "新增請求 ({})"),
     ("Next", "下一個"),
     ("Next page", "下一頁"),
+    ("Next tab", "下一個分頁"),
     ("No auth", "不驗證"),
     (
         "No Content: succeeded, with no body to return.",
@@ -754,6 +757,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Prev", "上一個"),
     ("Preview", "預覽"),
     ("Previous page", "上一頁"),
+    ("Previous tab", "上一個分頁"),
     ("Private key", "私密金鑰"),
     ("Properties", "屬性"),
     ("Proto", "Proto"),

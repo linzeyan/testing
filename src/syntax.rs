@@ -35,11 +35,13 @@ pub enum Lang {
     CLike,
 }
 
-/// The language of a snippet target (`codegen::TARGETS`); none for raw HTTP.
+/// The language of a snippet target (`codegen::targets`); none for raw HTTP.
 pub fn of_target(target: &str) -> Option<Lang> {
     let first = target.split(' ').next().unwrap_or_default();
     Some(match first {
-        "cURL" | "wget" | "HTTPie" | "PowerShell" => Lang::Shell,
+        "cURL" | "wget" | "HTTPie" | "PowerShell" | "websocat" | "mosquitto" | "grpcurl" => {
+            Lang::Shell
+        }
         "Python" => Lang::Python,
         "JavaScript" | "Node.js" => Lang::JavaScript,
         "Go" => Lang::Go,

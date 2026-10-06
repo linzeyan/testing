@@ -29,17 +29,39 @@ pub const TARGETS: &[(&str, Generator)] = &[
     ("Kotlin (OkHttp)", kotlin),
 ];
 
+/// The snippet targets for a request of this kind: HTTP's, or a stream's own (SSE,
+/// WebSocket, Socket.IO, MQTT, gRPC), in picker order.
+pub fn targets(method: &str) -> Vec<&'static str> {
+    match stream_targets(method) {
+        Some(list) => list.iter().map(|(name, _)| *name).collect(),
+        None => TARGETS.iter().map(|(name, _)| *name).collect(),
+    }
+}
+
+/// The target shown for `method` when `preferred` was picked last: itself, else the same
+/// language for this kind (Python (requests) → Python (websockets)), else the first.
+pub fn pick(method: &str, preferred: &str) -> &'static str {
+    let list = targets(method);
+    let language = |name: &str| name.split(" (").next().unwrap_or(name).to_owned();
+    (list.iter().find(|name| **name == preferred))
+        .or_else(|| {
+            list.iter()
+                .find(|name| language(name) == language(preferred))
+        })
+        .unwrap_or(&list[0])
+}
+
 /// `req` must be resolved (`Request::resolved`).
 pub fn generate(target: &str, req: Request) -> Result<String, String> {
+    if let Some(list) = stream_targets(&req.method) {
+        let (_, generator) = (list.iter().find(|(name, _)| *name == target))
+            .ok_or_else(|| format!("no {target} snippet for {}", req.method))?;
+        return Ok(generator(&Stream::new(req)?));
+    }
     let (_, generator) = TARGETS
         .iter()
         .find(|(name, _)| *name == target)
         .ok_or_else(|| format!("no code generator named {target}"))?;
-    if matches!(req.method.as_str(), "WS" | "GRPC" | "MQTT" | "SOCKETIO") {
-        return Err(
-            "Code snippets are for HTTP requests, not WebSocket, gRPC, MQTT or Socket.IO".into(),
-        );
-    }
     Ok(generator(&Wire::new(req)?))
 }
 
@@ -104,11 +126,7 @@ impl Wire {
         let mut digest = None;
         match std::mem::take(&mut req.auth) {
             Auth::Digest { username, password } => digest = Some((username, password)),
-            Auth::OAuth2(o) => {
-                let token = crate::auth::cached_token(&o)
-                    .unwrap_or_else(|| "<press Send once to fetch a token>".into());
-                req.auth = Auth::Bearer { token };
-            }
+            Auth::OAuth2(o) => req.auth = fetched_token(&o),
             auth => req.auth = auth,
         }
         let settings = req.settings.clone();
@@ -1493,6 +1511,973 @@ fn kotlin(w: &Wire) -> String {
     out
 }
 
+// --- Streams -------------------------------------------------------------------------
+
+type StreamGenerator = fn(&Stream) -> String;
+
+const SSE: &[(&str, StreamGenerator)] = &[
+    ("cURL", sse_curl),
+    ("JavaScript (fetch)", sse_fetch),
+    ("Python (requests)", sse_python),
+    ("Go (net/http)", sse_go),
+];
+
+const WEBSOCKET: &[(&str, StreamGenerator)] = &[
+    ("websocat", ws_websocat),
+    ("JavaScript (WebSocket)", ws_browser),
+    ("Node.js (ws)", ws_node),
+    ("Python (websockets)", ws_python),
+    ("Go (gorilla/websocket)", ws_go),
+];
+
+const SOCKETIO: &[(&str, StreamGenerator)] = &[
+    ("Node.js (socket.io-client)", sio_node),
+    ("Python (python-socketio)", sio_python),
+];
+
+const MQTT: &[(&str, StreamGenerator)] = &[
+    ("mosquitto", mqtt_mosquitto),
+    ("Python (paho-mqtt)", mqtt_python),
+    ("Node.js (mqtt)", mqtt_node),
+    ("Go (paho.mqtt.golang)", mqtt_go),
+];
+
+const GRPC: &[(&str, StreamGenerator)] = &[
+    ("grpcurl", grpc_grpcurl),
+    ("Node.js (@grpc/grpc-js)", grpc_node),
+    ("Python (grpcio)", grpc_python),
+];
+
+fn stream_targets(method: &str) -> Option<&'static [(&'static str, StreamGenerator)]> {
+    Some(match method {
+        "SSE" => SSE,
+        "WS" => WEBSOCKET,
+        "SOCKETIO" => SOCKETIO,
+        "MQTT" => MQTT,
+        "GRPC" => GRPC,
+        _ => return None,
+    })
+}
+
+/// What a stream's snippet is made from: the request, and the headers its handshake
+/// carries (its own and its auth's, as Connect sends them).
+pub struct Stream {
+    req: Request,
+    headers: Vec<(String, String)>,
+    /// gRPC: the method's shape, when its descriptor is at hand.
+    rpc: Option<crate::grpc::Rpc>,
+}
+
+impl Stream {
+    fn new(mut req: Request) -> Result<Self, String> {
+        if req.url.trim().is_empty() {
+            return Err("URL is empty".into());
+        }
+        if let Auth::OAuth2(o) = &req.auth {
+            req.auth = fetched_token(o);
+        }
+        let headers = match req.method.as_str() {
+            // MQTT has no headers; it signs in with Basic auth's name and password.
+            "MQTT" => Vec::new(),
+            _ => {
+                let handshake = Request {
+                    body: Body::None,
+                    ..req.clone()
+                };
+                let wire = build(&OFFLINE, handshake)?.build();
+                let wire = wire.map_err(|e| error_chain(&e))?;
+                (wire.headers().iter())
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_owned(),
+                            String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                        )
+                    })
+                    .filter(|(k, _)| k != "content-type")
+                    .collect()
+            }
+        };
+        let rpc = (req.method == "GRPC")
+            .then(|| crate::grpc::methods(&crate::grpc::source(&req.proto, &req.url)).ok())
+            .flatten()
+            .and_then(|list| list.into_iter().find(|r| r.name == req.rpc));
+        Ok(Self { req, headers, rpc })
+    }
+
+    /// The URL as an HTTP one: what SSE, Socket.IO and gRPC connect to.
+    fn http_url(&self) -> String {
+        crate::http::wire_url(&self.req.url)
+    }
+
+    /// ws:// or wss://, however it was typed.
+    fn ws_url(&self) -> String {
+        let url = self.http_url();
+        match url.strip_prefix("https://") {
+            Some(rest) => format!("wss://{rest}"),
+            None => url.replacen("http://", "ws://", 1),
+        }
+    }
+
+    fn sse_headers(&self) -> Vec<(String, String)> {
+        let mut headers = self.headers.clone();
+        if !headers.iter().any(|(k, _)| k == "accept") {
+            headers.insert(0, ("accept".into(), "text/event-stream".into()));
+        }
+        headers
+    }
+
+    fn body_text(&self) -> &str {
+        match &self.req.body {
+            Body::Json { text } | Body::Text { text } => text.trim(),
+            _ => "",
+        }
+    }
+}
+
+/// OAuth 2.0's token is fetched by Send; a snippet can only show the last one.
+fn fetched_token(o: &crate::model::OAuth2) -> Auth {
+    let token =
+        crate::auth::cached_token(o).unwrap_or_else(|| "<press Send once to fetch a token>".into());
+    Auth::Bearer { token }
+}
+
+/// A message typed in the app while connected; a snippet sends this one in its place.
+const MESSAGE: &str = "hello";
+
+fn sse_curl(s: &Stream) -> String {
+    // -N: print each event as it comes instead of buffering.
+    let mut out = format!("curl -N {}", sh(&s.http_url()));
+    for (k, v) in s.sse_headers() {
+        let _ = write!(out, " \\\n  -H {}", sh(&format!("{k}: {v}")));
+    }
+    out
+}
+
+fn sse_fetch(s: &Stream) -> String {
+    let mut out = format!(
+        "const response = await fetch({}, {{\n  headers: {{\n",
+        dq(&s.http_url())
+    );
+    for (k, v) in s.sse_headers() {
+        let _ = writeln!(out, "    {}: {},", dq(&k), dq(&v));
+    }
+    out.push_str(
+        "  },\n});\n\
+         // EventSource can't send headers, so the body is read as it arrives (browsers,\n\
+         // Node.js 18+).\n\
+         const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();\n\
+         for (;;) {\n  const { value, done } = await reader.read();\n  if (done) break;\n  \
+         console.log(value);\n}\n",
+    );
+    out
+}
+
+fn sse_python(s: &Stream) -> String {
+    let mut out = format!(
+        "import requests\n\nurl = {}\nheaders = {{\n",
+        dq(&s.http_url())
+    );
+    for (k, v) in s.sse_headers() {
+        let _ = writeln!(out, "    {}: {},", dq(&k), dq(&v));
+    }
+    out.push_str(
+        "}\nwith requests.get(url, headers=headers, stream=True) as response:\n    \
+         for line in response.iter_lines(decode_unicode=True):\n        if line:\n            \
+         print(line)\n",
+    );
+    out
+}
+
+fn sse_go(s: &Stream) -> String {
+    let mut out = String::from(
+        "package main\n\nimport (\n\t\"bufio\"\n\t\"fmt\"\n\t\"net/http\"\n)\n\nfunc main() {\n",
+    );
+    let _ = writeln!(
+        out,
+        "\treq, err := http.NewRequest(\"GET\", {}, nil)",
+        dq(&s.http_url())
+    );
+    out.push_str("\tif err != nil {\n\t\tpanic(err)\n\t}\n");
+    for (k, v) in s.sse_headers() {
+        let _ = writeln!(out, "\treq.Header.Set({}, {})", dq(&k), dq(&v));
+    }
+    out.push_str(
+        "\tresp, err := http.DefaultClient.Do(req)\n\tif err != nil {\n\t\tpanic(err)\n\t}\n\
+         \tdefer resp.Body.Close()\n\tscanner := bufio.NewScanner(resp.Body)\n\
+         \tfor scanner.Scan() {\n\t\tfmt.Println(scanner.Text())\n\t}\n}\n",
+    );
+    out
+}
+
+fn ws_websocat(s: &Stream) -> String {
+    let mut out = String::from("# Each line typed is sent; what arrives is printed.\nwebsocat");
+    for (k, v) in &s.headers {
+        let _ = write!(out, " \\\n  -H {}", sh(&format!("{k}: {v}")));
+    }
+    let _ = write!(out, " \\\n  {}", sh(&s.ws_url()));
+    out
+}
+
+fn ws_browser(s: &Stream) -> String {
+    let mut out = String::new();
+    if !s.headers.is_empty() {
+        out.push_str("// A browser can't set headers on a WebSocket; these aren't sent:\n");
+        for (k, v) in &s.headers {
+            let _ = writeln!(out, "//   {k}: {v}");
+        }
+    }
+    let _ = write!(
+        out,
+        "const socket = new WebSocket({});\n\
+         socket.addEventListener(\"open\", () => socket.send({}));\n\
+         socket.addEventListener(\"message\", (event) => console.log(event.data));\n",
+        dq(&s.ws_url()),
+        dq(MESSAGE)
+    );
+    out
+}
+
+fn ws_node(s: &Stream) -> String {
+    let mut out = format!(
+        "import WebSocket from \"ws\";\n\nconst socket = new WebSocket({}",
+        dq(&s.ws_url())
+    );
+    if !s.headers.is_empty() {
+        out.push_str(", {\n  headers: {\n");
+        for (k, v) in &s.headers {
+            let _ = writeln!(out, "    {}: {},", dq(k), dq(v));
+        }
+        out.push_str("  },\n}");
+    }
+    let _ = write!(
+        out,
+        ");\nsocket.on(\"open\", () => socket.send({}));\n\
+         socket.on(\"message\", (data) => console.log(data.toString()));\n",
+        dq(MESSAGE)
+    );
+    out
+}
+
+fn ws_python(s: &Stream) -> String {
+    let mut out = String::from("import asyncio\n\nimport websockets\n\n\nasync def main():\n");
+    let mut args = dq(&s.ws_url());
+    if !s.headers.is_empty() {
+        out.push_str("    headers = {\n");
+        for (k, v) in &s.headers {
+            let _ = writeln!(out, "        {}: {},", dq(k), dq(v));
+        }
+        out.push_str("    }\n");
+        args.push_str(", additional_headers=headers");
+    }
+    let _ = write!(
+        out,
+        "    async with websockets.connect({args}) as socket:\n        \
+         await socket.send({})\n        async for message in socket:\n            \
+         print(message)\n\n\nasyncio.run(main())\n",
+        dq(MESSAGE)
+    );
+    out
+}
+
+fn ws_go(s: &Stream) -> String {
+    let mut out = String::from(
+        "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n\n\t\"github.com/gorilla/websocket\"\n)\n\n\
+         func main() {\n\theader := http.Header{}\n",
+    );
+    for (k, v) in &s.headers {
+        let _ = writeln!(out, "\theader.Set({}, {})", dq(k), dq(v));
+    }
+    let _ = write!(
+        out,
+        "\tconn, _, err := websocket.DefaultDialer.Dial({}, header)\n\
+         \tif err != nil {{\n\t\tpanic(err)\n\t}}\n\tdefer conn.Close()\n\
+         \tif err := conn.WriteMessage(websocket.TextMessage, []byte({})); err != nil {{\n\
+         \t\tpanic(err)\n\t}}\n\tfor {{\n\t\t_, message, err := conn.ReadMessage()\n\
+         \t\tif err != nil {{\n\t\t\tpanic(err)\n\t\t}}\n\t\tfmt.Println(string(message))\n\t}}\n}}\n",
+        dq(&s.ws_url()),
+        dq(MESSAGE)
+    );
+    out
+}
+
+/// Socket.IO's namespace is the URL's path; the server is what comes before it.
+fn sio_parts(s: &Stream) -> (String, String) {
+    match reqwest::Url::parse(&s.http_url()) {
+        Ok(url) => {
+            let ns = match url.path().trim_end_matches('/') {
+                "" => "/".to_owned(),
+                p => p.to_owned(),
+            };
+            (url.origin().ascii_serialization(), ns)
+        }
+        Err(_) => (s.http_url(), "/".into()),
+    }
+}
+
+fn sio_node(s: &Stream) -> String {
+    let mut out = format!(
+        "import {{ io }} from \"socket.io-client\";\n\nconst socket = io({}, {{\n  \
+         transports: [\"websocket\"],\n",
+        dq(&s.http_url())
+    );
+    if !s.headers.is_empty() {
+        out.push_str("  extraHeaders: {\n");
+        for (k, v) in &s.headers {
+            let _ = writeln!(out, "    {}: {},", dq(k), dq(v));
+        }
+        out.push_str("  },\n");
+    }
+    // The JSON body is the CONNECT payload, as in the app; JSON is a JavaScript literal.
+    if !s.body_text().is_empty() {
+        let _ = writeln!(out, "  auth: {},", s.body_text());
+    }
+    let _ = write!(
+        out,
+        "}});\nsocket.on(\"connect\", () => {{\n  console.log(\"connected\", socket.id);\n  \
+         socket.emit(\"message\", {});\n}});\n\
+         socket.on(\"connect_error\", (err) => console.error(err.message));\n\
+         socket.onAny((event, ...args) => console.log(event, ...args));\n",
+        dq(MESSAGE)
+    );
+    out
+}
+
+fn sio_python(s: &Stream) -> String {
+    let (server, ns) = sio_parts(s);
+    let auth = s.body_text();
+    let mut out = String::new();
+    if !auth.is_empty() {
+        out.push_str("import json\n\n");
+    }
+    let _ = write!(
+        out,
+        "import socketio\n\nNAMESPACE = {}\nsio = socketio.Client()\n\n\n\
+         @sio.on(\"connect\", namespace=NAMESPACE)\ndef connect():\n    print(\"connected\")\n    \
+         sio.emit(\"message\", {}, namespace=NAMESPACE)\n\n\n\
+         @sio.on(\"*\", namespace=NAMESPACE)\ndef any_event(event, *args):\n    \
+         print(event, *args)\n\n\nsio.connect(\n    {},\n    namespaces=[NAMESPACE],\n    \
+         transports=[\"websocket\"],\n",
+        dq(&ns),
+        dq(MESSAGE),
+        dq(&server)
+    );
+    if !s.headers.is_empty() {
+        out.push_str("    headers={\n");
+        for (k, v) in &s.headers {
+            let _ = writeln!(out, "        {}: {},", dq(k), dq(v));
+        }
+        out.push_str("    },\n");
+    }
+    if !auth.is_empty() {
+        let _ = writeln!(out, "    auth=json.loads({}),", dq(auth));
+    }
+    out.push_str(")\nsio.wait()\n");
+    out
+}
+
+/// The broker as each client names it: scheme (mqtt, mqtts, ws or wss), host, port, and
+/// the path for WebSocket.
+struct Broker {
+    scheme: &'static str,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+impl Broker {
+    fn of(url: &str) -> Self {
+        let (scheme, rest) = url.trim().split_once("://").unwrap_or(("mqtt", url.trim()));
+        let (scheme, port) = match scheme.to_lowercase().as_str() {
+            "mqtts" | "ssl" => ("mqtts", 8883),
+            "ws" => ("ws", 80),
+            "wss" => ("wss", 443),
+            _ => ("mqtt", 1883),
+        };
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, p)) => (host, p.parse().unwrap_or(port)),
+            None => (authority, port),
+        };
+        Self {
+            scheme,
+            host: host.to_owned(),
+            port,
+            path: path.to_owned(),
+        }
+    }
+
+    fn tls(&self) -> bool {
+        matches!(self.scheme, "mqtts" | "wss")
+    }
+
+    fn websocket(&self) -> bool {
+        matches!(self.scheme, "ws" | "wss")
+    }
+
+    /// `scheme://host:port/path`, with the given name for each scheme.
+    fn url(&self, names: [&str; 4]) -> String {
+        let scheme = match self.scheme {
+            "mqtt" => names[0],
+            "mqtts" => names[1],
+            "ws" => names[2],
+            _ => names[3],
+        };
+        format!("{scheme}://{}:{}{}", self.host, self.port, self.path)
+    }
+}
+
+/// Basic auth's name and password: what MQTT signs in with.
+fn mqtt_login(s: &Stream) -> Option<(&str, &str)> {
+    match &s.req.auth {
+        Auth::Basic { username, password } => Some((username, password)),
+        _ => None,
+    }
+}
+
+fn mqtt_topics(s: &Stream) -> Vec<(&str, u8)> {
+    (s.req.mqtt.topics.iter())
+        .filter(|t| t.enabled && !t.filter.trim().is_empty())
+        .map(|t| (t.filter.trim(), t.qos))
+        .collect()
+}
+
+/// MQTT 5's user properties, sent with each publish like headers.
+fn mqtt_properties(s: &Stream) -> Vec<(&str, &str)> {
+    let m = &s.req.mqtt;
+    (m.user_properties.iter())
+        .filter(|p| m.v5 && p.enabled && !p.key.is_empty())
+        .map(|p| (p.key.as_str(), p.value.as_str()))
+        .collect()
+}
+
+fn mqtt_mosquitto(s: &Stream) -> String {
+    let (b, m) = (Broker::of(&s.req.url), &s.req.mqtt);
+    if b.websocket() {
+        return "# mosquitto_sub and mosquitto_pub don't connect over WebSocket; the Python, \
+                Node.js and Go snippets do."
+            .into();
+    }
+    let mut common = format!("-h {} -p {}", sh(&b.host), b.port);
+    if m.v5 {
+        common.push_str(" -V mqttv5");
+    }
+    if b.tls() {
+        common.push_str(" --tls-use-os-certs");
+    }
+    if let Some((user, pass)) = mqtt_login(s) {
+        let _ = write!(common, " -u {} -P {}", sh(user), sh(pass));
+    }
+    let mut out = String::new();
+    let topics = mqtt_topics(s);
+    if !topics.is_empty() {
+        out.push_str("# Subscribe, printing each message's topic and payload.\n");
+        let _ = write!(out, "mosquitto_sub {common} -v");
+        if !m.client_id.trim().is_empty() {
+            let _ = write!(out, " -i {}", sh(m.client_id.trim()));
+            if !m.clean_session {
+                out.push_str(" -c");
+            }
+        }
+        let _ = write!(out, " -k {}", m.keep_alive_secs);
+        if !m.will_topic.trim().is_empty() {
+            let _ = write!(
+                out,
+                " --will-topic {} --will-payload {} --will-qos {}",
+                sh(m.will_topic.trim()),
+                sh(&m.will_payload),
+                m.will_qos
+            );
+            if m.will_retain {
+                out.push_str(" --will-retain");
+            }
+        }
+        // One QoS for every topic: the highest asked for.
+        let qos = topics.iter().map(|(_, q)| *q).max().unwrap_or(0);
+        let _ = write!(out, " -q {qos}");
+        for (filter, _) in &topics {
+            let _ = write!(out, " -t {}", sh(filter));
+        }
+        out.push('\n');
+    }
+    if !m.topic.trim().is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("# Publish one message.\n");
+        let _ = write!(
+            out,
+            "mosquitto_pub {common} -t {} -q {}",
+            sh(m.topic.trim()),
+            m.qos
+        );
+        if m.retain {
+            out.push_str(" -r");
+        }
+        for (k, v) in mqtt_properties(s) {
+            let _ = write!(out, " -D publish user-property {} {}", sh(k), sh(v));
+        }
+        let _ = writeln!(out, " -m {}", sh(MESSAGE));
+    }
+    if out.is_empty() {
+        out.push_str("# Add a topic to subscribe to, or one to publish to.\n");
+    }
+    out
+}
+
+fn mqtt_python(s: &Stream) -> String {
+    let (b, m) = (Broker::of(&s.req.url), &s.req.mqtt);
+    let user_properties = mqtt_properties(s);
+    let mut out = String::from("import paho.mqtt.client as mqtt\n");
+    if !user_properties.is_empty() {
+        out.push_str(
+            "from paho.mqtt.packettypes import PacketTypes\n\
+             from paho.mqtt.properties import Properties\n\n\
+             publish_properties = Properties(PacketTypes.PUBLISH)\n\
+             publish_properties.UserProperty = [\n",
+        );
+        for (k, v) in &user_properties {
+            let _ = writeln!(out, "    ({}, {}),", dq(k), dq(v));
+        }
+        out.push_str("]\n");
+    }
+    out.push_str(
+        "\n\ndef on_connect(client, userdata, flags, reason_code, properties):\n    \
+         print(\"connected:\", reason_code)\n",
+    );
+    let topics = mqtt_topics(s);
+    if !topics.is_empty() {
+        let list: Vec<String> = topics
+            .iter()
+            .map(|(f, q)| format!("({}, {q})", dq(f)))
+            .collect();
+        let _ = writeln!(out, "    client.subscribe([{}])", list.join(", "));
+    }
+    if !m.topic.trim().is_empty() {
+        let retain = if m.retain { "True" } else { "False" };
+        let properties = match user_properties.is_empty() {
+            true => "",
+            false => ", properties=publish_properties",
+        };
+        let _ = writeln!(
+            out,
+            "    client.publish({}, {}, qos={}, retain={retain}{properties})",
+            dq(m.topic.trim()),
+            dq(MESSAGE),
+            m.qos
+        );
+    }
+    out.push_str(
+        "\n\ndef on_message(client, userdata, message):\n    \
+         print(message.topic, message.payload.decode())\n\n\n\
+         client = mqtt.Client(\n    mqtt.CallbackAPIVersion.VERSION2,\n",
+    );
+    if !m.client_id.trim().is_empty() {
+        let _ = writeln!(out, "    client_id={},", dq(m.client_id.trim()));
+    }
+    match m.v5 {
+        true => out.push_str("    protocol=mqtt.MQTTv5,\n"),
+        // MQTT 5 says clean start at connect instead.
+        false => {
+            let clean = if m.clean_session { "True" } else { "False" };
+            let _ = writeln!(out, "    clean_session={clean},");
+        }
+    }
+    if b.websocket() {
+        out.push_str("    transport=\"websockets\",\n");
+    }
+    out.push_str(")\n");
+    if let Some((user, pass)) = mqtt_login(s) {
+        let _ = writeln!(out, "client.username_pw_set({}, {})", dq(user), dq(pass));
+    }
+    if b.tls() {
+        out.push_str("client.tls_set()\n");
+    }
+    if b.websocket() && !b.path.is_empty() {
+        let _ = writeln!(out, "client.ws_set_options(path={})", dq(&b.path));
+    }
+    if !m.will_topic.trim().is_empty() {
+        let retain = if m.will_retain { "True" } else { "False" };
+        let _ = writeln!(
+            out,
+            "client.will_set({}, {}, qos={}, retain={retain})",
+            dq(m.will_topic.trim()),
+            dq(&m.will_payload),
+            m.will_qos
+        );
+    }
+    let _ = write!(
+        out,
+        "client.on_connect = on_connect\nclient.on_message = on_message\n\
+         client.connect({}, {}, keepalive={}",
+        dq(&b.host),
+        b.port,
+        m.keep_alive_secs
+    );
+    if m.v5 {
+        let clean = if m.clean_session { "True" } else { "False" };
+        let _ = write!(out, ", clean_start={clean}");
+    }
+    out.push_str(")\nclient.loop_forever()\n");
+    out
+}
+
+fn mqtt_node(s: &Stream) -> String {
+    let (b, m) = (Broker::of(&s.req.url), &s.req.mqtt);
+    let mut out = format!(
+        "import mqtt from \"mqtt\";\n\nconst client = mqtt.connect({}, {{\n",
+        dq(&b.url(["mqtt", "mqtts", "ws", "wss"]))
+    );
+    if !m.client_id.trim().is_empty() {
+        let _ = writeln!(out, "  clientId: {},", dq(m.client_id.trim()));
+    }
+    if let Some((user, pass)) = mqtt_login(s) {
+        let _ = writeln!(out, "  username: {},\n  password: {},", dq(user), dq(pass));
+    }
+    let _ = writeln!(
+        out,
+        "  protocolVersion: {},\n  keepalive: {},\n  clean: {},",
+        if m.v5 { 5 } else { 4 },
+        m.keep_alive_secs,
+        m.clean_session
+    );
+    if !m.will_topic.trim().is_empty() {
+        let _ = writeln!(
+            out,
+            "  will: {{ topic: {}, payload: {}, qos: {}, retain: {} }},",
+            dq(m.will_topic.trim()),
+            dq(&m.will_payload),
+            m.will_qos,
+            m.will_retain
+        );
+    }
+    out.push_str("});\nclient.on(\"connect\", () => {\n");
+    let topics = mqtt_topics(s);
+    if !topics.is_empty() {
+        let list: Vec<String> = (topics.iter())
+            .map(|(f, q)| format!("{}: {{ qos: {q} }}", dq(f)))
+            .collect();
+        let _ = writeln!(out, "  client.subscribe({{ {} }});", list.join(", "));
+    }
+    if !m.topic.trim().is_empty() {
+        let mut options = format!("qos: {}, retain: {}", m.qos, m.retain);
+        let properties = mqtt_properties(s);
+        if !properties.is_empty() {
+            let list: Vec<String> = (properties.iter())
+                .map(|(k, v)| format!("{}: {}", dq(k), dq(v)))
+                .collect();
+            let _ = write!(
+                options,
+                ", properties: {{ userProperties: {{ {} }} }}",
+                list.join(", ")
+            );
+        }
+        let _ = writeln!(
+            out,
+            "  client.publish({}, {}, {{ {options} }});",
+            dq(m.topic.trim()),
+            dq(MESSAGE)
+        );
+    }
+    out.push_str(
+        "});\nclient.on(\"message\", (topic, payload) => console.log(topic, payload.toString()));\n\
+         client.on(\"error\", (err) => console.error(err.message));\n",
+    );
+    out
+}
+
+fn mqtt_go(s: &Stream) -> String {
+    let (b, m) = (Broker::of(&s.req.url), &s.req.mqtt);
+    let mut out = String::new();
+    if m.v5 {
+        out.push_str(
+            "// paho.mqtt.golang speaks MQTT 3.1.1; for MQTT 5 there is github.com/eclipse/paho.golang.\n",
+        );
+        for (k, v) in mqtt_properties(s) {
+            let _ = writeln!(out, "// Left out, as MQTT 5 user property: {k}: {v}");
+        }
+    }
+    let _ = write!(
+        out,
+        "package main\n\nimport (\n\t\"fmt\"\n\t\"time\"\n\n\tmqtt \"github.com/eclipse/paho.mqtt.golang\"\n)\n\n\
+         func main() {{\n\topts := mqtt.NewClientOptions().AddBroker({})\n",
+        dq(&b.url(["tcp", "ssl", "ws", "wss"]))
+    );
+    if !m.client_id.trim().is_empty() {
+        let _ = writeln!(out, "\topts.SetClientID({})", dq(m.client_id.trim()));
+    }
+    if let Some((user, pass)) = mqtt_login(s) {
+        let _ = writeln!(
+            out,
+            "\topts.SetUsername({})\n\topts.SetPassword({})",
+            dq(user),
+            dq(pass)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\topts.SetKeepAlive({} * time.Second)\n\topts.SetCleanSession({})",
+        m.keep_alive_secs, m.clean_session
+    );
+    if !m.will_topic.trim().is_empty() {
+        let _ = writeln!(
+            out,
+            "\topts.SetWill({}, {}, {}, {})",
+            dq(m.will_topic.trim()),
+            dq(&m.will_payload),
+            m.will_qos,
+            m.will_retain
+        );
+    }
+    out.push_str("\topts.OnConnect = func(c mqtt.Client) {\n");
+    let topics = mqtt_topics(s);
+    if !topics.is_empty() {
+        let list: Vec<String> = topics
+            .iter()
+            .map(|(f, q)| format!("{}: {q}", dq(f)))
+            .collect();
+        let _ = writeln!(
+            out,
+            "\t\tc.SubscribeMultiple(map[string]byte{{{}}}, func(_ mqtt.Client, m mqtt.Message) {{\n\
+             \t\t\tfmt.Println(m.Topic(), string(m.Payload()))\n\t\t}})",
+            list.join(", ")
+        );
+    }
+    if !m.topic.trim().is_empty() {
+        let _ = writeln!(
+            out,
+            "\t\tc.Publish({}, {}, {}, {})",
+            dq(m.topic.trim()),
+            m.qos,
+            m.retain,
+            dq(MESSAGE)
+        );
+    }
+    out.push_str(
+        "\t}\n\tclient := mqtt.NewClient(opts)\n\
+         \tif token := client.Connect(); token.Wait() && token.Error() != nil {\n\
+         \t\tpanic(token.Error())\n\t}\n\tselect {}\n}\n",
+    );
+    out
+}
+
+/// gRPC's address (host:port, as its tools want it) and whether it is TLS.
+fn grpc_address(s: &Stream) -> (String, bool) {
+    match reqwest::Url::parse(&s.http_url()) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or_default();
+            let port = url.port_or_known_default().unwrap_or(80);
+            (format!("{host}:{port}"), url.scheme() == "https")
+        }
+        Err(_) => (s.req.url.trim().to_owned(), false),
+    }
+}
+
+/// The messages to send, compact: the body, or for a client stream each item of its
+/// array, as Connect sends them.
+fn grpc_messages(s: &Stream) -> Vec<String> {
+    let text = s.body_text();
+    let streaming = s.rpc.as_ref().is_some_and(|r| r.client_streaming);
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Array(items)) if streaming => {
+            items.iter().map(|v| v.to_string()).collect()
+        }
+        Ok(v) => vec![v.to_string()],
+        Err(_) if text.is_empty() => vec!["{}".into()],
+        Err(_) => vec![text.to_owned()],
+    }
+}
+
+/// `package.Service/Method` as (service with its package, method).
+fn grpc_names(s: &Stream) -> (&str, &str) {
+    s.req
+        .rpc
+        .trim()
+        .rsplit_once('/')
+        .unwrap_or(("package.Service", "Method"))
+}
+
+fn grpc_grpcurl(s: &Stream) -> String {
+    let (address, tls) = grpc_address(s);
+    let mut out = String::from("grpcurl");
+    if !tls {
+        out.push_str(" -plaintext");
+    }
+    let proto = s.req.proto.trim();
+    if !proto.is_empty() {
+        let (dir, file) = proto.rsplit_once(['/', '\\']).unwrap_or((".", proto));
+        let _ = write!(out, " \\\n  -import-path {} -proto {}", sh(dir), sh(file));
+    }
+    for (k, v) in &s.headers {
+        let _ = write!(out, " \\\n  -H {}", sh(&format!("{k}: {v}")));
+    }
+    let _ = write!(
+        out,
+        " \\\n  -d {} \\\n  {} {}",
+        sh(&grpc_messages(s).join("\n")),
+        sh(&address),
+        sh(s.req.rpc.trim())
+    );
+    out
+}
+
+fn grpc_node(s: &Stream) -> String {
+    let (address, tls) = grpc_address(s);
+    let (service, method) = grpc_names(s);
+    let proto = s.req.proto.trim();
+    let mut out = String::from(
+        "import grpc from \"@grpc/grpc-js\";\nimport protoLoader from \"@grpc/proto-loader\";\n\n",
+    );
+    if proto.is_empty() {
+        out.push_str("// No .proto in the request: save the service's .proto and name it here.\n");
+    }
+    let file = if proto.is_empty() {
+        "service.proto"
+    } else {
+        proto
+    };
+    let _ = write!(
+        out,
+        "const definition = protoLoader.loadSync({}, {{\n  keepCase: true,\n  longs: String,\n  \
+         enums: String,\n  defaults: true,\n  oneofs: true,\n}});\n\
+         const proto = grpc.loadPackageDefinition(definition);\n\
+         const client = new proto.{service}({}, grpc.credentials.{}());\n\
+         const metadata = new grpc.Metadata();\n",
+        dq(file),
+        dq(&address),
+        if tls { "createSsl" } else { "createInsecure" }
+    );
+    for (k, v) in &s.headers {
+        let _ = writeln!(out, "metadata.add({}, {});", dq(k), dq(v));
+    }
+    let messages = grpc_messages(s);
+    let (client, server) = s
+        .rpc
+        .as_ref()
+        .map_or((false, false), |r| (r.client_streaming, r.server_streaming));
+    let answer = "(err, response) => {\n  if (err) throw err;\n  console.log(response);\n}";
+    let on_data = "call.on(\"data\", (message) => console.log(message));\n\
+                   call.on(\"error\", (err) => console.error(err.message));\n";
+    match (client, server) {
+        (false, false) => {
+            let _ = writeln!(out, "client.{method}({}, metadata, {answer});", messages[0]);
+        }
+        (false, true) => {
+            let _ = write!(
+                out,
+                "const call = client.{method}({}, metadata);\n{on_data}",
+                messages[0]
+            );
+        }
+        (true, false) => {
+            let _ = writeln!(out, "const call = client.{method}(metadata, {answer});");
+        }
+        (true, true) => {
+            let _ = write!(out, "const call = client.{method}(metadata);\n{on_data}");
+        }
+    }
+    if client {
+        for m in &messages {
+            let _ = writeln!(out, "call.write({m});");
+        }
+        out.push_str("call.end();\n");
+    }
+    out
+}
+
+fn grpc_python(s: &Stream) -> String {
+    let (address, tls) = grpc_address(s);
+    let (service, method) = grpc_names(s);
+    let short = service.rsplit('.').next().unwrap_or(service);
+    let proto = s.req.proto.trim();
+    // protos_and_services only looks the file up along sys.path.
+    let (dir, file) = match proto.rsplit_once(['/', '\\']) {
+        Some((dir, file)) => (Some(dir), file),
+        None => (None, proto),
+    };
+    let mut out = String::new();
+    if dir.is_some() {
+        out.push_str("import sys\n\n");
+    }
+    out.push_str(
+        "import grpc\nfrom google.protobuf import json_format\n\n\
+         # protos_and_services compiles the .proto at run time (pip install grpcio grpcio-tools).\n",
+    );
+    if let Some(dir) = dir {
+        let _ = writeln!(out, "sys.path.append({})", dq(dir));
+    }
+    if proto.is_empty() {
+        out.push_str("# No .proto in the request: save the service's .proto beside this script.\n");
+    }
+    let file = if proto.is_empty() {
+        "service.proto"
+    } else {
+        file
+    };
+    let _ = writeln!(
+        out,
+        "protos, services = grpc.protos_and_services({})",
+        dq(file)
+    );
+    match tls {
+        true => {
+            let _ = writeln!(
+                out,
+                "channel = grpc.secure_channel({}, grpc.ssl_channel_credentials())",
+                dq(&address)
+            );
+        }
+        false => {
+            let _ = writeln!(out, "channel = grpc.insecure_channel({})", dq(&address));
+        }
+    }
+    let _ = writeln!(out, "stub = services.{short}Stub(channel)");
+    let list: Vec<String> = (s.headers.iter())
+        .map(|(k, v)| format!("({}, {})", dq(k), dq(v)))
+        .collect();
+    let _ = writeln!(out, "metadata = [{}]", list.join(", "));
+    let input = s.rpc.as_ref().map_or("Request", |r| r.input.as_str());
+    let parse = |m: &str| format!("json_format.Parse({}, protos.{input}())", dq(m));
+    let messages = grpc_messages(s);
+    let (client, server) = s
+        .rpc
+        .as_ref()
+        .map_or((false, false), |r| (r.client_streaming, r.server_streaming));
+    let request = match client {
+        true => {
+            let list: Vec<String> = messages
+                .iter()
+                .map(|m| format!("    {},\n", parse(m)))
+                .collect();
+            let _ = writeln!(out, "requests = [\n{}]", list.concat());
+            "iter(requests)".to_owned()
+        }
+        false => {
+            let _ = writeln!(out, "request = {}", parse(&messages[0]));
+            "request".to_owned()
+        }
+    };
+    match server {
+        true => {
+            let _ = write!(
+                out,
+                "for response in stub.{method}({request}, metadata=metadata):\n    \
+                 print(json_format.MessageToJson(response))\n"
+            );
+        }
+        false => {
+            let _ = write!(
+                out,
+                "response = stub.{method}({request}, metadata=metadata)\n\
+                 print(json_format.MessageToJson(response))\n"
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1636,11 +2621,151 @@ mod tests {
                 }
             }
         }
-        let ws = Request {
-            method: "WS".into(),
-            url: "ws://h/".into(),
+    }
+
+    /// Each kind of stream renders every one of its targets, carrying what Connect would
+    /// send: the URL as that client spells it, the handshake's headers, the login.
+    #[test]
+    fn every_stream_renders_what_connect_sends() {
+        let dump = std::env::var_os("APITOOL_SNIPPETS").map(std::path::PathBuf::from);
+        let dir = std::env::temp_dir().join(format!("apitool-codegen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let proto = dir.join("chat.proto");
+        std::fs::write(
+            &proto,
+            "syntax = \"proto3\";\npackage chat.v1;\nmessage Note { string text = 1; }\n\
+             service Chat { rpc Talk(stream Note) returns (stream Note); }\n",
+        )
+        .unwrap();
+        let token = Auth::Bearer {
+            token: "t0k".into(),
+        };
+        let note = vec![KeyValue::new("X-Note", "it's")];
+        let mqtt = crate::model::Mqtt {
+            client_id: "probe".into(),
+            v5: true,
+            topics: vec![
+                crate::model::Topic {
+                    filter: "sensors/+".into(),
+                    qos: 1,
+                    ..Default::default()
+                },
+                crate::model::Topic {
+                    filter: "muted/#".into(),
+                    enabled: false,
+                    ..Default::default()
+                },
+            ],
+            topic: "out".into(),
+            qos: 1,
+            retain: true,
+            user_properties: vec![KeyValue::new("trace", "42")],
+            will_topic: "gone".into(),
             ..Default::default()
         };
-        assert!(generate("cURL", ws).is_err());
+        #[rustfmt::skip]
+        let cases: Vec<(Request, &[&str])> = vec![
+            (
+                Request { method: "SSE".into(), url: "http://h.test:8080/events".into(), auth: token.clone(), ..Default::default() },
+                &["http://h.test:8080/events", "text/event-stream", "Bearer t0k"],
+            ),
+            (
+                Request { method: "WS".into(), url: "https://h.test/chat".into(), headers: note.clone(), ..Default::default() },
+                &["wss://h.test/chat", "x-note", "it"],
+            ),
+            (
+                Request {
+                    method: "SOCKETIO".into(), url: "http://h.test:3000/admin".into(), auth: token.clone(),
+                    body: Body::Json { text: r#"{"room": "a"}"#.into() }, ..Default::default()
+                },
+                &["h.test:3000", "/admin", "Bearer t0k", "room", "websocket"],
+            ),
+            (
+                Request {
+                    method: "MQTT".into(), url: "mqtts://broker.test".into(),
+                    auth: Auth::Basic { username: "bob".into(), password: "pw".into() }, mqtt, ..Default::default()
+                },
+                &["broker.test", "8883", "bob", "pw", "sensors/+", "out", "probe", "gone", "trace", "42"],
+            ),
+            (
+                Request {
+                    method: "GRPC".into(), url: "http://h.test:50051".into(), headers: note,
+                    proto: proto.to_string_lossy().into_owned(), rpc: "chat.v1.Chat/Talk".into(),
+                    body: Body::Json { text: r#"[{"text": "ay"}, {"text": "bee"}]"#.into() }, ..Default::default()
+                },
+                &["h.test:50051", "x-note", "Talk", "ay", "bee"],
+            ),
+        ];
+        for (req, pieces) in cases {
+            for target in targets(&req.method) {
+                let code = generate(target, req.clone()).unwrap();
+                for piece in pieces {
+                    assert!(code.contains(piece), "{target} lacks {piece}:\n{code}");
+                }
+                // A topic switched off isn't subscribed to.
+                assert!(!code.contains("muted"), "{target}:\n{code}");
+                if let Some(dir) = &dump {
+                    let ext = match target.split(' ').next().unwrap() {
+                        "cURL" | "websocat" | "mosquitto" | "grpcurl" => "sh",
+                        "Python" => "py",
+                        "JavaScript" | "Node.js" => "mjs",
+                        "Go" => "go",
+                        other => panic!("no extension for {other}"),
+                    };
+                    let file = target.replace(|c: char| !c.is_ascii_alphanumeric(), "");
+                    std::fs::create_dir_all(dir).unwrap();
+                    let name = format!("{}.{file}.{ext}", req.method.to_lowercase());
+                    std::fs::write(dir.join(name), code).unwrap();
+                }
+            }
+        }
+        // The .proto says Talk streams both ways: every message is written, every answer read.
+        let req = || Request {
+            method: "GRPC".into(),
+            url: "http://h.test:50051".into(),
+            proto: proto.to_string_lossy().into_owned(),
+            rpc: "chat.v1.Chat/Talk".into(),
+            body: Body::Json {
+                text: r#"[{"text": "a"}, {"text": "b"}]"#.into(),
+            },
+            ..Default::default()
+        };
+        let node = generate("Node.js (@grpc/grpc-js)", req()).unwrap();
+        assert!(
+            node.contains("call.write({\"text\":\"a\"});\ncall.write({\"text\":\"b\"});"),
+            "{node}"
+        );
+        let python = generate("Python (grpcio)", req()).unwrap();
+        assert!(
+            python.contains("protos.Note()")
+                && python.contains("for response in stub.Talk(iter(requests)")
+                && python.contains(r#"protos_and_services("chat.proto")"#),
+            "{python}"
+        );
+        let grpcurl = generate("grpcurl", req()).unwrap();
+        assert!(grpcurl.contains("-plaintext"), "{grpcurl}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The picker keeps the language last picked as requests of other kinds are opened.
+    #[test]
+    fn the_last_picked_language_carries_across_kinds() {
+        assert_eq!(pick("WS", "Python (requests)"), "Python (websockets)");
+        assert_eq!(pick("GET", "Python (websockets)"), "Python (requests)");
+        assert_eq!(pick("SSE", "cURL"), "cURL");
+        assert_eq!(pick("MQTT", "cURL"), "mosquitto");
+        assert_eq!(pick("POST", "Go (gorilla/websocket)"), "Go (net/http)");
+        assert_eq!(pick("GET", ""), "cURL");
+        assert!(
+            generate(
+                "cURL",
+                Request {
+                    method: "WS".into(),
+                    url: "ws://h/".into(),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
     }
 }

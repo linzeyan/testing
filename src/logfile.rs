@@ -90,6 +90,9 @@ impl log::Log for Logger {
 /// backtrace when there is a file. Only the first call counts.
 pub fn init(file: Option<PathBuf>) {
     let panics = file.is_some();
+    if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let sink = file.map(|path| Mutex::new(Sink::new(path, MAX)));
     if log::set_boxed_logger(Box::new(Logger(sink))).is_err() {
         return;

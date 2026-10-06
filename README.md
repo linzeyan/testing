@@ -25,7 +25,11 @@ such as Citrix VDI. No installer: unzip and run.
   version, redirects, TLS check, cookies, timeout); paste a curl command into the URL bar
   to import it, and "</> Code" for the request as curl, wget, HTTPie, PowerShell, raw
   HTTP, Python, fetch, axios, Go, Java, C#, PHP, Ruby, Rust, Swift or Kotlin (a Binary
-  body reads its file, and `--data-binary @file` pastes back as one); import a
+  body reads its file, and `--data-binary @file` pastes back as one), and streams in their
+  own clients: SSE (curl, fetch, requests, Go), WebSocket (websocat, browser, ws,
+  websockets, gorilla), Socket.IO (socket.io-client, python-socketio), MQTT (mosquitto,
+  paho-mqtt, mqtt.js, paho Go) and gRPC (grpcurl, grpc-js, grpcio, by the method's
+  streaming shape); the language picked last carries over between kinds; import a
   Postman v2.1 collection or environment, or an OpenAPI 3 / Swagger 2 spec in JSON or YAML
   (a request per operation, a folder per tag, `{{baseUrl}}` from the server, auth from the
   security schemes, bodies and saved examples from the schemas, so the mock server answers
@@ -84,10 +88,12 @@ such as Citrix VDI. No installer: unzip and run.
 
   The GUI re-reads the workspace when its window regains focus.
 
-The workspace (`workspace/` next to the executable, or `$APITOOL_WORKSPACE`) keeps
-everything in one SQLite file, `apitool.db`. For git, ⋯ > "Export to files" writes the
-collection, environments and globals as TOML beside it (`collections/`, `environments/`,
-`globals.toml`; secret values, history, cookies and OAuth tokens stay in the database, secret values sealed by the OS: DPAPI on Windows, a login-keychain key on macOS, plain on Linux; a database copied to another user or machine can't open them), and "Import from
-files…" reads them back, e.g. after a pull. A workspace from an older version, which was
-those TOML files, is imported into `apitool.db` on first start, secrets and history
-included.
+The workspace is `$APITOOL_WORKSPACE` if set, else `$XDG_DATA_HOME/apitool`
+(`~/.local/share/apitool`) on macOS and Linux, and `workspace/` next to the executable on
+Windows. It keeps everything in one SQLite file, `apitool.db`, and the collections,
+environments and globals as TOML beside it for git (`collections/`, `environments/`,
+`globals.toml`), kept in step both ways without anything to click. Secret values, history,
+cookies and OAuth tokens stay in the database, secret values sealed by the OS: DPAPI on
+Windows, a login-keychain key on macOS, plain on Linux; a database copied to another user
+or machine can't open them. The log, `apitool.log`, is in `$XDG_STATE_HOME/apitool`
+(`~/.local/state/apitool`) on macOS and Linux and in the workspace on Windows.

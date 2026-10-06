@@ -36,6 +36,35 @@ const NEW_REQUEST: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, 
 const FOCUS_URL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::L);
 const SWITCH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::K);
 const SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
+const SHIFT_COMMAND: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
+const SAVE_AS: KeyboardShortcut = KeyboardShortcut::new(SHIFT_COMMAND, Key::S);
+const SEND_DOWNLOAD: KeyboardShortcut = KeyboardShortcut::new(SHIFT_COMMAND, Key::Enter);
+const RENAME: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F2);
+const CODE: KeyboardShortcut = KeyboardShortcut::new(SHIFT_COMMAND, Key::G);
+const EDIT_ENV: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
+// Ctrl on a Mac too, as in its browsers: ⌘Tab belongs to the system.
+const NEXT_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Tab);
+const PREV_TAB: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab);
+/// What Ctrl+K also offers, by key.
+const KEYED_ACTIONS: [(KeyboardShortcut, Action); 4] = [
+    (
+        KeyboardShortcut::new(SHIFT_COMMAND, Key::N),
+        Action::NewFolder,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::O),
+        Action::ImportAny,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::Backslash),
+        Action::Sidebar,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::V),
+        Action::SideBySide,
+    ),
+];
 #[cfg(test)]
 const FILTER_HINT: &str = "Filter by name";
 /// Lines longer than this are clipped in the viewer; JSON is pretty-printed first so
@@ -778,9 +807,7 @@ impl App {
             saved_grants: crate::auth::grants(),
             cookie_manager: false,
             code: false,
-            code_lang: Some(state.code_lang)
-                .filter(|l| crate::codegen::TARGETS.iter().any(|(n, _)| l == n))
-                .unwrap_or_else(|| "cURL".into()),
+            code_lang: state.code_lang,
             wrap_response: state.wrap_response,
             side_by_side: !state.stacked,
             narrow: false,
@@ -879,6 +906,83 @@ impl App {
 
     /// Before Send, so no content type yet: the URL's file name if it has one
     /// (`/files/report.pdf`), else the request's name.
+    fn ask_save_as(&mut self) {
+        let Some(open) = &self.open else { return };
+        let kind = NameKind::SaveAs {
+            old: open.path.clone(),
+            folder: (open.path.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| self.ws.collections()),
+        };
+        self.dialog = Some(Dialog::name(kind, format!("{} copy", open.name())));
+    }
+
+    /// The keys added after the first ones (#15), taken before Ctrl+S, Ctrl+Enter and
+    /// Ctrl+N in `ui`: a shortcut also matches with Shift held, so the longer go first.
+    fn shortcuts(&mut self, ui: &mut egui::Ui) {
+        let pressed = |key: &KeyboardShortcut| ui.input_mut(|i| i.consume_shortcut(key));
+        let free =
+            self.dialog.is_none() && self.env_editor.is_none() && self.folder_editor.is_none();
+        for (key, action) in KEYED_ACTIONS {
+            if pressed(&key) && free {
+                self.act(action);
+            }
+        }
+        if pressed(&SAVE_AS) && free {
+            self.ask_save_as();
+        }
+        if pressed(&SEND_DOWNLOAD)
+            && free
+            && let Some(open) = &self.open
+            && !streams(&open.draft, &self.grpc_methods)
+            && open.draft.method != "GRPC"
+            && !self.pending.iter().any(|p| p.path == open.path)
+        {
+            self.ask_download();
+        }
+        if pressed(&RENAME)
+            && free
+            && let Some(open) = &self.open
+        {
+            let kind = NameKind::Rename(open.path.clone());
+            self.dialog = Some(Dialog::name(kind, open.name()));
+        }
+        if pressed(&CODE) && self.open.is_some() {
+            self.code = !self.code;
+        }
+        if pressed(&EDIT_ENV) && free {
+            // The active environment's variables, or the globals when none is.
+            self.open_env_editor(self.active_env.clone(), &[]);
+        }
+        // Ctrl+1…8 go to that tab, Ctrl+9 to the last, as in browsers.
+        let keys = [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+        ];
+        let keys = keys.into_iter().chain([Key::Num7, Key::Num8, Key::Num9]);
+        let numbered = (keys.enumerate())
+            .find(|(_, key)| pressed(&KeyboardShortcut::new(Modifiers::COMMAND, *key)));
+        let (prev, next) = (pressed(&PREV_TAB), pressed(&NEXT_TAB));
+        if !free || self.tabs.is_empty() {
+            return;
+        }
+        let (last, len) = (self.tabs.len() - 1, self.tabs.len());
+        let at = (self.open.as_ref()).and_then(|o| self.tab_index(&o.path));
+        let to = match (numbered, at) {
+            (Some((8, _)), _) => Some(last),
+            (Some((n, _)), _) => Some(n.min(last)),
+            (None, Some(at)) if next => Some((at + 1) % len),
+            (None, Some(at)) if prev => Some((at + len - 1) % len),
+            _ => None,
+        };
+        if let Some(to) = to.filter(|&to| Some(to) != at) {
+            self.activate(self.tabs[to].path.clone(), false);
+        }
+    }
+
     fn ask_download(&mut self) {
         let Some(open) = &self.open else { return };
         let url = open.draft.url.split(['?', '#']).next().unwrap_or("");
@@ -941,9 +1045,11 @@ impl App {
         let Some(ext) = external_type(&view.head) else {
             return;
         };
-        let path = std::env::temp_dir().join(format!("apitool-response.{ext}"));
+        let dir = store::cache_dir();
+        let path = dir.join(format!("apitool-response.{ext}"));
         let body = view.head.bytes.as_deref().unwrap_or(view.raw().as_bytes());
-        let opened = (std::fs::write(&path, body).map_err(|e| e.to_string()))
+        let opened = (std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)))
+            .map_err(|e| e.to_string())
             .and_then(|()| crate::auth::open_browser(&path.display().to_string()));
         if let Err(e) = opened {
             self.status = e;
@@ -2394,6 +2500,7 @@ impl eframe::App for App {
             }
         }
         // Consume shortcuts before widgets see them, so Ctrl+Enter doesn't also insert a newline.
+        self.shortcuts(ui);
         if ui.input_mut(|i| i.consume_shortcut(&SAVE)) {
             // Save what the user is looking at, not the request hidden behind the editor.
             if self.env_editor.is_some() {
@@ -2593,8 +2700,10 @@ impl App {
                 }
                 ui.separator();
                 let shown = !self.hide_sidebar;
+                let hint = t("Show or hide collections and history, for more room");
+                let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[2].0);
                 if icon_button(ui, icon::SIDEBAR_SIMPLE, t("Sidebar"), Some(shown))
-                    .on_hover_text(t("Show or hide collections and history, for more room"))
+                    .on_hover_text(format!("{hint} ({key})"))
                     .clicked()
                 {
                     self.hide_sidebar = shown;
@@ -2606,8 +2715,9 @@ impl App {
                     false => t("The response beside the request instead of under it"),
                 };
                 let on = self.side_by_side;
+                let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[3].0);
                 if icon_button(ui, icon::COLUMNS, t("Side by side"), Some(on))
-                    .on_hover_text(hint)
+                    .on_hover_text(format!("{hint} ({key})"))
                     .clicked()
                 {
                     self.side_by_side = !on;
@@ -2734,7 +2844,11 @@ impl App {
             }
             if let Some(name) = self.active_env.clone()
                 && icon_button(ui, icon::PENCIL_SIMPLE, t("Edit"), None)
-                    .on_hover_text(t("Edit this environment's variables"))
+                    .on_hover_text(format!(
+                        "{} ({})",
+                        t("Edit this environment's variables"),
+                        ui.ctx().format_shortcut(&EDIT_ENV)
+                    ))
                     .clicked()
             {
                 self.open_env_editor(Some(name), &[]);
@@ -2799,8 +2913,8 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
-                if ui
-                    .button(t("Import…"))
+                let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[1].0);
+                if (ui.add(egui::Button::new(t("Import…")).shortcut_text(key)))
                     .on_hover_text(t(
                         "A Postman collection or environment, or an OpenAPI/Swagger spec",
                     ))
@@ -3400,16 +3514,20 @@ impl App {
                 .default_size(380.0)
                 .show(ui, |ui| {
                     let (wire, _) = open.draft.resolved(&all_vars);
-                    let code = crate::codegen::generate(&self.code_lang, wire);
+                    // code_lang is the last pick; each kind of request shows its nearest.
+                    let target = crate::codegen::pick(&wire.method, &self.code_lang);
+                    let targets = crate::codegen::targets(&wire.method);
+                    let code = crate::codegen::generate(target, wire);
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("code_lang")
-                            .selected_text(&self.code_lang)
+                            .selected_text(target)
                             .show_ui(ui, |ui| {
-                                for (name, _) in crate::codegen::TARGETS {
-                                    let lang = &mut self.code_lang;
-                                    let r = ui.selectable_value(lang, (*name).to_owned(), *name);
-                                    lang_changed |= r.changed();
+                                for name in targets {
+                                    if ui.selectable_label(name == target, name).clicked() {
+                                        lang_changed |= self.code_lang != name;
+                                        self.code_lang = name.to_owned();
+                                    }
                                 }
                             });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3420,7 +3538,7 @@ impl App {
                                 && ui.add(primary(t("Copy"))).clicked()
                             {
                                 ui.ctx().copy_text(code.clone());
-                                self.status = tf("Copied {} snippet", &[&self.code_lang]);
+                                self.status = tf("Copied {} snippet", &[&target]);
                             }
                         });
                     });
@@ -3431,7 +3549,7 @@ impl App {
                             ui.weak(tf("This snippet is {}: too big to show here. Copy still copies all of it.", &[&human_size(code.len())]));
                         }
                         Ok(code) => {
-                            let lang = crate::syntax::of_target(&self.code_lang);
+                            let lang = crate::syntax::of_target(target);
                             let mut layouter = crate::syntax::layouter(lang);
                             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
                                 ui.add(
@@ -3468,8 +3586,8 @@ impl App {
                     egui::Popup::menu(&more)
                         .id(egui::Id::new("save-more"))
                         .show(|ui| {
-                            save_as = ui
-                                .button(t("Save as…"))
+                            let key = ui.ctx().format_shortcut(&SAVE_AS);
+                            save_as = (ui.add(egui::Button::new(t("Save as…")).shortcut_text(key)))
                                 .on_hover_text(t(
                                     "Save these edits as a new request; this one stays as saved",
                                 ))
@@ -3493,8 +3611,10 @@ impl App {
                         self.cookie_manager = !on;
                     }
                     let on = self.code;
+                    let hint = t("This request as curl, Python, Go, … to copy");
+                    let key = ui.ctx().format_shortcut(&CODE);
                     if icon_button(ui, icon::CODE, t("Code"), Some(on))
-                        .on_hover_text(t("This request as curl, Python, Go, … to copy"))
+                        .on_hover_text(format!("{hint} ({key})"))
                         .clicked()
                     {
                         self.code = !on;
@@ -3632,8 +3752,9 @@ impl App {
                     egui::Popup::menu(&button)
                         .id(egui::Id::new("send-more"))
                         .show(|ui| {
-                            download = ui
-                                .button(t("Send and download…"))
+                            let key = ui.ctx().format_shortcut(&SEND_DOWNLOAD);
+                            let button = egui::Button::new(t("Send and download…"));
+                            download = (ui.add(button.shortcut_text(key)))
                                 .on_hover_text(t(
                                     "Save the response straight to a file, for big ones",
                                 ))
@@ -4019,12 +4140,8 @@ impl App {
         if download {
             self.ask_download();
         }
-        if save_as && let Some(open) = &self.open {
-            let kind = NameKind::SaveAs {
-                old: open.path.clone(),
-                folder: open.path.parent().map(Path::to_path_buf).unwrap_or(root),
-            };
-            self.dialog = Some(Dialog::name(kind, format!("{} copy", open.name())));
+        if save_as {
+            self.ask_save_as();
         }
         if reflect {
             self.reflect(ui.ctx());
@@ -7368,26 +7485,50 @@ fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_s
 /// biggest blank area, and it is in view exactly when nothing has been sent yet.
 fn shortcut_list(ui: &mut egui::Ui) {
     ui.add_space(12.0);
-    egui::Grid::new("shortcuts")
-        .num_columns(2)
-        .spacing([16.0, 4.0])
-        .show(ui, |ui| {
-            for (what, key) in [
-                (t("Send request"), &SEND),
-                (t("Save changes"), &SAVE),
-                (t("Go to a request, folder or action"), &SWITCH),
-                (t("New request"), &NEW_REQUEST),
-                (t("Duplicate"), &DUPLICATE),
-                (t("Select the URL"), &FOCUS_URL),
-                (t("Find in the response"), &FIND),
-                (t("Close tab"), &CLOSE_TAB),
-                (t("Reopen closed tab"), &REOPEN_TAB),
-            ] {
-                ui.weak(what);
-                ui.weak(RichText::new(ui.ctx().format_shortcut(key)).monospace());
-                ui.end_row();
+    let key = |k: &KeyboardShortcut| ui.ctx().format_shortcut(k);
+    let first = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
+    let rows = [
+        (t("Send request"), key(&SEND)),
+        (t("Save changes"), key(&SAVE)),
+        (t("Go to a request, folder or action"), key(&SWITCH)),
+        (t("New request"), key(&NEW_REQUEST)),
+        (t("Duplicate"), key(&DUPLICATE)),
+        (t("Select the URL"), key(&FOCUS_URL)),
+        (t("Find in the response"), key(&FIND)),
+        (t("Close tab"), key(&CLOSE_TAB)),
+        (t("Reopen closed tab"), key(&REOPEN_TAB)),
+        (t("Next tab"), key(&NEXT_TAB)),
+        (t("Previous tab"), key(&PREV_TAB)),
+        (t("Go to tab 1–8, the last"), format!("{}…9", key(&first))),
+        (t("Save as…"), key(&SAVE_AS)),
+        (t("Send and download…"), key(&SEND_DOWNLOAD)),
+        (t("Rename"), key(&RENAME)),
+        (t("Code"), key(&CODE)),
+        (t("Edit environment"), key(&EDIT_ENV)),
+        (t("New collection"), key(&KEYED_ACTIONS[0].0)),
+        (t("Import…"), key(&KEYED_ACTIONS[1].0)),
+        (t("Sidebar"), key(&KEYED_ACTIONS[2].0)),
+        (t("Side by side"), key(&KEYED_ACTIONS[3].0)),
+    ];
+    // Two lists side by side when there's room, one under the other when there isn't.
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        let layout = egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true);
+        ui.with_layout(layout, |ui| {
+            for (i, half) in rows.chunks(rows.len().div_ceil(2)).enumerate() {
+                egui::Grid::new(("shortcuts", i))
+                    .num_columns(2)
+                    .spacing([16.0, 4.0])
+                    .show(ui, |ui| {
+                        for (what, keys) in half {
+                            ui.weak(*what);
+                            ui.weak(RichText::new(keys).monospace());
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(32.0);
             }
         });
+    });
 }
 
 const ASSERTS_HINT: &str = n_(
@@ -9348,6 +9489,13 @@ mod ui_tests {
         img.save(format!("/tmp/apitool-shots/{name}.png")).unwrap();
     }
 
+    /// The button saying `label`, a shortcut beside it or not. By role: the shortcut list
+    /// in the empty response pane says the same words.
+    fn button<'h>(h: &'h Harness<'_, App>, label: &'h str) -> egui_kittest::Node<'h> {
+        let by = egui_kittest::kittest::By::new().role(Role::Button);
+        h.get(by.label_contains(label))
+    }
+
     /// The nth text box, not counting the sidebar filter (there whenever the tree isn't
     /// empty), so the URL is 0 with a request open. The filter is told by its placeholder,
     /// which egui exposes only while it's empty.
@@ -9392,7 +9540,7 @@ mod ui_tests {
         assert!(h.state().env_editor.is_none());
         assert_eq!(h.state().vars.get("host"), Some(&host));
 
-        h.get_by_label("New collection").click();
+        button(&h, "New collection").click();
         h.run();
         h.key_press(Key::Escape);
         h.run();
@@ -9708,7 +9856,7 @@ mod ui_tests {
             r.top() < p.top() && r.left() > p.right(),
             "side by side by default: {p:?} {r:?}"
         );
-        h.get_by_label("Side by side").click();
+        button(&h, "Side by side").click();
         h.run();
         let (p, r) = rects(&h);
         assert!(
@@ -9718,7 +9866,7 @@ mod ui_tests {
         assert!(h.state().ws.load_state().stacked, "kept for the next start");
 
         // A narrow window stacks them whatever the toggle says.
-        h.get_by_label("Side by side").click();
+        button(&h, "Side by side").click();
         h.run();
         h.set_size(egui::vec2(1200.0, 800.0));
         h.run();
@@ -9796,7 +9944,7 @@ mod ui_tests {
     fn new_collection_makes_a_top_level_folder() {
         let mut h = harness(workspace("collection"));
         h.run();
-        h.get_by_label("New collection").click();
+        button(&h, "New collection").click();
         h.run();
         assert_eq!(
             h.get_all_by_label("New collection").count(),
@@ -9885,7 +10033,7 @@ mod ui_tests {
         std::fs::write(&file, shop).unwrap();
         h.get_all_by_label("More").next().unwrap().click();
         h.run();
-        h.get_by_label("Import…").click();
+        button(&h, "Import…").click();
         h.run();
         h.input_mut()
             .dropped_files
@@ -9963,7 +10111,7 @@ mod ui_tests {
     fn code_panel_shows_what_send_sends_and_keeps_the_language() {
         let mut h = with_request("code");
         h.state_mut().open.as_mut().unwrap().draft.url = "{{host}}/items".into();
-        h.get_by_label("Code").click();
+        button(&h, "Code").click();
         h.run();
         let snippet = |h: &Harness<'_, App>| {
             let roles = [Role::MultilineTextInput, Role::TextInput];
@@ -10519,7 +10667,7 @@ mod ui_tests {
             .click();
         h.run();
         shot(&mut h, "49-tree-more");
-        h.get_by_label("Rename").click();
+        button(&h, "Rename").click();
         h.run();
         assert!(matches!(
             &h.state().dialog,
@@ -10602,7 +10750,7 @@ mod ui_tests {
         h.run();
         h.get_by_label("More send options").click();
         h.run();
-        h.get_by_label("Send and download…").click();
+        button(&h, "Send and download…").click();
         h.run();
         shot(&mut h, "60-send-and-download");
         let file = h.state().ws.root.join("saved.csv");
@@ -10706,7 +10854,7 @@ mod ui_tests {
         h.run();
         h.get_by_label("More save options").click();
         h.run();
-        h.get_by_label("Save as…").click();
+        button(&h, "Save as…").click();
         h.run();
         let Some(Dialog::Name { name, kind, .. }) = &mut h.state_mut().dialog else {
             panic!("the save-as dialog should be open");
@@ -10736,7 +10884,7 @@ mod ui_tests {
         // Never over another request.
         h.get_by_label("More save options").click();
         h.run();
-        h.get_by_label("Save as…").click();
+        button(&h, "Save as…").click();
         h.run();
         if let Some(Dialog::Name { name, kind, .. }) = &mut h.state_mut().dialog
             && let NameKind::SaveAs { folder, .. } = kind
@@ -11192,14 +11340,14 @@ mod ui_tests {
         let mut h = harness(ws);
         h.state_mut().set_env(Some("prod".into()));
         h.run();
-        h.get_by_label("Sidebar").click();
+        button(&h, "Sidebar").click();
         h.run();
         assert!(
             h.query_by_label("New request").is_none(),
             "the tree is gone"
         );
         assert!(h.state().ws.load_state().hide_sidebar, "and stays gone");
-        h.get_by_label("Sidebar").click();
+        button(&h, "Sidebar").click();
         h.run();
         h.get_by_label("Environment colour").click();
         h.run();
@@ -12510,6 +12658,77 @@ mod ui_tests {
         }
     }
 
+    /// Ctrl+S, Ctrl+Enter and Ctrl+N also match with Shift held: the Shift ones must come
+    /// first, or Save as would save over the request and Send and download would send.
+    #[test]
+    fn every_shortcut_does_its_own_thing() {
+        let ws = workspace("shortcuts");
+        let dir = ws.collections();
+        for name in ["a", "b", "c"] {
+            ws.create_request(&dir, name).unwrap();
+        }
+        let mut h = harness(ws);
+        h.run();
+        for name in ["a", "b", "c"] {
+            h.state_mut()
+                .activate(dir.join(format!("{name}.toml")), true);
+            h.run();
+        }
+        let open = |h: &Harness<'_, App>| h.state().open.as_ref().unwrap().name();
+        let press = |h: &mut Harness<'_, App>, key: KeyboardShortcut| {
+            h.key_press_modifiers(key.modifiers, key.logical_key);
+            h.run();
+        };
+        // Around and back, then the first and the last.
+        press(&mut h, NEXT_TAB);
+        assert_eq!(open(&h), "a");
+        press(&mut h, PREV_TAB);
+        assert_eq!(open(&h), "c");
+        press(&mut h, KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1));
+        assert_eq!(open(&h), "a");
+        press(&mut h, KeyboardShortcut::new(Modifiers::COMMAND, Key::Num9));
+        assert_eq!(open(&h), "c");
+
+        h.state_mut().open.as_mut().unwrap().draft.url = "http://127.0.0.1:1/x".into();
+        press(&mut h, SAVE_AS);
+        let dialog = |h: &mut Harness<'_, App>| h.state_mut().dialog.take();
+        assert!(matches!(
+            dialog(&mut h),
+            Some(Dialog::Name {
+                kind: NameKind::SaveAs { .. },
+                ..
+            })
+        ));
+        assert!(
+            h.state().open.as_ref().unwrap().dirty(),
+            "saved over by Ctrl+S"
+        );
+        press(&mut h, SEND_DOWNLOAD);
+        assert!(matches!(
+            dialog(&mut h),
+            Some(Dialog::SaveBody { download: true, .. })
+        ));
+        assert!(h.state().pending.is_empty(), "sent by Ctrl+Enter");
+        press(&mut h, KEYED_ACTIONS[0].0);
+        assert!(matches!(
+            dialog(&mut h),
+            Some(Dialog::Name {
+                kind: NameKind::NewFolder(_),
+                ..
+            })
+        ));
+        press(&mut h, RENAME);
+        let rename = dialog(&mut h);
+        assert!(
+            matches!(&rename, Some(Dialog::Name { kind: NameKind::Rename(_), name, .. }) if name == "c")
+        );
+        let shown = !h.state().hide_sidebar;
+        press(&mut h, KEYED_ACTIONS[2].0);
+        assert_eq!(h.state().hide_sidebar, shown);
+        press(&mut h, CODE);
+        assert!(h.state().code);
+    }
+
     /// Not a check: prints what one frame costs in the states that look heavy, with the
     /// pointer moving as it does over a window (each move is a repaint).
     /// `cargo test --release --lib frame_cost -- --ignored --nocapture`
@@ -13119,7 +13338,7 @@ mod ui_tests {
         for (name, typed) in [("abc", "z"), ("hello", "y")] {
             h.get_by_label(name).click_secondary();
             h.run();
-            h.get_by_label("Rename").click();
+            button(&h, "Rename").click();
             h.run();
             h.event(egui::Event::Text(typed.into()));
             h.run();
