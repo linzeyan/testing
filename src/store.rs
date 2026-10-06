@@ -1718,8 +1718,10 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// The XDG variable when it's an absolute path, else its default under home.
+    /// The XDG variable when it's an absolute path, else its default under home. Not on
+    /// Windows, which has no XDG and where `/data` isn't absolute.
     #[test]
+    #[cfg(not(windows))]
     fn xdg_directories_follow_the_spec() {
         fn dir(vars: &[(&str, &str)]) -> Option<PathBuf> {
             let env = |name: &str| (vars.iter().find(|(n, _)| *n == name)).map(|(_, v)| v.into());

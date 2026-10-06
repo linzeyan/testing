@@ -242,7 +242,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apitool"
-version = "0.96.0"
+version = "0.96.1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
