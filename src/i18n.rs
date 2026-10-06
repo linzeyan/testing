@@ -421,6 +421,56 @@ const ZH_TW: &[(&str, &str)] = &[
         "加進 ~/.cursor/mcp.json，或專案裡的 .cursor/mcp.json。",
     ),
     ("Copied the setup for {}", "已複製 {} 的設定"),
+    ("Sync", "同步"),
+    ("owner/repository", "擁有者/儲存庫"),
+    ("Branch", "分支"),
+    ("Token kept; type to replace", "已保存 token；輸入可取代"),
+    ("Personal access token", "個人存取權杖（PAT）"),
+    (
+        "A fine-grained token with Contents: read and write on the repository",
+        "對該儲存庫有 Contents：讀寫權限的 fine-grained token",
+    ),
+    ("A token with the api scope", "具 api 範圍的 token"),
+    ("Sync now", "立即同步"),
+    (
+        "To a private repository. Secrets, history and cookies stay on this machine.",
+        "同步到私有儲存庫。機密值、歷史紀錄與 cookie 只留在這台電腦。",
+    ),
+    (
+        "Sync: name the repository and give a token in Settings first",
+        "同步：請先在設定填好儲存庫與 token",
+    ),
+    ("Sync: {}", "同步：{}"),
+    ("In step with {}", "已與 {} 一致"),
+    (
+        "Synced with {}: {} files came in, {} went out",
+        "已與 {} 同步：拉下 {} 個檔案，推上 {} 個",
+    ),
+    ("Changed in both places", "兩邊都改了"),
+    (
+        "Since the last sync, these changed both in {} and here. Which should stay? The other side's changes to them are lost.",
+        "上次同步後，這些在 {} 和這台電腦都被改過。要留哪一邊？另一邊對它們的修改會遺失。",
+    ),
+    ("Use the repository's", "用儲存庫的"),
+    ("Keep this machine's", "保留這台的"),
+    ("Sync with {} on {}", "與 {} 上的 {} 同步"),
+    (
+        "The workspace folder's files and apitool both changed: settle that first",
+        "工作區資料夾的檔案與 apitool 都有變更：請先處理那邊",
+    ),
+    (
+        "{} refused the token: check it, and that it may read and write the repository",
+        "{} 拒絕了 token：請檢查它，以及它能否讀寫該儲存庫",
+    ),
+    ("{} has no branch {}", "{} 沒有分支 {}"),
+    (
+        "No repository {} on {}, or the token can't see it",
+        "儲存庫 {} 不存在於 {}，或 token 看不到它",
+    ),
+    (
+        "The repository changed while this synced: sync again",
+        "同步途中儲存庫有了新變更：請再同步一次",
+    ),
     ("Edit globals", "編輯全域變數"),
     ("Edit this environment's variables", "編輯此環境的變數"),
     ("Edit {}", "編輯 {}"),
@@ -1300,6 +1350,7 @@ mod tests {
             include_str!("varedit.rs"),
             include_str!("appearance.rs"),
             include_str!("store.rs"),
+            include_str!("sync.rs"),
         ];
         let mut wrapped = std::collections::BTreeSet::new();
         for src in sources {

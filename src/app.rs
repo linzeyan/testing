@@ -108,6 +108,7 @@ enum Msg {
     Latest(Result<crate::update::Release, String>),
     /// An update was installed, or why not.
     Installed(crate::update::Release, Result<(), String>),
+    Synced(Result<crate::sync::Outcome, String>),
 }
 
 /// Where looking for and installing an update is at.
@@ -601,6 +602,8 @@ enum Dialog {
     Unsaved(Next),
     /// The workspace files and the database both changed since they were last in step.
     Sync,
+    /// Files changed both in the synced repository and here since the last sync.
+    RemoteConflict(Vec<String>),
     /// Pasted JSON or a file path; `note` says what went wrong or didn't come over.
     Paste {
         text: String,
@@ -772,6 +775,12 @@ pub struct App {
     mcp: Option<Result<McpHost, String>>,
     /// Which of `MCP_CLIENTS` Settings shows the setup for.
     mcp_client: usize,
+    /// The repository the workspace syncs with.
+    remote: crate::sync::Remote,
+    /// A token typed in Settings, sealed into the workspace when it closes or syncs.
+    remote_token: String,
+    remote_token_saved: bool,
+    syncing: bool,
     /// Word wrap in the response body, kept across restarts.
     wrap_response: bool,
     /// The response beside the request instead of under it (Postman's two-pane view).
@@ -867,6 +876,10 @@ impl App {
             mcp_window: state.mcp_window,
             mcp: None,
             mcp_client: 0,
+            remote: state.remote,
+            remote_token: String::new(),
+            remote_token_saved: ws.has_remote_token(),
+            syncing: false,
             wrap_response: state.wrap_response,
             side_by_side: !state.stacked,
             narrow: false,
@@ -1133,6 +1146,48 @@ impl App {
             mcp_window: self.mcp_window,
             mcp_port: self.mcp_host().map_or(0, |h| h.port),
             mcp_token: self.mcp_host().map(|h| h.token.clone()).unwrap_or_default(),
+            remote: self.remote.clone(),
+        });
+    }
+
+    /// Pulls and pushes the workspace's tree with its repository (Settings > Sync).
+    fn start_sync(&mut self, ctx: &egui::Context, resolution: Option<crate::sync::Resolution>) {
+        if self.syncing {
+            return;
+        }
+        let token = match self.ws.remote_token() {
+            Ok(Some(token)) if self.remote.is_set() => token,
+            Ok(_) => {
+                self.status =
+                    t("Sync: name the repository and give a token in Settings first").into();
+                self.settings = true;
+                return;
+            }
+            Err(e) => {
+                self.status = tf("Sync: {}", &[&e]);
+                return;
+            }
+        };
+        self.syncing = true;
+        let (cell, net, tx, ctx) = (
+            self.client.clone(),
+            (self.network.clone(), self.cookies.clone()),
+            self.tx.clone(),
+            ctx.clone(),
+        );
+        let (ws, remote) = (self.ws.clone(), self.remote.clone());
+        let failed = t("Network settings: {}");
+        self.rt.spawn(async move {
+            // Through the proxy chosen for requests: a VDI may have no other way out.
+            let result = match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
+                Ok(c) => crate::sync::sync(&c.http, &ws, &remote, &token, resolution).await,
+                Err(e) => Err(fill(failed, &[&e])),
+            };
+            let _ = tx.send(Msg::Synced(result));
+            ctx.request_repaint();
         });
     }
 
@@ -2131,6 +2186,33 @@ impl App {
                     };
                     continue;
                 }
+                Msg::Synced(result) => {
+                    use crate::sync::Outcome;
+                    self.syncing = false;
+                    let repo = self.remote.path();
+                    match result {
+                        Ok(Outcome::Synced {
+                            pulled: 0,
+                            pushed: 0,
+                        }) => {
+                            self.status = tf("In step with {}", &[&repo]);
+                        }
+                        Ok(Outcome::Synced { pulled, pushed }) => {
+                            self.status = tf(
+                                "Synced with {}: {} files came in, {} went out",
+                                &[&repo, &pulled, &pushed],
+                            );
+                            if pulled > 0 {
+                                self.refresh_from_disk();
+                            }
+                        }
+                        Ok(Outcome::Conflicts(paths)) => {
+                            self.dialog = Some(Dialog::RemoteConflict(paths));
+                        }
+                        Err(e) => self.status = tf("Sync: {}", &[&e]),
+                    }
+                    continue;
+                }
                 Msg::Response(path, outcome) => (path, *outcome),
             };
             if let Some(i) = self.pending.iter().position(|p| p.path == path) {
@@ -2906,6 +2988,16 @@ impl App {
                     .clicked()
                 {
                     self.settings = true;
+                }
+                if self.remote.is_set() {
+                    let shape = if self.syncing { icon::HOURGLASS } else { icon::ARROWS_CLOCKWISE };
+                    let hint = tf(
+                        "Sync with {} on {}",
+                        &[&self.remote.path(), &self.remote.provider.name()],
+                    );
+                    if icon_button(ui, shape, t("Sync"), None).on_hover_text(hint).clicked() {
+                        self.start_sync(&ui.ctx().clone(), None);
+                    }
                 }
                 let news = match &self.update {
                     Update::Available(r) => Some((&r.version, t("{} is available"))),
@@ -4846,6 +4938,37 @@ impl App {
                         cancel = ui.button(t("Cancel")).clicked();
                     });
                 }
+                Dialog::RemoteConflict(paths) => {
+                    ui.heading(t("Changed in both places"));
+                    ui.label(tf(
+                        "Since the last sync, these changed both in {} and here. Which should \
+                         stay? The other side's changes to them are lost.",
+                        &[&self.remote.path()],
+                    ));
+                    const SHOWN: usize = 8;
+                    for path in paths.iter().take(SHOWN) {
+                        let name = path.strip_prefix("collections/").unwrap_or(path);
+                        ui.monospace(name.strip_suffix(".toml").unwrap_or(name));
+                    }
+                    if paths.len() > SHOWN {
+                        ui.weak(tf("… and {} more", &[&(paths.len() - SHOWN)]));
+                    }
+                    ui.horizontal(|ui| {
+                        use crate::sync::Resolution;
+                        for (label, resolution) in [
+                            (t("Use the repository's"), Resolution::UseRemote),
+                            (t("Keep this machine's"), Resolution::KeepLocal),
+                        ] {
+                            if ui.button(label).clicked() {
+                                then = Some(Box::new(move |app, ctx| {
+                                    app.dialog = None;
+                                    app.start_sync(ctx, Some(resolution));
+                                }));
+                            }
+                        }
+                        cancel = ui.button(t("Cancel")).clicked();
+                    });
+                }
                 Dialog::Paste { text, note } => {
                     ui.heading(t("Import a collection or spec"));
                     ui.label(t(
@@ -5571,6 +5694,9 @@ impl App {
         let cli = std::env::current_exe().map(|exe| exe.with_file_name(cli_name));
         let root = self.ws.root.clone();
         let mut copied = None;
+        let (remote, remote_token) = (&mut self.remote, &mut self.remote_token);
+        let (token_saved, syncing) = (self.remote_token_saved, self.syncing);
+        let mut sync_now = false;
         let (mut close, mut network) = (false, false);
         let (mut check, mut install, mut restart) = (false, None, false);
         let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
@@ -5741,6 +5867,47 @@ impl App {
                         }
                     });
                     ui.end_row();
+                    ui.label(t("Sync"));
+                    ui.vertical(|ui| {
+                        use crate::sync::Provider;
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("remote-provider")
+                                .selected_text(remote.provider.name())
+                                .show_ui(ui, |ui| {
+                                    for p in [Provider::GitHub, Provider::GitLab] {
+                                        ui.selectable_value(&mut remote.provider, p, p.name());
+                                    }
+                                });
+                            let repo = egui::TextEdit::singleline(&mut remote.repo)
+                                .hint_text(t("owner/repository"))
+                                .desired_width(170.0);
+                            ui.add(repo);
+                            let branch = egui::TextEdit::singleline(&mut remote.branch)
+                                .hint_text("main")
+                                .desired_width(70.0);
+                            ui.add(branch).on_hover_text(t("Branch"));
+                        });
+                        ui.horizontal(|ui| {
+                            let hint = match token_saved {
+                                true => t("Token kept; type to replace"),
+                                false => t("Personal access token"),
+                            };
+                            let scope = match remote.provider {
+                                Provider::GitHub => t("A fine-grained token with Contents: read and write on the repository"),
+                                Provider::GitLab => t("A token with the api scope"),
+                            };
+                            let field = egui::TextEdit::singleline(remote_token)
+                                .password(true)
+                                .hint_text(hint)
+                                .desired_width(230.0);
+                            ui.add(field).on_hover_text(scope);
+                            let ready = remote.is_set() && (token_saved || !remote_token.is_empty());
+                            sync_now = (ui.add_enabled(!syncing && ready, egui::Button::new(t("Sync now"))))
+                                .clicked();
+                        });
+                        ui.weak(t("To a private repository. Secrets, history and cookies stay on this machine."));
+                    });
+                    ui.end_row();
                 });
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5749,6 +5916,17 @@ impl App {
         });
         if let Some(client) = copied {
             self.status = tf("Copied the setup for {}", &[&client]);
+        }
+        if (sync_now || close || network || modal.should_close()) && !self.remote_token.is_empty() {
+            let token = std::mem::take(&mut self.remote_token);
+            match self.ws.set_remote_token(token.trim()) {
+                Ok(()) => self.remote_token_saved = true,
+                Err(e) => self.status = tf("Sync: {}", &[&e]),
+            }
+        }
+        if sync_now {
+            self.save_state();
+            self.start_sync(ctx, None);
         }
         if close || network || modal.should_close() {
             self.settings = false;
@@ -13089,6 +13267,70 @@ mod ui_tests {
             server["args"],
             serde_json::json!(["mcp", "--workspace", "/w/s", "--window"])
         );
+    }
+
+    /// The token is kept by the workspace, not by the window's saved state; a conflict
+    /// asks before anything changes, naming requests as the tree does; and what a sync
+    /// pulled shows at once.
+    #[test]
+    fn sync_keeps_its_token_apart_and_asks_about_conflicts() {
+        use crate::sync::Outcome;
+        let ws = workspace("sync");
+        let mut h = harness(ws.clone());
+        let sync_button = || {
+            egui_kittest::kittest::By::new()
+                .role(Role::Button)
+                .label("Sync")
+        };
+        h.state_mut().settings = true;
+        h.run();
+        assert!(h.query(sync_button()).is_none(), "nothing to sync with yet");
+        assert!(button(&h, "Sync now").accesskit_node().is_disabled());
+
+        h.state_mut().remote.repo = "https://github.com/o/r".into();
+        h.state_mut().remote_token = "ghp_s3cret".into();
+        h.run();
+        assert!(!button(&h, "Sync now").accesskit_node().is_disabled());
+        shot(&mut h, "sync-settings");
+        button(&h, "Close").click();
+        h.run();
+        assert_eq!(ws.remote_token(), Ok(Some("ghp_s3cret".into())));
+        assert!(h.state().remote_token.is_empty());
+        let state = ws.load_state();
+        assert_eq!(state.remote.path(), "o/r");
+        let saved = serde_json::to_string(&state).unwrap();
+        assert!(!saved.contains("s3cret"), "{saved}");
+        assert!(h.query(sync_button()).is_some());
+
+        let both = vec![
+            "collections/users/list.toml".into(),
+            "environments/dev.toml".into(),
+        ];
+        h.state()
+            .tx
+            .send(Msg::Synced(Ok(Outcome::Conflicts(both))))
+            .unwrap();
+        h.run();
+        h.get_by_label("users/list");
+        h.get_by_label("environments/dev");
+        shot(&mut h, "sync-conflict");
+        button(&h, "Cancel").click();
+        h.run();
+        assert!(h.state().dialog.is_none() && !h.state().syncing);
+
+        ws.create_request(&ws.collections(), "pulled").unwrap();
+        let synced = Outcome::Synced {
+            pulled: 1,
+            pushed: 0,
+        };
+        h.state().tx.send(Msg::Synced(Ok(synced))).unwrap();
+        h.run();
+        assert!(
+            h.state().status.contains("1 files came in"),
+            "{}",
+            h.state().status
+        );
+        h.get_by_label("pulled");
     }
 
     #[test]

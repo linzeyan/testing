@@ -104,3 +104,12 @@ cookies and OAuth tokens stay in the database, secret values sealed by the OS: D
 Windows, a login-keychain key on macOS, plain on Linux; a database copied to another user
 or machine can't open them. The log, `apitool.log`, is in `$XDG_STATE_HOME/apitool`
 (`~/.local/state/apitool`) on macOS and Linux and in the workspace on Windows.
+
+Settings > Sync keeps that tree in a private GitHub.com or GitLab.com repository, so two
+machines share one workspace: give the repository (`owner/name` or its address), a branch
+and a token (GitHub: fine-grained, Contents read and write on that repository; GitLab: the
+`api` scope), kept sealed like secret values. The status bar's ↻ then pulls what changed
+there and pushes what changed here in one commit, through the proxy set for requests. A
+request changed on both sides since the last sync is asked about: keep the repository's
+or this machine's. Secret values, history, cookies and OAuth tokens never leave, and other
+files in the repository are left alone.

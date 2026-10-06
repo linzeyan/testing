@@ -165,6 +165,8 @@ pub struct State {
     pub mcp_port: u16,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub mcp_token: String,
+    /// The repository the workspace syncs with (Settings).
+    pub remote: crate::sync::Remote,
 }
 
 /// Clones share one connection: the GUI's mock server reads from its own thread.
@@ -580,6 +582,50 @@ impl Workspace {
     }
 
     /// OAuth tokens as `auth::export` wrote them; empty when there are none yet.
+    /// The repository's tree at the last sync (`sync::Base`, JSON).
+    pub fn remote_base(&self) -> Option<String> {
+        self.get("remote-base")
+    }
+
+    pub fn set_remote_base(&self, json: &str) -> Result<(), String> {
+        self.put("remote-base", json)
+    }
+
+    /// The sync token, sealed like environment secrets.
+    pub fn remote_token(&self) -> Result<Option<String>, String> {
+        self.get("remote-token")
+            .map(|sealed| crate::vault::open(&sealed))
+            .transpose()
+    }
+
+    /// Without unsealing it (which may ask the OS).
+    pub fn has_remote_token(&self) -> bool {
+        self.get("remote-token").is_some()
+    }
+
+    /// Empty forgets it.
+    pub fn set_remote_token(&self, token: &str) -> Result<(), String> {
+        if token.is_empty() {
+            return sql(self
+                .db()
+                .execute("DELETE FROM kv WHERE key = 'remote-token'", []))
+            .map(drop);
+        }
+        self.put("remote-token", &crate::vault::seal(token)?)
+    }
+
+    /// The TOML tree as `export` writes it: paths from the workspace folder, with '/',
+    /// and their text.
+    pub fn tree_files(&self) -> Result<Vec<(String, String)>, String> {
+        let plan = self.plan(&self.root)?;
+        Ok((plan.files.into_iter())
+            .map(|(path, text)| {
+                let rel = path.strip_prefix(&self.root).unwrap_or(&path);
+                (rel.to_string_lossy().replace('\\', "/"), text)
+            })
+            .collect())
+    }
+
     pub fn load_tokens(&self) -> String {
         self.get("oauth-tokens").unwrap_or_default()
     }

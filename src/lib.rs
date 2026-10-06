@@ -33,6 +33,7 @@ mod script;
 mod sigv4;
 pub mod store;
 mod stream;
+mod sync;
 mod syntax;
 mod update;
 mod varedit;
