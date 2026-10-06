@@ -98,8 +98,6 @@ pub fn is_newer(version: &str) -> bool {
 
 pub async fn latest(client: &reqwest::Client) -> Result<Release, String> {
     let response = (client.get(LATEST))
-        // GitHub's API refuses requests without one.
-        .header("User-Agent", "apitool")
         .header("Accept", "application/vnd.github+json")
         .timeout(Duration::from_secs(20))
         .send()
@@ -142,7 +140,6 @@ async fn install_into(
 async fn download(client: &reqwest::Client, url: &str, to: &Path) -> Result<(), String> {
     use std::io::Write;
     let mut response = (client.get(url))
-        .header("User-Agent", "apitool")
         .timeout(Duration::from_secs(600))
         .send()
         .await

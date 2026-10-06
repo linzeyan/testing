@@ -110,6 +110,10 @@ fn host_matches(pattern: &str, host: &str, port: Option<u16>) -> bool {
     }
 }
 
+/// Sent unless a request sets its own, as Postman sends `PostmanRuntime/x.y`: without
+/// one, some APIs (GitHub's) refuse the request.
+pub const USER_AGENT: &str = concat!("apitool/", env!("CARGO_PKG_VERSION"));
+
 /// gRPC needs HTTP/2 even over plain TCP (h2c), which reqwest only does with prior
 /// knowledge, and that would break HTTP/1-only servers for everything else.
 #[derive(Clone)]
@@ -316,6 +320,7 @@ pub async fn build_client_with_jar(
 
     let build = move |v: Variant| {
         let mut b = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
             .timeout(Duration::from_secs(net.timeout_secs.max(1)))
             .tls_danger_accept_invalid_certs(net.insecure || v.insecure)
             .redirect(match v.redirects {

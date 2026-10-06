@@ -44,6 +44,9 @@ const MAX_LINE: usize = 4096;
 // light background alike.
 const RED: Color32 = Color32::from_rgb(220, 80, 80);
 const ORANGE: Color32 = Color32::from_rgb(200, 120, 0);
+/// A dot in this says something is set inside (a body, auth, scripts); ORANGE's says
+/// unsaved edits. The Send button's blue.
+const BLUE: Color32 = Color32::from_rgb(40, 110, 200);
 /// The raw body's languages and the Content-Type each sets; Text sends the default.
 const RAW_TYPES: [(&str, &str); 4] = [
     ("Text", ""),
@@ -148,7 +151,7 @@ impl Open {
         leaf_name(&self.path)
     }
     fn dirty(&self) -> bool {
-        self.saved != self.draft
+        !self.saved.same_as(&self.draft)
     }
 }
 
@@ -707,6 +710,8 @@ pub struct App {
     /// Focus to move to on the next frame, once the target widget exists.
     focus_request: Option<egui::Id>,
     open: Option<Open>,
+    /// The request the editor showed last frame.
+    editing: Option<PathBuf>,
     tabs: Vec<Tab>,
     req_tab: ReqTab,
     script_tab: ScriptTab,
@@ -786,6 +791,7 @@ impl App {
             quick_look: false,
             focus_request: None,
             open: None,
+            editing: None,
             tabs: Vec::new(),
             req_tab: ReqTab::Params,
             script_tab: ScriptTab::Post,
@@ -1130,7 +1136,8 @@ impl App {
         self.refresh_inherited();
         let Some(open) = &mut self.open else { return };
         match self.ws.load_request(&open.path) {
-            Ok(disk) if disk == open.saved => {}
+            // As saved, not as typed: an empty body picked in the editor reads back as none.
+            Ok(disk) if disk.same_as(&open.saved) => {}
             Ok(disk) if !open.dirty() => {
                 open.saved = disk.clone();
                 open.draft = disk;
@@ -1955,6 +1962,18 @@ fn leaf_name(path: &Path) -> String {
 /// A "…" button that fills `path` from the system's file dialog; `save` asks where to
 /// write instead. A file inside the workspace comes back relative to it, so the path still
 /// works in a clone on another machine.
+/// Focuses the text field `id` with all of `text` selected, so typing replaces it.
+fn focus_all(ctx: &egui::Context, id: egui::Id, text: &str) {
+    let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+    let end = egui::text::CCursor::new(text.chars().count());
+    let all = egui::text_selection::CCursorRange::two(egui::text::CCursor::new(0), end);
+    state.cursor.set_char_range(Some(all));
+    state.store(ctx, id);
+    // Focused now, not via `focus_request`: an unfocused TextEdit collapses the selection
+    // when it draws.
+    ctx.memory_mut(|m| m.request_focus(id));
+}
+
 fn browse(ui: &mut egui::Ui, path: &mut String, filters: &[(&str, &[&str])], save: bool) -> bool {
     let hint = if save {
         t("Choose where to save")
@@ -2416,15 +2435,7 @@ impl eframe::App for App {
             && let Some(open) = &self.open
         {
             // Selected, as in a browser's address bar, so typing replaces it.
-            let id = egui::Id::new("url");
-            let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
-            let end = egui::text::CCursor::new(open.draft.url.chars().count());
-            let all = egui::text_selection::CCursorRange::two(egui::text::CCursor::new(0), end);
-            state.cursor.set_char_range(Some(all));
-            state.store(ui.ctx(), id);
-            // Focused now, not via `focus_request`: an unfocused TextEdit collapses the
-            // selection when it draws.
-            ui.memory_mut(|m| m.request_focus(id));
+            focus_all(ui.ctx(), egui::Id::new("url"), &open.draft.url);
         }
         if ui.input(|i| i.viewport().close_requested()) {
             if !self.allow_close && !self.unsaved().is_empty() {
@@ -2441,6 +2452,13 @@ impl eframe::App for App {
             }
         }
 
+        // egui keeps a text field's undo history under its id, and the editor's fields have
+        // the same ids whichever request is open: Ctrl+Z after a switch brought back the
+        // last request's URL. Each request opens with a fresh history instead.
+        if self.open.as_ref().map(|o| &o.path) != self.editing.as_ref() {
+            ui.data_mut(|d| d.remove_by_type::<egui::text_edit::TextEditState>());
+            self.editing = self.open.as_ref().map(|o| o.path.clone());
+        }
         // The active environment's colour across the top: hard to miss when it's prod.
         if let Some(color) = self.env_color() {
             egui::Panel::top("env-color")
@@ -2478,8 +2496,7 @@ impl App {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let shortcut = ui.ctx().format_shortcut(&SETTINGS);
-                let gear = ui.small_button(icon::GEAR_SIX);
-                if (named(gear, t("App settings"), None))
+                if icon_button(ui, icon::GEAR_SIX, t("App settings"), None)
                     .on_hover_text(tf("Settings ({})", &[&shortcut]))
                     .clicked()
                 {
@@ -2492,7 +2509,7 @@ impl App {
                 };
                 if let Some((version, hint)) = news {
                     let text = RichText::new(format!("{} {version}", icon::ARROW_CIRCLE_UP));
-                    let button = named(ui.small_button(text.color(GREEN)), t("Update"), None);
+                    let button = named(ui.button(text.color(GREEN)), t("Update"), None);
                     if button.on_hover_text(tf(hint, &[version])).clicked() {
                         self.settings = true;
                     }
@@ -2515,21 +2532,19 @@ impl App {
                     label = RichText::new(format!("{} {proxy} · {}", icon::GLOBE, t("TLS verify OFF"))).color(RED);
                 }
                 if ui
-                    .small_button(label)
+                    .button(label)
                     .on_hover_text(note.unwrap_or(t("Network settings")))
                     .clicked()
                 {
                     self.network_editor = Some(self.network.clone());
                 }
                 ui.separator();
-                let mut sidebar = !self.hide_sidebar;
-                let shown = sidebar;
-                let toggle = ui.toggle_value(&mut sidebar, icon::SIDEBAR_SIMPLE);
-                if (named(toggle, t("Sidebar"), Some(shown)))
+                let shown = !self.hide_sidebar;
+                if icon_button(ui, icon::SIDEBAR_SIMPLE, t("Sidebar"), Some(shown))
                     .on_hover_text(t("Show or hide collections and history, for more room"))
-                    .changed()
+                    .clicked()
                 {
-                    self.hide_sidebar = !sidebar;
+                    self.hide_sidebar = shown;
                     self.save_state();
                 }
                 ui.separator();
@@ -2538,30 +2553,30 @@ impl App {
                     false => t("The response beside the request instead of under it"),
                 };
                 let on = self.side_by_side;
-                let toggle = ui.toggle_value(&mut self.side_by_side, icon::COLUMNS);
-                if (named(toggle, t("Side by side"), Some(on)))
+                if icon_button(ui, icon::COLUMNS, t("Side by side"), Some(on))
                     .on_hover_text(hint)
-                    .changed()
+                    .clicked()
                 {
+                    self.side_by_side = !on;
                     self.save_state();
                 }
                 ui.separator();
                 let mut stop_mock = false;
                 if let Some(m) = &self.mock {
-                    ui.colored_label(GREEN, "●");
+                    dot(ui, GREEN);
                     let hover = tf(
                         "Answers with the saved examples of {}. Click to copy the URL.",
                         &[&m.folder],
                     );
                     if ui
-                        .small_button(tf("Mock {}", &[&m.url]))
+                        .button(tf("Mock {}", &[&m.url]))
                         .on_hover_text(hover)
                         .clicked()
                     {
                         ui.ctx().copy_text(m.url.clone());
                         self.status = t("Copied the mock server URL").into();
                     }
-                    stop_mock = ui.small_button(t("Stop")).clicked();
+                    stop_mock = ui.button(t("Stop")).clicked();
                     ui.separator();
                 }
                 if stop_mock {
@@ -2591,14 +2606,14 @@ impl App {
         ui.horizontal(|ui| {
             ui.strong(t("Environment"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if named(ui.small_button(icon::PLUS), t("New environment"), None)
+                if icon_button(ui, icon::PLUS, t("New environment"), None)
                     .on_hover_text(t("New environment"))
                     .clicked()
                 {
                     self.dialog = Some(Dialog::name(NameKind::NewEnv, ""));
                 }
                 if ui
-                    .small_button(t("Globals"))
+                    .button(t("Globals"))
                     .on_hover_text(t("Variables available in every environment"))
                     .clicked()
                 {
@@ -2639,8 +2654,11 @@ impl App {
                 self.set_env(env);
             }
             if let Some(name) = self.active_env.clone() {
-                let dot = RichText::new("●").color(self.env_color().unwrap_or(Color32::GRAY));
-                ui.menu_button(dot, |ui| {
+                let colour = icon_button(ui, "", t("Environment colour"), None)
+                    .on_hover_text(t("Colour this environment, e.g. prod in red"));
+                let fill = self.env_color().unwrap_or(Color32::GRAY);
+                (ui.painter()).circle_filled(colour.rect.center(), DOT + 1.0, fill);
+                egui::Popup::menu(&colour).show(|ui| {
                     let mut pick = |ui: &mut egui::Ui, label: RichText, rgb: Option<[u8; 3]>| {
                         if ui.button(label).clicked() {
                             match rgb {
@@ -2659,21 +2677,22 @@ impl App {
                         );
                     }
                     pick(ui, RichText::new(t("None")), None);
-                })
-                .response
-                .on_hover_text(t("Colour this environment, e.g. prod in red"));
+                });
             }
             if let Some(name) = self.active_env.clone()
-                && named(ui.small_button(icon::PENCIL_SIMPLE), t("Edit"), None)
+                && icon_button(ui, icon::PENCIL_SIMPLE, t("Edit"), None)
                     .on_hover_text(t("Edit this environment's variables"))
                     .clicked()
             {
                 self.open_env_editor(Some(name), &[]);
             }
             let on = self.quick_look;
-            let look = ui.toggle_value(&mut self.quick_look, icon::EYE);
-            named(look, t("Quick look"), Some(on))
-                .on_hover_text(t("Quick look: every variable in scope"));
+            if icon_button(ui, icon::EYE, t("Quick look"), Some(on))
+                .on_hover_text(t("Quick look: every variable in scope"))
+                .clicked()
+            {
+                self.quick_look = !on;
+            }
         });
         ui.separator();
         ui.horizontal(|ui| {
@@ -2695,7 +2714,7 @@ impl App {
         ui.horizontal(|ui| {
             let root = self.ws.collections();
             let shortcut = ui.ctx().format_shortcut(&NEW_REQUEST);
-            if named(ui.small_button(icon::FILE_PLUS), t("New request"), None)
+            if icon_button(ui, icon::FILE_PLUS, t("New request"), None)
                 .on_hover_text(tf("New request ({})", &[&shortcut]))
                 .clicked()
             {
@@ -2703,8 +2722,7 @@ impl App {
             }
             // A collection is a top-level folder: its settings, Run, mock and Postman copy
             // are a collection's, and a Postman import lands as one.
-            let collection = named(ui.small_button(icon::STACK_PLUS), t("New collection"), None);
-            if collection
+            if icon_button(ui, icon::STACK_PLUS, t("New collection"), None)
                 .on_hover_text(t(
                     "New collection: requests with their own variables, auth and scripts",
                 ))
@@ -2712,39 +2730,37 @@ impl App {
             {
                 self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
             }
-            let more = ui
-                .menu_button(icon::DOTS_THREE, |ui| {
-                    if ui.button(t("Copy docs as Markdown")).clicked() {
-                        self.copy_docs(&root, ui.ctx());
-                        ui.close();
-                    }
-                    if ui.button(t("Copy as Postman collection")).clicked() {
-                        self.copy_postman(&root, ui.ctx());
-                        ui.close();
-                    }
-                    if ui.button(t("Start mock server")).clicked() {
-                        self.start_mock(root.clone(), ui.ctx());
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .button(t("Import…"))
-                        .on_hover_text(t(
-                            "A Postman collection or environment, or an OpenAPI/Swagger spec",
-                        ))
-                        .clicked()
-                    {
-                        self.dialog = Some(Dialog::Paste {
-                            text: String::new(),
-                            note: String::new(),
-                        });
-                        ui.close();
-                    }
-                })
-                .response
+            let more = icon_button(ui, icon::DOTS_THREE, t("More"), None)
                 .on_hover_text(t("All collections"));
-            named(more, t("More"), None);
-            if named(ui.small_button(icon::PLAY), t("Run"), None)
+            egui::Popup::menu(&more).show(|ui| {
+                if ui.button(t("Copy docs as Markdown")).clicked() {
+                    self.copy_docs(&root, ui.ctx());
+                    ui.close();
+                }
+                if ui.button(t("Copy as Postman collection")).clicked() {
+                    self.copy_postman(&root, ui.ctx());
+                    ui.close();
+                }
+                if ui.button(t("Start mock server")).clicked() {
+                    self.start_mock(root.clone(), ui.ctx());
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .button(t("Import…"))
+                    .on_hover_text(t(
+                        "A Postman collection or environment, or an OpenAPI/Swagger spec",
+                    ))
+                    .clicked()
+                {
+                    self.dialog = Some(Dialog::Paste {
+                        text: String::new(),
+                        note: String::new(),
+                    });
+                    ui.close();
+                }
+            });
+            if icon_button(ui, icon::PLAY, t("Run"), None)
                 .on_hover_text(t("Run all collections"))
                 .clicked()
             {
@@ -3185,16 +3201,12 @@ impl App {
                         let m = &o.draft.method;
                         method_badge(ui, m, 0);
                     }
-                    let name = leaf_name(&tab.path);
-                    let mut text = RichText::new(match open.is_some_and(Open::dirty) {
-                        true => format!("{name} ●"),
-                        false => name,
-                    });
+                    let mut text = RichText::new(leaf_name(&tab.path));
                     if tab.preview {
                         text = text.italics();
                     }
-                    let label = ui
-                        .selectable_label(is_active, text)
+                    let unsaved = open.is_some_and(Open::dirty).then_some(ORANGE);
+                    let label = tab_label(ui, is_active, text, unsaved)
                         .on_hover_text(self.ws.display_name(&tab.path));
                     if label.clicked() {
                         show = Some(tab.path.clone());
@@ -3398,7 +3410,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Right to left: this lands to the right of Save.
-                    let more = ui.button("⏷");
+                    let more = icon_button(ui, icon::CARET_DOWN, t("More save options"), None);
                     egui::Popup::menu(&more)
                         .id(egui::Id::new("save-more"))
                         .show(|ui| {
@@ -3415,21 +3427,31 @@ impl App {
                         .clicked();
                     if !streaming {
                         let on = self.load.is_some();
-                        let load = ui.selectable_label(on, icon::GAUGE);
-                        toggle_load = named(load, t("Load test"), Some(on))
+                        toggle_load = icon_button(ui, icon::GAUGE, t("Load test"), Some(on))
                             .on_hover_text(t("Load test: many virtual users sending this request"))
                             .clicked();
                     }
                     let on = self.cookie_manager;
-                    let cookies = ui.toggle_value(&mut self.cookie_manager, icon::COOKIE);
-                    named(cookies, t("Cookies"), Some(on))
-                        .on_hover_text(t("Cookies the server set, sent back automatically"));
+                    if icon_button(ui, icon::COOKIE, t("Cookies"), Some(on))
+                        .on_hover_text(t("Cookies the server set, sent back automatically"))
+                        .clicked()
+                    {
+                        self.cookie_manager = !on;
+                    }
                     let on = self.code;
-                    let code = ui.toggle_value(&mut self.code, icon::CODE);
-                    named(code, t("Code"), Some(on))
-                        .on_hover_text(t("This request as curl, Python, Go, … to copy"));
+                    if icon_button(ui, icon::CODE, t("Code"), Some(on))
+                        .on_hover_text(t("This request as curl, Python, Go, … to copy"))
+                        .clicked()
+                    {
+                        self.code = !on;
+                    }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
+                        // Sideways only: the row is a button tall, and a name in a taller
+                        // font (CJK) lost its lower half to it.
+                        let (mut clip, max) = (ui.clip_rect(), ui.max_rect());
+                        (clip.min.x, clip.max.x) =
+                            (clip.min.x.max(max.min.x), clip.max.x.min(max.max.x));
+                        ui.set_clip_rect(clip);
                         for (i, (name, dir)) in crumbs.iter().enumerate() {
                             let link = ui.link(RichText::new(name).weak());
                             // The outermost is the collection.
@@ -3443,10 +3465,9 @@ impl App {
                             ui.weak("›");
                         }
                         if open.dirty() {
-                            ui.colored_label(ORANGE, "●")
-                                .on_hover_text(t("Unsaved changes"));
+                            dot(ui, ORANGE).on_hover_text(t("Unsaved changes"));
                         }
-                        let name = RichText::new(open.name()).heading();
+                        let name = RichText::new(open.name()).strong();
                         ui.add(egui::Label::new(name).truncate())
                             .on_hover_text(open.name());
                     });
@@ -3483,7 +3504,7 @@ impl App {
                 // gRPC answers aren't read as an HTTP body, so they can't go to a file.
                 let downloadable = !streaming && open.draft.method != "GRPC";
                 let more = match downloadable {
-                    true => 20.0 + ui.spacing().item_spacing.x,
+                    true => 22.0 + ui.spacing().item_spacing.x,
                     false => 0.0,
                 };
                 let width = ui.available_width() - button[0] - 8.0 - more;
@@ -3549,10 +3570,11 @@ impl App {
                         .clicked();
                 }
                 if downloadable {
-                    let button = ui.add_enabled(
-                        pending.is_none(),
-                        egui::Button::new("⏷").min_size(egui::vec2(20.0, 22.0)),
-                    );
+                    // As tall as Send beside it.
+                    let caret =
+                        egui::Button::new(icon::CARET_DOWN).min_size(egui::vec2(22.0, 22.0));
+                    let button = ui.add_enabled(pending.is_none(), caret);
+                    let button = named(button, t("More send options"), None);
                     egui::Popup::menu(&button)
                         .id(egui::Id::new("send-more"))
                         .show(|ui| {
@@ -3609,74 +3631,59 @@ impl App {
                         name.to_owned()
                     }
                 };
-                let dot = |none: bool, name: &str| {
-                    if none {
-                        name.to_owned()
-                    } else {
-                        format!("{name} ●")
-                    }
-                };
+                let current = &mut self.req_tab;
                 // MQTT has no query, headers or body: topics take their place.
                 let mqtt = open.draft.method == "MQTT";
                 let http_only = [ReqTab::Params, ReqTab::Headers, ReqTab::Body];
                 let mqtt_only = [ReqTab::Topics, ReqTab::Properties];
-                if mqtt && http_only.contains(&self.req_tab) {
-                    self.req_tab = ReqTab::Topics;
-                } else if !mqtt && mqtt_only.contains(&self.req_tab) {
-                    self.req_tab = ReqTab::Params;
+                if mqtt && http_only.contains(current) {
+                    *current = ReqTab::Topics;
+                } else if !mqtt && mqtt_only.contains(current) {
+                    *current = ReqTab::Params;
                 }
                 if mqtt {
                     let topics = open.draft.mqtt.topics.iter();
                     let on = topics.filter(|t| t.enabled && !t.filter.is_empty()).count();
-                    ui.selectable_value(&mut self.req_tab, ReqTab::Topics, tab(on, t("Topics")));
-                    ui.selectable_value(
-                        &mut self.req_tab,
+                    sub_tab(ui, current, ReqTab::Topics, tab(on, t("Topics")), false);
+                    let properties = count(&open.draft.mqtt.user_properties);
+                    sub_tab(
+                        ui,
+                        current,
                         ReqTab::Properties,
-                        tab(count(&open.draft.mqtt.user_properties), t("Properties")),
+                        tab(properties, t("Properties")),
+                        false,
                     );
                 } else {
-                    ui.selectable_value(
-                        &mut self.req_tab,
-                        ReqTab::Params,
-                        tab(
-                            count(&open.draft.params) + count(&open.draft.path_vars),
-                            t("Params"),
-                        ),
-                    );
-                    ui.selectable_value(
-                        &mut self.req_tab,
+                    let params = count(&open.draft.params) + count(&open.draft.path_vars);
+                    sub_tab(ui, current, ReqTab::Params, tab(params, t("Params")), false);
+                    let headers = count(&open.draft.headers);
+                    sub_tab(
+                        ui,
+                        current,
                         ReqTab::Headers,
-                        tab(count(&open.draft.headers), t("Headers")),
+                        tab(headers, t("Headers")),
+                        false,
                     );
-                    ui.selectable_value(
-                        &mut self.req_tab,
-                        ReqTab::Body,
-                        if open.draft.method == "GRAPHQL" {
-                            t("Query").to_owned()
-                        } else {
-                            dot(matches!(open.draft.body, Body::None), t("Body"))
-                        },
-                    );
+                    match open.draft.method == "GRAPHQL" {
+                        true => sub_tab(ui, current, ReqTab::Body, t("Query"), false),
+                        false => {
+                            let set = !open.draft.body.is_empty();
+                            sub_tab(ui, current, ReqTab::Body, t("Body"), set)
+                        }
+                    };
                 }
-                ui.selectable_value(
-                    &mut self.req_tab,
-                    ReqTab::Auth,
-                    dot(
-                        matches!(open.draft.effective_auth(), Auth::None | Auth::Inherit),
-                        t("Auth"),
-                    ),
-                );
-                let no_scripts =
-                    open.draft.pre_request.trim().is_empty() && open.draft.tests.trim().is_empty();
-                ui.selectable_value(
-                    &mut self.req_tab,
-                    ReqTab::Scripts,
-                    dot(no_scripts, t("Scripts")),
-                );
-                ui.selectable_value(
-                    &mut self.req_tab,
+                let auth = !matches!(open.draft.effective_auth(), Auth::None | Auth::Inherit);
+                sub_tab(ui, current, ReqTab::Auth, t("Auth"), auth);
+                let scripts = !open.draft.pre_request.trim().is_empty()
+                    || !open.draft.tests.trim().is_empty();
+                sub_tab(ui, current, ReqTab::Scripts, t("Scripts"), scripts);
+                let asserts = count(&open.draft.asserts);
+                sub_tab(
+                    ui,
+                    current,
                     ReqTab::Asserts,
-                    tab(count(&open.draft.asserts), t("Asserts")),
+                    tab(asserts, t("Asserts")),
+                    false,
                 );
                 // How a single HTTP exchange goes out, or MQTT's connection; other
                 // streams and gRPC have none.
@@ -3694,28 +3701,23 @@ impl App {
                         }
                         false => open.draft.settings.is_default(),
                     };
-                    ui.selectable_value(
-                        &mut self.req_tab,
-                        ReqTab::Settings,
-                        dot(default, t("Settings")),
-                    );
-                } else if self.req_tab == ReqTab::Settings {
-                    self.req_tab = ReqTab::Params;
+                    sub_tab(ui, current, ReqTab::Settings, t("Settings"), !default);
+                } else if *current == ReqTab::Settings {
+                    *current = ReqTab::Params;
                 }
-                ui.selectable_value(
-                    &mut self.req_tab,
-                    ReqTab::Docs,
-                    dot(open.draft.description.trim().is_empty(), t("Docs")),
-                );
+                let docs = !open.draft.description.trim().is_empty();
+                sub_tab(ui, current, ReqTab::Docs, t("Docs"), docs);
                 let examples = open.draft.examples.len();
                 if examples > 0 {
-                    ui.selectable_value(
-                        &mut self.req_tab,
+                    sub_tab(
+                        ui,
+                        current,
                         ReqTab::Examples,
                         tab(examples, t("Examples")),
+                        false,
                     );
-                } else if self.req_tab == ReqTab::Examples {
-                    self.req_tab = ReqTab::Params;
+                } else if *current == ReqTab::Examples {
+                    *current = ReqTab::Params;
                 }
             });
             ui.separator();
@@ -4171,15 +4173,19 @@ impl App {
                                 }
                             });
                     }
-                    let edit = ui.add(
+                    let id = egui::Id::new("name-edit");
+                    ui.add(
                         egui::TextEdit::singleline(name)
+                            .id(id)
                             .hint_text(t("Name"))
                             .desired_width(f32::INFINITY),
                     );
                     // Before refocusing: Enter is what made the field let go of focus.
                     let enter = enter_pressed(ui);
                     if !enter && ui.memory(|m| m.focused().is_none()) {
-                        edit.request_focus();
+                        // Whole name selected, as a file manager renames: the cursor was
+                        // wherever the last rename left it.
+                        focus_all(ui.ctx(), id, name);
                     }
                     if !error.is_empty() {
                         ui.colored_label(RED, error.as_str());
@@ -4689,17 +4695,13 @@ impl App {
                     0 => t("Variables").to_owned(),
                     n => tf("Variables ({})", &[&n]),
                 };
-                let dot = |set: bool, name: &str| match set {
-                    true => format!("{name} ●"),
-                    false => name.to_owned(),
-                };
                 let scripts = !f.pre_request.trim().is_empty() || !f.tests.trim().is_empty();
-                let auth = dot(f.auth != Auth::Inherit, t("Auth"));
-                ui.selectable_value(&mut ed.tab, FolderTab::Vars, vars_label);
-                ui.selectable_value(&mut ed.tab, FolderTab::Auth, auth);
-                ui.selectable_value(&mut ed.tab, FolderTab::Scripts, dot(scripts, t("Scripts")));
-                let docs = dot(!f.description.trim().is_empty(), t("Docs"));
-                ui.selectable_value(&mut ed.tab, FolderTab::Docs, docs);
+                let auth = !f.auth.is_unset();
+                let docs = !f.description.trim().is_empty();
+                sub_tab(ui, &mut ed.tab, FolderTab::Vars, vars_label, false);
+                sub_tab(ui, &mut ed.tab, FolderTab::Auth, t("Auth"), auth);
+                sub_tab(ui, &mut ed.tab, FolderTab::Scripts, t("Scripts"), scripts);
+                sub_tab(ui, &mut ed.tab, FolderTab::Docs, t("Docs"), docs);
             });
             ui.separator();
             egui::ScrollArea::vertical()
@@ -5811,7 +5813,11 @@ fn tree_row(
         egui::TextStyle::Button,
     );
     let color = visuals.text_color();
-    let at = |x: f32, g: &egui::Galley| egui::pos2(x, rect.center().y - g.size().y / 2.0);
+    // Before the status is put: `put` moves the cursor past it.
+    let pos = egui::pos2(
+        content.cursor().left(),
+        rect.center().y - text.size().y / 2.0,
+    );
     // A label, unlike the name: it has its own tooltip, and takes no clicks from the row.
     if let Some((text, hover, size)) = right {
         let min = egui::pos2(
@@ -5823,7 +5829,6 @@ fn tree_row(
             .put(egui::Rect::from_min_size(min, size), label)
             .on_hover_text(hover);
     }
-    let pos = at(content.cursor().left(), &text);
     ui.painter().galley(pos, text, color);
     row
 }
@@ -6813,7 +6818,7 @@ fn auth_editor(
             Auth::Jwt(model::Jwt {
                 algorithm: "HS256".into(),
                 secret: pass(),
-                payload: "{\n  \"sub\": \"\",\n  \"iat\": {{$timestamp}}\n}".into(),
+                payload: model::JWT_CLAIMS.into(),
             }),
         ),
     ];
@@ -7404,15 +7409,9 @@ fn scripts_editor(
 ) {
     let mut insert: Option<String> = None;
     ui.horizontal(|ui| {
-        let label = |name: &str, s: &str| {
-            if s.trim().is_empty() {
-                name.to_owned()
-            } else {
-                format!("{name} ●")
-            }
-        };
-        ui.selectable_value(tab, ScriptTab::Pre, label(t("Pre-request"), pre_request));
-        ui.selectable_value(tab, ScriptTab::Post, label(t("Post-response"), tests));
+        let set = |s: &str| !s.trim().is_empty();
+        sub_tab(ui, tab, ScriptTab::Pre, t("Pre-request"), set(pre_request));
+        sub_tab(ui, tab, ScriptTab::Post, t("Post-response"), set(tests));
         ui.separator();
         let snippets = if *tab == ScriptTab::Pre {
             PRE_SNIPPETS
@@ -7574,7 +7573,7 @@ fn grpc_bar(
             &[("Protocol Buffers", &["proto"])],
             false,
         );
-        let reload = named(ui.small_button(icon::ARROWS_CLOCKWISE), t("Reload"), None)
+        let reload = icon_button(ui, icon::ARROWS_CLOCKWISE, t("Reload"), None)
             .on_hover_text(match reflection {
                 true => t("Ask the server for its methods (gRPC reflection)"),
                 false => t("Reload .proto"),
@@ -8120,7 +8119,7 @@ fn response_ui(
                     t("Copy body")
                 };
                 if (timeline || !binary)
-                    && named(ui.small_button(icon::COPY), t("Copy"), None)
+                    && icon_button(ui, icon::COPY, t("Copy"), None)
                         .on_hover_text(what)
                         .clicked()
                 {
@@ -8130,32 +8129,24 @@ fn response_ui(
                     };
                     ui.ctx().copy_text(text);
                 }
-                if named(ui.small_button(icon::DOWNLOAD_SIMPLE), t("Save…"), None)
+                if icon_button(ui, icon::DOWNLOAD_SIMPLE, t("Save…"), None)
                     .on_hover_text(t("Save the body to a file, as received"))
                     .clicked()
                 {
                     *save_file = true;
                 }
                 if external_type(&view.head).is_some()
-                    && named(
-                        ui.small_button(icon::ARROW_SQUARE_OUT),
-                        t("Open in browser"),
-                        None,
-                    )
-                    .on_hover_text(t("Show it in your browser, or the system's PDF viewer"))
-                    .clicked()
+                    && icon_button(ui, icon::ARROW_SQUARE_OUT, t("Open in browser"), None)
+                        .on_hover_text(t("Show it in your browser, or the system's PDF viewer"))
+                        .clicked()
                 {
                     *open_external = true;
                 }
                 // Examples hold text.
                 if !binary
-                    && named(
-                        ui.small_button(icon::BOOKMARK_SIMPLE),
-                        t("Save as example"),
-                        None,
-                    )
-                    .on_hover_text(t("Save as example: keep this response with the request"))
-                    .clicked()
+                    && icon_button(ui, icon::BOOKMARK_SIMPLE, t("Save as example"), None)
+                        .on_hover_text(t("Save as example: keep this response with the request"))
+                        .clicked()
                 {
                     let h = &view.head;
                     let content_type = h
@@ -8184,7 +8175,7 @@ fn response_ui(
             {
                 let svg = external_type(&view.head) == Some("svg");
                 if !view.preview
-                    && (ui.selectable_label(*wrap, t("Wrap")))
+                    && (ui.add(egui::Button::new(t("Wrap")).selected(*wrap)))
                         .on_hover_text(t("Wrap long lines"))
                         .clicked()
                 {
@@ -8193,7 +8184,7 @@ fn response_ui(
                 // Right to left: Raw is added first to sit on the right. An SVG that
                 // isn't valid XML has no Pretty, but Raw still leaves the preview.
                 if (view.other.is_some() || svg)
-                    && (ui.selectable_label(!view.pretty && !view.preview, t("Raw")))
+                    && (ui.add(egui::Button::new(t("Raw")).selected(!view.pretty && !view.preview)))
                         .on_hover_text(t("As received"))
                         .clicked()
                 {
@@ -8201,24 +8192,26 @@ fn response_ui(
                     view.set_pretty(false);
                 }
                 if view.other.is_some()
-                    && (ui.selectable_label(view.pretty && !view.preview, t("Pretty"))).clicked()
+                    && (ui
+                        .add(egui::Button::new(t("Pretty")).selected(view.pretty && !view.preview)))
+                    .clicked()
                 {
                     view.preview = false;
                     view.set_pretty(true);
                 }
-                if svg && ui.selectable_label(view.preview, t("Preview")).clicked() {
+                if svg
+                    && ui
+                        .add(egui::Button::new(t("Preview")).selected(view.preview))
+                        .clicked()
+                {
                     view.preview = true;
                     view.find.close();
                 }
                 let shortcut = ui.ctx().format_shortcut(&FIND);
                 if !view.preview
-                    && named(
-                        ui.selectable_label(view.find.open, icon::MAGNIFYING_GLASS),
-                        t("Find"),
-                        Some(view.find.open),
-                    )
-                    .on_hover_text(tf("Find ({})", &[&shortcut]))
-                    .clicked()
+                    && icon_button(ui, icon::MAGNIFYING_GLASS, t("Find"), Some(view.find.open))
+                        .on_hover_text(tf("Find ({})", &[&shortcut]))
+                        .clicked()
                 {
                     match view.find.open {
                         true => view.find.close(),
@@ -8653,12 +8646,18 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     if enter || std::mem::take(&mut find.focus) {
         edit.request_focus(); // keep typing / pressing Enter for the next hit
     }
-    ui.toggle_value(&mut find.case, t("Aa"))
-        .on_hover_text(t("Match case"));
-    ui.toggle_value(&mut find.word, "W")
-        .on_hover_text(t("Whole word"));
-    ui.toggle_value(&mut find.regex, ".*")
-        .on_hover_text(t("Regular expression"));
+    for (on, glyph, hover) in [
+        (&mut find.case, t("Aa"), t("Match case")),
+        (&mut find.word, "W", t("Whole word")),
+        (&mut find.regex, ".*", t("Regular expression")),
+    ] {
+        if icon_button(ui, glyph, glyph, Some(*on))
+            .on_hover_text(hover)
+            .clicked()
+        {
+            *on = !*on;
+        }
+    }
     let wanted = (find.query.clone(), find.case, find.word, find.regex);
     if wanted != find.searched {
         // Searched in place: lowercasing a copy of a 16 MiB body per keystroke was a
@@ -8702,13 +8701,9 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
             if n == 0 { 0 } else { find.current + 1 }
         ));
     }
-    let prev = ui
-        .small_button(t("Prev"))
-        .on_hover_text("Shift+Enter")
-        .clicked();
-    let next = ui.small_button(t("Next")).on_hover_text("Enter").clicked();
-    let close = ui
-        .small_button("×")
+    let prev = ui.button(t("Prev")).on_hover_text("Shift+Enter").clicked();
+    let next = ui.button(t("Next")).on_hover_text("Enter").clicked();
+    let close = icon_button(ui, icon::X, t("Close"), None)
         .on_hover_text(t("Close (Esc)"))
         .clicked();
     if n > 0 {
@@ -8983,6 +8978,117 @@ fn named(r: egui::Response, label: &str, selected: Option<bool>) -> egui::Respon
         Some(on) => egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, on, label),
         None => egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label),
     });
+    r
+}
+
+/// A text button's height: what every icon button and tab heading is, so a row of them
+/// lines up whatever mix of widgets it holds.
+fn button_height(ui: &egui::Ui) -> f32 {
+    let text = ui.text_style_height(&egui::TextStyle::Button);
+    (ui.spacing().interact_size.y).max(text + 2.0 * ui.spacing().button_padding.y)
+}
+
+/// Every icon button is this one square with its background, so icons side by side are
+/// the same size and height (small_button, menu_button and toggle_value each had their
+/// own padding). `on` makes it a toggle, drawn selected while on.
+fn icon_button(ui: &mut egui::Ui, glyph: &str, label: &str, on: Option<bool>) -> egui::Response {
+    let side = button_height(ui);
+    let (rect, r) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let v = match on {
+            Some(true) => ui.style().interact_selectable(&r, true),
+            _ => *ui.style().interact(&r),
+        };
+        let (painter, fill) = (ui.painter(), v.weak_bg_fill);
+        let rect = rect.expand(v.expansion);
+        painter.rect(
+            rect,
+            v.corner_radius,
+            fill,
+            v.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            font,
+            v.text_color(),
+        );
+    }
+    named(r, label, on)
+}
+
+/// Radius of a status dot: drawn, not a "●" glyph, which a CJK font makes big.
+const DOT: f32 = 3.0;
+
+fn dot(ui: &mut egui::Ui, color: Color32) -> egui::Response {
+    let size = egui::vec2(2.0 * DOT, button_height(ui));
+    let (rect, r) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), DOT, color);
+    r
+}
+
+/// A tab heading, as `selectable_label` draws one, with an optional dot after the text:
+/// ORANGE for unsaved edits, BLUE for something set inside.
+fn tab_label(
+    ui: &mut egui::Ui,
+    selected: bool,
+    text: impl Into<egui::WidgetText>,
+    dot: Option<Color32>,
+) -> egui::Response {
+    let pad = ui.spacing().button_padding;
+    let wrap = Some(egui::TextWrapMode::Extend);
+    let galley = text
+        .into()
+        .into_galley(ui, wrap, f32::INFINITY, egui::TextStyle::Button);
+    let dotted = dot.map_or(0.0, |_| 2.0 * DOT + pad.x);
+    let width = galley.size().x + dotted + 2.0 * pad.x;
+    let size = egui::vec2(width, button_height(ui));
+    let (rect, r) = ui.allocate_exact_size(size, egui::Sense::click());
+    let label = galley.text().to_owned();
+    r.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &label)
+    });
+    if ui.is_rect_visible(rect) {
+        let v = ui.style().interact_selectable(&r, selected);
+        if selected || r.hovered() || r.highlighted() || r.has_focus() {
+            let back = rect.expand(v.expansion);
+            let stroke = v.bg_stroke;
+            (ui.painter()).rect(
+                back,
+                v.corner_radius,
+                v.weak_bg_fill,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        let top = rect.center().y - galley.size().y / 2.0;
+        let color = v.text_color();
+        ui.painter()
+            .galley(egui::pos2(rect.left() + pad.x, top), galley, color);
+        if let Some(c) = dot {
+            let center = egui::pos2(rect.right() - pad.x - DOT, rect.center().y);
+            ui.painter().circle_filled(center, DOT, c);
+        }
+    }
+    r
+}
+
+/// `selectable_value` with `tab_label`'s dot: BLUE when `set`.
+fn sub_tab<T: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    value: T,
+    text: impl Into<egui::WidgetText>,
+    set: bool,
+) -> egui::Response {
+    let mut r = tab_label(ui, *current == value, text, set.then_some(BLUE));
+    if r.clicked() && *current != value {
+        *current = value;
+        r.mark_changed();
+    }
     r
 }
 
@@ -9407,7 +9513,9 @@ mod ui_tests {
         h.run();
         assert_eq!(tabs(&h), ["b", "c"]);
         assert!(h.state().dialog.is_none());
-        h.get_by_label("b ●").click();
+        // Its tab keeps the unsaved dot while c is in front.
+        assert_eq!(painted_dots(&h, ORANGE).len(), 1);
+        h.get_all_by_label("b").last().unwrap().click();
         h.run();
         shot(&mut h, "13-tabs");
         assert_eq!(draft(&h).url, "http://edited");
@@ -10434,8 +10542,7 @@ mod ui_tests {
         let url = format!("http://{addr}/files/report.csv?v=2");
         h.state_mut().open.as_mut().unwrap().draft.url = url;
         h.run();
-        // Save's ⏷ comes first, on the row above.
-        h.get_all_by_label("⏷").last().unwrap().click();
+        h.get_by_label("More send options").click();
         h.run();
         h.get_by_label("Send and download…").click();
         h.run();
@@ -10504,10 +10611,9 @@ mod ui_tests {
         h.run();
         let before = h.state().history.len();
         let send = h.get_by_label("Send").rect();
-        // Send's own ⏷, on its row (Save has one too).
-        let more = (h.get_all_by_label("⏷"))
-            .find(|n| (n.rect().center().y - send.center().y).abs() < 4.0)
-            .unwrap();
+        // Beside Send, on its row.
+        let more = h.get_by_label("More send options");
+        assert!((more.rect().center().y - send.center().y).abs() < 4.0);
         more.click();
         h.run();
         h.get_by_label("Repeat every").click();
@@ -10540,7 +10646,7 @@ mod ui_tests {
         ws.save_folder(&team, &folder).unwrap();
         h.state_mut().open.as_mut().unwrap().draft.url = "http://api.test/v2".into();
         h.run();
-        h.get_all_by_label("⏷").next().unwrap().click();
+        h.get_by_label("More save options").click();
         h.run();
         h.get_by_label("Save as…").click();
         h.run();
@@ -10570,7 +10676,7 @@ mod ui_tests {
         assert_eq!(h.state().tabs.len(), 1);
 
         // Never over another request.
-        h.get_all_by_label("⏷").next().unwrap().click();
+        h.get_by_label("More save options").click();
         h.run();
         h.get_by_label("Save as…").click();
         h.run();
@@ -11037,7 +11143,7 @@ mod ui_tests {
         assert!(h.state().ws.load_state().hide_sidebar, "and stays gone");
         h.get_by_label("Sidebar").click();
         h.run();
-        h.get_by_label("●").click();
+        h.get_by_label("Environment colour").click();
         h.run();
         h.get_by_label("● Red").click();
         h.run();
@@ -11050,7 +11156,7 @@ mod ui_tests {
         assert_eq!(h.state().env_color(), None);
         h.state_mut().set_env(Some("prod".into()));
         h.run();
-        h.get_by_label("●").click();
+        h.get_by_label("Environment colour").click();
         h.run();
         h.get_by_label("None").click();
         h.run();
@@ -11595,7 +11701,7 @@ mod ui_tests {
         h.run();
         assert!(h.query_by_label("Params").is_none(), "MQTT has no query");
         // Only the will is set, and the tab says so.
-        h.get_by_label("Settings ●").click();
+        h.get_by_label("Settings").click();
         h.run();
         h.state_mut().open.as_mut().unwrap().draft.mqtt.client_id = "tester".into();
         h.run();
@@ -12673,6 +12779,179 @@ mod ui_tests {
         let mut h = harness(ws);
         h.run();
         h.get_by_label("傳送");
+    }
+
+    /// Every text the last frame painted: its string, where it was drawn and the clip it was
+    /// drawn under. What a screenshot would show, without needing a GPU.
+    fn painted_texts<S>(h: &Harness<'_, S>) -> Vec<(String, egui::Rect, egui::Rect)> {
+        fn walk(
+            shape: &egui::Shape,
+            clip: egui::Rect,
+            out: &mut Vec<(String, egui::Rect, egui::Rect)>,
+        ) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, clip, out)),
+                egui::Shape::Text(t) => {
+                    let rect = egui::Rect::from_min_size(t.pos, t.galley.size());
+                    out.push((t.galley.text().to_owned(), rect, clip));
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in &h.output().shapes {
+            walk(&c.shape, c.clip_rect, &mut out);
+        }
+        out
+    }
+
+    /// The circles the last frame painted in `color`.
+    fn painted_dots<S>(h: &Harness<'_, S>, color: Color32) -> Vec<egui::Pos2> {
+        fn walk(shape: &egui::Shape, color: Color32, out: &mut Vec<egui::Pos2>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, color, out)),
+                egui::Shape::Circle(c) if c.fill == color => out.push(c.center),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in &h.output().shapes {
+            walk(&c.shape, color, &mut out);
+        }
+        out
+    }
+
+    /// The name sat after the status code, leaving a gap where it belonged and cutting
+    /// it short at the row's end.
+    #[test]
+    fn a_tree_row_shows_its_name_after_the_method_and_the_status_at_the_end() {
+        let mut h = Harness::new_ui(|ui| {
+            ui.set_width(240.0);
+            for (name, status) in [("users", Some("200")), ("orders", None)] {
+                let lead = |ui: &mut egui::Ui| {
+                    method_badge(ui, "GET", 4);
+                };
+                let status = status.map(|s| (RichText::new(s).small(), "OK"));
+                tree_row(ui, Path::new(name), name, false, lead, status);
+            }
+        });
+        h.run();
+        let texts = painted_texts(&h);
+        let at = |name: &str| texts.iter().find(|(s, ..)| s == name).unwrap().1;
+        // Where the name goes doesn't depend on whether a status follows it.
+        assert_eq!(at("users").left(), at("orders").left());
+        let status = h.get_by_label("200").rect();
+        assert!(at("users").right() < status.left(), "{status:?}");
+    }
+
+    /// The request's name was a heading in a row a button tall, clipped to it: in a tall
+    /// CJK font its lower half was cut off, as if the URL row covered it.
+    #[test]
+    fn the_request_name_is_drawn_whole() {
+        let mut h = with_request("name-whole");
+        h.state_mut().open.as_mut().unwrap().draft.url = "http://x.test".into();
+        h.run();
+        let url = text_input(&h, 0).rect();
+        // "r" is also the tab and the tree row; the name is the one just above the URL.
+        let texts = painted_texts(&h);
+        let (_, rect, clip) = (texts.iter())
+            .filter(|(s, r, _)| s == "r" && r.top() < url.top())
+            .max_by(|a, b| a.1.top().total_cmp(&b.1.top()))
+            .unwrap();
+        assert!(clip.contains_rect(*rect), "{rect:?} clipped by {clip:?}");
+        assert!(rect.bottom() <= url.top(), "{rect:?} runs into {url:?}");
+    }
+
+    /// Ctrl+Z in the URL brought back the request open before: egui keeps undo history by
+    /// widget id, and every request's URL field has the same one.
+    #[test]
+    fn undo_in_a_field_never_brings_back_another_requests_text() {
+        let ws = workspace("undo-switch");
+        for (name, url) in [("a", "http://a.test"), ("b", "http://b.test")] {
+            let path = ws.create_request(&ws.collections(), name).unwrap();
+            let req = Request {
+                url: url.into(),
+                ..Default::default()
+            };
+            ws.save_request(&path, &req).unwrap();
+        }
+        let mut h = harness(ws);
+        h.run();
+        h.get_by_label("a").click();
+        h.run();
+        type_into(&mut h, 0, "/x");
+        h.get_all_by_label("b").next().unwrap().click();
+        h.run();
+        text_input(&h, 0).click();
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+        h.run();
+        assert_eq!(draft(&h).url, "http://b.test");
+    }
+
+    /// Renaming starts with the whole name selected, wherever the last rename left the
+    /// cursor: typing replaces it.
+    #[test]
+    fn rename_starts_with_the_whole_name_selected() {
+        let ws = workspace("rename-select");
+        for name in ["abc", "hello"] {
+            ws.create_request(&ws.collections(), name).unwrap();
+        }
+        let mut h = harness(ws);
+        h.run();
+        for (name, typed) in [("abc", "z"), ("hello", "y")] {
+            h.get_by_label(name).click_secondary();
+            h.run();
+            h.get_by_label("Rename").click();
+            h.run();
+            h.event(egui::Event::Text(typed.into()));
+            h.run();
+            let Some(Dialog::Name { name, .. }) = &h.state().dialog else {
+                panic!("no rename dialog");
+            };
+            assert_eq!(name, typed);
+            h.key_press(Key::Escape);
+            h.run();
+        }
+    }
+
+    /// Clicking a body type or an auth type changes nothing saved, so it isn't an edit;
+    /// typing into it is. The tab's dot follows what is set, not what is picked.
+    #[test]
+    fn picking_a_body_or_auth_type_alone_is_not_an_edit() {
+        let mut h = with_request("pick-type");
+        let dirty = |h: &Harness<'_, App>| h.state().open.as_ref().unwrap().dirty();
+        h.get_by_label("Body").click();
+        h.run();
+        for kind in ["JSON", "Text", "Form", "Multipart", "Binary", "None"] {
+            h.get_by_label(kind).click();
+            h.run();
+            assert!(!dirty(&h), "{kind}");
+        }
+        h.get_by_label("JSON").click();
+        h.run();
+        let blue = |h: &Harness<'_, App>| painted_dots(h, BLUE).len();
+        let orange = |h: &Harness<'_, App>| painted_dots(h, ORANGE).len();
+        assert_eq!((blue(&h), orange(&h)), (0, 0));
+        h.get_by_label("Auth").click();
+        h.run();
+        let picker = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("Inherit from parent");
+        h.get(picker).click();
+        h.run();
+        h.get_by_label("Bearer token").click();
+        h.run();
+        assert!(!dirty(&h) && matches!(draft(&h).auth, Auth::Bearer { .. }));
+        assert_eq!((blue(&h), orange(&h)), (0, 0));
+
+        // Typed: an edit, a blue dot on Auth and an orange one on the tab and the name.
+        type_into(&mut h, 1, "tok");
+        assert!(dirty(&h));
+        assert_eq!((blue(&h), orange(&h)), (1, 2));
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        h.run();
+        assert_eq!((blue(&h), orange(&h)), (1, 0));
     }
 
     /// Every protocol against public servers, through the same Send and Connect as a click:

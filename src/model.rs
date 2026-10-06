@@ -36,9 +36,9 @@ pub struct Request {
     pub path_vars: Vec<KeyValue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<KeyValue>,
-    #[serde(skip_serializing_if = "Body::is_none")]
+    #[serde(skip_serializing_if = "Body::is_empty")]
     pub body: Body,
-    #[serde(skip_serializing_if = "Auth::is_inherit")]
+    #[serde(skip_serializing_if = "Auth::is_unset")]
     pub auth: Auth,
     /// JavaScript run before sending (may edit the request and variables).
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -203,7 +203,7 @@ pub struct Folder {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vars: Vec<KeyValue>,
     /// Used by requests (and subfolders) whose auth is `inherit`.
-    #[serde(skip_serializing_if = "Auth::is_inherit")]
+    #[serde(skip_serializing_if = "Auth::is_unset")]
     pub auth: Auth,
     /// Runs before the request's own pre-request script.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -341,8 +341,17 @@ pub enum Body {
 }
 
 impl Body {
-    fn is_none(&self) -> bool {
-        matches!(self, Self::None)
+    /// A type picked and nothing put in it. Sent, saved and shown as no body, so clicking
+    /// a body type changes nothing until something is typed.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::Json { text } | Self::Text { text } => text.is_empty(),
+            Self::Form { fields } => fields.is_empty(),
+            Self::Multipart { parts } => parts.is_empty(),
+            Self::File { path } => path.is_empty(),
+            Self::GraphQL { query, variables } => query.is_empty() && variables.is_empty(),
+        }
     }
 }
 
@@ -468,9 +477,38 @@ pub enum Grant {
     Implicit,
 }
 
+/// The claims a JWT Bearer auth starts with when picked.
+pub const JWT_CLAIMS: &str = "{\n  \"sub\": \"\",\n  \"iat\": {{$timestamp}}\n}";
+
+static INHERIT: Auth = Auth::Inherit;
+
 impl Auth {
-    fn is_inherit(&self) -> bool {
-        matches!(self, Self::Inherit)
+    /// Inherit, or a type picked with every field as picking it fills them (choices such as
+    /// the grant or algorithm aside): nothing set yet, so it inherits, and saves as inherit.
+    pub fn is_unset(&self) -> bool {
+        match self {
+            Self::Inherit => true,
+            Self::None => false,
+            Self::Bearer { token } => token.is_empty(),
+            Self::Basic { username, password } | Self::Digest { username, password } => {
+                username.is_empty() && password.is_empty()
+            }
+            Self::OAuth2(o) => {
+                *o == OAuth2 {
+                    grant: o.grant,
+                    ..Default::default()
+                }
+            }
+            Self::ApiKey { key, value, .. } => key.is_empty() && value.is_empty(),
+            Self::AwsV4(a) => *a == AwsV4::default(),
+            Self::OAuth1(o) => {
+                *o == OAuth1 {
+                    signature_method: o.signature_method.clone(),
+                    ..Default::default()
+                }
+            }
+            Self::Jwt(j) => j.secret.is_empty() && j.payload == JWT_CLAIMS,
+        }
     }
 }
 
@@ -677,6 +715,7 @@ impl Request {
             path_vars: Vec::new(),
             headers: kv(&self.headers, &mut r),
             body: match &self.body {
+                b if b.is_empty() => Body::None,
                 Body::None => Body::None,
                 Body::Json { text } => Body::Json { text: r(text) },
                 Body::Text { text } => Body::Text { text: r(text) },
@@ -783,12 +822,45 @@ impl Request {
         (req, missing)
     }
 
-    /// The auth that applies: its own, or the inherited one.
+    /// The auth that applies: its own, or the inherited one when its own is unset.
     pub fn effective_auth(&self) -> &Auth {
         match (&self.auth, &self.inherited.auth) {
-            (Auth::Inherit, Some((_, auth))) => auth,
-            (auth, _) => auth,
+            (own, inherited) if own.is_unset() => inherited.as_ref().map_or(&INHERIT, |(_, a)| a),
+            (own, _) => own,
         }
+    }
+
+    /// Whether saving either would store the same: an empty body is no body and an unset
+    /// auth is inherit (they're saved that way), so picking a type alone isn't an edit.
+    /// `inherited` comes from the folders, never from the file, and isn't compared.
+    pub fn same_as(&self, other: &Request) -> bool {
+        let Request {
+            method,
+            url,
+            proto,
+            rpc,
+            description,
+            params,
+            path_vars,
+            headers,
+            body,
+            auth,
+            pre_request,
+            tests,
+            asserts,
+            settings,
+            mqtt,
+            examples,
+            inherited: _,
+        } = self;
+        (method, url, proto, rpc) == (&other.method, &other.url, &other.proto, &other.rpc)
+            && (description, params, path_vars)
+                == (&other.description, &other.params, &other.path_vars)
+            && (headers, pre_request, tests) == (&other.headers, &other.pre_request, &other.tests)
+            && (asserts, settings, mqtt) == (&other.asserts, &other.settings, &other.mqtt)
+            && examples == &other.examples
+            && (body == &other.body || body.is_empty() && other.body.is_empty())
+            && (auth == &other.auth || auth.is_unset() && other.auth.is_unset())
     }
 }
 
@@ -1065,5 +1137,78 @@ mod tests {
             toml::from_str::<Request>(&toml::to_string_pretty(&form).unwrap()).unwrap(),
             form
         );
+    }
+
+    /// A body or auth type picked and left empty is the same request as none picked: not
+    /// sent, not saved, and not an edit. Anything typed into it makes it real.
+    #[test]
+    fn an_empty_body_and_a_blank_auth_are_not_set() {
+        let plain = Request::default();
+        let with = |body: Body, auth: Auth| Request {
+            body,
+            auth,
+            ..Default::default()
+        };
+        let empty = [
+            Body::Json { text: "".into() },
+            Body::Text { text: "".into() },
+            Body::Form { fields: vec![] },
+            Body::Multipart { parts: vec![] },
+            Body::File { path: "".into() },
+        ];
+        let blank = [
+            Auth::Bearer { token: "".into() },
+            Auth::Basic {
+                username: "".into(),
+                password: "".into(),
+            },
+            Auth::OAuth2(OAuth2 {
+                grant: Grant::Password,
+                ..Default::default()
+            }),
+            Auth::Jwt(Jwt {
+                algorithm: "RS256".into(),
+                secret: "".into(),
+                payload: JWT_CLAIMS.into(),
+            }),
+        ];
+        for (body, auth) in empty.into_iter().zip(blank) {
+            let picked = with(body, auth);
+            assert!(
+                picked.same_as(&plain) && plain.same_as(&picked),
+                "{picked:?}"
+            );
+            let saved = toml::to_string_pretty(&picked).unwrap();
+            assert_eq!(saved, toml::to_string_pretty(&plain).unwrap());
+            assert_eq!(picked.resolved(&HashMap::new()).0.body, Body::None);
+        }
+
+        let typed = [
+            with(Body::Json { text: "{}".into() }, Auth::Inherit),
+            with(Body::Text { text: " ".into() }, Auth::Inherit),
+            with(Body::None, Auth::Bearer { token: "t".into() }),
+            // An explicit "No auth" is a choice, unlike a blank one.
+            with(Body::None, Auth::None),
+            // Claims edited before the secret: not blank, or the edit couldn't be saved.
+            with(
+                Body::None,
+                Auth::Jwt(Jwt {
+                    payload: "{}".into(),
+                    ..Default::default()
+                }),
+            ),
+        ];
+        for req in typed {
+            assert!(!req.same_as(&plain), "{req:?}");
+        }
+
+        // Blank inherits what the folders set, as no auth picked would.
+        let mut req = with(Body::None, Auth::Bearer { token: "".into() });
+        assert_eq!(req.effective_auth(), &Auth::Inherit);
+        let folder = Auth::Bearer {
+            token: "folder".into(),
+        };
+        req.inherited.auth = Some(("api".into(), folder.clone()));
+        assert_eq!(req.effective_auth(), &folder);
     }
 }

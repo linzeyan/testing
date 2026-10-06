@@ -401,6 +401,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Environment", "環境"),
     ("Environment \"{}\" already exists", "環境「{}」已存在"),
     ("Environment: {}", "環境：{}"),
+    ("Environment colour", "環境顏色"),
     ("Error", "錯誤"),
     ("Errors", "錯誤"),
     ("ETag from an earlier response", "先前回應的 ETag"),
@@ -588,6 +589,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Mock {}", "模擬 {}"),
     ("Mock: {}", "模擬：{}"),
     ("More", "更多"),
+    ("More save options", "更多儲存選項"),
+    ("More send options", "更多傳送選項"),
     (
         "Moved Permanently: the resource has a new URL for good.",
         "Moved Permanently：資源已永久移到新的 URL。",

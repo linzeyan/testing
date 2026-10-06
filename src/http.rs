@@ -429,6 +429,10 @@ impl Sent {
         if !has(&self.headers, "accept") {
             self.headers.push(("accept".into(), "*/*".into()));
         }
+        if !has(&self.headers, "user-agent") {
+            let agent = crate::net::USER_AGENT.into();
+            self.headers.push(("user-agent".into(), agent));
+        }
         if !has(&self.headers, "accept-encoding") && !has(&self.headers, "range") {
             self.headers.push(("accept-encoding".into(), "gzip".into()));
         }
@@ -479,7 +483,7 @@ pub fn auto_headers(mut req: Request, own: &[KeyValue]) -> Vec<(String, String, 
     let auto = sent.headers.into_iter().filter(|(k, _)| !own.contains(k));
     auto.map(|(k, v)| {
         let from = match k.as_str() {
-            "host" | "accept" | "accept-encoding" => "HTTP client",
+            "host" | "accept" | "user-agent" | "accept-encoding" => "HTTP client",
             "content-type" | "content-length" => "Body",
             // Authorization, or an API key's header.
             _ => "Auth",
@@ -1030,6 +1034,31 @@ pub(crate) mod tests {
         assert_eq!(from("authorization"), Some("Auth"));
         assert_eq!(from("content-type"), Some("Body"));
         assert_eq!(from("accept"), None, "the user's own replaces it");
+        // A User-Agent by default (some APIs refuse requests without one); the request's
+        // own replaces it.
+        let agent = ("user-agent".to_owned(), crate::net::USER_AGENT.to_owned());
+        assert!(received(&resp).contains(&agent), "{:?}", received(&resp));
+        let own = Request {
+            url: echo_server(),
+            headers: vec![KeyValue::new("User-Agent", "probe")],
+            ..Default::default()
+        };
+        let auto = auto_headers(own.clone(), &own.headers);
+        assert!(!auto.iter().any(|(k, ..)| k == "user-agent"), "{auto:?}");
+        let resp = rt.block_on(execute(client(&rt), own)).unwrap();
+        let agents: Vec<_> = (received(&resp).into_iter())
+            .filter(|(k, _)| k == "user-agent")
+            .collect();
+        assert_eq!(agents, [("user-agent".to_owned(), "probe".to_owned())]);
+        let plain = Request {
+            url: "http://x.test/a".into(),
+            ..Default::default()
+        };
+        let auto = auto_headers(plain, &[]);
+        assert!(
+            auto.contains(&(agent.0, agent.1, "HTTP client")),
+            "{auto:?}"
+        );
 
         // A file body, built outside any runtime as the UI does.
         let path = std::env::temp_dir().join(format!("apitool-auto-{}.png", std::process::id()));
