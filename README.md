@@ -77,8 +77,11 @@ such as Citrix VDI. No installer: unzip and run.
   `apitool-cli <folder|request> [-e env] [-d data.csv] [-n N] [--junit report.xml]`, with
   names as in the tree (`users/get user`; `.` is the whole collection); exit code 0 = all
   passed, 1 = failures, 2 = could not run.
-- **apitool-cli mcp** — MCP server (stdio) so an LLM client can list, read, write, send and
-  run requests and edit variables in the workspace. Secret values are masked unless asked for.
+- **apitool-cli mcp** — MCP server (stdio) so an LLM client can list, read, write, move,
+  delete, send and run requests, edit folders and variables, import collections and specs,
+  generate code, read the history and listen to streams (SSE, WebSocket, Socket.IO, MQTT,
+  gRPC) in the workspace. Secret values are masked unless asked for, in snippets too.
+  Settings > MCP gives the setup for Claude Code, Claude Desktop or Cursor to copy:
 
   ```json
   { "mcpServers": { "apitool": {
@@ -86,7 +89,11 @@ such as Citrix VDI. No installer: unzip and run.
       "args": ["mcp", "--workspace", "C:\\tools\\apitool\\workspace"] } } }
   ```
 
-  The GUI re-reads the workspace when its window regains focus.
+  The GUI re-reads the workspace when its window regains focus. With "Let it operate this
+  window" on, the window serves MCP itself on 127.0.0.1 (a new port and token each start,
+  web pages refused) and `apitool-cli mcp --window` relays to it: the client also sees
+  what's open (unsaved edits, the response, a live stream), opens requests, presses Send
+  and switches environments, and its changes show at once.
 
 The workspace is `$APITOOL_WORKSPACE` if set, else `$XDG_DATA_HOME/apitool`
 (`~/.local/share/apitool`) on macOS and Linux, and `workspace/` next to the executable on

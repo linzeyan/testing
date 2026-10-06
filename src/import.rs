@@ -31,3 +31,49 @@ pub fn parse(text: &str) -> Result<Import, String> {
             .to_owned()
     })
 }
+
+/// What an import added to the workspace.
+pub struct Imported {
+    /// The new top-level folder, as shown in the tree; none for an environment alone.
+    pub folder: Option<String>,
+    pub requests: usize,
+    /// The names given, which differ from the file's when one was taken.
+    pub environments: Vec<String>,
+    /// What didn't come over as it was.
+    pub warnings: Vec<String>,
+}
+
+/// `text` is the JSON or YAML. Nothing already there is replaced: a taken folder or
+/// environment name gets " copy".
+pub fn into_workspace(ws: &crate::store::Workspace, text: &str) -> Result<Imported, String> {
+    Ok(match parse(text)? {
+        Import::Collection {
+            name,
+            folders,
+            requests,
+            warnings,
+            environments,
+        } => {
+            let dir = ws.add_tree(&name, &folders, &requests)?;
+            let environments = (environments.iter())
+                .map(|(env, shared, secret)| ws.add_env(env, shared, secret))
+                .collect::<Result<_, _>>()?;
+            Imported {
+                folder: Some(ws.display_name(&dir)),
+                requests: requests.len(),
+                environments,
+                warnings,
+            }
+        }
+        Import::Environment {
+            name,
+            shared,
+            secret,
+        } => Imported {
+            folder: None,
+            requests: 0,
+            environments: vec![ws.add_env(&name, &shared, &secret)?],
+            warnings: Vec::new(),
+        },
+    })
+}

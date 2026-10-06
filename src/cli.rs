@@ -8,7 +8,7 @@ use crate::runner::{self, RunPlan, Vars};
 use crate::{net, store};
 
 const USAGE: &str = "usage: apitool-cli <folder|request> [options]
-       apitool-cli mcp [--workspace <dir>]
+       apitool-cli mcp [--workspace <dir>] [--window]
        apitool-cli docs [folder] [--workspace <dir>] [-o <file.md>]
        apitool-cli mock [folder] [--workspace <dir>] [--port <n>]
 
@@ -16,7 +16,9 @@ Runs every request under the folder or request, named as in the tree (`users`,
 `users/get user`; `.` is the whole collection), and exits with 1 if any request or
 test fails.
 
-`mcp` serves the workspace to an LLM client (Model Context Protocol over stdio).
+`mcp` serves the workspace to an LLM client (Model Context Protocol over stdio); with
+`--window`, it relays to the open apitool window instead (Settings > MCP), which can then
+be operated too.
 `docs` writes Markdown API docs (default: the whole collection, to stdout).
 `mock` answers HTTP calls with the saved examples (default port 3000, localhost only).
 
@@ -45,14 +47,20 @@ pub fn main() -> i32 {
 
 fn run(args: Vec<String>) -> Result<bool, String> {
     if args.first().map(String::as_str) == Some("mcp") {
-        let workspace = match &args[1..] {
+        let window = args[1..].iter().any(|a| a == "--window");
+        let rest: Vec<&String> = args[1..].iter().filter(|a| *a != "--window").collect();
+        let workspace = match rest[..] {
             [] => None,
             [flag, dir] if flag == "--workspace" => Some(PathBuf::from(dir)),
-            _ => return Err("usage: apitool-cli mcp [--workspace <dir>]".into()),
+            _ => return Err("usage: apitool-cli mcp [--workspace <dir>] [--window]".into()),
         };
         // stdout carries only JSON-RPC; diagnostics go to stderr via `main`.
         let ws = store::open_workspace(workspace)?;
-        crate::mcp::serve(ws, std::io::stdin().lock(), std::io::stdout().lock())?;
+        let (input, output) = (std::io::stdin().lock(), std::io::stdout().lock());
+        match window {
+            true => crate::mcp::relay(&ws, input, output)?,
+            false => crate::mcp::serve(ws, input, output)?,
+        }
         return Ok(true);
     }
     match args.first().map(String::as_str) {

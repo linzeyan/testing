@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -246,6 +247,55 @@ struct Pending {
     request: Request,
     started: Instant,
     abort: tokio::task::AbortHandle,
+}
+
+/// The window's MCP endpoint (Settings > MCP) while it serves.
+struct McpHost {
+    port: u16,
+    token: String,
+    calls: mpsc::Receiver<WindowCall>,
+    stop: Arc<AtomicBool>,
+}
+
+/// A tool call for the window from the MCP thread, answered on the next frame.
+struct WindowCall {
+    name: String,
+    args: serde_json::Value,
+    reply: mpsc::Sender<Result<serde_json::Value, String>>,
+}
+
+/// The MCP clients Settings has a setup for.
+const MCP_CLIENTS: [&str; 3] = ["Claude Code", "Claude Desktop", "Cursor"];
+
+/// What `MCP_CLIENTS[client]` is told to start: apitool-cli serving the workspace at
+/// `root`, or with `window`, relaying to this window.
+fn mcp_setup(client: usize, cli: &Path, root: &Path, window: bool) -> String {
+    let mut args = vec![
+        "mcp".to_owned(),
+        "--workspace".into(),
+        root.display().to_string(),
+    ];
+    if window {
+        args.push("--window".into());
+    }
+    if client > 0 {
+        let setup =
+            serde_json::json!({ "mcpServers": { "apitool": { "command": cli, "args": args } } });
+        return serde_json::to_string_pretty(&setup).unwrap_or_default();
+    }
+    // Double quotes read the same in sh, PowerShell and cmd.
+    let quote = |word: String| match word
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_-./:\\".contains(c))
+    {
+        true => word,
+        false => format!("\"{}\"", word.replace('"', "\\\"")),
+    };
+    let words: Vec<String> = std::iter::once(cli.display().to_string())
+        .chain(args)
+        .map(quote)
+        .collect();
+    format!("claude mcp add apitool -- {}", words.join(" "))
 }
 
 /// A live (or just ended) WebSocket/SSE connection or gRPC stream for the open request.
@@ -716,6 +766,12 @@ pub struct App {
     /// The code snippet panel, and its language (kept in the workspace state).
     code: bool,
     code_lang: String,
+    /// Settings: MCP clients may operate this window.
+    mcp_window: bool,
+    /// None until it's asked for; Err says why it couldn't start.
+    mcp: Option<Result<McpHost, String>>,
+    /// Which of `MCP_CLIENTS` Settings shows the setup for.
+    mcp_client: usize,
     /// Word wrap in the response body, kept across restarts.
     wrap_response: bool,
     /// The response beside the request instead of under it (Postman's two-pane view).
@@ -808,6 +864,9 @@ impl App {
             cookie_manager: false,
             code: false,
             code_lang: state.code_lang,
+            mcp_window: state.mcp_window,
+            mcp: None,
+            mcp_client: 0,
             wrap_response: state.wrap_response,
             side_by_side: !state.stacked,
             narrow: false,
@@ -1071,7 +1130,213 @@ impl App {
             raw_types: self.raw_types.clone(),
             appearance: self.appearance.clone(),
             updates: self.updates.clone(),
+            mcp_window: self.mcp_window,
+            mcp_port: self.mcp_host().map_or(0, |h| h.port),
+            mcp_token: self.mcp_host().map(|h| h.token.clone()).unwrap_or_default(),
         });
+    }
+
+    fn mcp_host(&self) -> Option<&McpHost> {
+        self.mcp.as_ref().and_then(|m| m.as_ref().ok())
+    }
+
+    /// Starts or stops the window's MCP endpoint as Settings says, and answers its calls.
+    fn serve_mcp(&mut self, ctx: &egui::Context) {
+        match (&self.mcp, self.mcp_window) {
+            (None, true) => {
+                self.mcp = Some(self.start_mcp(ctx));
+                self.save_state();
+            }
+            (Some(_), false) => {
+                if let Some(Ok(host)) = self.mcp.take() {
+                    host.stop.store(true, Ordering::Relaxed);
+                    // Wakes the thread from accept() to see the flag.
+                    let _ = std::net::TcpStream::connect(("127.0.0.1", host.port));
+                }
+                self.save_state();
+            }
+            _ => {}
+        }
+        let Some(host) = self.mcp_host() else { return };
+        let calls: Vec<WindowCall> = host.calls.try_iter().collect();
+        for call in calls {
+            let answer = self.window_tool(&call.name, &call.args, ctx);
+            let _ = call.reply.send(answer);
+        }
+    }
+
+    /// A port the system picks and a fresh token, each start: `apitool-cli mcp --window`
+    /// reads both from the workspace state.
+    fn start_mcp(&self, ctx: &egui::Context) -> Result<McpHost, String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let mut bytes = [0u8; 24];
+        getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let (calls_tx, calls) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = ctx.clone();
+        let window: crate::mcp::Window = Box::new(move |name, args| {
+            let (reply, answer) = mpsc::channel();
+            let call = WindowCall {
+                name: name.to_owned(),
+                args: args.clone(),
+                reply,
+            };
+            calls_tx
+                .send(call)
+                .map_err(|_| "the apitool window closed".to_owned())?;
+            ctx.request_repaint();
+            // Nobody waits for a reload; the next frame does it.
+            if name == "refresh" {
+                return Ok(serde_json::Value::Null);
+            }
+            (answer.recv_timeout(Duration::from_secs(10)))
+                .map_err(|_| "the apitool window didn't answer; is it minimized?".to_owned())?
+        });
+        let (ws, t, s) = (self.ws.clone(), token.clone(), stop.clone());
+        std::thread::spawn(move || crate::mcp::serve_http(listener, ws, t, window, s));
+        log::info!("MCP for this window on 127.0.0.1:{port}");
+        Ok(McpHost {
+            port,
+            token,
+            calls,
+            stop,
+        })
+    }
+
+    /// What MCP clients do in the window (`mcp::Window`).
+    fn window_tool(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        ctx: &egui::Context,
+    ) -> Result<serde_json::Value, String> {
+        use serde_json::{Value, json};
+        match name {
+            "refresh" => {
+                self.refresh_from_disk();
+                Ok(Value::Null)
+            }
+            "get_window" => Ok(self.window_state()),
+            "open_request" => {
+                self.open_for_mcp(args)?;
+                Ok(self.window_state())
+            }
+            "select_environment" => {
+                let env = args["environment"].as_str();
+                if let Some(name) = env
+                    && !self.envs.iter().any(|e| e == name)
+                {
+                    return Err(format!(
+                        "unknown environment \"{name}\"; existing: {:?}",
+                        self.envs
+                    ));
+                }
+                self.set_env(env.map(str::to_owned));
+                Ok(json!({ "environment": self.active_env }))
+            }
+            "send" => {
+                if args["path"].is_string() {
+                    self.open_for_mcp(&json!({ "path": args["path"] }))?;
+                }
+                let vars = self.all_vars();
+                let open = self.open.as_ref().ok_or("no request is open")?;
+                let live = (self.stream.as_mut()).filter(|s| s.path == open.path && s.live);
+                if let Some(message) = args["message"].as_str() {
+                    let s = live.ok_or("the open request has no live connection to send on")?;
+                    if s.outgoing.is_none() {
+                        return Err("this connection only listens".into());
+                    }
+                    // What the user is typing stays in the box.
+                    let typed = std::mem::replace(&mut s.compose, message.to_owned());
+                    let sent = s.send_compose(Some(&open.draft.mqtt), &vars);
+                    s.compose = typed;
+                    sent?;
+                    return Ok(json!({ "stream": true }));
+                }
+                if live.is_some() {
+                    return Err("already connected: pass `message` to send on it".into());
+                }
+                let stream = streams(&open.draft, &self.grpc_methods);
+                self.send(ctx, None);
+                if self.dialog.is_some() {
+                    return Err("Send is waiting for the user to fill in {{?prompted}} values in the window".into());
+                }
+                Ok(json!({ "stream": stream }))
+            }
+            other => Err(format!("unknown window tool {other}")),
+        }
+    }
+
+    /// Opens `path` in a tab; `request`, if given, becomes its unsaved edits.
+    fn open_for_mcp(&mut self, args: &serde_json::Value) -> Result<(), String> {
+        let name = args["path"].as_str().ok_or("missing `path`")?;
+        let path = self.ws.request_path(name)?;
+        if !self.ws.exists(&path) {
+            return Err(format!("no request at \"{name}\""));
+        }
+        self.activate(path.clone(), true);
+        let open = (self.open.as_mut())
+            .filter(|o| o.path == path)
+            .ok_or_else(|| self.status.clone())?;
+        if let Some(inline) = args.get("request").filter(|r| !r.is_null()) {
+            let mut req: Request =
+                serde_json::from_value(inline.clone()).map_err(|e| format!("request: {e}"))?;
+            req.method = req.method.trim().to_uppercase();
+            req.sync_params();
+            req.inherited = open.draft.inherited.clone();
+            open.draft = req;
+        }
+        Ok(())
+    }
+
+    /// The window as `get_window` reports it: what the user sees of the open request.
+    fn window_state(&self) -> serde_json::Value {
+        use serde_json::{Value, json};
+        let open = self.open.as_ref();
+        let response = match &self.response {
+            Some(Shown {
+                result: Ok(view),
+                tests,
+                logs,
+                ..
+            }) => {
+                let head = &view.head;
+                let body = view.unfiltered.as_deref().unwrap_or(&view.text);
+                json!({
+                    "status": head.status,
+                    "reason": head.reason,
+                    "time_ms": head.elapsed.as_millis() as u64,
+                    "headers": head.headers,
+                    "body": crate::mcp::cut(body, crate::mcp::MAX_BODY),
+                    "tests": tests,
+                    "logs": logs,
+                })
+            }
+            Some(Shown { result: Err(e), .. }) => json!({ "error": e }),
+            None => Value::Null,
+        };
+        let stream = (self.stream.as_ref())
+            .filter(|s| open.is_some_and(|o| o.path == s.path))
+            .map(|s| {
+                let log = s.log.lock().unwrap();
+                let latest = log.events.iter().rev().take(50).rev();
+                let events: Vec<Value> = latest
+                    .map(|(at, e)| crate::mcp::event_json(*at, e))
+                    .collect();
+                json!({ "connected": s.live, "events": events })
+            });
+        json!({
+            "tabs": self.tabs.iter().map(|t| self.ws.display_name(&t.path)).collect::<Vec<_>>(),
+            "open": open.map(|o| self.ws.display_name(&o.path)),
+            "unsaved": open.is_some_and(|o| o.dirty()),
+            "request": open.map(|o| &o.draft),
+            "environment": self.active_env,
+            "sending": open.is_some_and(|o| self.pending.iter().any(|p| p.path == o.path)),
+            "response": response,
+            "stream": stream,
+        })
     }
 
     fn apply_network(&mut self, network: Network, ctx: &egui::Context) {
@@ -1718,28 +1983,7 @@ impl App {
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
                 .await
             {
-                // MQTT isn't HTTP, but it takes the client's proxy choice (maybe from PAC).
-                Ok(client) if is_mqtt => {
-                    crate::mqtt::session(req, tls, client.route.clone(), pub_rx, emit).await
-                }
-                Ok(client) if req.method == "GRPC" => {
-                    crate::grpc::stream(client, req, out_rx, emit).await
-                }
-                // Streams keep the default settings; only the host's certificate varies.
-                Ok(client) => {
-                    let upgrades = is_ws || socketio || subscribes(&req);
-                    let http = match upgrades {
-                        true => client.websocket_for(&req.url),
-                        false => client.for_settings(&Default::default(), &req.url),
-                    };
-                    match http {
-                        Ok(http) if is_ws => stream::websocket(http, req, out_rx, emit).await,
-                        Ok(http) if socketio => stream::socketio(http, req, out_rx, emit).await,
-                        Ok(http) if upgrades => stream::graphql(http, req, emit).await,
-                        Ok(http) => stream::sse(http, req, emit).await,
-                        Err(e) => emit(Event::Error(fill(failed, &[&e]))),
-                    }
-                }
+                Ok(client) => stream::connect(client, tls, req, out_rx, pub_rx, emit).await,
                 Err(e) => emit(Event::Error(fill(failed, &[&e]))),
             }
         });
@@ -2480,6 +2724,7 @@ impl eframe::App for App {
             self.applied = Some(self.appearance.clone());
         }
         self.receive(ui.ctx());
+        self.serve_mcp(ui.ctx());
         self.tick_repeat(ui.ctx());
         if self.auto_update
             && !matches!(self.update, Update::Checking | Update::Installing(_))
@@ -3177,58 +3422,23 @@ impl App {
                 std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?
             }
         };
-        let warnings = match crate::import::parse(&text)? {
-            crate::postman::Import::Collection {
-                name,
-                folders,
-                requests,
-                warnings,
-                environments,
-            } => {
-                let dir = self.ws.add_tree(&name, &folders, &requests)?;
-                let name = self.ws.display_name(&dir);
-                for (env, shared, secret) in &environments {
-                    self.add_env(env, shared, secret)?;
-                }
-                self.status = tf(
-                    "Imported {} requests into \"{}\"",
-                    &[&requests.len(), &name],
-                );
-                match environments.len() {
-                    0 => {}
-                    1 => self.status += t(" and 1 environment"),
-                    n => self.status += &tf(" and {} environments", &[&n]),
-                }
-                warnings
-            }
-            crate::postman::Import::Environment {
-                name,
-                shared,
-                secret,
-            } => {
-                let name = self.add_env(&name, &shared, &secret)?;
-                self.status = tf("Imported environment \"{}\"", &[&name]);
-                Vec::new()
-            }
+        let imported = crate::import::into_workspace(&self.ws, &text)?;
+        self.status = match &imported.folder {
+            Some(name) => tf(
+                "Imported {} requests into \"{}\"",
+                &[&imported.requests, name],
+            ),
+            None => tf("Imported environment \"{}\"", &[&imported.environments[0]]),
         };
+        if imported.folder.is_some() {
+            match imported.environments.len() {
+                0 => {}
+                1 => self.status += t(" and 1 environment"),
+                n => self.status += &tf(" and {} environments", &[&n]),
+            }
+        }
         self.reload();
-        Ok(warnings)
-    }
-
-    /// Never replaces one: a same-named environment may hold this machine's secrets.
-    fn add_env(
-        &mut self,
-        name: &str,
-        shared: &[crate::model::KeyValue],
-        secret: &[crate::model::KeyValue],
-    ) -> Result<String, String> {
-        let names = self.ws.env_names();
-        let name = std::iter::once(name.to_owned())
-            .chain((1..).map(|n| crate::store::copy_name(name, n)))
-            .find(|n| !names.contains(n))
-            .expect("some name is free");
-        self.ws.save_env(Some(&name), shared, secret)?;
-        Ok(name)
+        Ok(imported.warnings)
     }
 
     fn copy_docs(&mut self, dir: &Path, ctx: &egui::Context) {
@@ -5347,6 +5557,20 @@ impl App {
             .get_or_insert_with(crate::appearance::families);
         let a = &mut self.appearance;
         let (updates, update) = (&mut self.updates, &self.update);
+        let (mcp_window, mcp_client) = (&mut self.mcp_window, &mut self.mcp_client);
+        let serving = match &self.mcp {
+            Some(Ok(host)) => Some(Ok(host.port)),
+            Some(Err(e)) => Some(Err(e.clone())),
+            None => None,
+        };
+        let cli_name = if cfg!(windows) {
+            "apitool-cli.exe"
+        } else {
+            "apitool-cli"
+        };
+        let cli = std::env::current_exe().map(|exe| exe.with_file_name(cli_name));
+        let root = self.ws.root.clone();
+        let mut copied = None;
         let (mut close, mut network) = (false, false);
         let (mut check, mut install, mut restart) = (false, None, false);
         let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
@@ -5465,12 +5689,67 @@ impl App {
                         });
                     });
                     ui.end_row();
+                    ui.label("MCP").on_hover_text(t(
+                        "Model Context Protocol: lets an LLM client such as Claude or Cursor use apitool",
+                    ));
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("mcp-client")
+                                .selected_text(MCP_CLIENTS[*mcp_client])
+                                .show_ui(ui, |ui| {
+                                    for (i, name) in MCP_CLIENTS.iter().enumerate() {
+                                        ui.selectable_value(mcp_client, i, *name);
+                                    }
+                                });
+                            ui.checkbox(mcp_window, t("Let it operate this window"))
+                                .on_hover_text(t(
+                                    "While apitool runs, the client can also see what's open, open requests, press Send and switch environments here. Without it, the client works on the workspace, even with apitool closed.",
+                                ));
+                        });
+                        match (&serving, &cli) {
+                            (Some(Err(e)), _) => {
+                                ui.colored_label(ORANGE, tf("Can't serve MCP: {}", &[e]));
+                            }
+                            (_, Ok(cli)) if !cli.exists() => {
+                                let at = cli.display();
+                                ui.colored_label(ORANGE, tf("apitool-cli isn't at {}", &[&at]));
+                            }
+                            (Some(Ok(port)), _) if *mcp_window => {
+                                ui.weak(tf("Serving this window on 127.0.0.1:{}", &[port]));
+                            }
+                            _ => {}
+                        }
+                        if let Ok(cli) = &cli {
+                            let setup = mcp_setup(*mcp_client, cli, &root, *mcp_window);
+                            ui.add(
+                                egui::TextEdit::multiline(&mut setup.as_str())
+                                    .code_editor()
+                                    .desired_rows(1)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button(t("Copy")).clicked() {
+                                    ui.ctx().copy_text(setup.clone());
+                                    copied = Some(MCP_CLIENTS[*mcp_client]);
+                                }
+                                ui.weak(match *mcp_client {
+                                    0 => t("Run it in a terminal; add --scope user for every project."),
+                                    1 => t("Add it to claude_desktop_config.json (Claude's Settings > Developer > Edit Config), then restart Claude."),
+                                    _ => t("Add it to ~/.cursor/mcp.json, or .cursor/mcp.json in a project."),
+                                });
+                            });
+                        }
+                    });
+                    ui.end_row();
                 });
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 close = ui.button(t("Close")).clicked();
             });
         });
+        if let Some(client) = copied {
+            self.status = tf("Copied the setup for {}", &[&client]);
+        }
         if close || network || modal.should_close() {
             self.settings = false;
             self.save_state();
@@ -7740,12 +8019,7 @@ fn rpc_of<'a>(req: &Request, rpcs: &'a Rpcs) -> Option<&'a crate::grpc::Rpc> {
 fn streams(req: &Request, rpcs: &Rpcs) -> bool {
     model::is_streaming(&req.method)
         || rpc_of(req, rpcs).is_some_and(|r| r.client_streaming || r.server_streaming)
-        || subscribes(req)
-}
-
-fn subscribes(req: &Request) -> bool {
-    req.method == "GRAPHQL"
-        && matches!(&req.body, Body::GraphQL { query, .. } if crate::graphql::is_subscription(query))
+        || stream::subscribes(req)
 }
 
 /// Returns an error to show, and whether to ask the server for its methods (reflection).
@@ -12660,6 +12934,163 @@ mod ui_tests {
 
     /// Ctrl+S, Ctrl+Enter and Ctrl+N also match with Shift held: the Shift ones must come
     /// first, or Save as would save over the request and Send and download would send.
+    /// An MCP client operates the window through `apitool-cli mcp --window` (`relay`): it
+    /// sees and edits what's open, picks the environment and presses Send, and what the
+    /// workspace tools change shows at once. Only this machine's programs holding the
+    /// token get in, and never a web page.
+    #[test]
+    fn an_mcp_client_operates_the_window() {
+        use serde_json::{Value, json};
+        let ws = workspace("mcp-window");
+        let mut h = harness(ws.clone());
+        h.state_mut().mcp_window = true;
+        h.step();
+        let state = ws.load_state();
+        assert!(
+            state.mcp_port != 0 && state.mcp_token.len() == 48,
+            "{:?}",
+            state.mcp_port
+        );
+
+        let host = crate::http::tests::echo_server().replace("/users", "");
+        let call = |id: u64, name: &str, args: Value| {
+            json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": { "name": name, "arguments": args } })
+        };
+        let messages = [
+            json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                    "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                                "clientInfo": { "name": "t", "version": "1" } } }),
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            call(
+                2,
+                "save_request",
+                json!({ "path": "users/list",
+                "request": { "method": "GET", "url": "{{host}}/users" } }),
+            ),
+            call(
+                3,
+                "set_variables",
+                json!({ "environment": "dev", "variables": { "host": host } }),
+            ),
+            call(4, "select_environment", json!({ "environment": "dev" })),
+            call(
+                5,
+                "open_request",
+                json!({ "path": "users/list", "request": {
+                "method": "GET", "url": "{{host}}/users",
+                "headers": [{ "key": "X-Edit", "value": "unsaved" }] } }),
+            ),
+            call(6, "send_in_window", json!({})),
+            call(7, "get_window", json!({})),
+            call(8, "select_environment", json!({ "environment": "nope" })),
+        ];
+        let input: String = messages.iter().map(|m| format!("{m}\n")).collect();
+        let relay_ws = ws.clone();
+        let client = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            crate::mcp::relay(&relay_ws, input.as_bytes(), &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        });
+        // The window answers on its frames.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !client.is_finished() {
+            assert!(Instant::now() < deadline, "the client still waits");
+            h.step();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let replies: Vec<Value> = (client.join().unwrap().lines())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let text = |i: usize| -> Value {
+            let r = &replies[i]["result"];
+            assert_ne!(r["isError"], true, "{r}");
+            serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap()
+        };
+        assert_eq!(replies.len(), 9, "the notification gets no answer");
+        let instructions = replies[0]["result"]["instructions"].as_str().unwrap();
+        assert!(
+            instructions.contains("inside the open apitool window"),
+            "{instructions}"
+        );
+        let tools = replies[1]["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "send_in_window"));
+
+        // What was saved shows in the tree without the window losing focus first.
+        let shown = |n: &Node| matches!(n, Node::Folder { children, .. } if !children.is_empty());
+        assert!(h.state().tree.iter().any(shown), "the tree reloaded");
+        assert_eq!(text(4)["environment"], "dev");
+        assert_eq!(text(5)["unsaved"], true);
+
+        // Send went out as the window has it: unsaved header, environment's host.
+        let sent = text(6);
+        assert_eq!(sent["response"]["status"], 200, "{sent}");
+        let wire = sent["response"]["body"].as_str().unwrap().to_lowercase();
+        assert!(
+            wire.starts_with("get /users ") && wire.contains("x-edit: unsaved"),
+            "{wire}"
+        );
+        let window = text(7);
+        assert_eq!(
+            (window["open"].as_str(), window["sending"].as_bool()),
+            (Some("users/list"), Some(false))
+        );
+        assert_eq!(replies[8]["result"]["isError"], true);
+        assert_eq!(h.state().active_env.as_deref(), Some("dev"));
+
+        // Without the token, or from a web page, the door stays shut.
+        let raw = |headers: &str| {
+            use std::io::{Read, Write};
+            let mut conn = std::net::TcpStream::connect(("127.0.0.1", state.mcp_port)).unwrap();
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+            write!(
+                conn,
+                "POST /mcp HTTP/1.1\r\n{headers}content-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let mut answer = String::new();
+            conn.read_to_string(&mut answer).unwrap();
+            answer.lines().next().unwrap_or_default().to_owned()
+        };
+        let token = format!("authorization: Bearer {}\r\n", state.mcp_token);
+        assert!(raw(&token).contains(" 200 "));
+        assert!(raw("authorization: Bearer guess\r\n").contains(" 401 "));
+        assert!(raw(&format!("{token}origin: https://evil.test\r\n")).contains(" 403 "));
+
+        // Switched off, the port is closed and the relay says why.
+        h.state_mut().mcp_window = false;
+        h.step();
+        assert_eq!(ws.load_state().mcp_port, 0);
+        let mut out = Vec::new();
+        let ask = format!("{}\n", messages[0]);
+        crate::mcp::relay(&ws, ask.as_bytes(), &mut out).unwrap();
+        let answer = String::from_utf8(out).unwrap();
+        assert!(
+            answer.contains("-32000") && answer.contains("isn't open"),
+            "{answer}"
+        );
+    }
+
+    /// Each client gets the setup it reads, with paths it can take as they are.
+    #[test]
+    fn mcp_setups_fit_each_client() {
+        let (cli, root) = (Path::new("/Apps/api tool/apitool-cli"), Path::new("/w/s"));
+        assert_eq!(
+            mcp_setup(0, cli, root, false),
+            r#"claude mcp add apitool -- "/Apps/api tool/apitool-cli" mcp --workspace /w/s"#
+        );
+        let desktop: serde_json::Value =
+            serde_json::from_str(&mcp_setup(1, cli, root, true)).unwrap();
+        let server = &desktop["mcpServers"]["apitool"];
+        assert_eq!(server["command"], "/Apps/api tool/apitool-cli");
+        assert_eq!(
+            server["args"],
+            serde_json::json!(["mcp", "--workspace", "/w/s", "--window"])
+        );
+    }
+
     #[test]
     fn every_shortcut_does_its_own_thing() {
         let ws = workspace("shortcuts");

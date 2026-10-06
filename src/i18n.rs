@@ -393,6 +393,34 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Edit", "編輯"),
     ("Edit Globals", "編輯全域變數"),
     ("Edit environment", "編輯環境"),
+    (
+        "Model Context Protocol: lets an LLM client such as Claude or Cursor use apitool",
+        "Model Context Protocol：讓 Claude、Cursor 等 LLM 用戶端使用 apitool",
+    ),
+    ("Let it operate this window", "讓它操作這個視窗"),
+    (
+        "While apitool runs, the client can also see what's open, open requests, press Send and switch environments here. Without it, the client works on the workspace, even with apitool closed.",
+        "apitool 執行時，用戶端還能看到這裡開著什麼、開啟請求、按下送出、切換環境。不勾選時，用戶端只操作工作區，apitool 關著也行。",
+    ),
+    ("Can't serve MCP: {}", "無法提供 MCP：{}"),
+    ("apitool-cli isn't at {}", "{} 找不到 apitool-cli"),
+    (
+        "Serving this window on 127.0.0.1:{}",
+        "這個視窗在 127.0.0.1:{} 提供服務",
+    ),
+    (
+        "Run it in a terminal; add --scope user for every project.",
+        "在終端機執行；加上 --scope user 讓每個專案都能用。",
+    ),
+    (
+        "Add it to claude_desktop_config.json (Claude's Settings > Developer > Edit Config), then restart Claude.",
+        "加進 claude_desktop_config.json（Claude 的 設定 > 開發者 > 編輯設定），再重新啟動 Claude。",
+    ),
+    (
+        "Add it to ~/.cursor/mcp.json, or .cursor/mcp.json in a project.",
+        "加進 ~/.cursor/mcp.json，或專案裡的 .cursor/mcp.json。",
+    ),
+    ("Copied the setup for {}", "已複製 {} 的設定"),
     ("Edit globals", "編輯全域變數"),
     ("Edit this environment's variables", "編輯此環境的變數"),
     ("Edit {}", "編輯 {}"),

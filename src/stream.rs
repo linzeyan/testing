@@ -21,6 +21,46 @@ pub enum Event {
     Error(String),
 }
 
+/// A GraphQL query that subscribes: it streams over WebSocket instead of sending once.
+pub fn subscribes(req: &Request) -> bool {
+    req.method == "GRAPHQL"
+        && matches!(&req.body, Body::GraphQL { query, .. } if crate::graphql::is_subscription(query))
+}
+
+/// Connects a resolved stream request of any kind and runs it until either side ends it.
+/// `text` carries what is sent on WebSocket, Socket.IO and gRPC streams, `mqtt` an MQTT
+/// session's publishes; dropping a sender disconnects gracefully.
+pub async fn connect(
+    clients: &crate::net::Clients,
+    net: crate::net::Network,
+    req: Request,
+    text: mpsc::UnboundedReceiver<String>,
+    mqtt: mpsc::UnboundedReceiver<crate::mqtt::Command>,
+    emit: impl Fn(Event),
+) {
+    match req.method.as_str() {
+        // MQTT isn't HTTP, but it takes the client's proxy choice (maybe from PAC).
+        "MQTT" => crate::mqtt::session(req, net, clients.route.clone(), mqtt, emit).await,
+        "GRPC" => crate::grpc::stream(clients, req, text, emit).await,
+        method => {
+            let (ws, sio) = (method.eq_ignore_ascii_case("WS"), method == "SOCKETIO");
+            let upgrades = ws || sio || subscribes(&req);
+            // Streams keep the default settings; only the host's certificate varies.
+            let http = match upgrades {
+                true => clients.websocket_for(&req.url),
+                false => clients.for_settings(&Default::default(), &req.url),
+            };
+            match http {
+                Ok(http) if ws => websocket(http, req, text, emit).await,
+                Ok(http) if sio => socketio(http, req, text, emit).await,
+                Ok(http) if upgrades => graphql(http, req, emit).await,
+                Ok(http) => sse(http, req, emit).await,
+                Err(e) => emit(Event::Error(crate::i18n::tf("Network settings: {}", &[&e]))),
+            }
+        }
+    }
+}
+
 /// Reads an event stream until the server ends it; `emit` receives every event.
 pub async fn sse(client: reqwest::Client, mut req: Request, emit: impl Fn(Event)) {
     if let Err(e) = http::with_token(&client, &mut req, false).await {

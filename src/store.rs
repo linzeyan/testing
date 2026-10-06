@@ -158,6 +158,13 @@ pub struct State {
     pub raw_types: Vec<String>,
     pub appearance: crate::appearance::Appearance,
     pub updates: crate::update::Updates,
+    /// MCP clients may operate the window (Settings).
+    pub mcp_window: bool,
+    /// Where the window serves MCP while it runs, for `apitool-cli mcp --window`: its port
+    /// on 127.0.0.1 (0 while it doesn't) and the token a caller must send, new each start.
+    pub mcp_port: u16,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub mcp_token: String,
 }
 
 /// Clones share one connection: the GUI's mock server reads from its own thread.
@@ -1048,6 +1055,23 @@ impl Workspace {
             [env.unwrap_or(""), &keep(shared)?, &secret],
         ))
         .map(drop)
+    }
+
+    /// Saves a new environment, never over one: a same-named environment may hold this
+    /// machine's secrets. Returns the name given ("<name> copy" when taken).
+    pub fn add_env(
+        &self,
+        name: &str,
+        shared: &[KeyValue],
+        secret: &[KeyValue],
+    ) -> Result<String, String> {
+        let names = self.env_names();
+        let name = std::iter::once(name.to_owned())
+            .chain((1..).map(|n| copy_name(name, n)))
+            .find(|n| !names.contains(n))
+            .expect("some name is free");
+        self.save_env(Some(&name), shared, secret)?;
+        Ok(name)
     }
 
     pub fn delete_env(&self, name: &str) -> Result<(), String> {
