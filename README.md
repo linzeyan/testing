@@ -1,5 +1,7 @@
 # apitool
 
+English | [正體中文](README.zh-TW.md)
+
 A small, portable Postman-style API client written in Rust with egui, built for low-memory
 machines such as Citrix VDI. No installer: unzip and run.
 
