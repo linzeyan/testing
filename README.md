@@ -308,7 +308,9 @@ The GUI re-reads the workspace when its window regains focus.
 
 With "Let it operate this window" on, the window serves MCP itself (a new token each start,
 web pages refused) and `apitool-cli mcp --window` relays to it. It listens on 127.0.0.1 and a
-new free port each start unless Settings gives a host and port. The
+new free port each start unless Settings gives a host and port. A client that connects
+over HTTP instead posts to the URL Settings shows, with the token shown there (copy icon
+beside it) as `Authorization: Bearer`. The
 client then also sees what's open (unsaved edits, the response, a live stream), opens
 requests, presses Send and switches environments, and its changes show at once.
 

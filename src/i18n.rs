@@ -433,6 +433,11 @@ const ZH_TW: &[(&str, &str)] = &[
         "加進 ~/.cursor/mcp.json，或專案裡的 .cursor/mcp.json。",
     ),
     ("Copied the setup for {}", "已複製 {} 的設定"),
+    ("Copied the token", "已複製權杖"),
+    (
+        "Sent as Authorization: Bearer by a client that connects over HTTP. New each start.",
+        "以 HTTP 直接連線的 client 要放在 Authorization: Bearer 送出。每次啟動都會換新。",
+    ),
     ("Sync", "同步"),
     ("owner/repository", "擁有者/儲存庫"),
     ("Branch", "分支"),

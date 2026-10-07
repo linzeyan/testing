@@ -5823,7 +5823,7 @@ impl App {
         let (bind_host, bind_port) = (&mut self.mcp_bind_host, &mut self.mcp_bind_port);
         let mut rebind = false;
         let serving = match &self.mcp {
-            Some(Ok(host)) => Some(Ok(host.addr)),
+            Some(Ok(host)) => Some(Ok((host.addr, host.token.clone()))),
             Some(Err(e)) => Some(Err(e.clone())),
             None => None,
         };
@@ -6004,16 +6004,34 @@ impl App {
                                 rebind = host.lost_focus() || port.lost_focus();
                             });
                         }
-                        match (&serving, &cli) {
-                            (Some(Err(e)), _) => {
+                        if let Ok(cli) = &cli
+                            && !cli.exists()
+                        {
+                            let at = cli.display();
+                            ui.colored_label(ORANGE, tf("apitool-cli isn't at {}", &[&at]));
+                        }
+                        match &serving {
+                            Some(Err(e)) => {
                                 ui.colored_label(ORANGE, tf("Can't serve MCP: {}", &[e]));
                             }
-                            (_, Ok(cli)) if !cli.exists() => {
-                                let at = cli.display();
-                                ui.colored_label(ORANGE, tf("apitool-cli isn't at {}", &[&at]));
-                            }
-                            (Some(Ok(addr)), _) if *mcp_window => {
-                                ui.weak(tf("Serving this window on {}", &[addr]));
+                            // Shown without apitool-cli too: a client connecting over HTTP
+                            // doesn't need it, only the token it would read for one.
+                            Some(Ok((addr, token))) if *mcp_window => {
+                                let url = format!("http://{addr}/mcp");
+                                ui.weak(tf("Serving this window on {}", &[&url]));
+                                ui.horizontal(|ui| {
+                                    ui.label(t("Token"));
+                                    ui.label(RichText::new(token).monospace()).on_hover_text(t(
+                                        "Sent as Authorization: Bearer by a client that connects over HTTP. New each start.",
+                                    ));
+                                    if icon_button(ui, icon::COPY, t("Copy"), None)
+                                        .on_hover_text(t("Copy"))
+                                        .clicked()
+                                    {
+                                        ui.ctx().copy_text(token.clone());
+                                        copied = Some(t("Copied the token").to_owned());
+                                    }
+                                });
                             }
                             _ => {}
                         }
@@ -6041,7 +6059,8 @@ impl App {
                                 });
                             if copy.inner {
                                 ui.ctx().copy_text(setup.clone());
-                                copied = Some(MCP_CLIENTS[*mcp_client]);
+                                let client = MCP_CLIENTS[*mcp_client];
+                                copied = Some(tf("Copied the setup for {}", &[&client]));
                             }
                             ui.weak(match *mcp_client {
                                 0 => t("Run it in a terminal; add --scope user for every project."),
@@ -6124,8 +6143,8 @@ impl App {
                 close = ui.button(t("Close")).clicked();
             });
         });
-        if let Some(client) = copied {
-            self.status = tf("Copied the setup for {}", &[&client]);
+        if let Some(copied) = copied {
+            self.status = copied;
         }
         // Not per keystroke: half a port number would bind somewhere else first.
         if rebind || close || modal.should_close() {
@@ -13608,6 +13627,18 @@ mod ui_tests {
         h.state_mut().settings = true;
         h.run();
         shot(&mut h, "72-settings-mcp");
+        // A client that connects over HTTP has no workspace to read the token from: it's
+        // shown, with the URL to post to, and copied with a click.
+        let token = ws.load_state().mcp_token;
+        h.get_by_label(&format!(
+            "Serving this window on http://{}/mcp",
+            addr(other)
+        ));
+        h.get_by_label(&token);
+        // The token's Copy comes before the setup's.
+        h.get_all_by_label("Copy").next().unwrap().click();
+        h.run();
+        assert_eq!(h.state().status, "Copied the token");
     }
 
     /// Each client gets the setup it reads, with paths it can take as they are.
