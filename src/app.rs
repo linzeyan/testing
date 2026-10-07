@@ -7429,14 +7429,15 @@ fn dropped_files(ui: &egui::Ui) -> Vec<PathBuf> {
 }
 
 /// One schema field; when its type has fields (or values) of its own, a ▸ opens them, as
-/// deep as wanted. With `click` saying what a click does, returns whether it was clicked.
+/// deep as wanted. With `click` saying what a click does, the fields under it can be
+/// clicked too; returns the clicked one's path of field names, from this one down.
 fn schema_field(
     ui: &mut egui::Ui,
     schema: &crate::graphql::Schema,
     f: &crate::graphql::Field,
     id: egui::Id,
     click: Option<&str>,
-) -> bool {
+) -> Option<Vec<String>> {
     let args: Vec<_> = f.args.iter().map(|(n, t)| format!("{n}: {t}")).collect();
     let args = match args.is_empty() {
         true => String::new(),
@@ -7465,22 +7466,32 @@ fn schema_field(
             false => line.on_hover_text(hover),
         }
     };
+    // A screen reader's click comes through whatever the sense.
+    let clicked =
+        |r: &egui::Response| (click.is_some() && r.clicked()).then(|| vec![f.name.clone()]);
     let Some(fields) = schema.fields_of(&f.base) else {
         // Where a ▸ would be, so the names line up.
         let row = ui.horizontal(|ui| {
             ui.add_space(ui.spacing().indent);
             line(ui)
         });
-        return row.inner.clicked();
+        return clicked(&row.inner);
     };
     let state =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    let mut picked = None;
     let (_, header, _) = state.show_header(ui, line).body(|ui| {
         for sub in fields {
-            schema_field(ui, schema, sub, id.with(&sub.name), None);
+            // An enum's values aren't fields to select.
+            let click = click
+                .filter(|_| !sub.ty.is_empty())
+                .map(|_| t("Click to add this field to the query."));
+            if let Some(path) = schema_field(ui, schema, sub, id.with(&sub.name), click) {
+                picked = Some([vec![f.name.clone()], path].concat());
+            }
         }
     });
-    header.inner.clicked()
+    clicked(&header.inner).or(picked)
 }
 
 /// Query and variables on the left, schema explorer on the right. Returns true when
@@ -7593,8 +7604,10 @@ fn graphql_editor(
                                             egui::Id::new(("gql", op == Operation::Query, &f.name));
                                         let click =
                                             t("Click to replace the query with this field.");
-                                        if schema_field(ui, schema, f, id, Some(click)) {
-                                            insert = Some((op, f.clone()));
+                                        if let Some(path) =
+                                            schema_field(ui, schema, f, id, Some(click))
+                                        {
+                                            insert = Some((op, path));
                                         }
                                     }
                                 });
@@ -7634,16 +7647,18 @@ fn graphql_editor(
             }
         }
     });
-    if let Some((op, field)) = insert
+    if let Some((op, path)) = insert
         && let Some(Ok(schema)) = &ex.schema
     {
-        let (text, vars) = schema.operation(op, &field);
-        *query = text;
-        *variables = if vars.is_empty() {
-            String::new()
-        } else {
-            serde_json::to_string_pretty(&serde_json::Value::Object(vars)).unwrap_or_default()
+        // A root field starts the query over; one further down joins the query there.
+        let picked = match path.len() {
+            1 => schema.operation(op, &path),
+            _ => schema.add(op, &path, query, variables),
         };
+        if let Some((text, vars)) = picked {
+            *query = text;
+            *variables = vars;
+        }
     }
     fetch
 }
@@ -12838,6 +12853,25 @@ mod ui_tests {
         };
         assert!(query.starts_with("query User($id: ID!) {"), "{query}");
         assert_eq!(variables, "{\n  \"id\": null\n}");
+        // Further down, a click adds just that field's path to the query, its root's
+        // argument declared; an enum's value isn't a field to add.
+        h.get_by_label("role: Role").click_accesskit();
+        h.run();
+        h.get_by_label("ADMIN").click_accesskit();
+        h.run();
+        shot(&mut h, "73-graphql-path-added");
+        let Body::GraphQL { query, variables } = &draft(&h).body else {
+            panic!("body changed type")
+        };
+        assert!(
+            query.starts_with("query User($id: ID!, $first: Int) {"),
+            "{query}"
+        );
+        assert!(
+            query.ends_with("  users(first: $first) {\n    role\n  }\n}\n"),
+            "{query}"
+        );
+        assert_eq!(variables, "{\n  \"id\": null,\n  \"first\": null\n}");
     }
 
     /// The request editor has its own Save; the modal's is drawn last.

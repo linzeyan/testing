@@ -249,6 +249,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "已清除此請求的回應紀錄",
     ),
     ("Click again to delete", "再點一次即刪除"),
+    (
+        "Click to add this field to the query.",
+        "點一下把這個欄位加進查詢。",
+    ),
     ("Click to load what was sent.", "點一下載入當時送出的內容。"),
     (
         "Click to replace the query with this field.",
