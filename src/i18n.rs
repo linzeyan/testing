@@ -402,12 +402,20 @@ const ZH_TW: &[(&str, &str)] = &[
         "While apitool runs, the client can also see what's open, open requests, press Send and switch environments here. Without it, the client works on the workspace, even with apitool closed.",
         "apitool 執行時，用戶端還能看到這裡開著什麼、開啟請求、按下送出、切換環境。不勾選時，用戶端只操作工作區，apitool 關著也行。",
     ),
+    ("Host", "主機"),
+    (
+        "127.0.0.1: this machine only. 0.0.0.0: other machines too; every call still needs the token.",
+        "127.0.0.1：只限這台電腦。0.0.0.0：其他電腦也連得到；每次呼叫仍須帶 token。",
+    ),
+    ("Port", "連接埠"),
+    ("auto", "自動"),
+    (
+        "auto: a free one the system picks, new each start",
+        "自動：由系統挑一個空的，每次啟動都不同",
+    ),
     ("Can't serve MCP: {}", "無法提供 MCP：{}"),
     ("apitool-cli isn't at {}", "{} 找不到 apitool-cli"),
-    (
-        "Serving this window on 127.0.0.1:{}",
-        "這個視窗在 127.0.0.1:{} 提供服務",
-    ),
+    ("Serving this window on {}", "這個視窗在 {} 提供服務"),
     (
         "Run it in a terminal; add --scope user for every project.",
         "在終端機執行；加上 --scope user 讓每個專案都能用。",
@@ -431,6 +439,11 @@ const ZH_TW: &[(&str, &str)] = &[
         "對該儲存庫有 Contents：讀寫權限的 fine-grained token",
     ),
     ("A token with the api scope", "具 api 範圍的 token"),
+    ("Create a token", "建立 token"),
+    (
+        "Sign in to {} and make one with what sync needs filled in",
+        "登入 {}，建立一個已填好同步所需權限的 token",
+    ),
     ("Sync now", "立即同步"),
     (
         "To a private repository. What isn't ticked stays on this machine.",
@@ -1268,9 +1281,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Version", "版本"),
     ("Virtual users", "虛擬使用者"),
     (
-        "What this is for, when to use it, what comes back…",
-        "用途、使用時機、會回傳什麼…",
+        "## What it's for\n\n## When to use it\n\n## What comes back\n",
+        "## 用途\n\n## 使用時機\n\n## 會回傳什麼\n",
     ),
+    ("Insert template", "插入範本"),
     (
         "What this response's Set-Cookie headers set",
         "此回應的 Set-Cookie 標頭設定了什麼",

@@ -52,6 +52,8 @@ pub fn apply(ctx: &egui::Context, a: &Appearance) -> Result<(), String> {
         Theme::Light => egui::ThemePreference::Light,
         Theme::Dark => egui::ThemePreference::Dark,
     });
+    // On Windows `title_bar` does it: winit's way leaves the title bar stale.
+    ctx.options_mut(|o| o.sync_window_theme = !cfg!(windows));
     let base = egui::Style::default().text_styles;
     let scale = a.size.clamp(*SIZES.start(), *SIZES.end()) / DEFAULT_SIZE;
     ctx.all_styles_mut(|style| {
@@ -106,6 +108,42 @@ pub fn apply(ctx: &egui::Context, a: &Appearance) -> Result<(), String> {
         false => Err(missing.join("; ")),
     }
 }
+
+/// Windows draws the title bar itself, and winit darkens it through an undocumented call
+/// that shows only once the frame is repainted: white at start, black after a move (its
+/// buttons gone meanwhile), a theme switch only after a focus change. The documented
+/// attribute plus a caption repaint switches it at once.
+#[cfg(windows)]
+pub fn title_bar(frame: &eframe::Frame, dark: bool) {
+    use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, GetForegroundWindow, WM_NCACTIVATE,
+    };
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = h.hwnd.get() as HWND;
+    let on = i32::from(dark);
+    // SAFETY: eframe's live window, and a BOOL-sized value as the attribute expects.
+    unsafe {
+        let size = size_of::<i32>() as u32;
+        let attr = DWMWA_USE_IMMERSIVE_DARK_MODE as u32;
+        DwmSetWindowAttribute(hwnd, attr, (&raw const on).cast(), size);
+        // Flipping the caption's active state redraws it; it ends as it was.
+        let active = GetForegroundWindow() == hwnd;
+        DefWindowProcW(hwnd, WM_NCACTIVATE, usize::from(!active), 0);
+        DefWindowProcW(hwnd, WM_NCACTIVATE, usize::from(active), 0);
+    }
+}
+
+/// Elsewhere egui's `sync_window_theme` keeps the title bar in step.
+#[cfg(not(windows))]
+pub fn title_bar(_: &eframe::Frame, _: bool) {}
 
 /// The OS font that gives CJK text its glyphs, and where it is.
 pub fn cjk() -> Option<(&'static str, &'static [u8])> {

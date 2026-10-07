@@ -163,9 +163,14 @@ pub struct State {
     pub updates: crate::update::Updates,
     /// MCP clients may operate the window (Settings).
     pub mcp_window: bool,
-    /// Where the window serves MCP while it runs, for `apitool-cli mcp --window`: its port
-    /// on 127.0.0.1 (0 while it doesn't) and the token a caller must send, new each start.
-    pub mcp_port: u16,
+    /// Where it listens (Settings): an empty host is 127.0.0.1, port 0 one the system
+    /// picks, new each start.
+    pub mcp_bind_host: String,
+    pub mcp_bind_port: u16,
+    /// Where the window serves MCP while it runs, for `apitool-cli mcp --window`: its
+    /// address (empty while it doesn't) and the token a caller must send, new each start.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub mcp_addr: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub mcp_token: String,
     /// The repository the workspace syncs with (Settings).
@@ -945,6 +950,10 @@ impl Workspace {
             true => path.with_file_name(format!("{}.toml", segment(name)?)),
             false => path.with_file_name(folder_segment(name)?),
         };
+        // OK on an unchanged name: it is itself, not another one already there.
+        if new == path {
+            return Ok(new);
+        }
         if self.exists(&new) {
             return Err(tf("\"{}\" already exists", &[&name.trim()]));
         }
@@ -1850,6 +1859,9 @@ mod tests {
             if matches!(&children[0], Node::Request { name, .. } if name == "Fetch user")));
         assert_eq!(ws.load_request(&renamed).unwrap(), Request::default());
         assert!(!ws.exists(&path) && ws.exists(&renamed));
+        // OK left as it was is no rename, not a clash with itself.
+        assert_eq!(ws.rename(&renamed, "Fetch user"), Ok(renamed.clone()));
+        assert_eq!(ws.rename(&folder, "Users"), Ok(folder.clone()));
 
         // Renaming a folder carries what's inside.
         let moved = ws.rename(&folder, "People").unwrap();

@@ -179,6 +179,8 @@ struct Open {
     path: PathBuf,
     saved: Request,
     draft: Request,
+    /// Its text fields' undo history while it's in the background.
+    undo: Vec<(egui::Id, egui::text_edit::TextEditState)>,
 }
 
 impl Open {
@@ -252,7 +254,9 @@ struct Pending {
 
 /// The window's MCP endpoint (Settings > MCP) while it serves.
 struct McpHost {
-    port: u16,
+    addr: std::net::SocketAddr,
+    /// The host and port Settings asked for, to tell when they change.
+    bind: (String, u16),
     token: String,
     calls: mpsc::Receiver<WindowCall>,
     stop: Arc<AtomicBool>,
@@ -263,6 +267,19 @@ struct WindowCall {
     name: String,
     args: serde_json::Value,
     reply: mpsc::Sender<Result<serde_json::Value, String>>,
+}
+
+/// Where a client reaches a listener: one on every interface (0.0.0.0, ::) answers on
+/// loopback.
+fn reach(mut addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    if addr.ip().is_unspecified() {
+        addr.set_ip(match addr.is_ipv4() {
+            true => Ipv4Addr::LOCALHOST.into(),
+            false => Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    addr
 }
 
 /// The MCP clients Settings has a setup for.
@@ -678,6 +695,8 @@ enum TreeAction {
     CopyDocs(PathBuf),
     CopyPostman(PathBuf),
     Mock(PathBuf),
+    /// A folder clicked: where the tree is now.
+    Folder(PathBuf),
     /// Ctrl+click: in or out of the picked rows.
     Pick(PathBuf),
     /// Shift+click: the requests from the last picked (or the open one) to this one.
@@ -771,6 +790,11 @@ pub struct App {
     code_lang: String,
     /// Settings: MCP clients may operate this window.
     mcp_window: bool,
+    /// Settings: where it listens. Port 0: one the system picks.
+    mcp_bind_host: String,
+    mcp_bind_port: u16,
+    /// Settings left the host or port: listen there if it changed.
+    mcp_rebind: bool,
     /// None until it's asked for; Err says why it couldn't start.
     mcp: Option<Result<McpHost, String>>,
     /// Which of `MCP_CLIENTS` Settings shows the setup for.
@@ -798,6 +822,9 @@ pub struct App {
     /// What `appearance` was when last applied; differs on the first frame and after a
     /// change in Settings.
     applied: Option<Appearance>,
+    /// The theme the native title bar was last given (dark?), and the system's then: the
+    /// system changing it re-darkens it (Windows, `appearance::title_bar`).
+    title_bar: Option<(bool, Option<egui::Theme>)>,
     settings: bool,
     updates: crate::update::Updates,
     update: Update,
@@ -818,6 +845,13 @@ pub struct App {
     open: Option<Open>,
     /// The request the editor showed last frame.
     editing: Option<PathBuf>,
+    /// The text fields focused while it showed: their undo history goes with it.
+    edited: Vec<egui::Id>,
+    /// The folder last clicked in the tree, until a request is opened: where the tree is,
+    /// for New request, F2 and Delete.
+    tree_folder: Option<PathBuf>,
+    /// The last click was in the tree: Delete and F2 are for it then.
+    tree_focus: bool,
     tabs: Vec<Tab>,
     req_tab: ReqTab,
     script_tab: ScriptTab,
@@ -877,6 +911,9 @@ impl App {
             code: false,
             code_lang: state.code_lang,
             mcp_window: state.mcp_window,
+            mcp_bind_host: state.mcp_bind_host,
+            mcp_bind_port: state.mcp_bind_port,
+            mcp_rebind: false,
             mcp: None,
             mcp_client: 0,
             remote: state.remote,
@@ -894,6 +931,7 @@ impl App {
             raw_types: state.raw_types.clone(),
             appearance: state.appearance.clone(),
             applied: None,
+            title_bar: None,
             updates: state.updates.clone(),
             update: Update::Idle,
             auto_update: false,
@@ -909,6 +947,9 @@ impl App {
             focus_request: None,
             open: None,
             editing: None,
+            edited: Vec::new(),
+            tree_folder: None,
+            tree_focus: false,
             tabs: Vec::new(),
             req_tab: ReqTab::Params,
             script_tab: ScriptTab::Post,
@@ -1018,10 +1059,12 @@ impl App {
         }
         if pressed(&RENAME)
             && free
-            && let Some(open) = &self.open
+            && let Some(path) = self.tree_target()
         {
-            let kind = NameKind::Rename(open.path.clone());
-            self.dialog = Some(Dialog::name(kind, open.name()));
+            self.dialog = Some(Dialog::name(
+                NameKind::Rename(path.clone()),
+                leaf_name(&path),
+            ));
         }
         if pressed(&CODE) && self.open.is_some() {
             self.code = !self.code;
@@ -1149,7 +1192,9 @@ impl App {
             appearance: self.appearance.clone(),
             updates: self.updates.clone(),
             mcp_window: self.mcp_window,
-            mcp_port: self.mcp_host().map_or(0, |h| h.port),
+            mcp_bind_host: self.mcp_bind_host.clone(),
+            mcp_bind_port: self.mcp_bind_port,
+            mcp_addr: (self.mcp_host()).map_or(String::new(), |h| reach(h.addr).to_string()),
             mcp_token: self.mcp_host().map(|h| h.token.clone()).unwrap_or_default(),
             remote: self.remote.clone(),
         });
@@ -1217,17 +1262,18 @@ impl App {
 
     /// Starts or stops the window's MCP endpoint as Settings says, and answers its calls.
     fn serve_mcp(&mut self, ctx: &egui::Context) {
+        // Settings changed where it listens (or it couldn't start): start over.
+        let bind = (self.mcp_bind_host.trim().to_owned(), self.mcp_bind_port);
+        if std::mem::take(&mut self.mcp_rebind) && self.mcp_host().is_none_or(|h| h.bind != bind) {
+            self.stop_mcp();
+        }
         match (&self.mcp, self.mcp_window) {
             (None, true) => {
                 self.mcp = Some(self.start_mcp(ctx));
                 self.save_state();
             }
             (Some(_), false) => {
-                if let Some(Ok(host)) = self.mcp.take() {
-                    host.stop.store(true, Ordering::Relaxed);
-                    // Wakes the thread from accept() to see the flag.
-                    let _ = std::net::TcpStream::connect(("127.0.0.1", host.port));
-                }
+                self.stop_mcp();
                 self.save_state();
             }
             _ => {}
@@ -1240,11 +1286,25 @@ impl App {
         }
     }
 
-    /// A port the system picks and a fresh token, each start: `apitool-cli mcp --window`
-    /// reads both from the workspace state.
+    fn stop_mcp(&mut self) {
+        if let Some(Ok(host)) = self.mcp.take() {
+            host.stop.store(true, Ordering::Relaxed);
+            // Wakes the thread from accept() to see the flag.
+            let _ = std::net::TcpStream::connect(reach(host.addr));
+        }
+    }
+
+    /// Where Settings says (a port the system picks unless one is set) with a fresh token,
+    /// each start: `apitool-cli mcp --window` reads both from the workspace state.
     fn start_mcp(&self, ctx: &egui::Context) -> Result<McpHost, String> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let bind = (self.mcp_bind_host.trim().to_owned(), self.mcp_bind_port);
+        let host = match bind.0.as_str() {
+            "" => "127.0.0.1",
+            h => h,
+        };
+        let listener = std::net::TcpListener::bind((host, bind.1))
+            .map_err(|e| format!("{host}:{}: {e}", bind.1))?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let mut bytes = [0u8; 24];
         getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -1271,9 +1331,10 @@ impl App {
         });
         let (ws, t, s) = (self.ws.clone(), token.clone(), stop.clone());
         std::thread::spawn(move || crate::mcp::serve_http(listener, ws, t, window, s));
-        log::info!("MCP for this window on 127.0.0.1:{port}");
+        log::info!("MCP for this window on {addr}");
         Ok(McpHost {
-            port,
+            addr,
+            bind,
             token,
             calls,
             stop,
@@ -1637,6 +1698,8 @@ impl App {
     /// Shows `path` in its tab, opening one if needed. A clean preview tab is reused, so
     /// clicking through the tree doesn't pile up tabs; `pin` makes the tab a normal one.
     fn activate(&mut self, path: PathBuf, pin: bool) {
+        // The tree is at the request now, not at the folder clicked before.
+        self.tree_folder = None;
         let current = self.open.as_ref().map(|o| o.path.clone());
         if current.as_ref() != Some(&path) {
             let from = current.as_ref().and_then(|p| self.tab_index(p));
@@ -1875,6 +1938,7 @@ impl App {
                     path,
                     saved: req.clone(),
                     draft: req,
+                    undo: Vec::new(),
                 });
                 self.response = None;
                 self.load = None;
@@ -2346,6 +2410,9 @@ impl App {
         opens.for_each(|o| moved(&mut o.path));
         self.tabs.iter_mut().for_each(|t| moved(&mut t.path));
         self.closed.iter_mut().for_each(|(p, _)| moved(p));
+        // The same request still: it keeps its undo history.
+        self.editing.iter_mut().for_each(moved);
+        self.tree_folder.iter_mut().for_each(moved);
     }
 
     /// After a drag and drop in the tree, with where each went; a reorder in place keeps
@@ -2829,6 +2896,12 @@ impl eframe::App for App {
             }
             self.applied = Some(self.appearance.clone());
         }
+        let dark = ui.ctx().theme() == egui::Theme::Dark;
+        let title_bar = Some((dark, ui.input(|i| i.raw.system_theme)));
+        if self.title_bar != title_bar {
+            crate::appearance::title_bar(frame, dark);
+            self.title_bar = title_bar;
+        }
         self.receive(ui.ctx());
         self.serve_mcp(ui.ctx());
         self.tick_repeat(ui.ctx());
@@ -2912,8 +2985,7 @@ impl eframe::App for App {
             && self.env_editor.is_none()
             && self.folder_editor.is_none()
         {
-            let root = self.ws.collections();
-            self.dialog = Some(Dialog::name(NameKind::NewRequest(root), ""));
+            self.new_request();
         }
         if ui.input_mut(|i| i.consume_shortcut(&SWITCH))
             && self.dialog.is_none()
@@ -2928,9 +3000,18 @@ impl eframe::App for App {
         if ui.input_mut(|i| i.consume_shortcut(&SETTINGS)) {
             self.settings = true;
         }
-        // As the picked rows' "Delete N items"; ⌘⌫ for Mac keyboards, which have no Delete.
-        // Not while typing: there the keys edit the text.
-        if !self.tree_picked.is_empty()
+        // As the picked rows' "Delete N items", else the menu's Delete for the row the tree
+        // is at; ⌘⌫ for Mac keyboards, which have no Delete. Not while typing: there the
+        // keys edit the text. Picked rows aside, only after a click in the tree: a stray
+        // Delete elsewhere shouldn't offer to delete the open request.
+        let doomed = match self.tree_picked.is_empty() {
+            true => self
+                .tree_target()
+                .filter(|_| self.tree_focused())
+                .map(|p| vec![p]),
+            false => Some(self.tree_picked.clone()),
+        };
+        if let Some(doomed) = doomed
             && self.dialog.is_none()
             && self.env_editor.is_none()
             && self.folder_editor.is_none()
@@ -2940,7 +3021,7 @@ impl eframe::App for App {
                     || i.consume_key(Modifiers::COMMAND, Key::Backspace)
             })
         {
-            self.dialog = Some(Dialog::Delete(self.tree_picked.clone()));
+            self.dialog = Some(Dialog::Delete(doomed));
         }
         if ui.input_mut(|i| i.consume_shortcut(&FOCUS_URL))
             && let Some(open) = &self.open
@@ -2965,9 +3046,24 @@ impl eframe::App for App {
 
         // egui keeps a text field's undo history under its id, and the editor's fields have
         // the same ids whichever request is open: Ctrl+Z after a switch brought back the
-        // last request's URL. Each request opens with a fresh history instead.
+        // last request's URL. So each request keeps its own: the fields focused while it
+        // showed go with its tab, and come back with it.
         if self.open.as_ref().map(|o| &o.path) != self.editing.as_ref() {
-            ui.data_mut(|d| d.remove_by_type::<egui::text_edit::TextEditState>());
+            use egui::text_edit::TextEditState;
+            let ctx = ui.ctx().clone();
+            let left = (self.tabs.iter_mut())
+                .find(|t| Some(&t.path) == self.editing.as_ref())
+                .and_then(|t| t.parked.as_mut());
+            if let Some(p) = left {
+                let kept = |&id: &egui::Id| Some((id, TextEditState::load(&ctx, id)?));
+                p.open.undo = self.edited.iter().filter_map(kept).collect();
+            }
+            ui.data_mut(|d| d.remove_by_type::<TextEditState>());
+            let back = (self.open.as_mut()).map_or_else(Vec::new, |o| std::mem::take(&mut o.undo));
+            self.edited = back.iter().map(|(id, _)| *id).collect();
+            for (id, state) in back {
+                state.store(&ctx, id);
+            }
             self.editing = self.open.as_ref().map(|o| o.path.clone());
         }
         // The active environment's colour across the top: hard to miss when it's prod.
@@ -2984,6 +3080,12 @@ impl eframe::App for App {
                 .show(ui, |ui| self.sidebar(ui));
         }
         egui::CentralPanel::default().show(ui, |ui| self.main_area(ui));
+        // Only a focused field can be typed in, so these are all that have history.
+        if let Some(id) = ui.memory(|m| m.focused())
+            && !self.edited.contains(&id)
+        {
+            self.edited.push(id);
+        }
         // Editing turns a preview tab into a normal one, as in VS Code.
         let dirty = self.open.as_ref().filter(|o| o.dirty());
         if let Some(i) = dirty.and_then(|o| self.tab_index(&o.path)) {
@@ -3246,7 +3348,7 @@ impl App {
                 .on_hover_text(tf("New request ({})", &[&shortcut]))
                 .clicked()
             {
-                self.dialog = Some(Dialog::name(NameKind::NewRequest(root.clone()), ""));
+                self.new_request();
             }
             // A collection is a top-level folder: its settings, Run, mock and Postman copy
             // are a collection's, and a Postman import lands as one.
@@ -3331,7 +3433,7 @@ impl App {
         let reveal = self.reveal.take();
         let expand =
             |p: &Path| !query.is_empty() || reveal.as_ref().is_some_and(|r| r.starts_with(p));
-        egui::ScrollArea::vertical()
+        let tree = egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
                 if self.tree.is_empty() {
@@ -3346,6 +3448,7 @@ impl App {
                 let view = TreeView {
                     root: &collections,
                     open: open.as_deref(),
+                    folder: self.tree_folder.as_deref(),
                     picked: &self.tree_picked,
                     statuses: &self.statuses,
                     expand: &expand,
@@ -3356,6 +3459,14 @@ impl App {
                 let rest = ui.allocate_response(size, egui::Sense::hover());
                 tree_drop(ui, &rows, rest.rect, &self.ws.collections(), &mut actions);
             });
+        let click = ui.input(|i| {
+            i.pointer
+                .primary_clicked()
+                .then_some(i.pointer.interact_pos())
+        });
+        if let Some(pos) = click.flatten() {
+            self.tree_focus = tree.inner_rect.contains(pos);
+        }
         // What is being dragged follows the pointer, on a backing of its own: bare text
         // ran over the rows' names.
         if let Some(held) = egui::DragAndDrop::payload::<Vec<PathBuf>>(ui.ctx())
@@ -3386,6 +3497,7 @@ impl App {
                     self.runner = None;
                     self.activate(path, pin);
                 }
+                TreeAction::Folder(path) => self.tree_folder = Some(path),
                 TreeAction::Pick(path) => {
                     // The open request was the one picked so far.
                     if self.tree_picked.is_empty()
@@ -4625,7 +4737,7 @@ impl App {
         };
         let folders: Vec<(String, PathBuf)> = match dialog {
             Dialog::Name {
-                kind: NameKind::SaveAs { .. },
+                kind: NameKind::SaveAs { .. } | NameKind::NewRequest(_),
                 ..
             } => {
                 let root = self.ws.collections();
@@ -4659,7 +4771,7 @@ impl App {
                         NameKind::NewEnv => t("New environment"),
                         NameKind::DuplicateEnv(_) => t("Duplicate environment"),
                     });
-                    if let NameKind::SaveAs { folder, .. } = kind {
+                    if let NameKind::SaveAs { folder, .. } | NameKind::NewRequest(folder) = kind {
                         let shown = (folders.iter())
                             .find(|(_, p)| p == folder)
                             .map_or("", |(label, _)| label.as_str());
@@ -4754,6 +4866,9 @@ impl App {
                                     app.drop_tab(i);
                                 }
                                 app.tree_picked.clear();
+                                if app.tree_folder.as_deref().is_some_and(gone) {
+                                    app.tree_folder = None;
+                                }
                                 app.save_state();
                                 app.reload();
                             }));
@@ -5705,8 +5820,10 @@ impl App {
         let a = &mut self.appearance;
         let (updates, update) = (&mut self.updates, &self.update);
         let (mcp_window, mcp_client) = (&mut self.mcp_window, &mut self.mcp_client);
+        let (bind_host, bind_port) = (&mut self.mcp_bind_host, &mut self.mcp_bind_port);
+        let mut rebind = false;
         let serving = match &self.mcp {
-            Some(Ok(host)) => Some(Ok(host.port)),
+            Some(Ok(host)) => Some(Ok(host.addr)),
             Some(Err(e)) => Some(Err(e.clone())),
             None => None,
         };
@@ -5858,6 +5975,35 @@ impl App {
                                     "While apitool runs, the client can also see what's open, open requests, press Send and switch environments here. Without it, the client works on the workspace, even with apitool closed.",
                                 ));
                         });
+                        if *mcp_window {
+                            ui.horizontal(|ui| {
+                                ui.label(t("Host"));
+                                let host = egui::TextEdit::singleline(bind_host)
+                                    .hint_text("127.0.0.1")
+                                    .desired_width(110.0);
+                                let host = ui.add(host).on_hover_text(t(
+                                    "127.0.0.1: this machine only. 0.0.0.0: other machines too; every call still needs the token.",
+                                ));
+                                ui.label(t("Port"));
+                                let auto = t("auto");
+                                // Typed, not dragged: a port is a number to pick, not a slider.
+                                let port = egui::DragValue::new(bind_port)
+                                    .speed(0.0)
+                                    .custom_formatter(move |n, _| match n as u16 {
+                                        0 => auto.to_owned(),
+                                        n => n.to_string(),
+                                    })
+                                    .custom_parser(move |s| match s.trim() {
+                                        "" => Some(0.0),
+                                        s if s == auto => Some(0.0),
+                                        s => s.parse().ok(),
+                                    });
+                                let port = ui.add(port).on_hover_text(t(
+                                    "auto: a free one the system picks, new each start",
+                                ));
+                                rebind = host.lost_focus() || port.lost_focus();
+                            });
+                        }
                         match (&serving, &cli) {
                             (Some(Err(e)), _) => {
                                 ui.colored_label(ORANGE, tf("Can't serve MCP: {}", &[e]));
@@ -5866,29 +6012,41 @@ impl App {
                                 let at = cli.display();
                                 ui.colored_label(ORANGE, tf("apitool-cli isn't at {}", &[&at]));
                             }
-                            (Some(Ok(port)), _) if *mcp_window => {
-                                ui.weak(tf("Serving this window on 127.0.0.1:{}", &[port]));
+                            (Some(Ok(addr)), _) if *mcp_window => {
+                                ui.weak(tf("Serving this window on {}", &[addr]));
                             }
                             _ => {}
                         }
                         if let Ok(cli) = &cli {
                             let setup = mcp_setup(*mcp_client, cli, &root, *mcp_window);
-                            ui.add(
-                                egui::TextEdit::multiline(&mut setup.as_str())
-                                    .code_editor()
-                                    .desired_rows(1)
-                                    .desired_width(f32::INFINITY),
-                            );
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.button(t("Copy")).clicked() {
-                                    ui.ctx().copy_text(setup.clone());
-                                    copied = Some(MCP_CLIENTS[*mcp_client]);
-                                }
-                                ui.weak(match *mcp_client {
-                                    0 => t("Run it in a terminal; add --scope user for every project."),
-                                    1 => t("Add it to claude_desktop_config.json (Claude's Settings > Developer > Edit Config), then restart Claude."),
-                                    _ => t("Add it to ~/.cursor/mcp.json, or .cursor/mcp.json in a project."),
+                            // A code block as docs show one, its copy icon in the corner.
+                            let copy = egui::Frame::new()
+                                .fill(ui.visuals().code_bg_color)
+                                .corner_radius(4.0)
+                                .inner_margin(egui::Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    ui.horizontal_top(|ui| {
+                                        let gap = ui.spacing().item_spacing.x;
+                                        let width = ui.available_width() - button_height(ui) - gap;
+                                        ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
+                                            ui.set_width(width);
+                                            let code = RichText::new(&setup).monospace();
+                                            ui.add(egui::Label::new(code).wrap());
+                                        });
+                                        icon_button(ui, icon::COPY, t("Copy"), None)
+                                            .on_hover_text(t("Copy"))
+                                            .clicked()
+                                    })
+                                    .inner
                                 });
+                            if copy.inner {
+                                ui.ctx().copy_text(setup.clone());
+                                copied = Some(MCP_CLIENTS[*mcp_client]);
+                            }
+                            ui.weak(match *mcp_client {
+                                0 => t("Run it in a terminal; add --scope user for every project."),
+                                1 => t("Add it to claude_desktop_config.json (Claude's Settings > Developer > Edit Config), then restart Claude."),
+                                _ => t("Add it to ~/.cursor/mcp.json, or .cursor/mcp.json in a project."),
                             });
                         }
                     });
@@ -5927,6 +6085,11 @@ impl App {
                                 .hint_text(hint)
                                 .desired_width(230.0);
                             ui.add(field).on_hover_text(scope);
+                            ui.hyperlink_to(t("Create a token"), remote.token_page())
+                                .on_hover_text(tf(
+                                    "Sign in to {} and make one with what sync needs filled in",
+                                    &[&remote.provider.name()],
+                                ));
                             let ready = remote.is_set()
                                 && (token_saved || !remote_token.is_empty())
                                 && (!remote.share.any() || passphrase_saved || !remote_passphrase.is_empty());
@@ -5963,6 +6126,10 @@ impl App {
         });
         if let Some(client) = copied {
             self.status = tf("Copied the setup for {}", &[&client]);
+        }
+        // Not per keystroke: half a port number would bind somewhere else first.
+        if rebind || close || modal.should_close() {
+            self.mcp_rebind = true;
         }
         if sync_now || close || network || modal.should_close() {
             let typed = [
@@ -6213,12 +6380,32 @@ const ACTIONS: [(&str, Action); 11] = [
 ];
 
 impl App {
+    /// Asks for its name, in the folder last clicked in the tree, else beside the open
+    /// request: where the user is working. The dialog can still pick another.
+    fn new_request(&mut self) {
+        let beside = self.open.as_ref().and_then(|o| o.path.parent());
+        let dir = (self.tree_folder.clone())
+            .or_else(|| beside.map(Path::to_path_buf))
+            .unwrap_or_else(|| self.ws.collections());
+        self.dialog = Some(Dialog::name(NameKind::NewRequest(dir), ""));
+    }
+
+    /// The last click was in the tree, and it's still in view.
+    fn tree_focused(&self) -> bool {
+        self.tree_focus && !self.hide_sidebar && !self.show_history
+    }
+
+    /// What F2 and Delete are for: the folder last clicked, while the tree has the focus,
+    /// else the open request.
+    fn tree_target(&self) -> Option<PathBuf> {
+        let folder = self.tree_folder.clone().filter(|_| self.tree_focused());
+        folder.or_else(|| self.open.as_ref().map(|o| o.path.clone()))
+    }
+
     fn act(&mut self, action: Action) {
         let root = self.ws.collections();
         match action {
-            Action::NewRequest => {
-                self.dialog = Some(Dialog::name(NameKind::NewRequest(root), ""));
-            }
+            Action::NewRequest => self.new_request(),
             Action::NewFolder => self.dialog = Some(Dialog::name(NameKind::NewFolder(root), "")),
             Action::NewEnv => self.dialog = Some(Dialog::name(NameKind::NewEnv, "")),
             Action::Globals => self.open_env_editor(None, &[]),
@@ -6337,8 +6524,10 @@ enum DropAt {
 struct TreeView<'a> {
     /// Its folders are collections.
     root: &'a Path,
-    /// The open request: highlighted while nothing is picked.
+    /// The open request: highlighted while nothing is picked and no folder is clicked.
     open: Option<&'a Path>,
+    /// `App::tree_folder`: highlighted instead of the open request.
+    folder: Option<&'a Path>,
     /// Picked with Ctrl or Shift+click, to move or delete together.
     picked: &'a [PathBuf],
     statuses: &'a HashMap<PathBuf, u16>,
@@ -6390,7 +6579,10 @@ fn tree_ui(
                         );
                     }
                 };
-                let picked = view.picked.contains(path);
+                let picked = match view.picked.is_empty() {
+                    true => view.folder == Some(path.as_path()),
+                    false => view.picked.contains(path),
+                };
                 let row = tree_row(ui, path, name, picked, lead, None);
                 rows.push(TreeRow {
                     path: path.clone(),
@@ -6400,8 +6592,15 @@ fn tree_ui(
                 if row.clicked() {
                     match ui.input(|i| i.modifiers.command) {
                         true => actions.push(TreeAction::Pick(path.clone())),
-                        false => state.toggle(ui),
+                        false => {
+                            state.toggle(ui);
+                            actions.push(TreeAction::Folder(path.clone()));
+                        }
                     }
+                }
+                // As a click: its menu's F2 and Delete are then for it.
+                if row.secondary_clicked() {
+                    actions.push(TreeAction::Folder(path.clone()));
                 }
                 if row.drag_started() {
                     actions.push(TreeAction::Drag(path.clone()));
@@ -6417,7 +6616,7 @@ fn tree_ui(
             }
             Node::Request { name, path, method } => {
                 let picked = match view.picked.is_empty() {
-                    true => view.open == Some(path.as_path()),
+                    true => view.open == Some(path.as_path()) && view.folder.is_none(),
                     false => view.picked.contains(path),
                 };
                 let status = (view.statuses.get(path)).map(|&status| {
@@ -6534,9 +6733,19 @@ fn row_menu(
     if picked.len() < 2 || !picked.iter().any(|p| p == path) {
         return own(ui, actions);
     }
-    if ui.button(tf("Delete {} items", &[&picked.len()])).clicked() {
+    let delete = egui::Button::new(tf("Delete {} items", &[&picked.len()]));
+    if ui.add(delete.shortcut_text(delete_key(ui.ctx()))).clicked() {
         actions.push(TreeAction::Dialog(Dialog::Delete(picked.to_vec())));
         ui.close();
+    }
+}
+
+/// What deletes the tree's row in menus: Delete, or ⌘⌫ on a Mac, whose keyboards have
+/// none. Either works everywhere.
+fn delete_key(ctx: &egui::Context) -> String {
+    match ctx.os() == egui::os::OperatingSystem::Mac {
+        true => ctx.format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Backspace)),
+        false => ctx.format_shortcut(&KeyboardShortcut::new(Modifiers::NONE, Key::Delete)),
     }
 }
 
@@ -6646,32 +6855,35 @@ fn folder_menu(
     collection: bool,
     actions: &mut Vec<TreeAction>,
 ) {
-    let mut item = |ui: &mut egui::Ui, label: &str, a: TreeAction| {
-        if ui.button(label).clicked() {
+    let (rename_key, delete_key) = (ui.ctx().format_shortcut(&RENAME), delete_key(ui.ctx()));
+    let mut keyed = |ui: &mut egui::Ui, label: &str, keys: Option<String>, a: TreeAction| {
+        let button = egui::Button::new(label);
+        let button = match keys {
+            Some(keys) => button.shortcut_text(keys),
+            None => button,
+        };
+        if ui.add(button).clicked() {
             actions.push(a);
             ui.close();
         }
     };
     let dialog = |kind| TreeAction::Dialog(Dialog::name(kind, ""));
     let path = path.to_path_buf();
-    item(
+    let new_request = dialog(NameKind::NewRequest(path.clone()));
+    keyed(ui, t("New request"), None, new_request);
+    let new_folder = dialog(NameKind::NewFolder(path.clone()));
+    keyed(ui, t("New folder"), None, new_folder);
+    let rename = TreeAction::Dialog(Dialog::name(NameKind::Rename(path.clone()), name));
+    keyed(ui, t("Rename"), Some(rename_key), rename);
+    keyed(
         ui,
-        t("New request"),
-        dialog(NameKind::NewRequest(path.clone())),
+        t("Duplicate"),
+        None,
+        TreeAction::Duplicate(path.clone()),
     );
-    item(
-        ui,
-        t("New folder"),
-        dialog(NameKind::NewFolder(path.clone())),
-    );
-    let rename = Dialog::name(NameKind::Rename(path.clone()), name);
-    item(ui, t("Rename"), TreeAction::Dialog(rename));
-    item(ui, t("Duplicate"), TreeAction::Duplicate(path.clone()));
-    item(
-        ui,
-        t("Delete"),
-        TreeAction::Dialog(Dialog::Delete(vec![path.clone()])),
-    );
+    let delete = TreeAction::Dialog(Dialog::Delete(vec![path.clone()]));
+    keyed(ui, t("Delete"), Some(delete_key), delete);
+    let mut item = |ui: &mut egui::Ui, label: &str, a: TreeAction| keyed(ui, label, None, a);
     ui.separator();
     let settings = match collection {
         true => t("Collection settings…"),
@@ -6697,7 +6909,8 @@ fn folder_menu(
 }
 
 fn request_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<TreeAction>) {
-    if ui.button(t("Rename")).clicked() {
+    let rename = egui::Button::new(t("Rename")).shortcut_text(ui.ctx().format_shortcut(&RENAME));
+    if ui.add(rename).clicked() {
         let rename = Dialog::name(NameKind::Rename(path.to_path_buf()), name);
         actions.push(TreeAction::Dialog(rename));
         ui.close();
@@ -6708,7 +6921,8 @@ fn request_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<Tr
         actions.push(TreeAction::Duplicate(path.to_path_buf()));
         ui.close();
     }
-    if ui.button(t("Delete")).clicked() {
+    let delete = egui::Button::new(t("Delete")).shortcut_text(delete_key(ui.ctx()));
+    if ui.add(delete).clicked() {
         actions.push(TreeAction::Dialog(Dialog::Delete(vec![path.to_path_buf()])));
         ui.close();
     }
@@ -7781,12 +7995,20 @@ fn auth_editor(
 }
 
 fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
-    ui.weak(t(
-        "Markdown, for the docs a folder's right-click menu copies (\"Copy docs as Markdown\").",
-    ));
+    ui.horizontal_wrapped(|ui| {
+        ui.weak(t(
+            "Markdown, for the docs a folder's right-click menu copies (\"Copy docs as Markdown\").",
+        ));
+        // Offered, not shown in the box: grey text there read as docs already written.
+        let template = t("## What it's for\n\n## When to use it\n\n## What comes back\n");
+        if description.is_empty()
+            && ui.button(t("Insert template")).on_hover_text(template).clicked()
+        {
+            description.push_str(template);
+        }
+    });
     ui.add(
         egui::TextEdit::multiline(description)
-            .hint_text(t("What this is for, when to use it, what comes back…"))
             .desired_rows(12)
             .desired_width(f32::INFINITY),
     );
@@ -8127,11 +8349,22 @@ fn scripts_editor(
         sub_tab(ui, tab, ScriptTab::Pre, t("Pre-request"), set(pre_request));
         sub_tab(ui, tab, ScriptTab::Post, t("Post-response"), set(tests));
         ui.separator();
-        let snippets = if *tab == ScriptTab::Pre {
-            PRE_SNIPPETS
-        } else {
-            POST_SNIPPETS
+        let (snippets, template, empty) = match tab {
+            ScriptTab::Pre => (
+                PRE_SNIPPETS,
+                t("// Runs before the request is sent.\n// pm.request, pm.environment, pm.variables, console.log"),
+                pre_request.is_empty(),
+            ),
+            ScriptTab::Post => (
+                POST_SNIPPETS,
+                t("// Runs after the response arrives.\n// pm.test(name, fn), pm.expect(...), pm.response.json()"),
+                tests.is_empty(),
+            ),
         };
+        // Offered, not shown in the box: grey text there read as a script already set.
+        if empty && ui.button(t("Insert template")).on_hover_text(template).clicked() {
+            insert = Some(format!("{template}\n"));
+        }
         ui.menu_button(t("Snippets"), |ui| {
             for (name, code) in snippets {
                 if ui.button(t(name)).clicked() {
@@ -8160,21 +8393,9 @@ fn scripts_editor(
         let folders: Vec<&str> = above.iter().map(|(f, _)| f.as_str()).collect();
         ui.weak(tf("Folder scripts run first: {}", &[&folders.join(", ")]));
     }
-    let (text, hint, id) = match tab {
-        ScriptTab::Pre => (
-            pre_request,
-            t(
-                "// Runs before the request is sent.\n// pm.request, pm.environment, pm.variables, console.log",
-            ),
-            "pre-request-script",
-        ),
-        ScriptTab::Post => (
-            tests,
-            t(
-                "// Runs after the response arrives.\n// pm.test(name, fn), pm.expect(...), pm.response.json()",
-            ),
-            "tests-script",
-        ),
+    let (text, id) = match tab {
+        ScriptTab::Pre => (pre_request, "pre-request-script"),
+        ScriptTab::Post => (tests, "tests-script"),
     };
     if let Some(code) = insert {
         if !text.is_empty() {
@@ -8196,7 +8417,6 @@ fn scripts_editor(
             .id(id)
             .code_editor()
             .layouter(&mut layouter)
-            .hint_text(hint)
             .desired_rows(12)
             .desired_width(f32::INFINITY),
     );
@@ -11011,7 +11231,7 @@ mod ui_tests {
         click(&mut h, "c", Modifiers::COMMAND);
         h.get_all_by_label("c").next().unwrap().click_secondary();
         h.run();
-        h.get_by_label("Delete 2 items").click();
+        button(&h, "Delete 2 items").click();
         h.run();
         shot(&mut h, "53-tree-delete-picked");
         // The heading, then the button.
@@ -13185,9 +13405,9 @@ mod ui_tests {
         h.step();
         let state = ws.load_state();
         assert!(
-            state.mcp_port != 0 && state.mcp_token.len() == 48,
+            state.mcp_addr.starts_with("127.0.0.1:") && state.mcp_token.len() == 48,
             "{:?}",
-            state.mcp_port
+            state.mcp_addr
         );
 
         let host = crate::http::tests::echo_server().replace("/users", "");
@@ -13280,7 +13500,7 @@ mod ui_tests {
         // Without the token, or from a web page, the door stays shut.
         let raw = |headers: &str| {
             use std::io::{Read, Write};
-            let mut conn = std::net::TcpStream::connect(("127.0.0.1", state.mcp_port)).unwrap();
+            let mut conn = std::net::TcpStream::connect(&state.mcp_addr).unwrap();
             let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
             write!(
                 conn,
@@ -13300,7 +13520,7 @@ mod ui_tests {
         // Switched off, the port is closed and the relay says why.
         h.state_mut().mcp_window = false;
         h.step();
-        assert_eq!(ws.load_state().mcp_port, 0);
+        assert_eq!(ws.load_state().mcp_addr, "");
         let mut out = Vec::new();
         let ask = format!("{}\n", messages[0]);
         crate::mcp::relay(&ws, ask.as_bytes(), &mut out).unwrap();
@@ -13309,6 +13529,51 @@ mod ui_tests {
             answer.contains("-32000") && answer.contains("isn't open"),
             "{answer}"
         );
+    }
+
+    /// Settings' host and port are where it listens, and the relay follows. A change moves
+    /// it once Settings lets go of the field: half a typed port would bind first.
+    #[test]
+    fn the_window_serves_mcp_where_settings_say() {
+        let ws = workspace("mcp-bind");
+        let free = || {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let pinged = || {
+            let mut out = Vec::new();
+            let ask = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"ping\"}\n";
+            crate::mcp::relay(&ws, ask.as_bytes(), &mut out).unwrap();
+            String::from_utf8(out).unwrap().contains("\"result\"")
+        };
+        let mut h = harness(ws.clone());
+        let port = free();
+        h.state_mut().mcp_bind_port = port;
+        h.state_mut().mcp_window = true;
+        h.step();
+        assert_eq!(ws.load_state().mcp_addr, format!("127.0.0.1:{port}"));
+        assert!(pinged());
+
+        let other = free();
+        h.state_mut().mcp_bind_port = other;
+        h.step();
+        let addr = |p: u16| format!("127.0.0.1:{p}");
+        assert_eq!(ws.load_state().mcp_addr, addr(port), "not while typing");
+        h.state_mut().mcp_rebind = true;
+        h.step();
+        assert_eq!(ws.load_state().mcp_addr, addr(other));
+        assert!(pinged());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::net::TcpStream::connect(addr(port)).is_ok() {
+            assert!(Instant::now() < deadline, "the old port stays open");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // One on every interface is reached on loopback.
+        let any: std::net::SocketAddr = "0.0.0.0:80".parse().unwrap();
+        assert_eq!(reach(any).to_string(), "127.0.0.1:80");
+        h.state_mut().settings = true;
+        h.run();
+        shot(&mut h, "72-settings-mcp");
     }
 
     /// Each client gets the setup it reads, with paths it can take as they are.
@@ -13489,6 +13754,110 @@ mod ui_tests {
         assert_eq!(h.state().hide_sidebar, shown);
         press(&mut h, CODE);
         assert!(h.state().code);
+    }
+
+    /// New requests land where the user is in the tree: the folder last clicked, else the
+    /// open request's folder, not always the top level. F2 and Delete (shown in the row
+    /// menus) are for that folder too, but Delete only after a click in the tree: a stray
+    /// one elsewhere mustn't offer to delete the open request.
+    #[test]
+    fn new_requests_and_keys_follow_where_the_tree_is() {
+        let ws = workspace("tree-at");
+        let top = ws.collections();
+        let api = ws.create_folder(&top, "api").unwrap();
+        let users = ws.create_folder(&top, "users").unwrap();
+        let r = ws.create_request(&api, "r").unwrap();
+        let mut h = harness(ws);
+        h.run();
+        let press = |h: &mut Harness<'_, App>, key: KeyboardShortcut| {
+            h.key_press_modifiers(key.modifiers, key.logical_key);
+            h.run();
+            h.state_mut().dialog.take()
+        };
+        let new_in = |h: &mut Harness<'_, App>| {
+            h.key_press_modifiers(NEW_REQUEST.modifiers, NEW_REQUEST.logical_key);
+            h.run();
+            shot(h, "68-new-request-where");
+            h.state_mut().dialog.take()
+        };
+        let new_in = |h: &mut Harness<'_, App>| match new_in(h) {
+            Some(Dialog::Name {
+                kind: NameKind::NewRequest(dir),
+                ..
+            }) => dir,
+            _ => panic!("no New request dialog"),
+        };
+        let renames = |dialog: Option<Dialog>| match dialog {
+            Some(Dialog::Name {
+                kind: NameKind::Rename(path),
+                ..
+            }) => path,
+            _ => panic!("no Rename dialog"),
+        };
+        assert_eq!(new_in(&mut h), top, "nothing open yet");
+        h.get_by_label("api").click();
+        h.run();
+        h.get_all_by_label("r").next().unwrap().click();
+        h.run();
+        assert_eq!(new_in(&mut h), api, "beside the open request");
+        h.get_by_label("users").click();
+        h.run();
+        shot(&mut h, "69-tree-folder-at");
+        assert_eq!(new_in(&mut h), users, "in the folder clicked");
+        assert_eq!(renames(press(&mut h, RENAME)), users);
+        let delete = KeyboardShortcut::new(Modifiers::NONE, Key::Delete);
+        assert!(matches!(press(&mut h, delete), Some(Dialog::Delete(p)) if p == [users.clone()]));
+        h.get_all_by_label("users")
+            .next()
+            .unwrap()
+            .click_secondary();
+        h.run();
+        shot(&mut h, "70-folder-menu-keys");
+        let rename = button(&h, "Rename")
+            .accesskit_node()
+            .label()
+            .unwrap_or_default();
+        assert!(rename.contains("F2"), "{rename}");
+        h.key_press(Key::Escape);
+        h.run();
+
+        // A click outside the tree: F2 is the open request's again, Delete nobody's.
+        h.get_by_label("Send request").click();
+        h.run();
+        assert!(press(&mut h, delete).is_none(), "a stray Delete");
+        assert_eq!(renames(press(&mut h, RENAME)), r);
+        // Opening a request moves the tree to it.
+        h.get_all_by_label("r").next().unwrap().click();
+        h.run();
+        assert_eq!(h.state().tree_folder, None);
+    }
+
+    /// Scripts and docs start empty: grey example text in the box read as if a script were
+    /// already set. The old text is a template a click away, offered only while empty.
+    #[test]
+    fn scripts_and_docs_start_empty_with_a_template_to_insert() {
+        let mut h = with_request("template");
+        let offered = |h: &Harness<'_, App>| {
+            let by = egui_kittest::kittest::By::new().role(Role::Button);
+            h.query(by.label_contains("Insert template")).is_some()
+        };
+        for (tab, written) in [
+            (ReqTab::Scripts, "// Runs after the response arrives."),
+            (ReqTab::Docs, "## What it's for"),
+        ] {
+            h.state_mut().req_tab = tab;
+            h.run();
+            shot(&mut h, &format!("71-template-{}", written.len()));
+            button(&h, "Insert template").click();
+            h.run();
+            let req = draft(&h);
+            let text = match tab {
+                ReqTab::Scripts => &req.tests,
+                _ => &req.description,
+            };
+            assert!(text.starts_with(written), "{text}");
+            assert!(!offered(&h), "only while empty");
+        }
     }
 
     /// Not a check: prints what one frame costs in the states that look heavy, with the
@@ -14061,7 +14430,8 @@ mod ui_tests {
     }
 
     /// Ctrl+Z in the URL brought back the request open before: egui keeps undo history by
-    /// widget id, and every request's URL field has the same one.
+    /// widget id, and every request's URL field has the same one. Wiping it on a switch
+    /// fixed that but lost each request's own history on a trip to another tab and back.
     #[test]
     fn undo_in_a_field_never_brings_back_another_requests_text() {
         let ws = workspace("undo-switch");
@@ -14085,6 +14455,14 @@ mod ui_tests {
         h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
         h.run();
         assert_eq!(draft(&h).url, "http://b.test");
+        // …and back on the first, its own history is still there.
+        h.get_all_by_label("a").next().unwrap().click();
+        h.run();
+        text_input(&h, 0).click();
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+        h.run();
+        assert_eq!(draft(&h).url, "http://a.test");
     }
 
     /// Renaming starts with the whole name selected, wherever the last rename left the

@@ -73,6 +73,10 @@ pub struct Schema {
     roots: Vec<String>,
 }
 
+/// How many objects deep a clicked field's selection goes. A connection takes three
+/// (`edges { node { … } }`); past that, a big schema's query runs to thousands of lines.
+const SELECT_DEPTH: usize = 4;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Operation {
     Query,
@@ -91,17 +95,15 @@ pub fn parse(body: &str) -> Result<Schema, String> {
         ));
     }
     let mut types = BTreeMap::new();
+    // Scalars and unions too, with no fields: a selection must know them from objects.
     for t in schema["types"].as_array().into_iter().flatten() {
         let Some(name) = t["name"].as_str().filter(|n| !n.starts_with("__")) else {
             continue;
         };
-        let Some(fields) =
-            (["fields", "inputFields", "enumValues"].iter()).find_map(|key| t[*key].as_array())
-        else {
-            continue;
-        };
+        let fields = (["fields", "inputFields", "enumValues"].iter())
+            .find_map(|key| t[*key].as_array())
+            .map_or_else(Vec::new, |f| f.iter().map(field).collect());
         let kind = t["kind"].as_str().unwrap_or_default().to_owned();
-        let fields = fields.iter().map(field).collect();
         types.insert(name.to_owned(), Type { kind, fields });
     }
     let roots: Vec<String> = (["queryType", "mutationType"].iter())
@@ -168,21 +170,59 @@ impl Schema {
             .filter(|f| !f.is_empty())
     }
 
-    /// The types to browse, by name: all but the query and mutation types.
+    /// The types to browse, by name: all with fields or values but the query and mutation
+    /// types.
     pub fn listed(&self) -> impl Iterator<Item = (&str, &Type)> {
         let roots = &self.roots;
         (self.types.iter())
-            .filter(move |(name, _)| !roots.contains(name))
+            .filter(move |(name, t)| !roots.contains(name) && !t.fields.is_empty())
             .map(|(name, t)| (name.as_str(), t))
     }
 
     /// Whether a selection goes inside a field of this type.
     fn composite(&self, name: &str) -> bool {
-        (self.types.get(name)).is_some_and(|t| matches!(t.kind.as_str(), "OBJECT" | "INTERFACE"))
+        (self.types.get(name))
+            .is_some_and(|t| matches!(t.kind.as_str(), "OBJECT" | "INTERFACE" | "UNION"))
     }
 
-    /// An operation calling `f` with every argument as a variable, selecting the scalar
-    /// fields of its result (one level of nesting is enough to start editing from).
+    /// Whether a field of this type is selected bare. One the schema doesn't list counts
+    /// as a scalar.
+    fn leaf(&self, name: &str) -> bool {
+        (self.types.get(name)).is_none_or(|t| matches!(t.kind.as_str(), "SCALAR" | "ENUM"))
+    }
+
+    /// The selection inside a field of type `base`, a line each, `indent` levels in: its
+    /// leaves, and its object fields with theirs, `SELECT_DEPTH` objects down. Left out:
+    /// a type already on the way in (`User.friends` would go round forever), a field with
+    /// a required argument (it can't go in bare) and a union's (it needs fragments).
+    fn selection(&self, base: &str, indent: usize, path: &mut Vec<String>) -> Vec<String> {
+        let Some(t) = self.types.get(base).filter(|_| self.composite(base)) else {
+            return Vec::new();
+        };
+        path.push(base.to_owned());
+        let pad = "  ".repeat(indent);
+        let mut lines = Vec::new();
+        for f in &t.fields {
+            if f.args.iter().any(|(_, ty)| ty.ends_with('!')) {
+                continue;
+            }
+            if self.leaf(&f.base) {
+                lines.push(format!("{pad}{}", f.name));
+            } else if path.len() < SELECT_DEPTH && !path.contains(&f.base) {
+                let inner = self.selection(&f.base, indent + 1, path);
+                if !inner.is_empty() {
+                    lines.push(format!("{pad}{} {{", f.name));
+                    lines.extend(inner);
+                    lines.push(format!("{pad}}}"));
+                }
+            }
+        }
+        path.pop();
+        lines
+    }
+
+    /// An operation calling `f` with every argument as a variable, selecting every field
+    /// of its result, nested objects' too (see `selection`).
     /// Returns (query text, variables as a JSON object).
     pub fn operation(&self, op: Operation, f: &Field) -> (String, serde_json::Map<String, Value>) {
         let keyword = match op {
@@ -210,22 +250,16 @@ impl Schema {
                 vars,
             )
         };
-        let selection = match self.types.get(&f.base).filter(|_| self.composite(&f.base)) {
-            Some(Type { fields, .. }) => {
-                let scalars: Vec<_> = fields
-                    .iter()
-                    .filter(|sub| !self.composite(&sub.base) && sub.args.is_empty())
-                    .map(|sub| format!("    {}", sub.name))
-                    .collect();
-                // An object with only nested objects still needs a valid selection.
-                let lines = if scalars.is_empty() {
-                    vec!["    __typename".to_owned()]
-                } else {
-                    scalars
-                };
+        let selection = match self.composite(&f.base) {
+            true => {
+                let mut lines = self.selection(&f.base, 2, &mut Vec::new());
+                // A union, or an object with nothing to select bare, still needs one.
+                if lines.is_empty() {
+                    lines.push("    __typename".to_owned());
+                }
                 format!(" {{\n{}\n  }}", lines.join("\n"))
             }
-            None => String::new(),
+            false => String::new(),
         };
         let text = format!(
             "{keyword} {name}{decls} {{\n  {}{call}{selection}\n}}\n",
@@ -315,6 +349,69 @@ pub(crate) mod tests {
         // (leaves too) are in.
         let (text, _) = schema.operation(Operation::Query, &schema.query[2]);
         assert_eq!(text, "query Version {\n  version\n}\n");
+    }
+
+    /// A click fills in every level, not only the first: nested objects come with their
+    /// own fields, down to SELECT_DEPTH. What would make the query invalid or endless is
+    /// left out: a type already on the way in, a required argument, a union.
+    #[test]
+    fn a_clicked_field_selects_every_level_down() {
+        let f = |name: &str, ty: Value| serde_json::json!({ "name": name, "args": [], "type": ty });
+        let obj = |name: &str, fields: Value| serde_json::json!({ "kind": "OBJECT", "name": name, "fields": fields });
+        let s = |name: &str| named("SCALAR", name);
+        let o = |name: &str| named("OBJECT", name);
+        let body = serde_json::json!({ "data": { "__schema": {
+            "queryType": { "name": "Query" },
+            "types": [
+                obj("Query", serde_json::json!([f("me", o("User"))])),
+                obj("User", serde_json::json!([
+                    f("id", s("ID")),
+                    f("address", o("Address")),
+                    { "name": "posts", "args": [
+                        { "name": "first", "type": wrap("NON_NULL", s("Int")) }
+                    ], "type": o("Post") },
+                    f("best", o("Post")),
+                    f("boss", o("User")),
+                    f("hit", named("UNION", "Hit")),
+                ])),
+                obj("Address", serde_json::json!([f("city", s("String")), f("geo", o("Geo"))])),
+                obj("Geo", serde_json::json!([f("lat", s("Float")), f("deep", o("L4"))])),
+                obj("L4", serde_json::json!([f("x", s("String")), f("y", o("L5"))])),
+                obj("L5", serde_json::json!([f("z", s("String"))])),
+                obj("Post", serde_json::json!([f("title", s("String")), f("author", o("User"))])),
+                { "kind": "UNION", "name": "Hit", "fields": null },
+                { "kind": "SCALAR", "name": "String", "fields": null },
+            ]
+        }}});
+        let schema = parse(&body.to_string()).unwrap();
+        let (text, _) = schema.operation(Operation::Query, &schema.query[0]);
+        assert_eq!(
+            text,
+            "query Me {
+  me {
+    id
+    address {
+      city
+      geo {
+        lat
+        deep {
+          x
+        }
+      }
+    }
+    best {
+      title
+    }
+  }
+}
+"
+        );
+        assert!(
+            schema
+                .listed()
+                .all(|(name, _)| name != "Hit" && name != "String"),
+            "nothing to open in a union or scalar"
+        );
     }
 
     /// Every type's fields can be looked at, not only the root ones: an object's fields,

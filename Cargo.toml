@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.99.0"
+version = "0.100.0"
 edition = "2024"
 
 [dependencies]
@@ -81,7 +81,8 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 [target."cfg(windows)".dependencies]
 # WinHTTP reads IE/Edge proxy settings and does WPAD discovery the way the OS does.
 # DPAPI seals environment secrets in apitool.db (see vault.rs).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Cryptography"] }
+# DWM and WM_NCACTIVATE switch the title bar with the theme (see appearance.rs).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Cryptography", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 # A fake MQTT broker's buffers, for rumqttc's packet codec.

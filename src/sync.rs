@@ -297,6 +297,23 @@ impl Remote {
     pub fn is_set(&self) -> bool {
         self.path().contains('/') && !self.branch.trim().is_empty()
     }
+
+    /// The provider's page for a new token, filled in with what sync needs: signing in
+    /// there is the login. An OAuth sign-in would need an app registered with each.
+    pub fn token_page(&self) -> String {
+        match self.provider {
+            Provider::GitHub => {
+                let path = self.path();
+                let owner = path.split('/').next().unwrap_or_default();
+                format!(
+                    "https://github.com/settings/personal-access-tokens/new?name=apitool+sync&contents=write&target_name={owner}"
+                )
+            }
+            Provider::GitLab => {
+                "https://gitlab.com/-/user_settings/personal_access_tokens?name=apitool+sync&scopes=api".into()
+            }
+        }
+    }
 }
 
 /// How the user settled the files both sides changed.

@@ -911,20 +911,20 @@ fn post(ws: &Workspace, message: &str) -> Result<Option<String>, String> {
     let off = "The apitool window isn't open, or Settings > MCP > \"Let MCP clients operate \
                this window\" is off";
     let state = ws.load_state();
-    if state.mcp_port == 0 {
+    if state.mcp_addr.is_empty() {
         return Err(off.into());
     }
     let io = |e: std::io::Error| e.to_string();
-    let mut conn = TcpStream::connect(("127.0.0.1", state.mcp_port)).map_err(|_| off.to_owned())?;
+    let mut conn = TcpStream::connect(&state.mcp_addr).map_err(|_| off.to_owned())?;
     // send_in_window waits for a response that long.
     let wait = SEND_TIMEOUT + Duration::from_secs(30);
     conn.set_read_timeout(Some(wait)).map_err(io)?;
     write!(
         conn,
-        "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1:{}\r\nauthorization: Bearer {}\r\n\
+        "POST /mcp HTTP/1.1\r\nhost: {}\r\nauthorization: Bearer {}\r\n\
          content-type: application/json\r\naccept: application/json, text/event-stream\r\n\
          content-length: {}\r\nconnection: close\r\n\r\n{message}",
-        state.mcp_port,
+        state.mcp_addr,
         state.mcp_token,
         message.len()
     )
