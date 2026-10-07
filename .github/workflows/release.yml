@@ -65,6 +65,17 @@ jobs:
           fi
           exit "$code"
       - name: Build
+        # The smallest binary that runs no slower (macOS arm64: 46 MB -> 30 MB): whole-program
+        # LTO in one codegen unit drops and merges more code and is as fast or faster, and
+        # the symbol table is never read at run time (a panic's log keeps its file and line,
+        # its backtrace loses names). Not opt-level s/z (smaller, slower code), UPX (unpacked
+        # into private memory at each start; no macOS) or panic=abort (a worker thread's
+        # panic would take the window with it). Here, not in Cargo.toml: local builds stay
+        # quick.
+        env:
+          CARGO_PROFILE_RELEASE_LTO: fat
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+          CARGO_PROFILE_RELEASE_STRIP: symbols
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
         shell: bash
