@@ -10836,7 +10836,8 @@ mod ui_tests {
     /// changed the user picks.
     #[test]
     fn the_workspace_files_follow_the_window_in_and_out() {
-        let mut h = with_request("sync");
+        // Not "sync": that folder is the GitHub sync test's, wiped here if both run at once.
+        let mut h = with_request("files-sync");
         let root = h.state().ws.root.clone();
         let (file, env) = (
             root.join("collections/r.toml"),
