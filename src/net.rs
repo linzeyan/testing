@@ -687,6 +687,7 @@ struct TimeConnect<S>(S);
 impl<R, S> tower_service::Service<R> for TimeConnect<S>
 where
     S: tower_service::Service<R>,
+    S::Response: hyper_util::client::legacy::connect::Connection,
     S::Future: Send + 'static,
 {
     type Response = S::Response;
@@ -705,16 +706,23 @@ where
         let started = Instant::now();
         let connecting = self.0.call(req);
         Box::pin(async move {
-            crate::http::trace(|t| t.hello = None);
+            crate::http::trace(|t| (t.hello, t.dns) = (None, None));
             let conn = connecting.await;
             let done = Instant::now();
+            let Ok(c) = &conn else { return conn };
+            let mut info = http::Extensions::new();
+            hyper_util::client::legacy::connect::Connection::connected(c).get_extras(&mut info);
+            let info = info.get::<hyper_util::client::legacy::connect::HttpInfo>();
             crate::http::trace(|t| {
-                *t.connect.get_or_insert_default() += done - started;
-                // Through an https:// proxy the first hello is the proxy's, so TLS also
-                // holds the CONNECT and the server's own handshake.
-                if let Some(hello) = t.hello.take() {
-                    *t.tls.get_or_insert_default() += done - hello;
-                }
+                t.opened.push(crate::http::Opened {
+                    local: info.map(|i| i.local_addr()),
+                    hop: t.hops.len(),
+                    connect: done - started,
+                    dns: t.dns.take(),
+                    // Through an https:// proxy the first hello is the proxy's, so TLS also
+                    // holds the CONNECT and the server's own handshake.
+                    tls: t.hello.take().map(|hello| done - hello),
+                })
             });
             conn
         })

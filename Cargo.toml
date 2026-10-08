@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.103.0"
+version = "0.103.1"
 edition = "2024"
 
 [dependencies]
@@ -63,8 +63,9 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # MQTT client. No provider of its own: TLS uses the ring one net.rs installs.
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider", "websocket", "proxy"] }
 # Already in the tree via reqwest, which reads the system proxy with it: MQTT asks it the
-# same question for the broker.
-hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+# same question for the broker. Its HttpInfo tells a response's connection from one that
+# opened beside it.
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy", "client-proxy-system", "tokio"] }
 http = "1.5.0"
 # Already in the tree via reqwest: the OS trust store (policy-installed roots on Windows)
 # for mqtts://, as reqwest uses it for https.

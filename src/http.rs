@@ -53,13 +53,25 @@ const MAX_SENT_BODY: usize = 64 << 10;
 pub struct Trace {
     pub cookie: Option<String>,
     pub hops: Vec<(u16, String)>,
-    /// Filled in by the connector, see `net::TimeConnect`, `net::TimeDns` and
-    /// `net::HelloAt`.
-    pub connect: Option<Duration>,
+    /// Filled in by the connector, see `net::TimeConnect`.
+    pub opened: Vec<Opened>,
+    /// For the connection being opened, see `net::TimeDns` and `net::HelloAt`: the time
+    /// looking its host up, and when its handshake started.
+    pub dns: Option<Duration>,
+    pub hello: Option<Instant>,
+}
+
+/// A connection opened during a send, which may not be the one it went out on: hyper
+/// races a connect against the pool, and when an open connection comes back first the
+/// request takes that, and the connect finishes in the background.
+pub struct Opened {
+    /// The socket's own address, which tells it apart from the one taken from the pool.
+    pub local: Option<std::net::SocketAddr>,
+    /// The redirects followed before it was asked for.
+    pub hop: usize,
+    pub connect: Duration,
     pub dns: Option<Duration>,
     pub tls: Option<Duration>,
-    /// When the handshake of the connection being opened started.
-    pub hello: Option<Instant>,
 }
 
 tokio::task_local! {
@@ -389,7 +401,10 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
     sent.waited = Some(started.elapsed());
     sent.added(trace.cookie, body_len);
     sent.hops = trace.hops;
-    (sent.connect, sent.dns, sent.tls) = (trace.connect, trace.dns, trace.tls);
+    let info = resp
+        .extensions()
+        .get::<hyper_util::client::legacy::connect::HttpInfo>();
+    sent.opened(&trace.opened, info.map(|i| i.local_addr()));
     sent.remote = resp.remote_addr().map(|a| a.to_string());
     let status = resp.status();
     let version = format!("{:?}", resp.version());
@@ -409,6 +424,25 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
 }
 
 impl Sent {
+    /// The time opening the connections the send went out on, the final hop's being the
+    /// one at `local`.
+    /// ponytail: an earlier hop's connects all count, reqwest's redirect policy not seeing
+    /// the connection; one that lost the race there still shows (loopback-fast connects).
+    fn opened(&mut self, opened: &[Opened], local: Option<std::net::SocketAddr>) {
+        for o in opened
+            .iter()
+            .filter(|o| o.hop < self.hops.len() || o.local == local)
+        {
+            *self.connect.get_or_insert_default() += o.connect;
+            if let Some(dns) = o.dns {
+                *self.dns.get_or_insert_default() += dns;
+            }
+            if let Some(tls) = o.tls {
+                *self.tls.get_or_insert_default() += tls;
+            }
+        }
+    }
+
     /// The headers reqwest and hyper add on the way out, as they add them.
     /// ponytail: mirrors reqwest 0.13's rules (checked by a test against what a server
     /// receives); revisit when upgrading reqwest.
@@ -1381,6 +1415,44 @@ pub(crate) mod tests {
         let second = rt.block_on(execute(c, req)).unwrap();
         assert!(first.sent.connect.is_some());
         assert_eq!(second.sent.connect, None);
+    }
+
+    /// The race the test above only loses now and then: a connect that finished beside
+    /// the pooled connection the request went out on.
+    #[test]
+    fn only_the_connection_a_response_came_on_counts() {
+        let at = |port| Some(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        let opened = |port, hop, ms| Opened {
+            local: at(port),
+            hop,
+            connect: Duration::from_millis(ms),
+            dns: Some(Duration::from_millis(1)),
+            tls: None,
+        };
+        let time = |opened: &[Opened], hops, port| {
+            let hops = vec![(302, String::new()); hops];
+            let mut sent = Sent {
+                hops,
+                ..Default::default()
+            };
+            sent.opened(opened, at(port));
+            (
+                sent.connect.map(|c| c.as_millis()),
+                sent.dns.map(|d| d.as_millis()),
+            )
+        };
+        // The pool's connection came back first; the new one goes on unused.
+        assert_eq!(time(&[opened(1, 0, 5)], 0, 2), (None, None));
+        assert_eq!(time(&[opened(1, 0, 5)], 0, 1), (Some(5), Some(1)));
+        // An earlier hop's connection can't be checked, so it counts.
+        assert_eq!(
+            time(&[opened(1, 0, 5), opened(2, 1, 7)], 1, 3),
+            (Some(5), Some(1))
+        );
+        assert_eq!(
+            time(&[opened(1, 0, 5), opened(2, 1, 7)], 1, 2),
+            (Some(12), Some(2))
+        );
     }
 
     fn get(rt: &tokio::runtime::Runtime, url: String) -> Response {
