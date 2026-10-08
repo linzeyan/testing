@@ -6949,7 +6949,8 @@ fn tree_drop(
         DropAt::Into(dir) => {
             let r = rect(dir).unwrap_or(rest);
             let stroke = ui.visuals().selection.stroke;
-            painter.rect_stroke(r, 2.0, stroke, egui::StrokeKind::Inside);
+            let corners = ui.visuals().widgets.inactive.corner_radius;
+            painter.rect_stroke(r, corners, stroke, egui::StrokeKind::Inside);
         }
     }
     if ui.input(|i| i.pointer.any_released()) {

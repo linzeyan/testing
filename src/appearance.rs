@@ -37,6 +37,10 @@ impl Default for Appearance {
 pub const DEFAULT_SIZE: f32 = 13.0;
 pub const SIZES: std::ops::RangeInclusive<f32> = 9.0..=24.0;
 
+/// Corners of buttons, and of what egui rounds with them (fields, tabs, rows, checkboxes):
+/// egui's 2 px read as square. Rounder makes a 14 px checkbox look like a radio button.
+const RADIUS: u8 = 4;
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Theme {
     #[default]
@@ -61,6 +65,10 @@ pub fn apply(ctx: &egui::Context, a: &Appearance) -> Result<(), String> {
             if let Some(b) = base.get(text_style) {
                 font.size = b.size * scale;
             }
+        }
+        let w = &mut style.visuals.widgets;
+        for v in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+            v.corner_radius = egui::CornerRadius::same(RADIUS);
         }
     });
     let mut fonts = egui::FontDefinitions::default();
@@ -255,6 +263,20 @@ mod tests {
         assert!(e.contains("No Such Font 123"), "{e}");
         let body = &ctx.style_of(egui::Theme::Dark).text_styles[&egui::TextStyle::Body];
         assert_eq!(body.size, 20.0);
+    }
+
+    /// In both themes, so switching keeps them round.
+    #[test]
+    fn buttons_are_rounded_in_both_themes() {
+        let ctx = egui::Context::default();
+        apply(&ctx, &Appearance::default()).unwrap();
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let style = ctx.style_of(theme);
+            let w = &style.visuals.widgets;
+            for v in [w.inactive, w.hovered, w.active, w.open] {
+                assert_eq!(v.corner_radius, egui::CornerRadius::same(RADIUS));
+            }
+        }
     }
 
     /// A chosen font comes first in its family, ahead of the built-in one.
