@@ -54,7 +54,13 @@ pub struct Remote {
     pub repo: String,
     pub branch: String,
     pub share: Share,
+    /// Minutes between syncs the window starts by itself, the first when it opens; 0 only
+    /// syncs when asked. One of `EVERY`.
+    pub every: u32,
 }
+
+/// What Settings offers for `Remote::every`.
+pub const EVERY: [u32; 5] = [0, 5, 15, 30, 60];
 
 impl Default for Remote {
     fn default() -> Self {
@@ -63,6 +69,7 @@ impl Default for Remote {
             repo: String::new(),
             branch: "main".into(),
             share: Share::default(),
+            every: 0,
         }
     }
 }

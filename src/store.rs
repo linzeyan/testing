@@ -159,6 +159,8 @@ pub struct State {
     pub recent_filters: Vec<String>,
     /// Content types last switched to Raw: their responses open that way.
     pub raw_types: Vec<String>,
+    /// A clicked root field in the GraphQL explorer replaces the query; off, it joins it.
+    pub gql_replace: bool,
     pub appearance: crate::appearance::Appearance,
     pub updates: crate::update::Updates,
     /// MCP clients may operate the window (Settings).

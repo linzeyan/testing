@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.102.1"
+version = "0.103.0"
 edition = "2024"
 
 [dependencies]
@@ -73,6 +73,9 @@ rustls-platform-verifier = "0.7"
 # macOS it calls the OS dialogs through windows-sys / objc2, both already in the tree.
 rfd = { version = "0.17", default-features = false }
 egui-phosphor = "0.14"
+# Already in the tree via reqwest's http2: the window's MCP endpoint also takes h2c.
+h2 = "0.4.19"
+bytes = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux has no dialog of its own: ask the desktop portal.
@@ -85,9 +88,6 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Cryptography", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
-# A fake MQTT broker's buffers, for rumqttc's packet codec.
-bytes = "1"
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
-h2 = "0.4.19"
 rcgen = "0.14"
 tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }

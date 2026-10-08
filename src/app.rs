@@ -151,6 +151,15 @@ enum ReqTab {
     Properties,
 }
 
+/// App settings' tabs.
+#[derive(PartialEq, Clone, Copy)]
+enum SettingsTab {
+    General,
+    Updates,
+    Mcp,
+    Sync,
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum FolderTab {
     Vars,
@@ -431,6 +440,9 @@ struct Explorer {
     schema: Option<Result<graphql::Schema, String>>,
     loading: bool,
     filter: String,
+    /// A clicked root field starts the query over, instead of joining it (kept in the
+    /// workspace state).
+    replace: bool,
 }
 
 struct ResponseView {
@@ -808,6 +820,10 @@ pub struct App {
     remote_passphrase: String,
     remote_passphrase_saved: bool,
     syncing: bool,
+    /// When this run last started a sync, for `remote.every`, and whether that one started
+    /// by itself: then a sync that changed nothing leaves the status bar alone.
+    synced_at: Option<Instant>,
+    sync_auto: bool,
     /// Word wrap in the response body, kept across restarts.
     wrap_response: bool,
     /// The response beside the request instead of under it (Postman's two-pane view).
@@ -826,6 +842,8 @@ pub struct App {
     /// system changing it re-darkens it (Windows, `appearance::title_bar`).
     title_bar: Option<(bool, Option<egui::Theme>)>,
     settings: bool,
+    /// The one Settings shows; the last one looked at, unless something opens another.
+    settings_tab: SettingsTab,
     updates: crate::update::Updates,
     update: Update,
     /// Checks on `updates`' schedule. Only the real app does: tests mustn't reach GitHub.
@@ -922,6 +940,8 @@ impl App {
             remote_passphrase: String::new(),
             remote_passphrase_saved: ws.has_sync_secret(crate::store::SYNC_PASSPHRASE),
             syncing: false,
+            synced_at: None,
+            sync_auto: false,
             wrap_response: state.wrap_response,
             side_by_side: !state.stacked,
             narrow: false,
@@ -937,6 +957,7 @@ impl App {
             auto_update: false,
             restart: false,
             settings: false,
+            settings_tab: SettingsTab::General,
             font_families: None,
             mock: None,
             ws,
@@ -960,7 +981,10 @@ impl App {
             answers: None,
             stream: None,
             grpc_methods: None,
-            explorer: Explorer::default(),
+            explorer: Explorer {
+                replace: state.gql_replace,
+                ..Default::default()
+            },
             load: None,
             status: String::new(),
             logged_status: String::new(),
@@ -1189,6 +1213,7 @@ impl App {
             env_colors: self.env_colors.clone(),
             recent_filters: self.recent_filters.clone(),
             raw_types: self.raw_types.clone(),
+            gql_replace: self.explorer.replace,
             appearance: self.appearance.clone(),
             updates: self.updates.clone(),
             mcp_window: self.mcp_window,
@@ -1210,7 +1235,7 @@ impl App {
             Ok(_) => {
                 self.status =
                     t("Sync: name the repository and give a token in Settings first").into();
-                self.settings = true;
+                (self.settings, self.settings_tab) = (true, SettingsTab::Sync);
                 return;
             }
             Err(e) => {
@@ -1229,7 +1254,7 @@ impl App {
                 return;
             }
         };
-        self.syncing = true;
+        (self.syncing, self.synced_at, self.sync_auto) = (true, Some(Instant::now()), false);
         let (cell, net, tx, ctx) = (
             self.client.clone(),
             (self.network.clone(), self.cookies.clone()),
@@ -1254,6 +1279,28 @@ impl App {
             let _ = tx.send(Msg::Synced(result));
             ctx.request_repaint();
         });
+    }
+
+    /// Syncs on Settings' schedule: once the window opens, then every `remote.every`
+    /// minutes. Not without the token (or a passphrase it needs): `start_sync` would open
+    /// Settings to ask each time. Not while Settings is open (a half-typed repository) or
+    /// a dialog is (a conflict waiting on its answer).
+    fn auto_sync(&mut self, ctx: &egui::Context) {
+        let every = Duration::from_secs(60 * u64::from(self.remote.every));
+        let kept =
+            self.remote_token_saved && (!self.remote.share.any() || self.remote_passphrase_saved);
+        if every.is_zero() || !self.remote.is_set() || !kept {
+            return;
+        }
+        let wait = (self.synced_at).map_or(Duration::ZERO, |at| every.saturating_sub(at.elapsed()));
+        if !wait.is_zero() {
+            // egui only draws on input: an untouched window would never get round to it.
+            ctx.request_repaint_after(wait);
+        } else if !self.syncing && !self.settings && self.dialog.is_none() {
+            self.start_sync(ctx, None);
+            // Also when it couldn't start: the next try waits its turn, not a frame.
+            (self.synced_at, self.sync_auto) = (Some(Instant::now()), true);
+        }
     }
 
     fn mcp_host(&self) -> Option<&McpHost> {
@@ -2279,7 +2326,9 @@ impl App {
                             pulled: 0,
                             pushed: 0,
                         }) => {
-                            self.status = tf("In step with {}", &[&repo]);
+                            if !self.sync_auto {
+                                self.status = tf("In step with {}", &[&repo]);
+                            }
                         }
                         Ok(Outcome::Synced { pulled, pushed }) => {
                             self.status = tf(
@@ -2911,6 +2960,7 @@ impl eframe::App for App {
         {
             self.check_updates(ui.ctx());
         }
+        self.auto_sync(ui.ctx());
         let focus = ui.input(|i| {
             i.events.iter().find_map(|e| match e {
                 egui::Event::WindowFocused(focused) => Some(*focused),
@@ -3134,7 +3184,7 @@ impl App {
                     let text = RichText::new(format!("{} {version}", icon::ARROW_CIRCLE_UP));
                     let button = named(ui.button(text.color(GREEN)), t("Update"), None);
                     if button.on_hover_text(tf(hint, &[version])).clicked() {
-                        self.settings = true;
+                        (self.settings, self.settings_tab) = (true, SettingsTab::Updates);
                     }
                 }
                 let proxy = match self.network.proxy {
@@ -3908,6 +3958,7 @@ impl App {
             .map(|r| r.every.as_secs());
         let mut define: Option<Vec<String>> = None;
         let mut fetch_schema = false;
+        let replace_query = self.explorer.replace;
         let mut reflect = false;
         let mut example = None;
         let pending = self.pending.iter().find(|p| p.path == open.path);
@@ -4586,6 +4637,9 @@ impl App {
         }
         if fetch_schema {
             self.fetch_schema(ui.ctx());
+        }
+        if self.explorer.replace != replace_query {
+            self.save_state();
         }
         if let Some(names) = define {
             self.open_env_editor(self.active_env.clone(), &names);
@@ -5842,52 +5896,70 @@ impl App {
         let mut sync_now = false;
         let (mut close, mut network) = (false, false);
         let (mut check, mut install, mut restart) = (false, None, false);
+        let tab = &mut self.settings_tab;
         let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
             ui.set_width(460.0);
             ui.heading(t("Settings"));
             ui.add_space(6.0);
-            egui::Grid::new("appearance")
-                .num_columns(2)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label(t("Language"));
-                    ui.horizontal(|ui| {
-                        use crate::i18n::Lang;
-                        ui.selectable_value(&mut a.language, Lang::English, "English");
-                        ui.selectable_value(&mut a.language, Lang::ZhTw, "繁體中文");
-                    });
-                    ui.end_row();
-                    ui.label(t("Theme"));
-                    ui.horizontal(|ui| {
-                        for (theme, name) in [
-                            (Theme::System, t("System")),
-                            (Theme::Light, t("Light")),
-                            (Theme::Dark, t("Dark")),
-                        ] {
-                            ui.selectable_value(&mut a.theme, theme, name);
-                        }
-                    });
-                    ui.end_row();
-                    ui.label(t("Interface font"));
-                    font_picker(ui, "ui-font", &mut a.ui_font, families.iter().map(|f| &f.0));
-                    ui.end_row();
-                    ui.label(t("Code font"));
-                    let mono = families.iter().filter(|f| f.1).map(|f| &f.0);
-                    font_picker(ui, "code-font", &mut a.code_font, mono);
-                    ui.end_row();
-                    ui.label(t("Text size"));
-                    ui.horizontal(|ui| {
-                        let slider = egui::Slider::new(&mut a.size, SIZES).step_by(0.5);
-                        ui.add(slider.suffix(" pt"));
-                        if a.size != DEFAULT_SIZE && ui.small_button(t("Reset")).clicked() {
-                            a.size = DEFAULT_SIZE;
-                        }
-                    });
-                    ui.end_row();
-                    ui.label(t("Network"));
-                    network = ui.button(t("Proxy and certificates…")).clicked();
-                    ui.end_row();
-                    ui.label(t("Updates"));
+            // A tab each: in one long grid, the sections ran together and got misread.
+            ui.horizontal(|ui| {
+                sub_tab(ui, tab, SettingsTab::General, t("General"), false);
+                sub_tab(ui, tab, SettingsTab::Updates, t("Updates"), false);
+                sub_tab(ui, tab, SettingsTab::Mcp, "MCP", false).on_hover_text(t(
+                    "Model Context Protocol: lets an LLM client such as Claude or Cursor use apitool",
+                ));
+                sub_tab(ui, tab, SettingsTab::Sync, t("Sync"), false);
+            });
+            ui.separator();
+            let top = ui.cursor().top();
+            match *tab {
+                SettingsTab::General => {
+                    egui::Grid::new("appearance")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(t("Language"));
+                            ui.horizontal(|ui| {
+                                use crate::i18n::Lang;
+                                ui.selectable_value(&mut a.language, Lang::English, "English");
+                                ui.selectable_value(&mut a.language, Lang::ZhTw, "繁體中文");
+                            });
+                            ui.end_row();
+                            ui.label(t("Theme"));
+                            ui.horizontal(|ui| {
+                                for (theme, name) in [
+                                    (Theme::System, t("System")),
+                                    (Theme::Light, t("Light")),
+                                    (Theme::Dark, t("Dark")),
+                                ] {
+                                    ui.selectable_value(&mut a.theme, theme, name);
+                                }
+                            });
+                            ui.end_row();
+                            ui.label(t("Interface font"));
+                            let all = families.iter().map(|f| &f.0);
+                            font_picker(ui, "ui-font", &mut a.ui_font, all);
+                            ui.end_row();
+                            ui.label(t("Code font"));
+                            let mono = families.iter().filter(|f| f.1).map(|f| &f.0);
+                            font_picker(ui, "code-font", &mut a.code_font, mono);
+                            ui.end_row();
+                            ui.label(t("Text size"));
+                            ui.horizontal(|ui| {
+                                let slider = egui::Slider::new(&mut a.size, SIZES).step_by(0.5);
+                                ui.add(slider.suffix(" pt"));
+                                if a.size != DEFAULT_SIZE && ui.small_button(t("Reset")).clicked()
+                                {
+                                    a.size = DEFAULT_SIZE;
+                                }
+                            });
+                            ui.end_row();
+                            ui.label(t("Network"));
+                            network = ui.button(t("Proxy and certificates…")).clicked();
+                            ui.end_row();
+                        });
+                }
+                SettingsTab::Updates => {
                     ui.vertical(|ui| {
                         use crate::update::Check;
                         let label = |c| match c {
@@ -5957,10 +6029,8 @@ impl App {
                             }
                         });
                     });
-                    ui.end_row();
-                    ui.label("MCP").on_hover_text(t(
-                        "Model Context Protocol: lets an LLM client such as Claude or Cursor use apitool",
-                    ));
+                }
+                SettingsTab::Mcp => {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             egui::ComboBox::from_id_salt("mcp-client")
@@ -6069,8 +6139,8 @@ impl App {
                             });
                         }
                     });
-                    ui.end_row();
-                    ui.label(t("Sync"));
+                }
+                SettingsTab::Sync => {
                     ui.vertical(|ui| {
                         use crate::sync::Provider;
                         ui.horizontal(|ui| {
@@ -6116,6 +6186,23 @@ impl App {
                                 .clicked();
                         });
                         ui.horizontal(|ui| {
+                            ui.label(t("Sync automatically"));
+                            let every = |m: u32| match m {
+                                0 => t("Off").to_owned(),
+                                60 => t("Every hour").to_owned(),
+                                m => tf("Every {} minutes", &[&m]),
+                            };
+                            egui::ComboBox::from_id_salt("remote-every")
+                                .selected_text(every(remote.every))
+                                .show_ui(ui, |ui| {
+                                    for m in crate::sync::EVERY {
+                                        ui.selectable_value(&mut remote.every, m, every(m));
+                                    }
+                                })
+                                .response
+                                .on_hover_text(t("When apitool starts, then this often"));
+                        });
+                        ui.horizontal(|ui| {
                             ui.label(t("Also sync"));
                             let share = &mut remote.share;
                             ui.checkbox(&mut share.secrets, t("Secret values"));
@@ -6136,9 +6223,17 @@ impl App {
                         }
                         ui.weak(t("To a private repository. What isn't ticked stays on this machine."));
                     });
-                    ui.end_row();
-                });
-            ui.add_space(6.0);
+                }
+            }
+            // As tall as the tallest tab shown yet: a shorter one would re-centre the window
+            // and move the tabs out from under the pointer.
+            let (used, tallest) = (ui.cursor().top() - top, egui::Id::new("settings-tallest"));
+            let most = ui.data_mut(|d| {
+                let most = d.get_temp_mut_or(tallest, 0.0f32);
+                *most = most.max(used);
+                *most
+            });
+            ui.add_space(most - used + 6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 close = ui.button(t("Close")).clicked();
             });
@@ -7586,6 +7681,13 @@ fn graphql_editor(
                     .on_hover_text(t("Introspect using this request's URL, headers and auth"))
                     .clicked();
             }
+            if let Some(Ok(_)) = ex.schema {
+                let mut add = !ex.replace;
+                ui.checkbox(&mut add, t("Add to the query")).on_hover_text(t(
+                    "On: a clicked field joins the query, so one query can ask for several. Off: a root field replaces the query.",
+                ));
+                ex.replace = !add;
+            }
         });
         match &ex.schema {
             None => {
@@ -7621,8 +7723,10 @@ fn graphql_editor(
                                     {
                                         let id =
                                             egui::Id::new(("gql", op == Operation::Query, &f.name));
-                                        let click =
-                                            t("Click to replace the query with this field.");
+                                        let click = match ex.replace {
+                                            true => t("Click to replace the query with this field."),
+                                            false => t("Click to add this field to the query."),
+                                        };
                                         if let Some(path) =
                                             schema_field(ui, schema, f, id, Some(click))
                                         {
@@ -7669,10 +7773,11 @@ fn graphql_editor(
     if let Some((op, path)) = insert
         && let Some(Ok(schema)) = &ex.schema
     {
-        // A root field starts the query over; one further down joins the query there.
-        let picked = match path.len() {
-            1 => schema.operation(op, &path),
-            _ => schema.add(op, &path, query, variables),
+        // A field joins the query where its path is, so one query can ask for several;
+        // with Add off, a root field starts it over.
+        let picked = match path.len() == 1 && ex.replace {
+            true => schema.operation(op, &path),
+            false => schema.add(op, &path, query, variables),
         };
         if let Some((text, vars)) = picked {
             *query = text;
@@ -12891,6 +12996,26 @@ mod ui_tests {
             "{query}"
         );
         assert_eq!(variables, "{\n  \"id\": null,\n  \"first\": null\n}");
+
+        // Another root field joins the query too: one query asks for several.
+        h.get_by_label("version: String").click_accesskit();
+        h.run();
+        let query = |h: &Harness<'_, App>| match &draft(h).body {
+            Body::GraphQL { query, .. } => query.clone(),
+            _ => panic!("body changed type"),
+        };
+        let both = query(&h);
+        assert!(
+            both.contains("  user(id: $id) {") && both.ends_with("  }\n  version\n}\n"),
+            "{both}"
+        );
+        // Unticked, a root field starts it over, and that's kept.
+        h.get_by_label("Add to the query").click();
+        h.run();
+        h.get_by_label("version: String").click_accesskit();
+        h.run();
+        assert_eq!(query(&h), "query Version {\n  version\n}\n");
+        assert!(h.state().ws.load_state().gql_replace);
     }
 
     /// The request editor has its own Save; the modal's is drawn last.
@@ -13626,6 +13751,8 @@ mod ui_tests {
         assert_eq!(reach(any).to_string(), "127.0.0.1:80");
         h.state_mut().settings = true;
         h.run();
+        h.get_by_label("MCP").click();
+        h.run();
         shot(&mut h, "72-settings-mcp");
         // A client that connects over HTTP has no workspace to read the token from: it's
         // shown, with the URL to post to, and copied with a click.
@@ -13672,9 +13799,13 @@ mod ui_tests {
                 .role(Role::Button)
                 .label("Sync")
         };
-        h.state_mut().settings = true;
         h.run();
         assert!(h.query(sync_button()).is_none(), "nothing to sync with yet");
+        h.state_mut().settings = true;
+        h.run();
+        // The tab; the status bar's button is the one tested above and below.
+        h.get_by_label("Sync").click();
+        h.run();
         assert!(button(&h, "Sync now").accesskit_node().is_disabled());
 
         h.state_mut().remote.repo = "https://github.com/o/r".into();
@@ -13750,6 +13881,56 @@ mod ui_tests {
         let rows = h.state().cookies.rows();
         assert!(rows.iter().any(|r| r.value == "pulled-c00kie"));
         assert!(crate::auth::export().contains("pulled-t0ken"));
+    }
+
+    /// Set to, the window syncs when it opens and again once the time is up, with nothing
+    /// to click and while left untouched; never under Settings (a repository half typed).
+    /// One that started by itself and changed nothing says nothing.
+    #[test]
+    fn the_workspace_syncs_by_itself_as_often_as_settings_say() {
+        use crate::sync::Outcome;
+        let ws = workspace("auto-sync");
+        ws.set_sync_secret(crate::store::SYNC_TOKEN, "t0k").unwrap();
+        let mut state = ws.load_state();
+        state.remote.repo = "o/r".into();
+        ws.save_state(&state);
+        let mut h = harness(ws);
+        // No network in tests: a sync fails at its first step, which shows it started.
+        let offline = Some(Err("offline".to_owned()));
+        h.state_mut().client = Arc::new(tokio::sync::OnceCell::new_with(offline));
+        let tried = |h: &mut Harness<'_, App>| {
+            wait(h, |app| !app.syncing);
+            std::mem::take(&mut h.state_mut().status).contains("offline")
+        };
+        h.run();
+        assert!(!tried(&mut h), "only when asked unless set");
+
+        h.state_mut().remote.every = 5;
+        h.run();
+        assert!(tried(&mut h), "when the window opens");
+        h.run();
+        assert!(!tried(&mut h), "not again before its time");
+        // Woken for it, untouched: no repaint asked for at all reads as Duration::MAX.
+        let delay = h.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        let due = Duration::from_secs(4 * 60)..=Duration::from_secs(5 * 60);
+        assert!(due.contains(&delay), "{delay:?}");
+
+        h.state_mut().synced_at = Some(Instant::now() - Duration::from_secs(5 * 60));
+        h.state_mut().settings = true;
+        h.run();
+        assert!(!tried(&mut h), "not under Settings");
+        h.state_mut().settings = false;
+        h.run();
+        assert!(tried(&mut h), "once the time is up");
+
+        h.state_mut().status = "Tests: 1/1 passed".into();
+        let unchanged = Outcome::Synced {
+            pulled: 0,
+            pushed: 0,
+        };
+        h.state().tx.send(Msg::Synced(Ok(unchanged))).unwrap();
+        h.run();
+        assert_eq!(h.state().status, "Tests: 1/1 passed");
     }
 
     #[test]

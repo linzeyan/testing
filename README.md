@@ -27,7 +27,7 @@ Each archive holds `apitool` (the GUI) and `apitool-cli` (runner, docs, mock ser
 MCP server). apitool looks for a newer release once a day and offers to install it in
 place, used from the next start; Settings > Updates sets how often (never, at start, daily,
 weekly) and whether to install without asking. The interface is in English or Traditional
-Chinese (Settings > Language).
+Chinese (Settings > General).
 
 To build from source with stable Rust:
 
@@ -310,7 +310,8 @@ With "Let it operate this window" on, the window serves MCP itself (a new token 
 web pages refused) and `apitool-cli mcp --window` relays to it. It listens on 127.0.0.1 and a
 new free port each start unless Settings gives a host and port. A client that connects
 over HTTP instead posts to the URL Settings shows, with the token shown there (copy icon
-beside it) as `Authorization: Bearer`. The
+beside it) as `Authorization: Bearer`, over HTTP/1.1 or HTTP/2 without TLS (h2c, with prior
+knowledge). The
 client then also sees what's open (unsaved edits, the response, a live stream), opens
 requests, presses Send and switches environments, and its changes show at once.
 
@@ -339,7 +340,8 @@ so two machines share one workspace.
    - GitHub: fine-grained, Contents read and write on that repository.
    - GitLab: the `api` scope.
 2. ↻ in the status bar pulls what changed there and pushes what changed here in one commit,
-   through the proxy set for requests.
+   through the proxy set for requests. "Sync automatically" also does it when apitool starts
+   and then every 5, 15, 30 or 60 minutes.
 
 A request changed on both sides since the last sync is asked about: keep the repository's or
 this machine's.

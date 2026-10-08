@@ -143,6 +143,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Access token", "存取權杖"),
     ("Add a file part", "加入檔案欄位"),
     ("Add to", "加入到"),
+    ("Add to the query", "加入查詢"),
     ("Algorithm", "演算法"),
     ("All ({})", "全部 ({})"),
     ("All collections", "所有集合"),
@@ -453,6 +454,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "Sign in to {} and make one with what sync needs filled in",
         "登入 {}，建立一個已填好同步所需權限的 token",
     ),
+    ("Sync automatically", "自動同步"),
     ("Sync now", "立即同步"),
     (
         "To a private repository. What isn't ticked stays on this machine.",
@@ -528,6 +530,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Errors", "錯誤"),
     ("ETag from an earlier response", "先前回應的 ETag"),
     ("ETag to match", "要比對的 ETag"),
+    ("Every {} minutes", "每 {} 分鐘"),
+    ("Every hour", "每小時"),
     ("Examples", "範例"),
     ("Expires", "到期"),
     (
@@ -579,6 +583,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "Gateway Timeout: a proxy or gateway got no answer from upstream in time.",
         "Gateway Timeout：代理或閘道沒有及時收到上游的回應。",
     ),
+    ("General", "一般"),
     ("Globals", "全域變數"),
     ("Go to tab 1–8, the last", "跳到第 1–8 個分頁、最後一個"),
     (
@@ -823,6 +828,11 @@ const ZH_TW: &[(&str, &str)] = &[
         "關閉：broker 會為這個用戶端 ID 保留訂閱與排隊中的訊息",
     ),
     ("OK: the request succeeded.", "OK：請求成功。"),
+    ("Off", "關閉"),
+    (
+        "On: a clicked field joins the query, so one query can ask for several. Off: a root field replaces the query.",
+        "開啟：點的欄位會加進查詢，一個查詢可同時查多個。關閉：點根欄位會取代整個查詢。",
+    ),
     ("Open in browser", "在瀏覽器開啟"),
     ("optional", "選填"),
     (
@@ -1301,6 +1311,10 @@ const ZH_TW: &[(&str, &str)] = &[
     (
         "What was sent, redirects, and what came back",
         "送出的內容、重新導向與收到的回應",
+    ),
+    (
+        "When apitool starts, then this often",
+        "apitool 啟動時同步一次，之後依此間隔",
     ),
     ("Whole word", "全字相符"),
     ("Will message", "遺囑訊息內容"),

@@ -764,9 +764,11 @@ pub fn cut(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-/// Serves MCP's Streamable HTTP transport at `/mcp` (answering in JSON, one exchange per
-/// connection) for the window, until `stop` is set. Any program on this machine can reach
-/// 127.0.0.1, so a caller must send `token`; a web page's Origin is refused outright.
+/// Serves MCP's Streamable HTTP transport at `/mcp` (answering in JSON) for the window,
+/// until `stop` is set: over HTTP/1.1, one exchange per connection, or over HTTP/2
+/// without TLS (h2c, prior knowledge), as many as the client sends on it. Any program on
+/// this machine can reach 127.0.0.1, so a caller must send `token`; a web page's Origin
+/// is refused outright.
 pub fn serve_http(
     listener: TcpListener,
     ws: Workspace,
@@ -774,53 +776,42 @@ pub fn serve_http(
     window: Window,
     stop: Arc<AtomicBool>,
 ) {
-    let mut server = match Server::new(ws, Some(window)) {
-        Ok(s) => s,
+    let server = match Server::new(ws, Some(window)) {
+        Ok(s) => Arc::new(Mutex::new(s)),
         Err(e) => return log::warn!("MCP: {e}"),
     };
     for conn in listener.incoming() {
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        // ponytail: one exchange at a time; a client sends a request and waits anyway.
-        if let Ok(conn) = conn
-            && let Err(e) = exchange(&mut server, &token, conn)
-        {
-            log::warn!("MCP: {e}");
-        }
+        let Ok(conn) = conn else { continue };
+        let (server, token, stop) = (server.clone(), token.clone(), stop.clone());
+        // A thread each: an HTTP/2 client keeps its connection open between messages, and
+        // would shut out every other one. Messages are still handled one at a time.
+        std::thread::spawn(move || {
+            if let Err(e) = connection(&server, &token, &stop, conn) {
+                log::warn!("MCP: {e}");
+            }
+        });
     }
 }
 
-fn exchange(server: &mut Server, token: &str, mut conn: TcpStream) -> std::io::Result<()> {
+fn connection(
+    server: &Arc<Mutex<Server>>,
+    token: &str,
+    stop: &AtomicBool,
+    mut conn: TcpStream,
+) -> std::io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(10)))?;
+    // Peeked, so an HTTP/1.1 request is still there to read. No request line starts like
+    // the preface; h2 checks the rest of it.
+    let mut head = [0u8; H2_PREFACE.len()];
+    let n = conn.peek(&mut head)?;
+    if n >= 3 && H2_PREFACE.starts_with(&head[..n]) {
+        return h2c(server, token, stop, conn);
+    }
     let (method, target, headers, body) = read_request(&mut conn)?;
-    let header = |name: &str| headers.get(name).map(String::as_str);
-    let local = |origin: &str| {
-        reqwest::Url::parse(origin)
-            .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
-    };
-    let (status, reply) = if header("origin").is_some_and(|o| !local(o)) {
-        (403, None)
-    } else if header("authorization") != Some(&format!("Bearer {token}")) {
-        (401, None)
-    } else if target.split('?').next() != Some("/mcp") {
-        (404, None)
-    } else if method != "POST" {
-        // No server-initiated stream (GET) and no sessions to end (DELETE).
-        (405, None)
-    } else {
-        match serde_json::from_slice::<Value>(&body) {
-            Ok(msg) => match server.handle(&msg) {
-                Some(reply) => (200, Some(reply)),
-                None => (202, None),
-            },
-            Err(e) => (
-                400,
-                Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
-            ),
-        }
-    };
-    let body = reply.map(|r| r.to_string()).unwrap_or_default();
+    let (status, body) = answer(server, token, &method, &target, &headers, &body);
     let reason = match status {
         200 => "OK",
         202 => "Accepted",
@@ -837,6 +828,130 @@ fn exchange(server: &mut Server, token: &str, mut conn: TcpStream) -> std::io::R
         body.len()
     )?;
     conn.flush()
+}
+
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// One HTTP/2 connection: each request on a stream of its own, until the client hangs up
+/// or the window stops serving.
+fn h2c(
+    server: &Arc<Mutex<Server>>,
+    token: &str,
+    stop: &AtomicBool,
+    conn: TcpStream,
+) -> std::io::Result<()> {
+    conn.set_nonblocking(true)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let mut h2 = (h2::server::handshake(tokio::net::TcpStream::from_std(conn)?).await)
+            .map_err(std::io::Error::other)?;
+        while let Some(next) = h2.accept().await {
+            let (request, respond) = next.map_err(std::io::Error::other)?;
+            // Switched off (or moved): this connection's token is no longer the one.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let (server, token) = (server.clone(), token.to_owned());
+            // A task of its own: a body arrives only while `accept` keeps being polled.
+            tokio::spawn(async move {
+                if let Err(e) = h2_exchange(server, token, request, respond).await {
+                    log::warn!("MCP: {e}");
+                }
+            });
+        }
+        Ok(())
+    })
+}
+
+async fn h2_exchange(
+    server: Arc<Mutex<Server>>,
+    token: String,
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<bytes::Bytes>,
+) -> Result<(), String> {
+    let (head, mut body) = request.into_parts();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > 16 << 20 {
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            return Err("body too large".into());
+        }
+    }
+    let headers = (head.headers.iter())
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
+        .collect();
+    let target = head
+        .uri
+        .path_and_query()
+        .map_or("/", |p| p.as_str())
+        .to_owned();
+    // Off the connection's thread: a window call waits for the next frame, and the server
+    // blocks on a runtime of its own, which can't be done from inside this one.
+    let method = head.method.to_string();
+    let answered = move || answer(&server, &token, &method, &target, &headers, &bytes);
+    let (status, reply) =
+        (tokio::task::spawn_blocking(answered).await).map_err(|e| e.to_string())?;
+    let response = http::Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("allow", "POST")
+        .body(())
+        .map_err(|e| e.to_string())?;
+    let mut send =
+        (respond.send_response(response, reply.is_empty())).map_err(|e| e.to_string())?;
+    if !reply.is_empty() {
+        send.send_data(reply.into(), true)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// The status and JSON body for a request, whichever HTTP brought it.
+fn answer(
+    server: &Mutex<Server>,
+    token: &str,
+    method: &str,
+    target: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> (u16, String) {
+    let header = |name: &str| headers.get(name).map(String::as_str);
+    let local = |origin: &str| {
+        reqwest::Url::parse(origin)
+            .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+    };
+    let (status, reply) = if header("origin").is_some_and(|o| !local(o)) {
+        (403, None)
+    } else if header("authorization") != Some(&format!("Bearer {token}")) {
+        (401, None)
+    } else if target.split('?').next() != Some("/mcp") {
+        (404, None)
+    } else if method != "POST" {
+        // No server-initiated stream (GET) and no sessions to end (DELETE).
+        (405, None)
+    } else {
+        match serde_json::from_slice::<Value>(body) {
+            // A panic in one call leaves the server usable for the next.
+            Ok(msg) => match server
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .handle(&msg)
+            {
+                Some(reply) => (200, Some(reply)),
+                None => (202, None),
+            },
+            Err(e) => (
+                400,
+                Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
+            ),
+        }
+    };
+    (status, reply.map(|r| r.to_string()).unwrap_or_default())
 }
 
 type HttpRequest = (String, String, HashMap<String, String>, Vec<u8>);
@@ -1262,6 +1377,55 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    /// The window's endpoint takes HTTP/2 without TLS too, from a client that knows it
+    /// will (prior knowledge), checking the token the same way. That client keeps its
+    /// connection open between messages, which mustn't shut out an HTTP/1.1 one (the
+    /// relay); once the window stops serving, the open connection is refused as well.
+    #[test]
+    fn the_window_endpoint_takes_h2c_beside_http1() {
+        crate::net::install_provider();
+        let dir = std::env::temp_dir().join(format!("apitool-mcp-h2c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = Workspace::open(dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let window: Window = Box::new(|_: &str, _: &Value| Err("no window here".into()));
+        let serving = stop.clone();
+        std::thread::spawn(move || serve_http(listener, ws, "t0ken".into(), window, serving));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let post = |client: &reqwest::Client, token: &str| {
+            let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+            rt.block_on(async {
+                let r = client
+                    .post(&url)
+                    .bearer_auth(token)
+                    .body(ping)
+                    .send()
+                    .await?;
+                Ok::<_, reqwest::Error>((r.version(), r.status().as_u16(), r.text().await?))
+            })
+        };
+        let client = |b: reqwest::ClientBuilder| b.no_proxy().timeout(Duration::from_secs(5));
+        let h2 = client(reqwest::Client::builder().http2_prior_knowledge())
+            .build()
+            .unwrap();
+        let (version, status, body) = post(&h2, "t0ken").unwrap();
+        assert_eq!((version, status), (reqwest::Version::HTTP_2, 200));
+        assert!(body.contains("\"result\""), "{body}");
+        assert_eq!(post(&h2, "guess").unwrap().1, 401);
+
+        let h1 = client(reqwest::Client::builder().http1_only())
+            .build()
+            .unwrap();
+        let (version, status, _) = post(&h1, "t0ken").unwrap();
+        assert_eq!((version, status), (reqwest::Version::HTTP_11, 200));
+
+        stop.store(true, Ordering::Relaxed);
+        assert!(post(&h2, "t0ken").is_err(), "still served after it stopped");
     }
 
     fn call(id: u64, name: &str, args: Value) -> Value {
