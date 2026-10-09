@@ -33,6 +33,8 @@ pub enum Lang {
     Shell,
     /// Java, C#, Kotlin, Swift, Rust, PHP: close enough to share a list.
     CLike,
+    /// A request URL: only its path variables are coloured.
+    Url,
 }
 
 /// The language of a snippet target (`codegen::targets`); none for raw HTTP.
@@ -253,6 +255,7 @@ fn spec(lang: Lang) -> Spec {
             ],
             &["true", "false", "null", "nil", "None", "Some", "Ok", "Err"],
         ),
+        Lang::Url => unreachable!("tokens() colours URLs itself"),
     }
 }
 
@@ -263,6 +266,10 @@ fn ident(c: u8) -> bool {
 /// The coloured spans of `text`, in order; what's between them is plain. Every span starts
 /// and ends at an ASCII byte or the end, so on a char boundary.
 pub fn tokens(text: &str, lang: Lang) -> Vec<(Range<usize>, Kind)> {
+    if lang == Lang::Url {
+        let spans = crate::model::path_var_spans(text).into_iter();
+        return spans.map(|r| (r, Kind::Key)).collect();
+    }
     let spec = spec(lang);
     let b = text.as_bytes();
     let mut out: Vec<(Range<usize>, Kind)> = Vec::new();

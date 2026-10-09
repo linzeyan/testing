@@ -70,8 +70,9 @@ MQTT:
 
 - A description per param, header and form field; Bulk Edit edits those tables as
   `key: value` lines.
-- Path variables: `/users/:id` gets an `id` row under Params, filled in on Send and kept on
-  Postman import and export.
+- Path variables: `/users/:id` (or OpenAPI's `/users/{id}`, as copied from Swagger UI) gets
+  an `id` row under Params, is coloured in the URL bar, filled in on Send and kept on Postman
+  import and export.
 - Header names and Content-Type values complete while typing. The Headers tab folds out what
   Send adds (Host, auth, Content-Type…) and where each comes from.
 - All 120 of Postman's dynamic variables (`{{$guid}}`, `{{$timestamp}}`, `{{$randomEmail}}`,

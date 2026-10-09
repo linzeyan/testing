@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::model::{Example, Request};
+use crate::model::{Example, Request, path_var};
 use crate::store::Workspace;
 
 /// Calls handled at once. Each loads every request in scope, so a burst (a load test aimed
@@ -189,7 +189,8 @@ fn pattern(url: &str) -> (Vec<&str>, bool) {
     )
 }
 
-/// Number of literal segments if `path` matches; `{{var}}` and `:name` match any segment.
+/// Number of literal segments if `path` matches; `{{var}}`, `:name` and `{name}` match any
+/// segment.
 fn matches(pattern: &[&str], anchored: bool, path: &[&str]) -> Option<usize> {
     if pattern.len() > path.len() || (anchored && pattern.len() != path.len()) {
         return None;
@@ -197,7 +198,7 @@ fn matches(pattern: &[&str], anchored: bool, path: &[&str]) -> Option<usize> {
     let tail = &path[path.len() - pattern.len()..];
     let mut literal = 0;
     for (p, s) in pattern.iter().zip(tail) {
-        if p.contains("{{") || p.starts_with(':') {
+        if p.contains("{{") || path_var(p).is_some() {
             continue;
         }
         if p != s {
@@ -250,6 +251,10 @@ mod tests {
                 req("GET", "http://shop.test/api/orders", &[("orders", 200)]),
             ),
             ("no examples".into(), req("GET", "{{base}}/health", &[])),
+            (
+                "order".into(),
+                req("GET", "{{base}}/orders/{id}/:line", &[("order", 200)]),
+            ),
         ];
         let hit = |method: &str, path: &str, want: Option<&str>| {
             find(&requests, method, path, want).map(|(_, e)| e.name.as_str())
@@ -268,6 +273,8 @@ mod tests {
         assert_eq!(hit("GET", "/api/orders", None), Some("orders"));
         assert_eq!(hit("GET", "/v2/api/orders", None), None);
         assert_eq!(hit("GET", "/health", None), None, "nothing to answer with");
+        // Path variables in either form stand for any segment.
+        assert_eq!(hit("GET", "/orders/7/2", None), Some("order"));
         assert_eq!(hit("GET", "/users/7", Some("404")), Some("gone"));
         assert_eq!(hit("GET", "/users/7", Some("gone")), Some("gone"));
         assert_eq!(hit("GET", "/users/7", Some("teapot")), None);

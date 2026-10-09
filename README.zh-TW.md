@@ -67,7 +67,7 @@ MQTT：
 **參數、標頭與變數**
 
 - 每個參數、標頭與表單欄位都能加說明；「批次編輯」以 `key: value` 逐行編輯這些表格。
-- 路徑變數：`/users/:id` 會在「參數」下產生一列 `id`，傳送時代入；Postman 匯入與匯出都會保留。
+- 路徑變數：`/users/:id`（或從 Swagger UI 複製來的 OpenAPI 寫法 `/users/{id}`）會在「參數」下產生一列 `id`，在網址列上色，傳送時代入；Postman 匯入與匯出都會保留。
 - 輸入時自動完成標頭名稱與 Content-Type 值。「標頭」分頁可展開查看傳送時自動加上的標頭（Host、
   驗證、Content-Type…）及各自的來源。
 - 支援 Postman 全部 120 個動態變數（`{{$guid}}`、`{{$timestamp}}`、`{{$randomEmail}}`、

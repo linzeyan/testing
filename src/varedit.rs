@@ -225,7 +225,8 @@ pub fn var_edit(
         ui.data_mut(|d| d.remove::<Popup>(popup_id));
     }
 
-    if !focused && text.contains("{{") {
+    // A URL's preview also fills its path variables, which only the caller has.
+    if !focused && text.contains("{{") && lang != Some(Lang::Url) {
         response = response.on_hover_ui(|ui| {
             let mut missing = Vec::new();
             let resolved = model::resolve(text, vars, &mut missing);

@@ -4183,10 +4183,19 @@ impl App {
                     &all_vars,
                     egui::TextStyle::Monospace,
                     false,
-                    None,
+                    Some(Lang::Url),
                     &[],
                     |e| e.hint_text(hint).desired_width(width),
                 );
+                let fills = open.draft.url.contains("{{") || !open.draft.path_vars.is_empty();
+                let url = if fills && !url.has_focus() {
+                    url.on_hover_ui(|ui| {
+                        let wire = open.draft.resolved(&all_vars).0.url;
+                        ui.label(RichText::new(clip(&wire, 400)).monospace());
+                    })
+                } else {
+                    url
+                };
                 // Pasting a curl command (e.g. devtools "Copy as cURL") imports it, like Postman.
                 if url.changed() && open.draft.url.trim_start().starts_with("curl ") {
                     match crate::curl::from_curl(&open.draft.url) {

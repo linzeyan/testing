@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
@@ -577,37 +578,68 @@ fn split_url(url: &str) -> (&str, &str, &str) {
     }
 }
 
-/// The names of the `/:name` path segments, in order. A port's ':' never starts a segment,
-/// so `host:8080` is not taken for one.
-fn path_names(url: &str) -> Vec<String> {
+/// The variable a whole path segment names: Postman's `:id`, or OpenAPI's `{id}` so a path
+/// copied from Swagger UI works as pasted. `{{id}}` is an environment variable instead.
+pub fn path_var(segment: &str) -> Option<&str> {
+    let name = match segment.strip_prefix(':') {
+        Some(name) => name,
+        None => {
+            (segment.strip_prefix('{')?.strip_suffix('}')).filter(|n| !n.contains(['{', '}']))?
+        }
+    };
+    (!name.is_empty()).then_some(name)
+}
+
+/// Byte ranges of the path variable segments. A port's ':' never starts a segment, so
+/// `host:8080` is not taken for one.
+pub fn path_var_spans(url: &str) -> Vec<Range<usize>> {
     let (base, _, _) = split_url(url);
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for (i, segment) in base.split('/').enumerate() {
+        if i > 0 && path_var(segment).is_some() {
+            spans.push(at..at + segment.len());
+        }
+        at += segment.len() + 1;
+    }
+    spans
+}
+
+/// The names of the path variables, in order.
+fn path_names(url: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    for name in base.split('/').skip(1).filter_map(|s| s.strip_prefix(':')) {
-        if !name.is_empty() && !names.iter().any(|n| n == name) {
+    for name in path_var_spans(url)
+        .into_iter()
+        .filter_map(|r| path_var(&url[r]))
+    {
+        if !names.iter().any(|n| n == name) {
             names.push(name.to_owned());
         }
     }
     names
 }
 
-/// `/:name` as a whole path segment becomes `/value`.
+/// `/:name` or `/{name}` as a whole path segment becomes `/value`.
 pub fn fill(url: &str, name: &str, value: &str) -> String {
-    let segment = format!("/:{name}");
-    let mut out = String::new();
-    let mut rest = url;
-    while let Some(i) = rest.find(&segment) {
-        let after = &rest[i + segment.len()..];
-        let whole = after
-            .chars()
-            .next()
-            .is_none_or(|c| matches!(c, '/' | '?' | '#'));
-        out.push_str(&rest[..i]);
-        out.push('/');
-        out.push_str(if whole { value } else { &segment[1..] });
-        rest = after;
+    let mut url = url.to_owned();
+    for segment in [format!("/:{name}"), format!("/{{{name}}}")] {
+        let mut out = String::new();
+        let mut rest = url.as_str();
+        while let Some(i) = rest.find(&segment) {
+            let after = &rest[i + segment.len()..];
+            let whole = after
+                .chars()
+                .next()
+                .is_none_or(|c| matches!(c, '/' | '?' | '#'));
+            out.push_str(&rest[..i]);
+            out.push('/');
+            out.push_str(if whole { value } else { &segment[1..] });
+            rest = after;
+        }
+        out.push_str(rest);
+        url = out;
     }
-    out.push_str(rest);
-    out
+    url
 }
 
 impl Request {
@@ -638,8 +670,9 @@ impl Request {
         self.params = params;
     }
 
-    /// Rebuilds the path variable rows from the URL's `/:name` segments. A row keeps its
-    /// value and description by name, or else by place (its name is being edited).
+    /// Rebuilds the path variable rows from the URL's `/:name` and `/{name}` segments. A
+    /// row keeps its value and description by name, or else by place (its name is being
+    /// edited).
     pub fn path_vars_from_url(&mut self) {
         let names = path_names(&self.url);
         let old = std::mem::take(&mut self.path_vars);
@@ -1012,6 +1045,31 @@ mod tests {
             fill("http://h/:id/:idx/:id", "id", "7"),
             "http://h/7/:idx/7"
         );
+    }
+
+    /// A path copied from Swagger UI (`/orders/{id}`) must work as pasted, without
+    /// mistaking a `{{var}}` for one or filling a `{id}` that is only part of a segment.
+    #[test]
+    fn openapi_style_path_variables_work_as_pasted() {
+        let url = "{{base}}/orders/{id}/{{v}}/{id}.json/:line?q={id}";
+        let mut req = Request {
+            url: url.into(),
+            ..Default::default()
+        };
+        req.sync_params();
+        let keys: Vec<_> = req.path_vars.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, ["id", "line"]);
+        let spans: Vec<_> = (path_var_spans(url).into_iter()).map(|r| &url[r]).collect();
+        assert_eq!(spans, ["{id}", ":line"], "what the URL bar colours");
+        req.path_vars[0].value = "7".into();
+        req.path_vars[1].value = "2".into();
+        let vars = HashMap::from([("base".into(), "http://h".into()), ("v".into(), "x".into())]);
+        assert_eq!(
+            req.resolved(&vars).0.url,
+            "http://h/orders/7/x/{id}.json/2?q={id}"
+        );
+        assert_eq!(path_var("{}"), None);
+        assert_eq!(path_var(":"), None);
     }
 
     #[test]

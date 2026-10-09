@@ -552,7 +552,11 @@ fn rows_json(rows: &[KeyValue]) -> Value {
 
 /// Postman reads the parts, not `raw`, so they're written the way its own exports have them.
 fn url_json(req: &Request) -> Value {
-    let raw = req.url.as_str();
+    // Postman reads only `:id`, so an OpenAPI-style `{id}` goes out in that form.
+    let raw = (req.path_vars.iter()).fold(req.url.clone(), |url, p| {
+        model::fill(&url, &p.key, &format!(":{}", p.key))
+    });
+    let raw = raw.as_str();
     let base = raw.split(['?', '#']).next().unwrap_or_default();
     let (protocol, rest) = match base.split_once("://") {
         Some((p, rest)) => (Some(p), rest),
@@ -759,6 +763,20 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    /// Postman fills only `:id`; a `{id}` sent as is would reach the server literally.
+    #[test]
+    fn openapi_style_path_variables_go_to_postman_as_colons() {
+        let req = Request {
+            url: "{{base}}/orders/{id}/{{v}}?q={id}".into(),
+            path_vars: vec![KeyValue::new("id", "7")],
+            ..Default::default()
+        };
+        let url = url_json(&req);
+        assert_eq!(url["raw"], "{{base}}/orders/:id/{{v}}?q={id}");
+        assert_eq!(url["path"], json!(["orders", ":id", "{{v}}"]));
+        assert_eq!(url["variable"][0]["key"], "id");
+    }
 
     /// Shaped like Postman's own export, with what people actually put in collections.
     const SHOP: &str = r#"{
