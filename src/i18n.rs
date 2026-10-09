@@ -1232,6 +1232,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "伺服器有 {} 個服務（gRPC reflection）",
     ),
     (
+        "The system's proxy script {} can't be used, so requests go out directly (as in a browser).\n{}",
+        "系統的代理伺服器 PAC 指令碼 {} 無法使用，所以請求改為直接連線（與瀏覽器相同）。\n{}",
+    ),
+    (
         "The token is fetched on Send and reused until it expires or is rejected.",
         "傳送時取得權杖，並重複使用到過期或被拒絕為止。",
     ),
@@ -1448,6 +1452,7 @@ mod tests {
             include_str!("appearance.rs"),
             include_str!("store.rs"),
             include_str!("sync.rs"),
+            include_str!("net.rs"),
         ];
         let mut wrapped = std::collections::BTreeSet::new();
         for src in sources {

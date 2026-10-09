@@ -6478,6 +6478,9 @@ impl App {
     }
 
     fn network_editor_ui(&mut self, ctx: &egui::Context) {
+        // Why the system's script was skipped: what Windows is configured with says nothing
+        // about whether it worked.
+        let skipped = (self.client.get()).and_then(|c| c.as_ref().ok()?.note.clone());
         let Some(net) = &mut self.network_editor else {
             return;
         };
@@ -6509,6 +6512,9 @@ impl App {
             });
             match net.proxy {
                 ProxyMode::System => match net::system_auto_config() {
+                    _ if let Some(skipped) = &skipped => {
+                        ui.colored_label(ORANGE, skipped.as_str());
+                    }
                     (Some(url), _) => {
                         ui.weak(tf("Windows is configured with a PAC script, which will be used:\n{}", &[&url]));
                     }
@@ -10928,6 +10934,34 @@ mod ui_tests {
         h.run();
         assert!(h.state().env_editor.is_none());
         assert!(!h.state().vars.contains_key("tmp"));
+    }
+
+    /// The VDI case: WPAD found an intranet page, so requests go out directly. Network
+    /// settings say why, not that Windows' script "will be used".
+    #[test]
+    fn network_settings_say_why_the_system_script_was_skipped() {
+        let mut h = harness(workspace("pac-skipped"));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut clients = rt.block_on(net::build_client(Default::default())).unwrap();
+        let why = "The system's proxy script http://wpad/wpad.dat can't be used, so requests go \
+                   out directly (as in a browser).\nPAC script: not JavaScript";
+        clients.note = Some(why.into());
+        let client = tokio::sync::OnceCell::new_with(Some(Ok(clients)));
+        h.state_mut().client = std::sync::Arc::new(client);
+        h.state_mut().network_editor = Some(h.state().network.clone());
+        h.run();
+        assert!(h.query_by_label(why).is_some());
+        // Another mode picked in the dialog: its own hint, as the note is about System.
+        h.get_by_label("None").click();
+        h.run();
+        assert!(h.query_by_label(why).is_none());
+        assert!(
+            h.query_by_label("Connect directly, ignoring OS settings.")
+                .is_some()
+        );
     }
 
     #[test]

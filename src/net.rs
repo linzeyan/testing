@@ -390,9 +390,10 @@ async fn system_proxy(pac: Option<String>) -> (Option<Arc<Pac>>, Option<String>)
         Ok(pac) => (Some(pac), None),
         Err(e) => (
             None,
-            Some(format!(
-                "The system's proxy script {url} can't be used, so requests go out directly \
-                 (as in a browser).\n{e}"
+            Some(crate::i18n::tf(
+                "The system's proxy script {} can't be used, so requests go out directly \
+                 (as in a browser).\n{}",
+                &[&url, &e],
             )),
         ),
     }
