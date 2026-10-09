@@ -221,6 +221,107 @@ impl Schema {
         lines
     }
 
+    /// For the word ending at byte `at` of a query: where it starts and the fields that can
+    /// go there, those starting with it first, each with its arguments and type. None
+    /// outside a selection set, in arguments, strings and comments, for names that aren't
+    /// fields (fragments, types, directives, variables), or once a field's whole name is
+    /// typed: Enter then ends the line instead of picking a longer one.
+    pub fn complete(&self, text: &str, at: usize) -> Option<(usize, Vec<(String, String)>)> {
+        let word = |c: char| c == '_' || c.is_ascii_alphanumeric();
+        let start = text[..at].trim_end_matches(word).len();
+        let typed = &text[start..at];
+        if typed.is_empty() || typed.starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        let fields = self.fields_at(&text[..start])?;
+        if fields.iter().any(|f| f.name == typed) {
+            return None;
+        }
+        let typed = typed.to_lowercase();
+        let mut hits: Vec<&Field> = (fields.iter())
+            .filter(|f| f.name.to_lowercase().contains(&typed))
+            .collect();
+        hits.sort_by_key(|f| !f.name.to_lowercase().starts_with(&typed));
+        let signature = |f: &Field| match f.args.is_empty() {
+            true => f.ty.clone(),
+            false => {
+                let args: Vec<_> = f.args.iter().map(|(n, t)| format!("{n}: {t}")).collect();
+                format!("({}) {}", args.join(", "), f.ty)
+            }
+        };
+        let list: Vec<_> = hits
+            .iter()
+            .map(|f| (f.name.clone(), signature(f)))
+            .collect();
+        (!list.is_empty()).then_some((start, list))
+    }
+
+    /// The fields that can be selected where `before` ends, if that's where a field's
+    /// name goes.
+    fn fields_at(&self, before: &str) -> Option<&[Field]> {
+        // The tokens skip comments and strings whole, so the cursor being in one is seen
+        // on its line.
+        let line = &before[before.rfind('\n').map_or(0, |n| n + 1)..];
+        let mut quoted = false;
+        for c in line.chars() {
+            match c {
+                '"' => quoted = !quoted,
+                '#' if !quoted => return None,
+                _ => {}
+            }
+        }
+        if quoted {
+            return None;
+        }
+        let p = Parser::new(before);
+        let token = |i: usize| p.tokens.get(i).map_or("", |&(s, e)| &before[s..e]);
+        let of = |name: &str| self.types.get(name).map_or(&[][..], |t| &t.fields[..]);
+        // Each open selection set's fields; what the next `{` opens.
+        let (mut sets, mut next): (Vec<&[Field]>, Option<&[Field]>) = (Vec::new(), None);
+        let (mut parens, mut i) = (0usize, 0);
+        while i < p.tokens.len() {
+            let t = token(i);
+            i += 1;
+            match t {
+                "(" => parens += 1,
+                ")" => parens = parens.saturating_sub(1),
+                _ if parens > 0 => {}
+                "{" => sets.push(next.take().unwrap_or(match sets.is_empty() {
+                    // The `{ … }` shorthand is a query.
+                    true => &self.query,
+                    false => &[],
+                })),
+                "}" => {
+                    sets.pop();
+                }
+                "query" if sets.is_empty() => next = Some(&self.query),
+                "mutation" if sets.is_empty() => next = Some(&self.mutation),
+                // Not introspected: its fields are unknown.
+                "subscription" if sets.is_empty() => next = Some(&[]),
+                // `fragment F on Type`, `... on Type`.
+                "on" if sets.is_empty() || token(i - 2) == "..." => {
+                    next = Some(of(token(i)));
+                    i += 1;
+                }
+                // A fragment spread's name, a directive's.
+                "..." | "@" if token(i) != "on" => i += 1,
+                // In `alias: field` the field's name comes next and replaces the alias's
+                // guess.
+                name if !sets.is_empty() && Parser::name(name) => {
+                    let set = sets.last().copied().unwrap_or_default();
+                    let f = set.iter().find(|f| f.name == name);
+                    next = Some(f.map_or(&[], |f| of(&f.base)));
+                }
+                _ => {}
+            }
+        }
+        let last = token(p.tokens.len().wrapping_sub(1));
+        let named = matches!(last, "..." | "@" | "$" | "on");
+        (parens == 0 && !named)
+            .then(|| sets.last().copied())
+            .flatten()
+    }
+
     /// The fields `path` names, from a root field of `op` down.
     fn resolve(&self, op: Operation, path: &[String]) -> Option<Vec<&Field>> {
         let mut fields = match op {
@@ -736,6 +837,66 @@ pub(crate) mod tests {
 
     fn path(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Typing in the query offers the fields of the selection set the cursor (`|`) is in,
+    /// down any path and through aliases, arguments, fragments and the `{ }` shorthand;
+    /// those starting with what's typed come first. Nothing where no field goes.
+    #[test]
+    fn fields_complete_where_the_cursor_is() {
+        let schema = parse(&sample()).unwrap();
+        let complete = |q: &str| {
+            let at = q.find('|').unwrap();
+            schema.complete(&q.replace('|', ""), at)
+        };
+        let names = |q: &str| -> Vec<String> {
+            let list = complete(q).unwrap_or_else(|| panic!("nothing for {q}")).1;
+            list.into_iter().map(|(name, _)| name).collect()
+        };
+        let (start, list) = complete("query { us| }").unwrap();
+        assert_eq!(start, 8, "the word typed is what's replaced");
+        assert_eq!(
+            list,
+            [
+                ("users".to_owned(), "(first: Int) [User!]!".to_owned()),
+                ("user".to_owned(), "(id: ID!) User".to_owned()),
+            ]
+        );
+        assert_eq!(names("{ user(id: 1) { n| } }"), ["name", "friends"]);
+        let deep = "query Q($id: ID!) {\n  me: user(id: $id) @include(if: true) {\n    friends { i| }\n  }\n}";
+        assert_eq!(names(deep), ["id", "friends"]);
+        assert_eq!(names("fragment F on User { ro| }"), ["role"]);
+        assert_eq!(names("{ users { ... on User { na| } } }"), ["name"]);
+        assert_eq!(names("{ users { ...F id } versi| }"), ["version"]);
+
+        // Starting with what's typed outranks containing it, whatever the schema's order.
+        let field = |name: &str| serde_json::json!({ "name": name, "args": [], "type": named("SCALAR", "ID") });
+        let ranked = serde_json::json!({ "data": { "__schema": {
+            "queryType": { "name": "Query" },
+            "types": [{ "kind": "OBJECT", "name": "Query", "fields": [field("valid"), field("id")] }]
+        }}});
+        let ranked = parse(&ranked.to_string()).unwrap();
+        let (_, list) = ranked.complete("{ i }", 3).unwrap();
+        assert_eq!(
+            list.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["id", "valid"]
+        );
+
+        for nothing in [
+            "{ user(i| ) { id } }",
+            "{ user(id: \"us|\") }",
+            "{\n  # us|\n}",
+            "{ users { ...Fr| } }",
+            "{ users { id @sk| } }",
+            "query ($fi|: Int) { users { id } }",
+            "{ user| }",
+            "qu|",
+            "subscription { us| }",
+            "{ nope { i| } }",
+            "{ users { | } }",
+        ] {
+            assert_eq!(complete(nothing), None, "{nothing}");
+        }
     }
 
     #[test]

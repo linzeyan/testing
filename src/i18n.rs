@@ -562,8 +562,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Fetch a token first", "先取得權杖"),
     ("Fetch schema", "取得 schema"),
     (
-        "Fetch the schema and click a field →\nor type a query here.",
-        "取得 schema 後點選欄位 →\n或在這裡輸入查詢。",
+        "Fetch the schema and click a field →\nor type a query here: its fields complete as you type.",
+        "取得 schema 後點選欄位 →\n或在這裡輸入查詢：輸入時會補全欄位。",
     ),
     (
         "Fetch the schema to browse its queries and mutations.",

@@ -16,9 +16,21 @@ pub const DEFINED: Color32 = Color32::from_rgb(40, 150, 70);
 pub const UNDEFINED: Color32 = Color32::from_rgb(220, 80, 80);
 const MAX_SUGGESTIONS: usize = 8;
 
+/// What completes besides `{{variables}}`.
+pub enum Complete<'a> {
+    None,
+    /// The whole field, from these words with their descriptions (header names).
+    Words(&'a [(&'a str, &'static str)]),
+    /// The word at the cursor: given the text and the cursor's byte offset, where that
+    /// word starts and what can go there, with a description each (GraphQL fields).
+    At(&'a CompleteAt<'a>),
+}
+
+pub type CompleteAt<'a> = dyn Fn(&str, usize) -> Option<(usize, Vec<(String, String)>)> + 'a;
+
 #[derive(Clone, Copy, Default)]
 struct Popup {
-    /// Byte offset of the `{{` being completed.
+    /// Byte offset of the `{{` or word being completed.
     start: usize,
     selected: usize,
     visible: bool,
@@ -90,8 +102,8 @@ pub fn is_known(name: &str, vars: &HashMap<String, String>) -> bool {
 }
 
 /// `configure` adds hint text, width, rows… to the TextEdit; `id` must be stable across
-/// frames because the autocomplete state is keyed by it. `words` complete the whole field
-/// outside `{{` (header names). `lang` colours the text as code under the `{{var}}`s.
+/// frames because the autocomplete state is keyed by it. `complete` says what completes
+/// outside `{{`. `lang` colours the text as code under the `{{var}}`s.
 // A builder for one function would be more code than the long argument list.
 #[allow(clippy::too_many_arguments)]
 pub fn var_edit(
@@ -102,7 +114,7 @@ pub fn var_edit(
     style: TextStyle,
     multiline: bool,
     lang: Option<Lang>,
-    words: &[(&str, &'static str)],
+    complete: Complete<'_>,
     configure: impl FnOnce(egui::TextEdit<'_>) -> egui::TextEdit<'_>,
 ) -> egui::Response {
     if let Some(response) = too_big(ui, id, text) {
@@ -150,11 +162,24 @@ pub fn var_edit(
     let context = cursor
         .filter(|_| focused)
         .and_then(|c| completion_context(text, c));
-    // Outside a `{{`, the field as a whole completes from `words`.
-    let start = match &context {
-        Some((start, ..)) => Some(*start),
-        None if focused && cursor.is_some() && !words.is_empty() => Some(usize::MAX),
-        None => None,
+    // Outside a `{{`: the word at the cursor, as (its start, the cursor, what can go there).
+    let word = match (&context, &complete, cursor) {
+        (None, Complete::At(at), Some(c)) if focused => {
+            let byte = text.char_indices().nth(c).map_or(text.len(), |(i, _)| i);
+            at(text, byte).map(|(start, mut list)| {
+                list.truncate(MAX_SUGGESTIONS);
+                (start, byte, list)
+            })
+        }
+        _ => None,
+    };
+    // Else the field as a whole completes from `words`.
+    let start = match (&context, &word, &complete) {
+        (Some((start, ..)), ..) | (None, Some((start, ..)), _) => Some(*start),
+        (None, None, Complete::Words(w)) if focused && cursor.is_some() && !w.is_empty() => {
+            Some(usize::MAX)
+        }
+        _ => None,
     };
     let mut suggestions = Vec::new();
     if let Some(start) = start {
@@ -165,19 +190,29 @@ pub fn var_edit(
             };
         }
         if !popup.dismissed {
-            suggestions = match &context {
-                Some((_, _, prefix)) => suggest(prefix, vars),
-                None => suggest_words(text, words),
+            suggestions = match (&context, &word, &complete) {
+                (Some((_, _, prefix)), ..) => suggest(prefix, vars),
+                (None, Some((_, _, list)), _) => list.clone(),
+                (None, None, Complete::Words(w)) => suggest_words(text, w),
+                _ => Vec::new(),
             };
         }
     }
     let showing = !suggestions.is_empty();
     popup.selected = popup.selected.min(suggestions.len().saturating_sub(1));
 
+    // A word mid-text gets its list under the cursor; a whole field under the field.
+    let below = match (&word, &output.cursor_range) {
+        (Some(_), Some(r)) => {
+            let at = output.galley.pos_from_cursor(r.primary);
+            output.galley_pos + at.left_bottom().to_vec2()
+        }
+        _ => response.rect.left_bottom(),
+    };
     if showing {
         egui::Area::new(popup_id)
             .order(egui::Order::Foreground)
-            .fixed_pos(response.rect.left_bottom())
+            .fixed_pos(below)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(240.0);
@@ -201,9 +236,13 @@ pub fn var_edit(
 
     if accept && showing {
         let pick = &suggestions[popup.selected].0;
-        let index = match context {
-            Some((start, cursor_byte, _)) => insert(text, start, cursor_byte, pick),
-            None => {
+        let index = match (context, word) {
+            (Some((start, cursor_byte, _)), _) => insert(text, start, cursor_byte, pick),
+            (None, Some((start, cursor_byte, _))) => {
+                text.replace_range(start..cursor_byte, pick);
+                text[..start + pick.len()].chars().count()
+            }
+            (None, None) => {
                 pick.clone_into(text);
                 text.chars().count()
             }

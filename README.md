@@ -40,7 +40,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | Protocol | Notes |
 |---|---|
 | HTTP | HTTP version, redirects, TLS check, cookies and timeout per request |
-| GraphQL | A `subscription` connects over WebSocket (graphql-transport-ws or the older graphql-ws) and streams each result |
+| GraphQL | Once the schema is fetched, fields complete as you type the query; a `subscription` connects over WebSocket (graphql-transport-ws or the older graphql-ws) and streams each result |
 | WebSocket | |
 | SSE | |
 | Socket.IO 4 | The URL's path is the namespace and a JSON body the auth payload; send `event {"json": "arg"}` or a `["event", …]` array; acks are shown |

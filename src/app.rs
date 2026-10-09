@@ -20,7 +20,7 @@ use crate::script::{Changes, TestResult};
 use crate::store::{self, HistoryEntry, Node, State, Synced, Workspace};
 use crate::stream::{self, Event};
 use crate::syntax::{Kind, Lang};
-use crate::varedit::{clip, var_edit};
+use crate::varedit::{Complete, clip, var_edit};
 use egui_phosphor::regular as icon;
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
@@ -4245,7 +4245,7 @@ impl App {
                     egui::TextStyle::Monospace,
                     false,
                     Some(Lang::Url),
-                    &[],
+                    Complete::None,
                     |e| e.hint_text(hint).desired_width(width),
                 );
                 let fills = open.draft.url.contains("{{") || !open.draft.path_vars.is_empty();
@@ -7518,7 +7518,7 @@ fn kv_table(
                 style.clone(),
                 false,
                 None,
-                if headers { HEADER_NAMES } else { &[] },
+                Complete::Words(if headers { HEADER_NAMES } else { &[] }),
                 |e| e.hint_text(t("Key")).desired_width(key_width),
             );
             var_edit(
@@ -7530,8 +7530,8 @@ fn kv_table(
                 false,
                 None,
                 match headers && row.key.trim().eq_ignore_ascii_case("content-type") {
-                    true => CONTENT_TYPES,
-                    false => &[],
+                    true => Complete::Words(CONTENT_TYPES),
+                    false => Complete::None,
                 },
                 |e| e.hint_text(t("Value")).desired_width(value_width),
             );
@@ -7585,7 +7585,7 @@ fn path_vars_table(ui: &mut egui::Ui, rows: &mut [KeyValue], vars: &HashMap<Stri
                 egui::TextStyle::Body,
                 false,
                 None,
-                &[],
+                Complete::None,
                 |e| e.hint_text(t("Value")).desired_width(rest * 0.6),
             );
             ui.add(
@@ -7784,7 +7784,7 @@ fn body_editor(
                         egui::TextStyle::Monospace,
                         false,
                         None,
-                        &[],
+                        Complete::None,
                         |e| {
                             e.hint_text(t("path/to/file (relative to the workspace)"))
                                 .desired_width(f32::INFINITY)
@@ -7911,6 +7911,8 @@ fn graphql_editor(
     ui.columns(2, |cols| {
         let ui = &mut cols[0];
         ui.label(t("Query"));
+        let schema = ex.schema.as_ref().and_then(|s| s.as_ref().ok());
+        let fields = |text: &str, at: usize| schema?.complete(text, at);
         var_edit(
             ui,
             egui::Id::new("gql-query"),
@@ -7919,11 +7921,11 @@ fn graphql_editor(
             egui::TextStyle::Monospace,
             true,
             Some(Lang::GraphQl),
-            &[],
+            Complete::At(&fields),
             |e| {
                 e.code_editor()
                     .hint_text(t(
-                        "Fetch the schema and click a field →\nor type a query here.",
+                        "Fetch the schema and click a field →\nor type a query here: its fields complete as you type.",
                     ))
                     .desired_rows(8)
                     .desired_width(f32::INFINITY)
@@ -7945,7 +7947,7 @@ fn graphql_editor(
             egui::TextStyle::Monospace,
             true,
             Some(Lang::Json),
-            &[],
+            Complete::None,
             |e| {
                 e.code_editor()
                     .hint_text("{ \"id\": \"{{userId}}\" }")
@@ -8091,7 +8093,7 @@ fn code_editor(
         egui::TextStyle::Monospace,
         true,
         lang,
-        &[],
+        Complete::None,
         |e| {
             e.code_editor()
                 .desired_rows(12)
@@ -8183,7 +8185,7 @@ fn auth_editor(
             egui::TextStyle::Body,
             false,
             None,
-            &[],
+            Complete::None,
             |e| e.hint_text(hint).desired_width(420.0),
         );
         ui.end_row();
@@ -8271,7 +8273,7 @@ fn auth_editor(
                         egui::TextStyle::Monospace,
                         true,
                         None,
-                        &[],
+                        Complete::None,
                         |e| {
                             e.hint_text(t("{{private_key}} or -----BEGIN PRIVATE KEY-----…"))
                                 .desired_rows(3)
@@ -8289,7 +8291,7 @@ fn auth_editor(
                     egui::TextStyle::Monospace,
                     true,
                     Some(Lang::Json),
-                    &[],
+                    Complete::None,
                     |e| e.desired_rows(4).desired_width(420.0),
                 );
                 ui.end_row();
@@ -13572,6 +13574,48 @@ mod ui_tests {
                 Event::Closed("OK".into()),
             ]
         );
+    }
+
+    #[test]
+    fn graphql_fields_complete_while_typing() {
+        let mut h = with_request("gql-complete");
+        let picker = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("GET");
+        h.get(picker).click();
+        h.run();
+        h.get_by_label("GraphQL").click();
+        h.run();
+        let schema = crate::graphql::parse(&crate::graphql::tests::sample());
+        h.state_mut().explorer.schema = Some(schema);
+        h.run();
+        let query = |h: &Harness<'_, App>| match &draft(h).body {
+            Body::GraphQL { query, .. } => query.clone(),
+            _ => panic!("not GraphQL"),
+        };
+        // The first multiline field: the query, above the variables.
+        fn editor<'h>(h: &'h Harness<'_, App>) -> egui_kittest::Node<'h> {
+            h.get_all_by_role(Role::MultilineTextInput).next().unwrap()
+        }
+        editor(&h).click();
+        h.run();
+        editor(&h).type_text("{ us");
+        h.run();
+        shot(&mut h, "95-graphql-complete");
+        let item = egui_kittest::kittest::By::new().label("users");
+        assert!(h.query(item).is_some(), "users is offered");
+        h.key_press(Key::Enter);
+        h.run();
+        assert_eq!(query(&h), "{ users");
+        editor(&h).type_text(" { na");
+        h.run();
+        h.key_press(Key::Enter);
+        h.run();
+        assert_eq!(query(&h), "{ users { name");
+        // Typed out, Enter is a new line again.
+        h.key_press(Key::Enter);
+        h.run();
+        assert_eq!(query(&h), "{ users { name\n");
     }
 
     #[test]

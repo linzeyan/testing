@@ -38,7 +38,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | 協定 | 說明 |
 |---|---|
 | HTTP | 每個請求可個別設定 HTTP 版本、重新導向、TLS 驗證、Cookie 與逾時 |
-| GraphQL | `subscription` 透過 WebSocket 連線（graphql-transport-ws 或較舊的 graphql-ws），逐筆串流結果 |
+| GraphQL | 取得 schema 後，輸入查詢時會補全欄位；`subscription` 透過 WebSocket 連線（graphql-transport-ws 或較舊的 graphql-ws），逐筆串流結果 |
 | WebSocket | |
 | SSE | |
 | Socket.IO 4 | URL 的路徑即 namespace，JSON 內容即 auth payload；以 `event {"json": "arg"}` 或 `["event", …]` 陣列送出；會顯示 ack |
