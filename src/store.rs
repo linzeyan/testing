@@ -119,6 +119,8 @@ pub enum Node {
         name: String,
         path: PathBuf,
         method: String,
+        /// As saved, `{{variables}}` unresolved: for Ctrl+K.
+        url: String,
     },
 }
 
@@ -720,7 +722,14 @@ impl Workspace {
             rows.collect()
         };
         let folders = rows("SELECT path, settings FROM folders");
-        let requests = rows("SELECT path, method FROM requests");
+        let requests = || -> rusqlite::Result<Vec<(String, String, String)>> {
+            let query = "SELECT path, method, ifnull(json_extract(request, '$.url'), '') \
+                         FROM requests";
+            let mut q = db.prepare(query)?;
+            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect()
+        };
+        let requests = requests();
         drop(db);
         match (folders, requests) {
             (Ok(mut folders), Ok(requests)) => {
@@ -746,7 +755,7 @@ impl Workspace {
         &self,
         parent: &str,
         folders: &[(String, String)],
-        requests: &[(String, String)],
+        requests: &[(String, String, String)],
         orders: &HashMap<String, Vec<String>>,
     ) -> Vec<Node> {
         let leaf = |key: &str| unescape_name(key.rsplit('/').next().unwrap_or(key));
@@ -761,11 +770,12 @@ impl Workspace {
             .collect();
         let mut here: Vec<Node> = requests
             .iter()
-            .filter(|(key, _)| parent_of(key) == parent)
-            .map(|(key, method)| Node::Request {
+            .filter(|(key, ..)| parent_of(key) == parent)
+            .map(|(key, method, url)| Node::Request {
                 name: leaf(key),
                 path: self.request_at(key),
                 method: method.clone(),
+                url: url.clone(),
             })
             .collect();
         let name = |n: &Node| match n {

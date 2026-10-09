@@ -4876,7 +4876,7 @@ impl App {
                 let root = self.ws.collections();
                 let mut found = vec![(t("(top level)").to_owned(), root.clone())];
                 let all = switch_targets(&self.tree, &root, &[]).into_iter();
-                found.extend(all.filter_map(|(label, _, go)| match go {
+                found.extend(all.filter_map(|(label, _, go, _)| match go {
                     Go::Folder(dir) => Some((label, dir)),
                     _ => None,
                 }));
@@ -5136,14 +5136,24 @@ impl App {
                     if !enter && ui.memory(|m| m.focused().is_none()) {
                         edit.request_focus();
                     }
+                    let typed = query.trim().to_lowercase();
                     let mut hits: Vec<_> = (targets.iter())
-                        .filter_map(|t| fuzzy(&t.0, query).map(|rank| (rank, t)))
+                        .filter_map(|t| {
+                            // A URL only holding what's typed: scattered letters are in most
+                            // of them.
+                            let url = (!typed.is_empty())
+                                .then(|| t.3.to_lowercase().find(&typed))
+                                .flatten()
+                                .map(|at| (false, at, t.3.len()));
+                            let rank = fuzzy(&t.0, query).into_iter().chain(url).min()?;
+                            Some((rank, t, url.is_some()))
+                        })
                         .collect();
-                    hits.sort_by_key(|(rank, _)| *rank);
+                    hits.sort_by_key(|(rank, ..)| *rank);
                     hits.truncate(12);
                     *selected = (*selected).min(hits.len().saturating_sub(1));
                     let mut go = None;
-                    for (i, (_, (label, badge, target))) in hits.iter().enumerate() {
+                    for (i, (_, (label, badge, target, url), by_url)) in hits.iter().enumerate() {
                         let row = ui.horizontal(|ui| {
                             match target {
                                 Go::Request(_) => {
@@ -5154,7 +5164,14 @@ impl App {
                                     ui.label(text.monospace().small().weak());
                                 }
                             }
-                            ui.add(egui::Button::selectable(i == *selected, label.as_str()))
+                            let button = egui::Button::selectable(i == *selected, label.as_str());
+                            let button = ui.add(button);
+                            // What it was found by.
+                            if *by_url {
+                                let url = RichText::new(url).small().weak();
+                                ui.add(egui::Label::new(url).truncate().selectable(false));
+                            }
+                            button
                         });
                         if row.inner.clicked() || (enter && i == *selected) {
                             go = Some(target.clone());
@@ -6833,10 +6850,15 @@ impl App {
     }
 }
 
-/// What Ctrl+K can jump to or do: (label, badge, target). Requests and folders are labelled by
-/// their place in the tree, so two "get user"s in different folders can be told apart.
-fn switch_targets(nodes: &[Node], root: &Path, envs: &[String]) -> Vec<(String, String, Go)> {
-    fn walk(nodes: &[Node], root: &Path, out: &mut Vec<(String, String, Go)>) {
+/// What Ctrl+K can jump to or do: (label, badge, target, a request's URL). Requests and
+/// folders are labelled by their place in the tree, so two "get user"s in different folders
+/// can be told apart.
+fn switch_targets(
+    nodes: &[Node],
+    root: &Path,
+    envs: &[String],
+) -> Vec<(String, String, Go, String)> {
+    fn walk(nodes: &[Node], root: &Path, out: &mut Vec<(String, String, Go, String)>) {
         let label = |path: &Path| {
             let rel = path.strip_prefix(root).unwrap_or(path);
             let rel = match store::is_request(path) {
@@ -6848,21 +6870,38 @@ fn switch_targets(nodes: &[Node], root: &Path, envs: &[String]) -> Vec<(String, 
         for node in nodes {
             match node {
                 Node::Folder { path, children, .. } => {
-                    out.push((label(path), "DIR".to_owned(), Go::Folder(path.clone())));
+                    let go = Go::Folder(path.clone());
+                    out.push((label(path), "DIR".to_owned(), go, String::new()));
                     walk(children, root, out);
                 }
-                Node::Request { path, method, .. } => {
-                    out.push((label(path), method.clone(), Go::Request(path.clone())));
+                Node::Request {
+                    path, method, url, ..
+                } => {
+                    let go = Go::Request(path.clone());
+                    out.push((label(path), method.clone(), go, url.clone()));
                 }
             }
         }
     }
     let mut out = Vec::new();
     walk(nodes, root, &mut out);
-    out.extend((envs.iter()).map(|e| (e.clone(), "ENV".to_owned(), Go::Env(e.clone()))));
-    out.extend(
-        (ACTIONS.iter()).map(|(label, a)| (t(label).to_owned(), "CMD".to_owned(), Go::Action(*a))),
-    );
+    let envs = envs.iter().map(|e| {
+        (
+            e.clone(),
+            "ENV".to_owned(),
+            Go::Env(e.clone()),
+            String::new(),
+        )
+    });
+    out.extend(envs);
+    out.extend((ACTIONS.iter()).map(|(label, a)| {
+        (
+            t(label).to_owned(),
+            "CMD".to_owned(),
+            Go::Action(*a),
+            String::new(),
+        )
+    }));
     out
 }
 
@@ -7016,7 +7055,9 @@ fn tree_ui(
                 });
                 state.show_body_indented(&row, ui, |ui| tree_ui(ui, children, view, rows, actions));
             }
-            Node::Request { name, path, method } => {
+            Node::Request {
+                name, path, method, ..
+            } => {
                 let picked = match view.picked.is_empty() {
                     true => view.open == Some(path.as_path()) && view.folder.is_none(),
                     false => view.picked.contains(path),
@@ -12523,8 +12564,16 @@ mod ui_tests {
             ws.create_request(&dir, "get user").unwrap();
         }
         ws.save_env(Some("prod"), &[], &[]).unwrap();
+        let order = ws.create_request(&top, "fetch one").unwrap();
+        let url = "{{baseUrl}}/orders/:id";
+        let req = Request {
+            url: url.into(),
+            ..Default::default()
+        };
+        ws.save_request(&order, &req).unwrap();
         let mut h = harness(ws);
         h.run();
+        // Whether a URL was shown as what a request was found by.
         let switch = |h: &mut Harness<'_, App>, text: &str, downs: usize| {
             h.key_press_modifiers(Modifiers::COMMAND, Key::K);
             h.run();
@@ -12539,8 +12588,10 @@ mod ui_tests {
                 h.run();
             }
             shot(h, "53-switcher");
+            let by_url = h.query_by_label(url).is_some();
             h.key_press(Key::Enter);
             h.run();
+            by_url
         };
         let open = |h: &Harness<'_, App>| h.state().open.as_ref().map(|o| o.path.clone());
         // Scattered letters across the folder and the name.
@@ -12571,6 +12622,15 @@ mod ui_tests {
         switch(&mut h, "users", 0);
         let editing = h.state().folder_editor.as_ref().map(|f| f.dir.clone());
         assert_eq!(editing, Some(top.join("users")));
+        h.state_mut().folder_editor = None;
+        assert!(!switch(&mut h, "", 0), "nothing typed lists no URLs");
+        // Scattered letters would find most URLs.
+        assert!(!switch(&mut h, "rdr:i", 0));
+        assert!(h.query_by_label("Nothing matches.").is_some());
+        h.state_mut().dialog = None;
+        // Nothing in its name says "orders".
+        assert!(switch(&mut h, "url}}/Orders", 0), "in any case");
+        assert_eq!(open(&h), Some(order));
     }
 
     #[test]

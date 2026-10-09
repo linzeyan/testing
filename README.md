@@ -233,7 +233,7 @@ lists these too.
 | Sidebar | `Ctrl+\` |
 | Side by side | `Ctrl+Alt+V` |
 
-Ctrl+K finds a request by folder and name (letters in order are enough), a folder (its
+Ctrl+K finds a request by folder and name (letters in order are enough) or by part of its URL, a folder (its
 settings) or an environment, and does what a button does (new request, network settings,
 cookies, side by side…).
 
