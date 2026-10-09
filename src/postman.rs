@@ -457,6 +457,22 @@ pub fn collection(ws: &Workspace, dir: &Path) -> Result<(String, usize, usize), 
     Ok((text, counts.0, counts.1))
 }
 
+/// An environment as Postman's Import takes it; secrets are its secret type, which Postman
+/// masks. One row per key where an enabled secret overrides a shared one, as it does here.
+pub fn environment_json(name: &str, shared: &[KeyValue], secret: &[KeyValue]) -> String {
+    let overridden = |key: &str| secret.iter().any(|s| s.enabled && s.key == key);
+    let shared = shared.iter().filter(|kv| !overridden(&kv.key));
+    let rows = (shared.map(|kv| (kv, "default"))).chain(secret.iter().map(|kv| (kv, "secret")));
+    let values: Vec<Value> = rows
+        .filter(|(kv, _)| !kv.key.trim().is_empty())
+        .map(|(kv, kind)| {
+            json!({ "key": kv.key, "value": kv.value, "type": kind, "enabled": kv.enabled })
+        })
+        .collect();
+    let env = json!({ "name": name, "values": values, "_postman_variable_scope": "environment" });
+    serde_json::to_string_pretty(&env).unwrap_or_default()
+}
+
 fn group(
     ws: &Workspace,
     folder: &Folder,
@@ -983,6 +999,40 @@ mod tests {
         assert_eq!(shared, [KeyValue::new("host", "h"), old]);
         assert_eq!(secret, [KeyValue::new("token", "s")]);
         assert!(crate::import::parse("{}").is_err() && crate::import::parse("not json").is_err());
+    }
+
+    /// Postman reads back what's in effect here: the secret that overrides a shared value
+    /// goes as the only row for its key, still secret.
+    #[test]
+    fn an_environment_goes_to_postman_and_back() {
+        let off = |kv: KeyValue| KeyValue {
+            enabled: false,
+            ..kv
+        };
+        let shared = [
+            KeyValue::new("host", "h"),
+            KeyValue::new("token", "placeholder"),
+            off(KeyValue::new("debug", "1")),
+            KeyValue::new("user", "shared"),
+            KeyValue::new(" ", ""),
+        ];
+        let secret = [
+            KeyValue::new("token", "s"),
+            // Disabled, so the shared "user" is still what's used.
+            off(KeyValue::new("user", "mine")),
+        ];
+        let json = environment_json("Prod", &shared, &secret);
+        let Import::Environment {
+            name,
+            shared: back,
+            secret: back_secret,
+        } = crate::import::parse(&json).unwrap()
+        else {
+            panic!("not an environment");
+        };
+        assert_eq!(name, "Prod");
+        assert_eq!(back, [&shared[0], &shared[2], &shared[3]].map(Clone::clone));
+        assert_eq!(back_secret, secret);
     }
 
     /// What goes to Postman must come back the same: a team may move both ways.

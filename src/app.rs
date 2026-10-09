@@ -5372,6 +5372,13 @@ impl App {
                         .button(t("Duplicate…"))
                         .on_hover_text(t("Save, then copy into a new environment (e.g. dev → prod)"))
                         .clicked();
+                    // As shown, edits included; for Postman's Import > Raw text.
+                    if ui.button(t("Copy as Postman environment")).clicked() {
+                        let name = ed.env.as_deref().unwrap_or_default();
+                        let json = crate::postman::environment_json(name, &ed.shared, &ed.secret);
+                        ui.ctx().copy_text(json);
+                        self.status = tf("Copied {} as a Postman environment", &[&name]);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let label = if ed.confirm_delete {
                             t("Click again to delete")
@@ -10921,6 +10928,58 @@ mod ui_tests {
         h.run();
         assert!(h.state().env_editor.is_none());
         assert!(!h.state().vars.contains_key("tmp"));
+    }
+
+    #[test]
+    fn an_environment_copies_for_postman_as_the_editor_shows_it() {
+        let ws = workspace("env-postman");
+        let (host, token) = (KeyValue::new("host", "h"), KeyValue::new("token", "s"));
+        ws.save_env(
+            Some("dev"),
+            std::slice::from_ref(&host),
+            std::slice::from_ref(&token),
+        )
+        .unwrap();
+        let mut h = harness(ws);
+        h.state_mut().open_env_editor(Some("dev".into()), &[]);
+        h.run();
+        // Typed into the blank row the editor opens on, not saved.
+        for c in "port".chars() {
+            h.event(egui::Event::Text(c.into()));
+            h.step();
+        }
+        h.key_press(Key::Tab);
+        h.event(egui::Event::Text("8443".into()));
+        h.run();
+        shot(&mut h, "96-env-postman");
+        h.get_by_label("Copy as Postman environment").click();
+        // The frame that handles the click is the one whose output carries the copy.
+        let copied = (0..4).find_map(|_| {
+            h.step();
+            (h.output().platform_output.commands.iter()).find_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+        });
+        let Ok(crate::postman::Import::Environment {
+            name,
+            shared,
+            secret,
+        }) = crate::import::parse(&copied.expect("nothing copied"))
+        else {
+            panic!("not a Postman environment");
+        };
+        let port = KeyValue::new("port", "8443");
+        assert_eq!(
+            (name.as_str(), shared, secret),
+            ("dev", vec![host, port], vec![token])
+        );
+        h.run();
+        assert_eq!(h.state().status, "Copied dev as a Postman environment");
+        assert!(
+            h.state().env_editor.is_some(),
+            "copying doesn't close the editor"
+        );
     }
 
     #[test]

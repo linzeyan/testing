@@ -233,7 +233,7 @@ Ctrl+K 可依資料夾與名稱（依序打出其中幾個字母即可）或 URL
 | Insomnia v4 JSON / v5 YAML | 資料夾、驗證與指令碼；`{{ _.x }}` 轉為 `{{x}}`；base environment 成為集合變數，每個 sub-environment 成為一個環境 |
 | 瀏覽器開發者工具的 HAR | 每個主機一個資料夾，每筆回應保留為該請求的範例 |
 
-資料夾或整個集合可以「複製為 Postman 集合」。
+資料夾或整個集合可以「複製為 Postman 集合」；環境可在其編輯視窗「複製為 Postman 環境」，秘密變數會成為 Postman 的 secret 類型。
 
 「</> 程式碼」可將請求轉成 curl、wget、HTTPie、PowerShell、原始 HTTP、Python、fetch、axios、Go、
 Java、C#、PHP、Ruby、Rust、Swift 或 Kotlin。二進位內容會讀入對應的檔案，而 `--data-binary @file`

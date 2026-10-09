@@ -324,12 +324,17 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Copied the docs as Markdown", "已將文件複製為 Markdown"),
     ("Copied the mock server URL", "已複製模擬伺服器 URL"),
     (
+        "Copied {} as a Postman environment",
+        "已將 {} 複製為 Postman 環境",
+    ),
+    (
         "Copied {} requests as a Postman collection{}",
         "已將 {} 個請求複製為 Postman 集合{}",
     ),
     ("Copied {} snippet", "已複製 {} 程式碼片段"),
     ("Copy", "複製"),
     ("Copy as Postman collection", "複製為 Postman 集合"),
+    ("Copy as Postman environment", "複製為 Postman 環境"),
     ("Copy body", "複製內容"),
     ("Copy docs as Markdown", "複製文件為 Markdown"),
     ("Copy the timeline", "複製時間軸"),

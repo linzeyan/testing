@@ -249,7 +249,8 @@ Import from ⋯ > "Import…": paste it, give its path or drop the file.
 | Insomnia v4 JSON / v5 YAML | Folders, auth and scripts; `{{ _.x }}` as `{{x}}`; the base environment as collection variables and each sub-environment as an environment |
 | HAR from browser devtools | A folder per host, each response kept as the request's example |
 
-Copy a folder or the whole collection as a Postman collection.
+Copy a folder or the whole collection as a Postman collection, and an environment (from its
+editor) as a Postman environment, its secrets as Postman's secret type.
 
 "</> Code" writes the request as curl, wget, HTTPie, PowerShell, raw HTTP, Python, fetch,
 axios, Go, Java, C#, PHP, Ruby, Rust, Swift or Kotlin. A Binary body reads its file, and
