@@ -553,9 +553,11 @@ async fn sync_at(
             },
         }
     }
-    // Read in like a git pull, and written back in apitool's own layout.
+    // Read in like a git pull, and written back in apitool's own layout. Not `ws.sync()`,
+    // which takes a tree gone altogether for a mistake and writes it back: here it was
+    // all deleted there on purpose. In step before the pull (checked above).
     if !pull.is_empty() {
-        ws.sync()?;
+        ws.resolve(true)?;
     }
     let mut pulled = pull.len();
     for c in carried.iter().filter(|c| !c.pull.is_empty()) {
@@ -636,6 +638,9 @@ struct Api<'a> {
 }
 
 const MESSAGE: &str = "Sync from apitool";
+/// Git's tree with nothing in it. GitHub answers 404 when it's read and when a tree would
+/// come out empty (verified 10-09), so it's never asked for.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 impl Api<'_> {
     fn github(&self) -> bool {
@@ -784,6 +789,9 @@ impl Api<'_> {
             }
         };
         if self.github() {
+            if head.tree == EMPTY_TREE {
+                return Ok(Files::new());
+            }
             let mut url = self.at(&["git", "trees", &head.tree])?;
             url.query_pairs_mut().append_pair("recursive", "1");
             let (status, body, _) = self.call(Method::GET, url, None).await?;
@@ -921,13 +929,15 @@ impl Api<'_> {
         let tree = json!({ "base_tree": head.tree, "tree": entries });
         let url = self.at(&["git", "trees"])?;
         let (status, body, _) = self.call(Method::POST, url, Some(tree)).await?;
-        if status != 201 {
+        // Everything deleted: GitHub won't make the empty tree, but a commit takes it.
+        let emptied = status == 404 && changes.iter().all(|(_, text)| text.is_none());
+        if status != 201 && !emptied {
             return Err(self.failed(status, &body));
         }
-        let tree = self.json(&body)?["sha"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
+        let tree = match emptied {
+            true => EMPTY_TREE.to_owned(),
+            false => (self.json(&body)?["sha"].as_str().unwrap_or_default()).to_owned(),
+        };
         let commit = json!({ "message": MESSAGE, "tree": tree, "parents": [head.commit] });
         let url = self.at(&["git", "commits"])?;
         let (status, body, _) = self.call(Method::POST, url, Some(commit)).await?;
@@ -976,6 +986,8 @@ mod tests {
         made: u32,
         /// The next branch update finds someone else's push first.
         raced: bool,
+        /// The next tree can't be made: GitHub's 404 for a base it doesn't have.
+        lost: bool,
     }
 
     impl Fake {
@@ -986,7 +998,9 @@ mod tests {
 
         fn files(&self) -> Files {
             let tree = self.head.as_ref().map(|c| &self.commits[c]);
-            tree.map(|t| self.trees[t].clone()).unwrap_or_default()
+            // The empty tree is git's own, never made here.
+            tree.and_then(|t| self.trees.get(t).cloned())
+                .unwrap_or_default()
         }
 
         /// A commit of `files` on the head.
@@ -1022,6 +1036,10 @@ mod tests {
                     }
                     None => (409, json!({ "message": "Git Repository is empty." })),
                 },
+                // As GitHub does for the empty tree.
+                ("GET", ["git", "trees", tree]) if *tree == EMPTY_TREE => {
+                    (404, json!({ "message": "Not Found" }))
+                }
                 ("GET", ["git", "trees", tree]) => {
                     let entries: Vec<Value> = (self.trees[*tree].iter())
                         .map(|(p, h)| json!({ "path": p, "type": "blob", "sha": h }))
@@ -1056,14 +1074,22 @@ mod tests {
                         json!({ "commit": { "sha": commit, "tree": { "sha": tree } } }),
                     )
                 }
+                ("POST", ["git", "trees"]) if std::mem::take(&mut self.lost) => {
+                    (404, json!({ "message": "Not Found" }))
+                }
                 ("POST", ["git", "trees"]) => {
-                    let mut files = self.trees[body["base_tree"].as_str().unwrap()].clone();
+                    let base = body["base_tree"].as_str().unwrap();
+                    let mut files = self.trees.get(base).cloned().unwrap_or_default();
                     for e in body["tree"].as_array().unwrap() {
                         let path = e["path"].as_str().unwrap().to_owned();
                         match e["content"].as_str() {
                             Some(text) => files.insert(path, self.blob(text)),
                             None => files.remove(&path),
                         };
+                    }
+                    // GitHub won't make the empty tree.
+                    if files.is_empty() {
+                        return (404, json!({ "message": "Not Found" }));
                     }
                     let tree = self.id();
                     self.trees.insert(tree.clone(), files);
@@ -1495,6 +1521,55 @@ mod tests {
             "again, it goes"
         );
         assert!(sync("wrong").unwrap_err().contains("refused the token"));
+    }
+
+    /// Everything deleted leaves the branch on git's empty tree, which GitHub neither
+    /// makes nor lists; syncing goes on both ways.
+    #[test]
+    fn a_branch_emptied_by_sync_still_syncs() {
+        let fake = Arc::new(Mutex::new(Fake::default()));
+        let root = serve(fake.clone(), Provider::GitHub);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        let http = rt.block_on(crate::net::build_client(net)).unwrap().http;
+        let remote = Remote {
+            repo: "o/r".into(),
+            ..Default::default()
+        };
+        let [a, b] = ["a", "b"].map(|m| workspace(&format!("emptied-{m}")));
+        let sync = |ws: &Workspace| {
+            let r = rt.block_on(sync_at(&http, ws, &remote, "t0k", "", None, &root));
+            r.unwrap()
+        };
+        let synced = |pulled, pushed| Outcome::Synced { pulled, pushed };
+        put(&a, "one", "http://h.test/1");
+        assert_eq!(sync(&a), synced(0, 1));
+        assert_eq!(sync(&b), synced(1, 0));
+        a.delete(&a.request_path("one").unwrap()).unwrap();
+        assert_eq!(sync(&a), synced(0, 1));
+        assert!(fake.lock().unwrap().files().is_empty());
+        assert_eq!(sync(&b), synced(1, 0));
+        assert!(!b.exists(&b.request_path("one").unwrap()));
+        put(&b, "two", "http://h.test/2");
+        assert_eq!(sync(&b), synced(0, 1), "built on the empty tree");
+        assert_eq!(sync(&a), synced(1, 0));
+        assert_eq!(url(&a, "two"), "http://h.test/2");
+        // Any other 404 is an error, never taken for everything deleted.
+        put(&a, "three", "http://h.test/3");
+        fake.lock().unwrap().lost = true;
+        let failed = rt.block_on(sync_at(&http, &a, &remote, "t0k", "", None, &root));
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(
+            fake.lock().unwrap().files().len(),
+            1,
+            "\"two\" is still there"
+        );
     }
 
     #[test]
