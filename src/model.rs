@@ -51,6 +51,10 @@ pub struct Request {
     /// first; none means `eq`). Each row is a test result.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub asserts: Vec<KeyValue>,
+    /// Bruno's post-response vars: key a variable, value what to take from the response
+    /// (`res.body.token`, as in `asserts`). Set in the environment before the scripts run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub response_vars: Vec<KeyValue>,
     #[serde(skip_serializing_if = "Settings::is_default")]
     pub settings: Settings,
     #[serde(skip_serializing_if = "Mqtt::is_default")]
@@ -275,6 +279,7 @@ impl Default for Request {
             settings: Settings::default(),
             mqtt: Mqtt::default(),
             asserts: Vec::new(),
+            response_vars: Vec::new(),
             examples: Vec::new(),
             inherited: Inherited::default(),
         }
@@ -828,6 +833,7 @@ impl Request {
                 ..self.mqtt.clone()
             },
             asserts: Vec::new(),
+            response_vars: Vec::new(),
             examples: Vec::new(),
             inherited: Inherited::default(),
         };
@@ -881,6 +887,7 @@ impl Request {
             pre_request,
             tests,
             asserts,
+            response_vars,
             settings,
             mqtt,
             examples,
@@ -891,7 +898,7 @@ impl Request {
                 == (&other.description, &other.params, &other.path_vars)
             && (headers, pre_request, tests) == (&other.headers, &other.pre_request, &other.tests)
             && (asserts, settings, mqtt) == (&other.asserts, &other.settings, &other.mqtt)
-            && examples == &other.examples
+            && (examples, response_vars) == (&other.examples, &other.response_vars)
             && (body == &other.body || body.is_empty() && other.body.is_empty())
             && (auth == &other.auth || auth.is_unset() && other.auth.is_unset())
     }
@@ -1147,6 +1154,7 @@ mod tests {
             tests: "pm.test(\"ok\", function () {\n    pm.response.to.have.status(200);\n});\n"
                 .into(),
             asserts: vec![KeyValue::new("res.body.items", "length 3")],
+            response_vars: vec![KeyValue::new("token", "res.body.access_token")],
             settings: Settings {
                 http_version: HttpVersion::Http1,
                 follow_redirects: false,

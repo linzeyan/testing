@@ -141,6 +141,8 @@ enum ReqTab {
     Body,
     Auth,
     Scripts,
+    /// Variables set from the response.
+    Vars,
     Asserts,
     Settings,
     Examples,
@@ -4359,6 +4361,8 @@ impl App {
                 let scripts = !open.draft.pre_request.trim().is_empty()
                     || !open.draft.tests.trim().is_empty();
                 sub_tab(ui, current, ReqTab::Scripts, t("Scripts"), scripts);
+                let vars = count(&open.draft.response_vars);
+                sub_tab(ui, current, ReqTab::Vars, tab(vars, t("Vars")), false);
                 let asserts = count(&open.draft.asserts);
                 sub_tab(
                     ui,
@@ -4459,6 +4463,12 @@ impl App {
                             &open.draft.inherited,
                             json_response,
                         )
+                    }
+                    ReqTab::Vars => {
+                        let vars = &mut open.draft.response_vars;
+                        kv_table(ui, "response-vars", vars, &all_vars, false);
+                        ui.add_space(8.0);
+                        ui.weak(t(VARS_HINT));
                     }
                     ReqTab::Asserts => {
                         kv_table(ui, "asserts", &mut open.draft.asserts, &all_vars, false);
@@ -8637,6 +8647,14 @@ fn shortcut_list(ui: &mut egui::Ui) {
     });
 }
 
+const VARS_HINT: &str = n_(
+    "Each row sets a variable from the response, before the scripts and Asserts run, so \
+    they can use it. Key: the variable, e.g. token. Value: what to take, as in Asserts: \
+    res.body.access_token, res.body.items[0].id, res.headers['x-request-id'], res.status. \
+    It goes to the selected environment (the globals when there is none), as \
+    pm.environment.set does. A row that fails or finds nothing shows up under Tests.",
+);
+
 const ASSERTS_HINT: &str = n_(
     "Key: what to check, e.g. res.status, res.body.items.length, \
     res.body[0].id, res.headers['content-type'], res.responseTime.\n\
@@ -12042,6 +12060,38 @@ mod ui_tests {
             }
         );
         assert!(h.query_by_label_contains("too big to edit").is_none());
+    }
+
+    /// A row in the Vars tab, sent as the user would, lands in the selected environment.
+    #[test]
+    fn the_vars_tab_sets_an_environment_variable_from_the_response() {
+        let mut h = with_request("vars");
+        let url = format!("{}/x", crate::http::tests::echo_server());
+        h.state_mut().open.as_mut().unwrap().draft.url = url;
+        h.get_by_label("Vars").click();
+        h.run();
+        type_into(&mut h, 1, "path");
+        type_into(&mut h, 2, "res.body.split(' ')[1]");
+        shot(&mut h, "92-vars-tab");
+        let rows = &draft(&h).response_vars;
+        assert_eq!(
+            (rows[0].key.as_str(), rows[0].value.as_str()),
+            ("path", "res.body.split(' ')[1]")
+        );
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| {
+            app.pending.is_empty() && app.response.is_some()
+        });
+        assert_eq!(
+            h.state().vars.get("path").map(String::as_str),
+            Some("/users/x")
+        );
+        let saved = h.state().ws.env_vars(Some("dev")).unwrap();
+        assert_eq!(
+            saved.get("path").map(String::as_str),
+            Some("/users/x"),
+            "kept in dev"
+        );
     }
 
     /// A request moved or deleted since the order was set drops out of it; one added since

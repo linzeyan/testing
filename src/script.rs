@@ -367,13 +367,33 @@ var __ops = (function (E) {
     isArray: function (l) { E(l).to.be.an('array'); }
   };
 })(chai.expect);
-// Rows of [left, "op value"]; the left side is a JS expression over `res`, as in Bruno.
-function __asserts(rows) {
+// What `res` is to the Assert and Vars tables, as in Bruno: the body parsed if it's JSON.
+function __resValue() {
   var text = __in.response.body, body;
   try { body = JSON.parse(text); } catch (e) { body = text; }
   var headers = {};
   __in.response.headers.forEach(function (h) { headers[String(h[0]).toLowerCase()] = h[1]; });
-  var res = { status: __in.response.code, statusText: __in.response.status, responseTime: __in.response.time, headers: headers, body: body };
+  return { status: __in.response.code, statusText: __in.response.status, responseTime: __in.response.time, headers: headers, body: body };
+}
+// Rows of [name, JS expression over `res`]: each sets that environment variable, as
+// pm.environment.set would. Text stays as it is, anything else becomes its JSON. A row
+// that throws or finds nothing is a failed test, so a missing token is seen right here.
+function __vars(rows) {
+  var res = __resValue();
+  rows.forEach(function (row) {
+    var value, error;
+    try { value = new Function('res', 'return (' + row[1] + ');')(res); } catch (e) { error = e; }
+    if (error === undefined && value === undefined) error = new Error(row[1] + ' is undefined');
+    if (error !== undefined) {
+      pm.test(row[0] + ' = ' + row[1], function () { throw error; });
+      return;
+    }
+    pm.environment.set(row[0], typeof value === 'string' ? value : JSON.stringify(value));
+  });
+}
+// Rows of [left, "op value"]; the left side is a JS expression over `res`, as in Bruno.
+function __asserts(rows) {
+  var res = __resValue();
   rows.forEach(function (row) {
     var spec = row[1], gap = spec.indexOf(' ');
     var op = gap < 0 ? spec : spec.slice(0, gap), arg = gap < 0 ? '' : spec.slice(gap + 1);

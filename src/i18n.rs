@@ -533,6 +533,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ("ETag to match", "要比對的 ETag"),
     ("Every {} minutes", "每 {} 分鐘"),
     ("Every hour", "每小時"),
+    (
+        "Each row sets a variable from the response, before the scripts and Asserts run, so they can use it. Key: the variable, e.g. token. Value: what to take, as in Asserts: res.body.access_token, res.body.items[0].id, res.headers['x-request-id'], res.status. It goes to the selected environment (the globals when there is none), as pm.environment.set does. A row that fails or finds nothing shows up under Tests.",
+        "每一列從回應取一個值設成變數，在指令碼與斷言執行前完成，所以它們都能使用。鍵：變數名稱，例如 token。值：要取什麼，寫法同斷言：res.body.access_token、res.body.items[0].id、res.headers['x-request-id']、res.status。存進選定的環境（沒選環境時存進全域變數），與 pm.environment.set 相同。失敗或取不到值的列會出現在「測試」下。",
+    ),
     ("Examples", "範例"),
     (
         "Export the results as JUnit XML…",
@@ -1303,6 +1307,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Value", "值"),
     ("Values for this request", "這個請求的值"),
     ("Variables", "變數"),
+    ("Vars", "回應變數"),
     ("Variables (JSON)", "變數 (JSON)"),
     ("Variables ({})", "變數 ({})"),
     (

@@ -140,6 +140,15 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
 
     if let Ok(resp) = &response {
         let mut tests = scripts(&req.inherited.tests, &req.tests);
+        let captures: Vec<_> = (req.response_vars.iter())
+            .filter(|v| v.enabled && !v.key.trim().is_empty() && !v.value.trim().is_empty())
+            .map(|v| (v.key.trim(), v.value.trim()))
+            .collect();
+        if !captures.is_empty() {
+            // First, so the folders' and the request's scripts and its Asserts can use them.
+            let code = format!("__vars({});", serde_json::json!(captures));
+            tests.insert(0, (String::new(), code));
+        }
         let asserts: Vec<_> = (req.asserts.iter())
             .filter(|a| a.enabled && !a.key.trim().is_empty())
             .map(|a| (a.key.trim(), a.value.trim()))
@@ -977,6 +986,60 @@ mod tests {
                 .unwrap()
                 .contains("\"nope\"")
         );
+    }
+
+    /// The Vars table sets variables from the response before the scripts and Asserts,
+    /// which can use them; a row that throws or finds nothing is a failed test.
+    #[test]
+    fn response_vars_set_variables_for_what_follows() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt.block_on(build_client(Network::default())).unwrap();
+        let base = crate::http::tests::echo_server();
+        let mut off = KeyValue::new("off", "res.status");
+        off.enabled = false;
+        let req = Request {
+            url: format!("{base}/x"),
+            // The echo server answers with the request line: "GET /users/x HTTP/1.1".
+            response_vars: vec![
+                KeyValue::new("path", "res.body.split(' ')[1]"),
+                KeyValue::new("code", "res.status"),
+                KeyValue::new("missing", "res.headers['x-none']"),
+                KeyValue::new("broken", "res.body.nope.deeper"),
+                off,
+            ],
+            tests: r#"pm.test("sees it", function () {
+                pm.expect(pm.environment.get("path")).to.equal("/users/x");
+            });"#
+                .into(),
+            asserts: vec![KeyValue::new("res.status", "eq {{code}}")],
+            ..Default::default()
+        };
+        let out = rt.block_on(super::run(
+            client,
+            &Info::single("t".into()),
+            req,
+            Vars::default(),
+        ));
+        let tests: Vec<_> = (out.tests.iter())
+            .map(|t| (t.name.as_str(), t.passed))
+            .collect();
+        assert_eq!(
+            tests,
+            [
+                ("missing = res.headers['x-none']", false),
+                ("broken = res.body.nope.deeper", false),
+                ("sees it", true),
+                ("res.status eq {{code}}", true),
+            ]
+        );
+        let set: std::collections::BTreeMap<_, _> = out.env.into_iter().collect();
+        let want = [("code", "200"), ("path", "/users/x")];
+        let want = want.map(|(k, v)| (k.to_owned(), Some(v.to_owned())));
+        assert_eq!(set, std::collections::BTreeMap::from(want));
     }
 
     /// With bail, a run ends at its first failure instead of piling up more of them.

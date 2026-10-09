@@ -135,6 +135,10 @@ Without JavaScript:
 - The Asserts tab, as in Bruno: rows like `res.status` `eq 200`, `res.body.items` `length 3`,
   `res.headers['content-type']` `contains json`. 28 operators, `{{variables}}` on the right;
   each row is a test result.
+- The Vars tab, Bruno's post-response vars: `token` `res.body.access_token` sets `token` in
+  the selected environment once the response is in, before the scripts and Asserts, so a
+  login hands its token on without a line of JavaScript. A row that fails or finds nothing
+  shows up under Tests.
 - The post-response Snippets menu's "Response matches its schema" adds a `jsonSchema`
   contract test generated from the response (array items merged; keys only some items have
   are left optional).

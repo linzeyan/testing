@@ -128,6 +128,9 @@ Postman 風格的請求前與測試指令碼，預設是空的，由你自己撰
 - 「斷言」分頁，作法同 Bruno：例如 `res.status` `eq 200`、`res.body.items` `length 3`、
   `res.headers['content-type']` `contains json`。共 28 種運算子，右側可用 `{{variables}}`；
   每一列就是一筆測試結果。
+- 「回應變數」分頁，即 Bruno 的 post-response vars：`token` `res.body.access_token` 會在收到回應後、
+  指令碼與斷言之前，把 `token` 存進選定的環境；登入取得的 token 不必寫 JavaScript 就能交給後面的
+  請求。失敗或取不到值的列會出現在「測試」下。
 - 回應後「程式碼片段」選單中的「回應符合 schema」，會依回應產生 `jsonSchema` 契約測試（陣列
   元素合併；只有部分元素才有的鍵設為選填）。
 
