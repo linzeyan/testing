@@ -29,6 +29,7 @@ options:
   -d, --data <file>      CSV or JSON data file; one iteration per row
   -n, --iterations <n>   iterations without a data file (default 1)
   --delay <ms>           pause between requests
+  --bail                 stop at the first request that fails
   --junit <file>         also write a JUnit XML report (for CI test dashboards)
 ";
 
@@ -69,7 +70,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         _ => {}
     }
     let (mut target, mut workspace, mut env, mut data) = (None, None, None, None);
-    let (mut iterations, mut delay, mut junit) = (1usize, 0u64, None);
+    let (mut iterations, mut delay, mut junit, mut bail) = (1usize, 0u64, None, false);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -82,6 +83,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
             "-e" | "--env" => env = Some(value()?),
             "-d" | "--data" => data = Some(PathBuf::from(value()?)),
             "--junit" => junit = Some(PathBuf::from(value()?)),
+            "--bail" => bail = true,
             "-n" | "--iterations" => {
                 iterations = value()?
                     .parse()
@@ -130,6 +132,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         data,
         iterations,
         delay: Duration::from_millis(delay),
+        bail,
     };
     let vars = Vars {
         env,
@@ -139,7 +142,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
     let (mut total, mut failed, mut tests, mut tests_failed) = (0, 0, 0, 0);
     let mut suites = String::new();
     rt.block_on(runner::run_collection(client, plan, vars, |item| {
-        suites.push_str(&junit_suite(&item));
+        suites.push_str(&runner::junit_suite(&item));
         total += 1;
         failed += item.failed() as usize;
         let mark = if item.failed() { "FAIL" } else { "ok  " };
@@ -169,10 +172,8 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         ws.save_tokens(&crate::auth::export())?;
     }
     if let Some(path) = junit {
-        let xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites name=\"apitool\">\n{suites}</testsuites>\n"
-        );
-        std::fs::write(&path, xml).map_err(|e| format!("write {}: {e}", path.display()))?;
+        std::fs::write(&path, runner::junit(&suites))
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
     }
     Ok(failed == 0)
 }
@@ -265,53 +266,6 @@ fn mock(args: &[String]) -> Result<bool, String> {
         crate::mock::serve(ws, dir, listener, |line| println!("{line}")).await;
         Ok(true)
     })
-}
-
-/// One `<testsuite>` per request run, one `<testcase>` per `pm.test`, like newman's
-/// JUnit reporter. A request that got no response is a single erroring testcase.
-fn junit_suite(item: &runner::RunItem) -> String {
-    let name = esc(&format!("{} #{}", item.name, item.iteration + 1));
-    let (time, cases) = match &item.status {
-        Err(e) => (
-            0.0,
-            format!(
-                "    <testcase name=\"{name}\" classname=\"{name}\"><error message=\"{}\"/></testcase>\n",
-                esc(e)
-            ),
-        ),
-        Ok((_, ms)) => {
-            let cases: String = item
-                .tests
-                .iter()
-                .map(|t| {
-                    let failure = if t.passed {
-                        String::new()
-                    } else {
-                        let why = t.error.as_deref().unwrap_or("failed");
-                        format!("<failure message=\"{}\"/>", esc(why))
-                    };
-                    format!(
-                        "    <testcase name=\"{}\" classname=\"{name}\">{failure}</testcase>\n",
-                        esc(&t.name)
-                    )
-                })
-                .collect();
-            (*ms as f64 / 1000.0, cases)
-        }
-    };
-    let count = item.tests.len().max(item.status.is_err() as usize);
-    let failures = item.tests.iter().filter(|t| !t.passed).count();
-    let errors = item.status.is_err() as usize;
-    format!(
-        "  <testsuite name=\"{name}\" tests=\"{count}\" failures=\"{failures}\" errors=\"{errors}\" time=\"{time:.3}\">\n{cases}  </testsuite>\n"
-    )
-}
-
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 #[cfg(test)]

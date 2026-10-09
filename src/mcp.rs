@@ -688,6 +688,7 @@ impl Server {
             data,
             iterations: args["iterations"].as_u64().unwrap_or(1).max(1) as usize,
             delay: std::time::Duration::ZERO,
+            bail: args["bail"].as_bool().unwrap_or(false),
         };
         let vars = self.vars(env.as_deref())?;
         let client = self.client()?;
@@ -1311,6 +1312,7 @@ fn tools(window: bool) -> Value {
                     "environment": environment,
                     "iterations": { "type": "integer", "minimum": 1 },
                     "data_file": { "type": "string", "description": "CSV or JSON array file, relative to the workspace" },
+                    "bail": { "type": "boolean", "description": "Stop at the first request that fails" },
                 },
             },
             "annotations": { "openWorldHint": true },

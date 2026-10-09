@@ -372,6 +372,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Disconnect", "中斷連線"),
     ("Docs", "文件"),
     ("Domain", "網域"),
+    ("Drag to change the order", "拖曳以調整順序"),
     ("Don't check", "不檢查"),
     (
         "Downloads it in the background; it starts next time",
@@ -533,6 +534,15 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Every {} minutes", "每 {} 分鐘"),
     ("Every hour", "每小時"),
     ("Examples", "範例"),
+    (
+        "Export the results as JUnit XML…",
+        "將結果匯出為 JUnit XML…",
+    ),
+    ("Exported {} results to {}", "已將 {} 筆結果匯出到 {}"),
+    (
+        "Exported {} of {} results (the failures and the latest passes) to {}",
+        "已將 {} 筆結果（共 {} 筆，含所有失敗與最近的通過）匯出到 {}",
+    ),
     ("Expires", "到期"),
     (
         "Extra CA bundle (PEM file path)",
@@ -664,6 +674,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Iterations", "迭代次數"),
     ("JSON body has a property", "JSON 內容有某個屬性"),
     ("JSON, YAML or a path", "JSON、YAML 或路徑"),
+    ("JUnit XML", "JUnit XML"),
     ("just now", "剛剛"),
     ("JWT Bearer", "JWT Bearer"),
     ("Keep alive", "保持連線"),
@@ -948,10 +959,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "Request Timeout：伺服器等待請求逾時。",
     ),
     ("Requests", "請求數"),
-    (
-        "Requests run in the order shown on the left, with the selected environment.",
-        "請求依左側順序、以選定的環境執行。",
-    ),
+    ("Requests ({}/{})", "請求 ({}/{})"),
     (
         "Requests set to \"Inherit from parent\" use this.",
         "設為「繼承上層」的請求會使用這個。",
@@ -961,6 +969,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "送出的請求會出現在這裡。",
     ),
     ("Reset", "重設"),
+    (
+        "Reset to the tree's order, all ticked",
+        "恢復成樹狀清單的順序並全部勾選",
+    ),
     ("Reset to defaults", "重設為預設值"),
     ("Response matches its schema", "回應符合 schema"),
     ("Response time is below 500 ms", "回應時間低於 500 ms"),
@@ -1128,6 +1140,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Status code is 200", "狀態碼為 200"),
     ("Status codes", "狀態碼"),
     ("Stop", "停止"),
+    ("Stop at the first failure", "遇到第一個失敗就停止"),
+    ("stopped at the first failure", "已在第一個失敗處停止"),
     ("Stop repeat", "停止重送"),
     (
         "Stop sending; the server can still reply",
@@ -1216,6 +1230,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "This request as curl, Python, Go, … to copy",
         "將此請求轉成 curl、Python、Go 等程式碼以便複製",
     ),
+    (
+        "The ticked requests run in the order on the left, with the selected environment.",
+        "勾選的請求依左側順序、以選定的環境執行。",
+    ),
     ("This request has no body.", "這個請求沒有內容。"),
     (
         "This snippet is {}: too big to show here. Copy still copies all of it.",
@@ -1226,6 +1244,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "無法繪製此 SVG（{}）。「原始」會顯示其文字。",
     ),
     ("Throughput", "吞吐量"),
+    ("Tick the requests to run.", "請勾選要執行的請求。"),
     ("Timeline", "時間軸"),
     ("Timeout", "逾時"),
     (

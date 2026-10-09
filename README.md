@@ -262,7 +262,9 @@ right-click a folder > "Copy docs as Markdown", or `apitool-cli docs`.
 ## Runner, load test and mock server
 
 - **Collection runner** with CSV or JSON data. Counts cover every row; the list keeps
-  failures and the latest 1000 results.
+  failures and the latest 1000 results. Tick the requests to run and drag them into the
+  order wanted (kept per folder on this machine; ↺ goes back to the tree's). "Stop at the
+  first failure" ends the run there. The export icon writes the results as JUnit XML.
 - **Load test** pane. Response bodies are read and dropped, so many users cost no RAM.
 - **Mock server** answering with saved examples: right-click a folder > "Start mock server",
   or `apitool-cli mock`. An `x-mock-response-name` or `x-mock-response-code` header picks
@@ -286,6 +288,7 @@ Every command takes `--workspace <dir>`. Requests are named as in the tree (`use
 | `-d, --data <file>` | CSV or JSON data file; one iteration per row |
 | `-n, --iterations <n>` | Iterations without a data file (default 1) |
 | `--delay <ms>` | Pause between requests |
+| `--bail` | Stop at the first request that fails |
 | `--junit <file>` | Also write a JUnit XML report |
 
 Exit code: `0` all passed, `1` something failed, `2` could not run.

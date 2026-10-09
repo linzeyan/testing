@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -728,6 +728,9 @@ struct RunnerView {
     iterations: usize,
     data_path: String,
     delay_ms: u64,
+    /// The scope's requests in run order, each ticked to run or not.
+    order: Vec<(PathBuf, bool)>,
+    bail: bool,
     only_failures: bool,
     error: String,
     run: Option<RunState>,
@@ -744,6 +747,8 @@ struct RunState {
     failed: usize,
     /// Passed, run.
     tests: (usize, usize),
+    /// Ends at the first failure (`RunPlan::bail`).
+    bail: bool,
     abort: tokio::task::AbortHandle,
 }
 
@@ -895,6 +900,8 @@ pub struct App {
     env_editor: Option<EnvEditor>,
     folder_editor: Option<FolderEditor>,
     runner: Option<RunnerView>,
+    /// `State::run_orders`.
+    run_orders: HashMap<String, Vec<(String, bool)>>,
     next_run_id: u64,
     network: Network,
     network_editor: Option<Network>,
@@ -993,6 +1000,7 @@ impl App {
             env_editor: None,
             folder_editor: None,
             runner: None,
+            run_orders: state.run_orders.clone(),
             next_run_id: 0,
             network: state.network,
             network_editor: None,
@@ -1214,6 +1222,7 @@ impl App {
             recent_filters: self.recent_filters.clone(),
             raw_types: self.raw_types.clone(),
             gql_replace: self.explorer.replace,
+            run_orders: self.run_orders.clone(),
             appearance: self.appearance.clone(),
             updates: self.updates.clone(),
             mcp_window: self.mcp_window,
@@ -5625,6 +5634,12 @@ impl App {
         };
         // Keep the previous settings when re-opening, which is how people iterate on a run.
         let prev = self.runner.take();
+        let kept: Vec<(PathBuf, bool)> = (self.run_orders.get(&self.ws.key(&scope)))
+            .into_iter()
+            .flatten()
+            .filter_map(|(key, on)| Some((self.ws.request_path(key).ok()?, *on)))
+            .collect();
+        let order = run_order(&tree_requests(&self.tree, &scope), &kept);
         self.runner = Some(RunnerView {
             scope,
             title,
@@ -5634,6 +5649,8 @@ impl App {
                 .map(|p| p.data_path.clone())
                 .unwrap_or_default(),
             delay_ms: prev.as_ref().map_or(0, |p| p.delay_ms),
+            order,
+            bail: prev.as_ref().is_some_and(|p| p.bail),
             only_failures: false,
             error: String::new(),
             run: None,
@@ -5643,11 +5660,10 @@ impl App {
     /// "Folder/Request" relative to the collections root, without the extension.
     fn start_run(&mut self, ctx: &egui::Context) {
         let Some(view) = &self.runner else { return };
-        let mut paths = Vec::new();
-        store::requests_in(&self.tree, &view.scope, &mut paths);
+        let paths = view.order.iter().filter(|(_, on)| *on).map(|(p, _)| p);
         let mut requests = Vec::new();
         let mut error = String::new();
-        for path in &paths {
+        for path in paths {
             match self.ws.load_request(path) {
                 Ok(req) => requests.push((self.ws.display_name(path), req)),
                 Err(e) => error = e,
@@ -5671,7 +5687,11 @@ impl App {
             }
         };
         if requests.is_empty() && error.is_empty() {
-            error = t("No requests to run here.").into();
+            error = match view.order.is_empty() {
+                true => t("No requests to run here."),
+                false => t("Tick the requests to run."),
+            }
+            .into();
         }
         let view = self.runner.as_mut().expect("runner open");
         view.error = error;
@@ -5692,6 +5712,7 @@ impl App {
             data,
             iterations: view.iterations,
             delay: Duration::from_millis(view.delay_ms),
+            bail: view.bail,
         };
         let total = plan.requests.len() * count;
 
@@ -5739,14 +5760,18 @@ impl App {
             done: 0,
             failed: 0,
             tests: (0, 0),
+            bail: view.bail,
             abort: task.abort_handle(),
         });
     }
 
     fn runner_ui(&mut self, ui: &mut egui::Ui) {
-        let (mut start, mut close) = (false, false);
+        let (mut start, mut close, mut export) = (false, false, None);
         let Some(view) = &mut self.runner else { return };
         let running = view.run.as_ref().is_some_and(RunState::running);
+        // The tree may have changed since the pane opened: new requests join at the end.
+        let tree = tree_requests(&self.tree, &view.scope);
+        view.order = run_order(&tree, &view.order);
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.heading(tf("Run: {}", &[&view.title]));
@@ -5774,6 +5799,9 @@ impl App {
                 ui.label(t("Delay"));
                 ui.add(egui::DragValue::new(&mut view.delay_ms).range(0..=60_000).suffix(" ms"));
                 ui.end_row();
+                ui.label("");
+                ui.checkbox(&mut view.bail, t("Stop at the first failure"));
+                ui.end_row();
             });
         });
         if !view.error.is_empty() {
@@ -5795,8 +5823,50 @@ impl App {
                     .clicked();
             }
             ui.checkbox(&mut view.only_failures, t("Failures only"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let done = view
+                    .run
+                    .as_ref()
+                    .is_some_and(|r| !r.running() && !r.items.is_empty());
+                let label = t("Export the results as JUnit XML…");
+                if ui
+                    .add_enabled_ui(done, |ui| icon_button(ui, icon::EXPORT, label, None))
+                    .inner
+                    .clicked()
+                {
+                    let xml = [(t("JUnit XML"), &["xml"][..])];
+                    export = pick_file("apitool-run.xml", &xml, true);
+                }
+            });
         });
         ui.separator();
+
+        let changed = egui::Panel::left("runner-order")
+            .resizable(true)
+            .default_size(280.0)
+            .min_size(180.0)
+            .show(ui, |ui| {
+                ui.add_enabled_ui(!running, |ui| {
+                    run_order_ui(ui, &mut view.order, &tree, &self.ws)
+                })
+                .inner
+            })
+            .inner;
+        if changed {
+            let key = self.ws.key(&view.scope);
+            let as_tree = view
+                .order
+                .iter()
+                .map(|(p, _)| p)
+                .eq(tree.iter().map(|(p, _)| p));
+            match as_tree && view.order.iter().all(|(_, on)| *on) {
+                true => self.run_orders.remove(&key),
+                false => {
+                    let keys = view.order.iter().map(|(p, on)| (self.ws.key(p), *on));
+                    self.run_orders.insert(key, keys.collect())
+                }
+            };
+        }
 
         if let Some(run) = &view.run {
             let (done, failed, (tests_passed, tests_total)) = (run.done, run.failed, run.tests);
@@ -5821,7 +5891,11 @@ impl App {
                 ui.colored_label(color, tf("Tests {}/{}", &[&tests_passed, &tests_total]));
                 if run.finished.is_some() && done < run.total {
                     ui.separator();
-                    ui.colored_label(ORANGE, t("cancelled"));
+                    // A bailing run ends at its first failure; any other ends early by Cancel.
+                    match run.bail && failed > 0 {
+                        true => ui.colored_label(ORANGE, t("stopped at the first failure")),
+                        false => ui.colored_label(ORANGE, t("cancelled")),
+                    };
                 }
             });
             if running {
@@ -5850,7 +5924,7 @@ impl App {
                 });
         } else {
             ui.weak(t(
-                "Requests run in the order shown on the left, with the selected environment.",
+                "The ticked requests run in the order on the left, with the selected environment.",
             ));
         }
 
@@ -5866,7 +5940,27 @@ impl App {
             self.runner = None;
         } else if start {
             self.start_run(ui.ctx());
+        } else if let Some(path) = export {
+            self.export_run(Path::new(&path));
         }
+    }
+
+    /// The runner's results as JUnit XML: the ones it kept, which are every failure and
+    /// the latest passes.
+    fn export_run(&mut self, path: &Path) {
+        let Some(run) = self.runner.as_ref().and_then(|r| r.run.as_ref()) else {
+            return;
+        };
+        let suites: String = run.items.iter().map(runner::junit_suite).collect();
+        let (kept, shown) = (run.items.len(), path.display());
+        self.status = match std::fs::write(path, runner::junit(&suites)) {
+            Ok(()) if kept < run.done => tf(
+                "Exported {} of {} results (the failures and the latest passes) to {}",
+                &[&kept, &run.done, &shown],
+            ),
+            Ok(()) => tf("Exported {} results to {}", &[&kept, &shown]),
+            Err(e) => format!("{shown}: {e}"),
+        };
     }
 
     /// Changes show at once; they're kept when the window closes.
@@ -6414,6 +6508,130 @@ impl App {
             self.network_editor = None;
         }
     }
+}
+
+/// The requests under `scope` with their methods, in tree order.
+fn tree_requests(nodes: &[Node], scope: &Path) -> Vec<(PathBuf, String)> {
+    fn walk(nodes: &[Node], scope: &Path, out: &mut Vec<(PathBuf, String)>) {
+        for node in nodes {
+            match node {
+                Node::Folder { children, .. } => walk(children, scope, out),
+                Node::Request { path, method, .. } if path.starts_with(scope) => {
+                    out.push((path.clone(), method.clone()))
+                }
+                Node::Request { .. } => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(nodes, scope, &mut out);
+    out
+}
+
+/// The runner's order: the `kept` requests still in the tree, as kept, then the tree's
+/// other requests in its order, ticked.
+fn run_order(tree: &[(PathBuf, String)], kept: &[(PathBuf, bool)]) -> Vec<(PathBuf, bool)> {
+    let there: HashSet<&PathBuf> = tree.iter().map(|(p, _)| p).collect();
+    let mut order: Vec<_> = (kept.iter())
+        .filter(|(p, _)| there.contains(p))
+        .cloned()
+        .collect();
+    let placed: HashSet<PathBuf> = order.iter().map(|(p, _)| p.clone()).collect();
+    let new = tree.iter().filter(|(p, _)| !placed.contains(p));
+    order.extend(new.map(|(p, _)| (p.clone(), true)));
+    order
+}
+
+/// The runner's request list: tick what runs, drag a row by its grip to reorder. True
+/// when the user changed something.
+fn run_order_ui(
+    ui: &mut egui::Ui,
+    order: &mut Vec<(PathBuf, bool)>,
+    tree: &[(PathBuf, String)],
+    ws: &Workspace,
+) -> bool {
+    let mut changed = false;
+    let ticked = order.iter().filter(|(_, on)| *on).count();
+    ui.horizontal(|ui| {
+        let mut all = ticked == order.len();
+        let label = tf("Requests ({}/{})", &[&ticked, &order.len()]);
+        let some = ticked > 0 && ticked < order.len();
+        if ui
+            .add(egui::Checkbox::new(&mut all, label).indeterminate(some))
+            .changed()
+        {
+            order.iter_mut().for_each(|(_, on)| *on = all);
+            changed = true;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let reset = t("Reset to the tree's order, all ticked");
+            if icon_button(ui, icon::ARROW_COUNTER_CLOCKWISE, reset, None).clicked() {
+                *order = tree.iter().map(|(p, _)| (p.clone(), true)).collect();
+                changed = true;
+            }
+        });
+    });
+    ui.separator();
+    let methods: HashMap<&PathBuf, &str> = tree.iter().map(|(p, m)| (p, m.as_str())).collect();
+    let (mut rows, mut dragged, mut dropped) = (Vec::with_capacity(order.len()), None, None);
+    egui::ScrollArea::vertical()
+        .id_salt("runner-order")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            for (i, (path, on)) in order.iter_mut().enumerate() {
+                let row = ui.horizontal(|ui| {
+                    let grip = RichText::new(icon::DOTS_SIX_VERTICAL).weak();
+                    let grip = egui::Label::new(grip).selectable(false);
+                    let grip = (ui.add(grip.sense(egui::Sense::drag())))
+                        .on_hover_cursor(egui::CursorIcon::Grab)
+                        .on_hover_text(t("Drag to change the order"));
+                    let name = ws.display_name(path);
+                    let r = ui.checkbox(on, "");
+                    let (enabled, ticked) = (r.enabled(), *on);
+                    r.widget_info(|| {
+                        let kind = egui::WidgetType::Checkbox;
+                        egui::WidgetInfo::selected(kind, enabled, ticked, &name)
+                    });
+                    changed |= r.changed();
+                    method_badge(ui, methods.get(path).copied().unwrap_or_default(), 5);
+                    ui.add(egui::Label::new(name).truncate());
+                    grip
+                });
+                if row.inner.dragged() {
+                    dragged = Some(i);
+                } else if row.inner.drag_stopped() {
+                    dropped = Some(i);
+                }
+                rows.push(row.response.rect);
+            }
+            // Where the row would go: before the first row whose middle is below the pointer.
+            let y = ui.ctx().pointer_interact_pos().map(|p| p.y);
+            let to = |y: f32| {
+                rows.iter()
+                    .position(|r| y < r.center().y)
+                    .unwrap_or(rows.len())
+            };
+            match (dragged, dropped, y) {
+                (Some(_), _, Some(y)) => {
+                    let at = match rows.get(to(y)) {
+                        Some(r) => r.top() - ui.spacing().item_spacing.y / 2.0,
+                        None => rows.last().map_or(0.0, |r| r.bottom() + 1.0),
+                    };
+                    // Above the first row is outside the scroll area, which would clip it.
+                    let at = at.max(ui.clip_rect().top() + 1.0);
+                    let stroke = egui::Stroke::new(2.0, ui.visuals().selection.bg_fill);
+                    ui.painter().hline(ui.max_rect().x_range(), at, stroke);
+                }
+                (_, Some(from), Some(y)) => {
+                    let to = to(y);
+                    let item = order.remove(from);
+                    order.insert(if to > from { to - 1 } else { to }, item);
+                    changed |= to != from && to != from + 1;
+                }
+                _ => {}
+            }
+        });
+    changed
 }
 
 fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
@@ -11826,6 +12044,112 @@ mod ui_tests {
         assert!(h.query_by_label_contains("too big to edit").is_none());
     }
 
+    /// A request moved or deleted since the order was set drops out of it; one added since
+    /// joins at the end, ticked, so it isn't silently left out of the run.
+    #[test]
+    fn the_run_order_keeps_what_was_set_and_adds_new_requests_ticked() {
+        let p = PathBuf::from;
+        let tree = [("a", "GET"), ("b", "GET"), ("new", "POST")].map(|(n, m)| (p(n), m.into()));
+        let kept = [(p("b"), false), (p("gone"), true), (p("a"), true)];
+        let want = [(p("b"), false), (p("a"), true), (p("new"), true)];
+        assert_eq!(run_order(&tree, &kept), want);
+    }
+
+    /// The runner runs what's ticked in the order dragged to, stops at the first failure
+    /// when asked, keeps its order for next time (until Reset) and exports what it ran.
+    #[test]
+    fn the_runner_runs_the_ticked_requests_in_the_order_set() {
+        let ws = workspace("run-order");
+        let top = ws.collections();
+        let base = crate::http::tests::echo_server();
+        for (name, url) in [
+            ("a", format!("{base}/a")),
+            ("b", format!("{base}/b")),
+            ("c", "http://127.0.0.1:1/c".into()),
+        ] {
+            let path = ws.create_request(&top, name).unwrap();
+            let req = Request {
+                url,
+                ..Default::default()
+            };
+            ws.save_request(&path, &req).unwrap();
+        }
+        let mut h = harness(ws);
+        h.run();
+        h.state_mut().open_runner(top.clone());
+        h.run();
+        let order = |h: &Harness<'_, App>| -> Vec<(String, bool)> {
+            let view = h.state().runner.as_ref().unwrap();
+            let named = |(p, on): &(PathBuf, bool)| (h.state().ws.display_name(p), *on);
+            view.order.iter().map(named).collect()
+        };
+        let row = |name: &str, on: bool| (name.to_owned(), on);
+        let by = egui_kittest::kittest::By::new().role(Role::CheckBox);
+        h.get(by.label("b")).click();
+        h.run();
+        // A row by its grip to just past the middle of another: down, then up.
+        let drag = |h: &mut Harness<'_, App>, from: usize, onto: usize, dy: f32| {
+            let grips: Vec<_> = (h.get_all_by_label(icon::DOTS_SIX_VERTICAL))
+                .map(|n| n.rect().center())
+                .collect();
+            let (from, to) = (grips[from], grips[onto] + egui::vec2(0.0, dy));
+            h.drag_at(from);
+            h.run();
+            h.hover_at(from + egui::vec2(0.0, dy.signum() * 12.0));
+            h.run();
+            h.hover_at(to);
+            h.run();
+            shot(h, "90-runner-order");
+            h.drop_at(to);
+            h.run();
+        };
+        drag(&mut h, 0, 1, 4.0);
+        assert_eq!(order(&h), [row("b", false), row("a", true), row("c", true)]);
+        drag(&mut h, 2, 0, -4.0);
+        assert_eq!(order(&h), [row("c", true), row("b", false), row("a", true)]);
+
+        let run = |h: &mut Harness<'_, App>| -> Vec<String> {
+            button(h, "▶ Run").click();
+            for _ in 0..500 {
+                h.step();
+                let view = h.state().runner.as_ref().unwrap();
+                if let Some(run) = view.run.as_ref().filter(|r| !r.running()) {
+                    return run.items.iter().map(|i| i.name.clone()).collect();
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the run didn't finish");
+        };
+        assert_eq!(run(&mut h), ["c", "a"], "c fails to connect, a still runs");
+        h.get_by_label("Stop at the first failure").click();
+        h.run();
+        assert_eq!(run(&mut h), ["c"]);
+        h.run();
+        shot(&mut h, "91-runner-bail");
+
+        let report = std::env::temp_dir().join(format!("apitool-run-{}.xml", std::process::id()));
+        h.state_mut().export_run(&report);
+        let xml = std::fs::read_to_string(&report).unwrap();
+        let _ = std::fs::remove_file(&report);
+        assert!(xml.contains(r#"<testsuite name="c #1" tests="1" failures="0" errors="1""#));
+        assert_eq!(xml.matches("<testsuite ").count(), 1, "{xml}");
+
+        let kept = [row("c", true), row("b", false), row("a", true)];
+        assert_eq!(h.state().run_orders[""], kept);
+        h.state_mut().runner = None;
+        h.state_mut().open_runner(top);
+        h.run();
+        assert_eq!(order(&h), kept, "kept for next time");
+        h.get_by_label("Reset to the tree's order, all ticked")
+            .click();
+        h.run();
+        assert_eq!(order(&h), [row("a", true), row("b", true), row("c", true)]);
+        assert!(
+            h.state().run_orders.is_empty(),
+            "the tree's order needs no entry"
+        );
+    }
+
     /// A long data-driven run keeps a bounded list, but the counts cover every row and
     /// no failure is pushed out by passes.
     #[test]
@@ -11840,6 +12164,7 @@ mod ui_tests {
             done: 0,
             failed: 0,
             tests: (0, 0),
+            bail: false,
             abort: rt.spawn(async {}).abort_handle(),
         };
         for i in 0..3 * MAX_RUN_ROWS {

@@ -243,6 +243,8 @@ pub struct RunPlan {
     pub data: Vec<HashMap<String, String>>,
     pub iterations: usize,
     pub delay: Duration,
+    /// Stop at the first request that fails (an error or a failed test), as newman's --bail.
+    pub bail: bool,
 }
 
 /// Runs every request for every iteration, chaining variable writes between requests.
@@ -309,17 +311,76 @@ pub async fn run_collection(
             }
             // Postman leaves skipped requests out of the results too.
             if !out.skipped || tests.iter().any(|t| !t.passed) {
-                on_item(RunItem {
+                let item = RunItem {
                     iteration,
                     name: name.clone(),
                     method: req.method.clone(),
                     status: out.response.map(|r| (r.status, r.elapsed.as_millis())),
                     tests,
-                });
+                };
+                let stop = plan.bail && item.failed();
+                on_item(item);
+                if stop {
+                    return (env, globals);
+                }
             }
         }
     }
     (env, globals)
+}
+
+/// A JUnit XML report of these `junit_suite`s.
+pub fn junit(suites: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites name=\"apitool\">\n{suites}</testsuites>\n"
+    )
+}
+
+/// One `<testsuite>` per request run, one `<testcase>` per `pm.test`, like newman's
+/// JUnit reporter. A request that got no response is a single erroring testcase.
+pub fn junit_suite(item: &RunItem) -> String {
+    let name = esc(&format!("{} #{}", item.name, item.iteration + 1));
+    let (time, cases) = match &item.status {
+        Err(e) => (
+            0.0,
+            format!(
+                "    <testcase name=\"{name}\" classname=\"{name}\"><error message=\"{}\"/></testcase>\n",
+                esc(e)
+            ),
+        ),
+        Ok((_, ms)) => {
+            let cases: String = item
+                .tests
+                .iter()
+                .map(|t| {
+                    let failure = if t.passed {
+                        String::new()
+                    } else {
+                        let why = t.error.as_deref().unwrap_or("failed");
+                        format!("<failure message=\"{}\"/>", esc(why))
+                    };
+                    format!(
+                        "    <testcase name=\"{}\" classname=\"{name}\">{failure}</testcase>\n",
+                        esc(&t.name)
+                    )
+                })
+                .collect();
+            (*ms as f64 / 1000.0, cases)
+        }
+    };
+    let count = item.tests.len().max(item.status.is_err() as usize);
+    let failures = item.tests.iter().filter(|t| !t.passed).count();
+    let errors = item.status.is_err() as usize;
+    format!(
+        "  <testsuite name=\"{name}\" tests=\"{count}\" failures=\"{failures}\" errors=\"{errors}\" time=\"{time:.3}\">\n{cases}  </testsuite>\n"
+    )
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn apply_one(map: &mut HashMap<String, String>, k: &str, v: &Option<String>) {
@@ -777,6 +838,7 @@ mod tests {
             ],
             iterations: 99, // ignored: data rows decide the count
             delay: Duration::ZERO,
+            bail: false,
         };
         let mut items = Vec::new();
         let (env, _) = rt.block_on(run_collection(client, plan, Vars::default(), |item| {
@@ -876,6 +938,7 @@ mod tests {
             data: vec![],
             iterations: 1,
             delay: Duration::ZERO,
+            bail: false,
         };
         let mut items = Vec::new();
         let (env, _) = rt.block_on(run_collection(
@@ -900,6 +963,7 @@ mod tests {
             data: vec![],
             iterations: 1,
             delay: Duration::ZERO,
+            bail: false,
         };
         let mut items = Vec::new();
         rt.block_on(run_collection(client, plan, Vars::default(), |item| {
@@ -913,6 +977,48 @@ mod tests {
                 .unwrap()
                 .contains("\"nope\"")
         );
+    }
+
+    /// With bail, a run ends at its first failure instead of piling up more of them.
+    #[test]
+    fn bail_stops_the_run_at_the_first_failure() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt.block_on(build_client(Network::default())).unwrap();
+        let base = crate::http::tests::echo_server();
+        let req = |tests: &str| Request {
+            url: format!("{base}/x"),
+            tests: tests.into(),
+            ..Default::default()
+        };
+        let fail = r#"pm.test("no", function () { pm.expect(1).to.equal(2); });"#;
+        let plan = |bail| RunPlan {
+            requests: vec![
+                ("a".into(), req("")),
+                ("b".into(), req(fail)),
+                ("c".into(), req("")),
+            ],
+            data: vec![],
+            iterations: 2,
+            delay: Duration::ZERO,
+            bail,
+        };
+        for (bail, ran) in [
+            (false, &["a", "b", "c", "a", "b", "c"][..]),
+            (true, &["a", "b"]),
+        ] {
+            let mut names = Vec::new();
+            rt.block_on(run_collection(
+                client.clone(),
+                plan(bail),
+                Vars::default(),
+                |i| names.push(i.name),
+            ));
+            assert_eq!(names, ran, "bail: {bail}");
+        }
     }
 
     #[test]
