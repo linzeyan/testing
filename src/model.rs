@@ -59,6 +59,10 @@ pub struct Request {
     pub settings: Settings,
     #[serde(skip_serializing_if = "Mqtt::is_default")]
     pub mqtt: Mqtt,
+    /// Messages kept to send again on a stream (WebSocket, Socket.IO, MQTT, gRPC), as
+    /// Postman's saved messages.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<String>,
     /// Saved responses, for reference and documentation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<Example>,
@@ -280,6 +284,7 @@ impl Default for Request {
             mqtt: Mqtt::default(),
             asserts: Vec::new(),
             response_vars: Vec::new(),
+            messages: Vec::new(),
             examples: Vec::new(),
             inherited: Inherited::default(),
         }
@@ -834,6 +839,7 @@ impl Request {
             },
             asserts: Vec::new(),
             response_vars: Vec::new(),
+            messages: Vec::new(),
             examples: Vec::new(),
             inherited: Inherited::default(),
         };
@@ -890,6 +896,7 @@ impl Request {
             response_vars,
             settings,
             mqtt,
+            messages,
             examples,
             inherited: _,
         } = self;
@@ -899,6 +906,7 @@ impl Request {
             && (headers, pre_request, tests) == (&other.headers, &other.pre_request, &other.tests)
             && (asserts, settings, mqtt) == (&other.asserts, &other.settings, &other.mqtt)
             && (examples, response_vars) == (&other.examples, &other.response_vars)
+            && messages == &other.messages
             && (body == &other.body || body.is_empty() && other.body.is_empty())
             && (auth == &other.auth || auth.is_unset() && other.auth.is_unset())
     }
@@ -1155,6 +1163,7 @@ mod tests {
                 .into(),
             asserts: vec![KeyValue::new("res.body.items", "length 3")],
             response_vars: vec![KeyValue::new("token", "res.body.access_token")],
+            messages: vec!["{\"op\": \"subscribe\"}".into()],
             settings: Settings {
                 http_version: HttpVersion::Http1,
                 follow_redirects: false,

@@ -56,6 +56,10 @@ MQTT:
 - TLS takes the network settings' CA file, client certificate and "accept any certificate".
   The connection goes through the proxy https would use, tunnelled with CONNECT.
 
+Every stream's log narrows to received or sent messages (↓ ↑) and to text, which keeps up
+with a busy feed. The bookmark under Send keeps the typed message in the request; the list
+beside it puts a kept one back in the box.
+
 ## Requests
 
 **Bodies**

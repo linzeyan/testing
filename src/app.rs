@@ -346,7 +346,56 @@ struct StreamSession {
     hint: &'static str,
     live: bool,
     compose: String,
+    filter: LogFilter,
     abort: tokio::task::AbortHandle,
+}
+
+/// What the stream log shows when filtered. The log only grows at the end and loses its
+/// oldest, so each event is looked at once per filter rather than every frame.
+#[derive(Default)]
+struct LogFilter {
+    text: String,
+    /// None: every event; Some(true): received messages only; Some(false): sent ones.
+    received: Option<bool>,
+    /// What `hits` was found for: the text lowercased, and `received`.
+    key: (String, Option<bool>),
+    /// Numbers of the events kept (counted as `Log::dropped` counts), oldest first.
+    hits: VecDeque<u64>,
+    /// Events up to this number have been looked at.
+    seen: u64,
+}
+
+impl LogFilter {
+    fn active(&self) -> bool {
+        !self.text.trim().is_empty() || self.received.is_some()
+    }
+
+    fn update(&mut self, log: &Log) {
+        let key = (self.text.trim().to_lowercase(), self.received);
+        if key != self.key {
+            (self.key, self.seen) = (key, 0);
+            self.hits.clear();
+        }
+        while self.hits.front().is_some_and(|n| *n < log.dropped) {
+            self.hits.pop_front();
+        }
+        let end = log.dropped + log.events.len() as u64;
+        for n in self.seen.max(log.dropped)..end {
+            let (text, received) = &self.key;
+            let event = &log.events[(n - log.dropped) as usize].1;
+            let (dir, said) = match event {
+                Event::In(s) => (Some(true), s),
+                Event::Out(s) => (Some(false), s),
+                Event::Open(s) | Event::Info(s) | Event::Closed(s) | Event::Error(s) => (None, s),
+            };
+            if (received.is_none() || dir == *received)
+                && (text.is_empty() || said.to_lowercase().contains(text.as_str()))
+            {
+                self.hits.push_back(n);
+            }
+        }
+        self.seen = end;
+    }
 }
 
 enum Outgoing {
@@ -2202,6 +2251,7 @@ impl App {
                 .take()
                 .map(|s| s.compose.clone())
                 .unwrap_or_default(),
+            filter: LogFilter::default(),
             abort: task.abort_handle(),
         });
     }
@@ -4534,7 +4584,8 @@ impl App {
             if streaming {
                 match session {
                     Some(s) => {
-                        if let Err(e) = stream_ui(ui, s, &mut open.draft.mqtt, &all_vars) {
+                        let draft = &mut open.draft;
+                        if let Err(e) = stream_ui(ui, s, draft, &all_vars) {
                             self.status = e;
                         }
                     }
@@ -9108,10 +9159,16 @@ impl StreamSession {
 fn stream_ui(
     ui: &mut egui::Ui,
     s: &mut StreamSession,
-    mqtt: &mut model::Mqtt,
+    draft: &mut Request,
     vars: &HashMap<String, String>,
 ) -> Result<(), String> {
+    let (mqtt, saved) = (&mut draft.mqtt, &mut draft.messages);
     let mut sent = Ok(());
+    let (total, shown) = {
+        let log = s.log.lock().unwrap();
+        s.filter.update(&log);
+        (log.events.len(), s.filter.hits.len())
+    };
     ui.horizontal(|ui| {
         if s.live {
             // A spinner here drew every frame for as long as the connection lasted.
@@ -9122,11 +9179,31 @@ fn stream_ui(
         } else {
             ui.weak(t("Not connected"));
         }
-        ui.weak(tf("· {} events", &[&s.log.lock().unwrap().events.len()]));
+        match s.filter.active() {
+            true => ui.weak(tf("· {} of {} events", &[&shown, &total])),
+            false => ui.weak(tf("· {} events", &[&total])),
+        };
         if ui.small_button(t("Clear")).clicked() {
             s.log.lock().unwrap().clear();
             s.selected = None;
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let f = &mut s.filter;
+            ui.add(
+                egui::TextEdit::singleline(&mut f.text)
+                    .hint_text(t("Filter messages"))
+                    .desired_width(160.0),
+            );
+            for (dir, glyph, label) in [
+                (false, icon::ARROW_UP, t("Sent only")),
+                (true, icon::ARROW_DOWN, t("Received only")),
+            ] {
+                let on = f.received == Some(dir);
+                if icon_button(ui, glyph, label, Some(on)).clicked() {
+                    f.received = (!on).then_some(dir);
+                }
+            }
+        });
     });
     if matches!(s.outgoing, Some(Outgoing::Mqtt(_))) {
         // Part of the request, as in Postman, so it's there next time.
@@ -9157,17 +9234,23 @@ fn stream_ui(
                         .desired_width(ui.available_width() - send_w - 8.0),
                 );
             }
-            if ui
-                .add_sized([send_w, 22.0], egui::Button::new(t("Send")))
-                .on_hover_text(ui.ctx().format_shortcut(&SEND))
-                .clicked()
-            {
-                sent = s.send_compose(Some(mqtt), vars);
-            }
+            ui.vertical(|ui| {
+                if ui
+                    .add_sized([send_w, 22.0], egui::Button::new(t("Send")))
+                    .on_hover_text(ui.ctx().format_shortcut(&SEND))
+                    .clicked()
+                {
+                    sent = s.send_compose(Some(mqtt), vars);
+                }
+                ui.horizontal(|ui| saved_messages(ui, &mut s.compose, saved));
+            });
         });
     }
     ui.separator();
     let log = s.log.lock().unwrap();
+    // Again: the connection may have logged more since the counts above.
+    s.filter.update(&log);
+    let filtered = s.filter.active().then_some(&s.filter.hits);
     // The selected event, whole, under the list; gone once it scrolls out of the log.
     let selected = s.selected.as_ref().map(|(n, _)| *n);
     let at = |n: u64| n.checked_sub(log.dropped).map(|i| i as usize);
@@ -9203,47 +9286,55 @@ fn stream_ui(
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .stick_to_bottom(true)
-        .show_rows(ui, row_h, log.events.len(), |ui, rows| {
-            for i in rows {
-                let (at, event) = &log.events[i];
-                let (badge, color, text) = match event {
-                    Event::Open(t) => ("OPEN", GREEN, t),
-                    Event::Info(t) => ("INFO", Color32::GRAY, t),
-                    Event::In(t) => ("IN", Color32::from_rgb(90, 160, 230), t),
-                    Event::Out(t) => ("OUT", ORANGE, t),
-                    Event::Closed(t) => ("CLOSED", Color32::GRAY, t),
-                    Event::Error(t) => ("ERROR", RED, t),
-                };
-                let n = log.dropped + i as u64;
-                ui.horizontal(|ui| {
-                    ui.set_height(row_h);
-                    ui.weak(format!("{:>8.3}", at.as_secs_f32()));
-                    ui.add_sized(
-                        [56.0, row_h],
-                        egui::Label::new(RichText::new(badge).color(color).strong().monospace()),
-                    );
-                    let line: String = text
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(300)
-                        .collect();
-                    let mut line = RichText::new(line).monospace();
-                    if selected == Some(n) {
-                        line = line.background_color(ui.visuals().selection.bg_fill);
-                    }
-                    let row = ui.add(
-                        egui::Label::new(line)
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                    );
-                    if row.on_hover_text(t("Click to see it whole")).clicked() {
-                        clicked = Some((n, text));
-                    }
-                });
-            }
-        });
+        .show_rows(
+            ui,
+            row_h,
+            filtered.map_or(log.events.len(), VecDeque::len),
+            |ui, rows| {
+                for row in rows {
+                    let i = filtered.map_or(row, |hits| (hits[row] - log.dropped) as usize);
+                    let (at, event) = &log.events[i];
+                    let (badge, color, text) = match event {
+                        Event::Open(t) => ("OPEN", GREEN, t),
+                        Event::Info(t) => ("INFO", Color32::GRAY, t),
+                        Event::In(t) => ("IN", Color32::from_rgb(90, 160, 230), t),
+                        Event::Out(t) => ("OUT", ORANGE, t),
+                        Event::Closed(t) => ("CLOSED", Color32::GRAY, t),
+                        Event::Error(t) => ("ERROR", RED, t),
+                    };
+                    let n = log.dropped + i as u64;
+                    ui.horizontal(|ui| {
+                        ui.set_height(row_h);
+                        ui.weak(format!("{:>8.3}", at.as_secs_f32()));
+                        ui.add_sized(
+                            [56.0, row_h],
+                            egui::Label::new(
+                                RichText::new(badge).color(color).strong().monospace(),
+                            ),
+                        );
+                        let line: String = text
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(300)
+                            .collect();
+                        let mut line = RichText::new(line).monospace();
+                        if selected == Some(n) {
+                            line = line.background_color(ui.visuals().selection.bg_fill);
+                        }
+                        let row = ui.add(
+                            egui::Label::new(line)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        );
+                        if row.on_hover_text(t("Click to see it whole")).clicked() {
+                            clicked = Some((n, text));
+                        }
+                    });
+                }
+            },
+        );
     if let Some((n, text)) = clicked {
         s.selected = match selected == Some(n) {
             true => None,
@@ -9252,6 +9343,52 @@ fn stream_ui(
         };
     }
     sent
+}
+
+/// Under Send: keep the typed message in the request, and the list of those kept, to put
+/// one back in the compose box.
+fn saved_messages(ui: &mut egui::Ui, compose: &mut String, saved: &mut Vec<String>) {
+    let new = !compose.trim().is_empty() && !saved.contains(compose);
+    let save = t("Save this message in the request");
+    if (ui.add_enabled_ui(new, |ui| icon_button(ui, icon::BOOKMARK_SIMPLE, save, None)))
+        .inner
+        .clicked()
+    {
+        saved.push(compose.clone());
+    }
+    let list = icon_button(
+        ui,
+        icon::LIST,
+        &tf("Saved messages ({})", &[&saved.len()]),
+        None,
+    );
+    egui::Popup::menu(&list).show(|ui| {
+        if saved.is_empty() {
+            ui.weak(t("None yet: type a message and press the bookmark."));
+        }
+        let mut remove = None;
+        for (i, message) in saved.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let first: String = message
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
+                if ui.button(first).on_hover_text(message.as_str()).clicked() {
+                    *compose = message.clone();
+                    ui.close();
+                }
+                if icon_button(ui, icon::X, t("Remove"), None).clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            saved.remove(i);
+        }
+    });
 }
 
 /// The open request's past responses, newest first, and what the user did with them.
@@ -12060,6 +12197,128 @@ mod ui_tests {
             }
         );
         assert!(h.query_by_label_contains("too big to edit").is_none());
+    }
+
+    /// The stream log's filter keeps the direction and text asked for, and follows the log
+    /// as it grows and is cleared, numbering events as the log does.
+    #[test]
+    fn the_stream_filter_follows_the_log() {
+        let mut log = Log::default();
+        let at = Duration::ZERO;
+        log.push(at, Event::Open("connected".into()));
+        log.push(at, Event::Out("subscribe BTC".into()));
+        log.push(at, Event::In("btc price 1".into()));
+        log.push(at, Event::In("eth price 2".into()));
+        let mut f = LogFilter {
+            received: Some(true),
+            ..Default::default()
+        };
+        f.update(&log);
+        assert_eq!(f.hits, [2, 3]);
+        f.text = "BTC ".into();
+        f.update(&log);
+        assert_eq!(f.hits, [2]);
+        f.received = None;
+        f.update(&log);
+        assert_eq!(f.hits, [1, 2], "either way, whatever the case");
+        log.push(at, Event::In("btc price 3".into()));
+        f.update(&log);
+        assert_eq!(f.hits, [1, 2, 4], "only the new event is looked at");
+        log.clear();
+        log.push(at, Event::In("btc price 4".into()));
+        f.update(&log);
+        assert_eq!(f.hits, [5]);
+    }
+
+    /// On a live WebSocket: a message saved in the request comes back from its list, and
+    /// the log narrows to received messages and to text.
+    #[test]
+    fn stream_messages_are_saved_and_the_log_filtered() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let Ok(mut ws) = tungstenite::accept(s) else {
+                        return;
+                    };
+                    while let Ok(m) = ws.read() {
+                        if m.is_text() && ws.send(m).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let ws = workspace("stream-filter");
+        let path = ws.create_request(&ws.collections(), "socket").unwrap();
+        let req = Request {
+            method: "WS".into(),
+            url: format!("ws://{addr}/"),
+            ..Default::default()
+        };
+        ws.save_request(&path, &req).unwrap();
+        let mut h = harness(ws);
+        h.run();
+        h.state_mut().activate(path, true);
+        h.run();
+        h.get_by_label("Connect").click();
+        let received = |n: usize| {
+            move |app: &App| {
+                let events = app.stream.as_ref().map(|s| s.events()).unwrap_or_default();
+                events
+                    .iter()
+                    .filter(|(_, e)| matches!(e, Event::In(_)))
+                    .count()
+                    == n
+            }
+        };
+        let say = |h: &mut Harness<'_, App>, text: &str, n: usize| {
+            h.state_mut().stream.as_mut().unwrap().compose = text.into();
+            h.run();
+            button(h, "Send").click();
+            wait_live(h, received(n));
+        };
+        wait_live(&mut h, |app| {
+            app.stream.as_ref().is_some_and(|s| s.outgoing.is_some())
+        });
+        say(&mut h, "hello alpha", 1);
+        h.get_by_label("Save this message in the request").click();
+        h.run();
+        assert_eq!(draft(&h).messages, ["hello alpha"]);
+        say(&mut h, "beta", 2);
+        assert_eq!(
+            h.get_all_by_label("hello alpha").count(),
+            2,
+            "sent and echoed"
+        );
+
+        h.get_by_label("Received only").click();
+        h.run();
+        assert_eq!(h.get_all_by_label("hello alpha").count(), 1);
+        assert_eq!(h.get_all_by_label("beta").count(), 1);
+        let filter = h
+            .get_all_by_role(Role::TextInput)
+            .find(|n| n.accesskit_node().placeholder() == Some("Filter messages"));
+        filter.unwrap().click();
+        h.run();
+        let filter = h
+            .get_all_by_role(Role::TextInput)
+            .find(|n| n.accesskit_node().placeholder() == Some("Filter messages"));
+        filter.unwrap().type_text("ALPHA");
+        h.run();
+        shot(&mut h, "93-stream-filter");
+        assert_eq!(h.get_all_by_label("hello alpha").count(), 1);
+        assert_eq!(h.query_all_by_label("beta").count(), 0);
+
+        h.state_mut().stream.as_mut().unwrap().compose.clear();
+        h.get_by_label("Saved messages (1)").click();
+        h.run();
+        shot(&mut h, "94-saved-messages");
+        let by = egui_kittest::kittest::By::new().role(Role::Button);
+        h.get(by.label("hello alpha")).click();
+        h.run();
+        assert_eq!(h.state().stream.as_ref().unwrap().compose, "hello alpha");
     }
 
     /// A row in the Vars tab, sent as the user would, lands in the selected environment.

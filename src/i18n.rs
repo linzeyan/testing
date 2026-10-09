@@ -372,6 +372,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Disconnect", "中斷連線"),
     ("Docs", "文件"),
     ("Domain", "網域"),
+    (
+        "None yet: type a message and press the bookmark.",
+        "還沒有：輸入訊息後按書籤圖示。",
+    ),
     ("Drag to change the order", "拖曳以調整順序"),
     ("Don't check", "不檢查"),
     (
@@ -538,6 +542,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "每一列從回應取一個值設成變數，在指令碼與斷言執行前完成，所以它們都能使用。鍵：變數名稱，例如 token。值：要取什麼，寫法同斷言：res.body.access_token、res.body.items[0].id、res.headers['x-request-id']、res.status。存進選定的環境（沒選環境時存進全域變數），與 pm.environment.set 相同。失敗或取不到值的列會出現在「測試」下。",
     ),
     ("Examples", "範例"),
+    ("Filter messages", "篩選訊息"),
     (
         "Export the results as JUnit XML…",
         "將結果匯出為 JUnit XML…",
@@ -972,6 +977,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "Requests you send show up here.",
         "送出的請求會出現在這裡。",
     ),
+    ("Received only", "只看收到"),
     ("Reset", "重設"),
     (
         "Reset to the tree's order, all ticked",
@@ -1143,6 +1149,9 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Status", "狀態"),
     ("Status code is 200", "狀態碼為 200"),
     ("Status codes", "狀態碼"),
+    ("Save this message in the request", "把這則訊息存進請求"),
+    ("Saved messages ({})", "已存的訊息 ({})"),
+    ("Sent only", "只看送出"),
     ("Stop", "停止"),
     ("Stop at the first failure", "遇到第一個失敗就停止"),
     ("stopped at the first failure", "已在第一個失敗處停止"),
@@ -1413,6 +1422,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "{}等待（TTFB）{} ms{}\n下載 {} ms",
     ),
     ("· {} events", "· {} 個事件"),
+    ("· {} of {} events", "· {} 個事件（共 {} 個）"),
     ("… and {} more", "…還有 {} 個"),
     ("▶ Run", "▶ 執行"),
     ("▶ Start", "▶ 開始"),
