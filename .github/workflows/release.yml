@@ -32,6 +32,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             check: true
+          # Native on GitHub's arm runner (free for public repositories); tests already ran
+          # on x86_64 Linux above.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            check: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7

@@ -22,6 +22,7 @@ Download the archive for your system from
 | macOS, Apple silicon | `apitool-v<version>-aarch64-apple-darwin.tar.gz` |
 | macOS, Intel | `apitool-v<version>-x86_64-apple-darwin.tar.gz` |
 | Linux x64 | `apitool-v<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `apitool-v<version>-aarch64-unknown-linux-gnu.tar.gz` |
 
 Each archive holds `apitool` (the GUI) and `apitool-cli` (runner, docs, mock server and
 MCP server). apitool looks for a newer release once a day and offers to install it in

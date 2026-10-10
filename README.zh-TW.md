@@ -21,6 +21,7 @@
 | macOS（Apple 晶片） | `apitool-v<version>-aarch64-apple-darwin.tar.gz` |
 | macOS（Intel） | `apitool-v<version>-x86_64-apple-darwin.tar.gz` |
 | Linux x64 | `apitool-v<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 | `apitool-v<version>-aarch64-unknown-linux-gnu.tar.gz` |
 
 每個壓縮檔都包含 `apitool`（GUI）與 `apitool-cli`（執行器、文件、模擬伺服器與 MCP 伺服器）。
 apitool 預設每天檢查一次新版本，找到時會提供原地安裝，下次啟動生效；可在「設定 > 更新」調整
