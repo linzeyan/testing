@@ -17,7 +17,7 @@ fn main() -> eframe::Result {
             eframe::Renderer::Wgpu
         },
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
+            .with_inner_size(app::WINDOW_SIZE)
             .with_min_inner_size([720.0, 480.0])
             .with_title("apitool")
             .with_icon(Arc::new(
@@ -87,6 +87,7 @@ fn main() -> eframe::Result {
             log::info!("{}", renderer.replace('\n', ", "));
             let mut app = app::App::new(ws, renderer);
             app.auto_update();
+            app.restore_window(cc.storage);
             Ok(Box::new(app))
         }),
     );

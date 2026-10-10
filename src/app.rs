@@ -899,6 +899,8 @@ pub struct App {
     title_bar: Option<(bool, Option<egui::Theme>)>,
     /// Whether the window was checked against the screen yet, which happens once.
     fitted: bool,
+    /// The window as last saved neither maximized nor full screen (see `save`).
+    window: Option<WindowSettings>,
     settings: bool,
     /// The one Settings shows; the last one looked at, unless something opens another.
     settings_tab: SettingsTab,
@@ -1011,6 +1013,7 @@ impl App {
             applied: None,
             title_bar: None,
             fitted: false,
+            window: None,
             updates: state.updates.clone(),
             update: Update::Idle,
             auto_update: false,
@@ -1678,6 +1681,11 @@ impl App {
     pub fn auto_update(&mut self) {
         crate::update::clean_up();
         self.auto_update = true;
+    }
+
+    /// For the real app: the window as saved last time, which `save` keeps un-maximized.
+    pub fn restore_window(&mut self, storage: Option<&dyn eframe::Storage>) {
+        self.window = storage.and_then(|s| eframe::get_value(s, WINDOW_KEY));
     }
 
     fn check_updates(&mut self, ctx: &egui::Context) {
@@ -2996,10 +3004,55 @@ fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Kind)> {
     out
 }
 
+/// The window's size on first start, and to un-maximize to when it was never seen otherwise.
+pub const WINDOW_SIZE: [f32; 2] = [1200.0, 800.0];
+
+/// eframe's key for the window in `.window.ron`.
+const WINDOW_KEY: &str = "window";
+
+/// The window as eframe saves it: egui-winit's `WindowSettings`, whose fields are private
+/// (`window_settings_match_egui_winit` keeps the two alike).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Default, PartialEq, Debug)]
+#[serde(default)]
+struct WindowSettings {
+    inner_position_pixels: Option<egui::Pos2>,
+    outer_position_pixels: Option<egui::Pos2>,
+    fullscreen: bool,
+    maximized: bool,
+    inner_size_points: Option<egui::Vec2>,
+}
+
 impl eframe::App for App {
     /// Only the window is kept (persistence): the app keeps its own state in the workspace.
     fn persist_egui_memory(&self) -> bool {
         false
+    }
+
+    /// eframe has just put the window as it is into `storage`. Maximized, it came back at
+    /// the maximized size, so un-maximizing it then left it filling the screen (seen on
+    /// macOS): the size and place from before are saved instead, for the system to return to.
+    /// Learned from these saves, not from frames: macOS zooms in steps, each not maximized.
+    // ponytail: eframe saves every 30 s, so a resize in the 30 s before maximizing is missed
+    // (seen on the VM); tracking frames instead needs to tell a zoom's steps from a resize.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let Some(now) = eframe::get_value::<WindowSettings>(storage, WINDOW_KEY) else {
+            return;
+        };
+        if !now.maximized && !now.fullscreen {
+            self.window = Some(now);
+            return;
+        }
+        // Maximized since it started (the first save is 30 s in): placed by the system.
+        let normal = self.window.unwrap_or(WindowSettings {
+            inner_size_points: Some(WINDOW_SIZE.into()),
+            ..Default::default()
+        });
+        let kept = WindowSettings {
+            maximized: now.maximized,
+            fullscreen: now.fullscreen,
+            ..normal
+        };
+        eframe::set_value(storage, WINDOW_KEY, &kept);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -10834,6 +10887,90 @@ mod ui_tests {
             h.step();
             assert!(!maximize(&h), "{screen:?}");
         }
+    }
+
+    /// `.window.ron` in memory.
+    #[derive(Default)]
+    struct Stored(HashMap<String, String>);
+
+    impl eframe::Storage for Stored {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.into(), value);
+        }
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn window_settings_match_egui_winit() {
+        // A field renamed upstream would go unread, and the window back at the maximized size.
+        let (mut ours, mut theirs) = (Stored::default(), Stored::default());
+        eframe::set_value(&mut ours, WINDOW_KEY, &WindowSettings::default());
+        eframe::set_value(
+            &mut theirs,
+            WINDOW_KEY,
+            &egui_winit::WindowSettings::default(),
+        );
+        assert_eq!(ours.0, theirs.0);
+    }
+
+    #[test]
+    fn a_maximized_window_is_saved_with_its_size_from_before() {
+        // As eframe saved them on the macOS VM: moved and resized, then zoomed.
+        let normal = WindowSettings {
+            inner_position_pixels: Some(egui::pos2(1440.0, 478.0)),
+            outer_position_pixels: Some(egui::pos2(1440.0, 414.0)),
+            inner_size_points: Some(egui::vec2(900.0, 600.0)),
+            ..Default::default()
+        };
+        let zoomed = WindowSettings {
+            inner_position_pixels: Some(egui::pos2(0.0, 124.0)),
+            outer_position_pixels: Some(egui::pos2(0.0, 60.0)),
+            maximized: true,
+            inner_size_points: Some(egui::vec2(2240.0, 1108.0)),
+            ..Default::default()
+        };
+        // eframe writes the window as it is, then calls save.
+        fn save(app: &mut App, storage: &mut Stored, now: WindowSettings) -> WindowSettings {
+            eframe::set_value(storage, WINDOW_KEY, &now);
+            eframe::App::save(app, storage);
+            eframe::get_value(storage, WINDOW_KEY).unwrap()
+        }
+        let mut storage = Stored::default();
+        let mut h = harness(workspace("window-save"));
+        // Maximized before the first save: the first start's size, placed by the system.
+        let first = WindowSettings {
+            maximized: true,
+            inner_size_points: Some(WINDOW_SIZE.into()),
+            ..Default::default()
+        };
+        assert_eq!(save(h.state_mut(), &mut storage, zoomed), first);
+        assert_eq!(save(h.state_mut(), &mut storage, normal), normal);
+        let back = WindowSettings {
+            maximized: true,
+            ..normal
+        };
+        assert_eq!(save(h.state_mut(), &mut storage, zoomed), back);
+        let full = WindowSettings {
+            fullscreen: true,
+            maximized: false,
+            ..zoomed
+        };
+        let back_full = WindowSettings {
+            fullscreen: true,
+            ..normal
+        };
+        assert_eq!(save(h.state_mut(), &mut storage, full), back_full);
+        // Started again maximized, and never un-maximized: still the size from before.
+        let mut h = harness(workspace("window-save-again"));
+        eframe::set_value(&mut storage, WINDOW_KEY, &back);
+        h.state_mut().restore_window(Some(&storage));
+        assert_eq!(save(h.state_mut(), &mut storage, zoomed), back);
     }
 
     /// The button saying `label`, a shortcut beside it or not. By role: the shortcut list
