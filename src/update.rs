@@ -239,9 +239,10 @@ pub fn clean_up() {
     });
 }
 
-/// Starts the binary now in place of this one, with the same arguments.
+/// Starts the binary the update put in place of this one, with the same arguments. By name:
+/// on Linux current_exe follows this one's rename to apitool.old (seen on the VM).
 pub fn restart() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = here()?.join(name("apitool"));
     let args = std::env::args_os().skip(1);
     std::process::Command::new(exe)
         .args(args)
