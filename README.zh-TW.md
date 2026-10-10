@@ -188,7 +188,8 @@ Postman 風格的請求前與測試指令碼，預設是空的，由你自己撰
 在分頁上按右鍵可複製一份，或關閉其他分頁、右側分頁或所有分頁，有未儲存變更的分頁會保持開啟。
 
 **版面**：回應預設在請求右側；視窗寬度不夠排兩欄時改為上下堆疊，拉寬後恢復。狀態列的「左右
-並排」可關閉這個行為，「側邊欄」可收起樹狀清單；兩者在重新啟動後都會保留。
+並排」可關閉這個行為，「側邊欄」可收起樹狀清單；兩者在重新啟動後都會保留，視窗的大小、位置
+與是否最大化也是。螢幕放不下預設大小的視窗時，會自動最大化。
 
 ## 鍵盤快捷鍵
 
@@ -312,7 +313,7 @@ HTTP/2（h2c，prior knowledge）皆可。此時用戶端還能看到目前開�
 | | macOS 與 Linux | Windows |
 |---|---|---|
 | 工作區 | `$APITOOL_WORKSPACE`，未設定時為 `$XDG_DATA_HOME/apitool`（`~/.local/share/apitool`） | `$APITOOL_WORKSPACE`，未設定時為執行檔旁的 `workspace/` |
-| 記錄檔 `apitool.log` | `$XDG_STATE_HOME/apitool`（`~/.local/state/apitool`） | 工作區內 |
+| 記錄檔 `apitool.log`、視窗狀態 `.window.ron` | `$XDG_STATE_HOME/apitool`（`~/.local/state/apitool`） | 工作區內 |
 
 工作區把所有資料存在單一 SQLite 檔 `apitool.db`。集合、環境與全域變數另外以 TOML 寫在旁邊，
 方便納入 git（`collections/`、`environments/`、`globals.toml`），雙向自動保持一致，不需要任何

@@ -897,6 +897,8 @@ pub struct App {
     /// The theme the native title bar was last given (dark?), and the system's then: the
     /// system changing it re-darkens it (Windows, `appearance::title_bar`).
     title_bar: Option<(bool, Option<egui::Theme>)>,
+    /// Whether the window was checked against the screen yet, which happens once.
+    fitted: bool,
     settings: bool,
     /// The one Settings shows; the last one looked at, unless something opens another.
     settings_tab: SettingsTab,
@@ -904,8 +906,6 @@ pub struct App {
     update: Update,
     /// Checks on `updates`' schedule. Only the real app does: tests mustn't reach GitHub.
     auto_update: bool,
-    /// Start the installed update once the window has closed.
-    restart: bool,
     /// The system's fonts for the pickers, read when Settings first opens.
     font_families: Option<Vec<(String, bool)>>,
     mock: Option<MockServer>,
@@ -1010,10 +1010,10 @@ impl App {
             appearance: state.appearance.clone(),
             applied: None,
             title_bar: None,
+            fitted: false,
             updates: state.updates.clone(),
             update: Update::Idle,
             auto_update: false,
-            restart: false,
             settings: false,
             settings_tab: SettingsTab::General,
             font_families: None,
@@ -2997,6 +2997,11 @@ fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Kind)> {
 }
 
 impl eframe::App for App {
+    /// Only the window is kept (persistence): the app keeps its own state in the workspace.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         crate::i18n::set(self.appearance.language);
         self.log_frame(frame.info().cpu_usage);
@@ -3011,6 +3016,21 @@ impl eframe::App for App {
         if self.title_bar != title_bar {
             crate::appearance::title_bar(frame, dark);
             self.title_bar = title_bar;
+        }
+        // The default size suits a desktop monitor, but at 150–175% on a laptop it ran under
+        // the taskbar, hiding the status bar. Once: un-maximizing is the user's to do.
+        if !self.fitted
+            && let Some((outer, screen)) =
+                ui.input(|i| Some((i.viewport().outer_rect?, i.viewport().monitor_size?)))
+        {
+            self.fitted = true;
+            // ponytail: the work area isn't known, so a fixed allowance stands in for a taskbar
+            // or dock plus where the system puts a new window (Windows cascades it ~120 points
+            // down).
+            let fits = outer.width() <= screen.x && outer.height() + 160.0 <= screen.y;
+            if !fits && ui.input(|i| i.viewport().maximized) != Some(true) {
+                (ui.ctx()).send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
         }
         self.receive(ui.ctx());
         self.serve_mcp(ui.ctx());
@@ -3147,11 +3167,6 @@ impl eframe::App for App {
                 self.dialog = Some(Dialog::Unsaved(Next::Quit));
             } else {
                 self.sync();
-                if self.restart
-                    && let Err(e) = crate::update::restart()
-                {
-                    log::error!("restarting: {e}");
-                }
             }
         }
 
@@ -6472,7 +6487,7 @@ impl App {
         }
         if restart {
             // Through the usual close, which asks about unsaved edits first.
-            self.restart = true;
+            (crate::update::RESTART).store(true, std::sync::atomic::Ordering::Relaxed);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -10797,6 +10812,28 @@ mod ui_tests {
         std::fs::create_dir_all("/tmp/apitool-shots").unwrap();
         let img = h.render().unwrap();
         img.save(format!("/tmp/apitool-shots/{name}.png")).unwrap();
+    }
+
+    #[test]
+    fn a_window_too_big_for_the_screen_is_maximized_once() {
+        use egui::{ViewportCommand, ViewportId};
+        // The default window as Windows placed it at 175% on 2038×1588 (the status bar went
+        // under the taskbar), then on a 1080p monitor at 100%, where it fits.
+        let outer = egui::Rect::from_min_size(egui::pos2(130.0, 124.0), egui::vec2(1164.0, 831.0));
+        for (screen, too_big) in [([1164.0, 907.0], true), ([1920.0, 1080.0], false)] {
+            let mut h = harness(workspace(&format!("fit-{too_big}")));
+            let root = h.input_mut().viewports.get_mut(&ViewportId::ROOT).unwrap();
+            (root.outer_rect, root.monitor_size) = (Some(outer), Some(screen.into()));
+            let maximize = |h: &Harness<'_, App>| {
+                let out = &h.output().viewport_output[&ViewportId::ROOT];
+                out.commands.contains(&ViewportCommand::Maximized(true))
+            };
+            h.step();
+            assert_eq!(maximize(&h), too_big, "{screen:?}");
+            // Un-maximized again by the user: left that way.
+            h.step();
+            assert!(!maximize(&h), "{screen:?}");
+        }
     }
 
     /// The button saying `label`, a shortcut beside it or not. By role: the shortcut list

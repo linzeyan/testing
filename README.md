@@ -202,7 +202,8 @@ right or all, which leaves tabs with unsaved edits open.
 
 **Layout**: the response sits beside the request; a window too narrow for two columns stacks
 them until it's wider. "Side by side" in the status bar turns that off and "Sidebar" folds
-the tree away; both are kept across restarts.
+the tree away; both are kept across restarts, as are the window's size, place and
+maximized. A screen too small for the default window gets it maximized.
 
 ## Keyboard shortcuts
 
@@ -333,7 +334,7 @@ requests, presses Send and switches environments, and its changes show at once.
 | | macOS and Linux | Windows |
 |---|---|---|
 | Workspace | `$APITOOL_WORKSPACE`, else `$XDG_DATA_HOME/apitool` (`~/.local/share/apitool`) | `$APITOOL_WORKSPACE`, else `workspace/` next to the executable |
-| Log, `apitool.log` | `$XDG_STATE_HOME/apitool` (`~/.local/state/apitool`) | The workspace |
+| Log, `apitool.log`; the window, `.window.ron` | `$XDG_STATE_HOME/apitool` (`~/.local/state/apitool`) | The workspace |
 
 The workspace keeps everything in one SQLite file, `apitool.db`. The collections,
 environments and globals are also written beside it as TOML for git (`collections/`,

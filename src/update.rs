@@ -3,6 +3,7 @@
 //! (Windows lets a running exe be renamed, not replaced) and deleted on the next start.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// Release archives are named `apitool-v<version>-<target>.<zip|tar.gz>`.
 const TARGET: &str = env!("APITOOL_TARGET");
 const BINARIES: [&str; 2] = ["apitool", "apitool-cli"];
+/// Set by Restart now; main starts the new binary once the window has closed.
+pub static RESTART: AtomicBool = AtomicBool::new(false);
 
 /// Chosen in Settings.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -217,13 +220,23 @@ fn here() -> Result<PathBuf, String> {
         .ok_or_else(|| "the binary has no folder".into())
 }
 
-/// Deletes the binaries the last update renamed aside: they were running then.
+/// Deletes the binaries the last update renamed aside: they were running then. Retried for
+/// a while on its own thread: after Restart now the old apitool may still be exiting, and
+/// Windows won't delete a running exe (seen on the VM, the new one up in 84 ms).
 pub fn clean_up() {
-    if let Ok(dir) = here() {
-        for binary in BINARIES {
-            let _ = std::fs::remove_file(dir.join(format!("{}.old", name(binary))));
+    let Ok(dir) = here() else { return };
+    std::thread::spawn(move || {
+        for _ in 0..20 {
+            let olds = BINARIES.map(|b| dir.join(format!("{}.old", name(b))));
+            if olds
+                .iter()
+                .all(|old| !old.exists() || std::fs::remove_file(old).is_ok())
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
-    }
+    });
 }
 
 /// Starts the binary now in place of this one, with the same arguments.

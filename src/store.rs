@@ -29,7 +29,7 @@ use crate::model::{Auth, Folder, Inherited, KeyValue, Request};
 const DB: &str = "apitool.db";
 /// The workspace directory may be a git repo of the exported tree; the database and the
 /// per-machine files of older workspaces stay out of it.
-const GITIGNORE: &str = "apitool.db\napitool.db-journal\n*.secret.toml\n.state.toml\n.history.jsonl\n.cookies.json\n*.tmp\napitool.log*\n";
+const GITIGNORE: &str = "apitool.db\napitool.db-journal\n*.secret.toml\n.state.toml\n.history.jsonl\n.cookies.json\n*.tmp\napitool.log*\n.window.ron\n";
 const SECRET_SUFFIX: &str = ".secret";
 const HISTORY: &str = ".history.jsonl";
 /// Starts with a dot, so it is never taken for a request.

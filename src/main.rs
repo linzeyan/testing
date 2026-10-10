@@ -6,7 +6,7 @@ use eframe::egui;
 use eframe::egui_wgpu::WgpuSetup;
 use eframe::wgpu;
 
-use apitool::{app, appearance, logfile, store};
+use apitool::{app, appearance, logfile, store, update};
 
 fn main() -> eframe::Result {
     let use_glow = std::env::args().any(|a| a == "--glow");
@@ -54,6 +54,8 @@ fn main() -> eframe::Result {
     };
     let logs = store::state_dir().unwrap_or_else(|| ws.root.clone());
     logfile::init(Some(logs.join("apitool.log")));
+    // Beside the log rather than eframe's %APPDATA%: on Windows the tool is portable.
+    options.persistence_path = Some(logs.join(".window.ron"));
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
     let version = env!("CARGO_PKG_VERSION");
     log::info!(
@@ -75,7 +77,7 @@ fn main() -> eframe::Result {
             std::thread::sleep(std::time::Duration::from_secs(60));
         }
     });
-    eframe::run_native(
+    let result = eframe::run_native(
         "apitool",
         options,
         Box::new(|cc| {
@@ -87,7 +89,15 @@ fn main() -> eframe::Result {
             app.auto_update();
             Ok(Box::new(app))
         }),
-    )
+    );
+    // Not at the close request: eframe saves the window on a thread it joins only as it
+    // shuts down, so starting the new apitool then could beat the save.
+    if update::RESTART.load(std::sync::atomic::Ordering::Relaxed)
+        && let Err(e) = update::restart()
+    {
+        log::error!("restarting: {e}");
+    }
+    result
 }
 
 fn renderer_info(cc: &eframe::CreationContext<'_>) -> String {

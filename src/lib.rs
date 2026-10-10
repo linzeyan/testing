@@ -35,7 +35,7 @@ pub mod store;
 mod stream;
 mod sync;
 mod syntax;
-mod update;
+pub mod update;
 mod varedit;
 mod vault;
 mod xpath;

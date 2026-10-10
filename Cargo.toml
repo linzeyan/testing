@@ -1,14 +1,15 @@
 [package]
 name = "apitool"
-version = "0.111.2"
+version = "0.112.0"
 edition = "2024"
 
 [dependencies]
 base64 = "0.23"
 csv = "1"
 # x11 and wayland matter only on Linux, where winit needs at least one; both load their
-# libraries at run time, so building needs none installed.
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "glow", "default_fonts", "accesskit", "x11", "wayland"] }
+# libraries at run time, so building needs none installed. persistence keeps the window's
+# size, place and maximized across restarts.
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "glow", "default_fonts", "accesskit", "x11", "wayland", "persistence"] }
 # Already in the tree via eframe (PNG, for icons); JPEG added for the response preview.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # No raster-images (pictures inside an SVG) or svgz: those pull in more decoders.
