@@ -320,6 +320,10 @@ pub async fn socketio(
     // Engine.IO 3 has the client ping every pingInterval, or the server hangs up; from 4
     // on the server pings instead.
     let mut pings: Option<tokio::time::Interval> = None;
+    // A server ignores events sent before it has confirmed the namespace, and MCP queues
+    // its messages before the connection is up: hold them until the CONNECT comes back.
+    let mut joined = false;
+    let mut pending = Vec::new();
     loop {
         tokio::select! {
             _ = async { pings.as_mut().unwrap().tick().await }, if pings.is_some() => {
@@ -328,16 +332,7 @@ pub async fn socketio(
                 }
             },
             out = outgoing.recv() => match out {
-                Some(text) => {
-                    let args = match event_args(&text) {
-                        Ok(a) => a,
-                        Err(e) => { emit(Event::Error(e)); continue; }
-                    };
-                    if let Err(e) = sink.send(Message::Text(format!("42{prefix}{args}"))).await {
-                        return emit(Event::Error(error_chain(&e)));
-                    }
-                    emit(Event::Out(args));
-                }
+                Some(text) => pending.push(text),
                 None => {
                     let _ = sink.send(Message::Text(format!("41{prefix}"))).await;
                     let _ = sink.send(Message::Close { code: CloseCode::Normal, reason: String::new() }).await;
@@ -382,6 +377,7 @@ pub async fn socketio(
                     Some(b'4') if v2 && !ns.is_empty() && text == "40" => {}
                     Some(b'4') => match socketio_packet(&text[1..]) {
                         Packet::Connected => {
+                            joined = true;
                             let at = if ns.is_empty() { "/" } else { &ns };
                             emit(Event::Open(format!("connected to {at}")));
                         }
@@ -392,6 +388,22 @@ pub async fn socketio(
                     _ => {}
                 }
             }
+        }
+        if !joined {
+            continue;
+        }
+        for text in pending.drain(..) {
+            let args = match event_args(&text) {
+                Ok(a) => a,
+                Err(e) => {
+                    emit(Event::Error(e));
+                    continue;
+                }
+            };
+            if let Err(e) = sink.send(Message::Text(format!("42{prefix}{args}"))).await {
+                return emit(Event::Error(error_chain(&e)));
+            }
+            emit(Event::Out(args));
         }
     }
 }
@@ -938,6 +950,70 @@ pub mod tests {
         assert_eq!(event_args("ping").unwrap(), r#"["ping"]"#);
         assert_eq!(event_args("say hi there").unwrap(), r#"["say","hi there"]"#);
         assert!(event_args("[1, 2]").is_err() && event_args("  ").is_err());
+    }
+
+    /// MCP's stream_request queues its messages before the socket is even open; a server
+    /// drops events that come before its CONNECT reply, so they must wait for it.
+    // tungstenite's handshake callback type fixes the error type the lint objects to.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn socketio_holds_queued_events_until_the_namespace_is_joined() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(s).unwrap();
+            let open = r#"0{"sid":"e1","pingInterval":25000,"pingTimeout":20000}"#;
+            ws.send(tungstenite::Message::text(open)).unwrap();
+            let mut got = Vec::new();
+            while let Ok(msg) = ws.read() {
+                let t = msg.to_text().unwrap_or_default().to_owned();
+                if t.starts_with("40/chat,") {
+                    // Slow to confirm, as a server checking auth is.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    ws.send(tungstenite::Message::text(r#"40/chat,{"sid":"s1"}"#))
+                        .unwrap();
+                }
+                got.push(t);
+            }
+            got
+        });
+        let (rt, client) = sio_runtime();
+        let req = Request {
+            method: "SOCKETIO".into(),
+            url: format!("http://{addr}/chat"),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send("first".into()).unwrap();
+        tx.send("second 2".into()).unwrap();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let events = std::sync::Mutex::new(Vec::new());
+        rt.block_on(socketio(client, req, rx, |e| {
+            if matches!(&e, Event::Out(a) if a.contains("second")) {
+                drop(tx.lock().unwrap().take());
+            }
+            events.lock().unwrap().push(e);
+        }));
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "40/chat,",
+                r#"42/chat,["first"]"#,
+                r#"42/chat,["second",2]"#,
+                "41/chat,",
+                ""
+            ]
+        );
+        assert_eq!(
+            events.into_inner().unwrap(),
+            [
+                Event::Open("connected to /chat".into()),
+                Event::Out(r#"["first"]"#.into()),
+                Event::Out(r#"["second",2]"#.into()),
+                Event::Closed("disconnected".into()),
+            ]
+        );
     }
 
     /// What a server answers a handshake at a path it doesn't serve.
