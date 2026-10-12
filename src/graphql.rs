@@ -525,6 +525,302 @@ fn with_variables(variables: &str, decls: &[(String, String)]) -> String {
     serde_json::to_string_pretty(&Value::Object(map)).unwrap_or_default()
 }
 
+/// A variable an operation declares: `$name: Type = default`.
+#[derive(Debug, PartialEq)]
+pub struct Declared {
+    pub name: String,
+    /// As written, without spaces: `[ID!]!`.
+    pub ty: String,
+    /// The default value's text, if it has one.
+    pub default: Option<String>,
+}
+
+impl Declared {
+    /// The server refuses the operation without a value for it.
+    pub fn required(&self) -> bool {
+        self.ty.ends_with('!') && self.default.is_none()
+    }
+}
+
+/// The variables the document's first operation declares, in order.
+pub fn declared(query: &str) -> Vec<Declared> {
+    let p = Parser::new(query);
+    let token = |i: usize| p.tokens.get(i).map_or("", |&(s, e)| &query[s..e]);
+    // Fragments may come first; a field named `query` is inside braces.
+    let (mut i, mut depth) = (0, 0);
+    loop {
+        match token(i) {
+            "" => return Vec::new(),
+            "{" => depth += 1,
+            "}" => depth -= 1,
+            "query" | "mutation" | "subscription" if depth == 0 => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    i += 1;
+    if Parser::name(token(i)) {
+        i += 1;
+    }
+    if token(i) != "(" {
+        return Vec::new();
+    }
+    i += 1;
+    let mut out = Vec::new();
+    while token(i) == "$" && token(i + 2) == ":" {
+        let name = token(i + 1).to_owned();
+        i += 3;
+        let mut ty = String::new();
+        while !matches!(token(i), "=" | "$" | "@" | ")" | "") {
+            ty.push_str(token(i));
+            i += 1;
+        }
+        let mut default = None;
+        if token(i) == "=" {
+            i += 1;
+            let (from, mut nest) = (p.at(i), 0);
+            while !token(i).is_empty() && (nest > 0 || !matches!(token(i), "$" | "@" | ")")) {
+                match token(i) {
+                    "{" | "[" | "(" => nest += 1,
+                    "}" | "]" | ")" => nest -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            // Commas are whitespace, so the one before the next variable is in the slice.
+            let text = query[from..p.at(i)].trim().trim_end_matches(',').trim_end();
+            default = Some(text.to_owned());
+        }
+        while token(i) == "@" {
+            i += 2;
+            if token(i) == "(" {
+                while !matches!(token(i), ")" | "") {
+                    i += 1;
+                }
+                i += 1;
+            }
+        }
+        out.push(Declared { name, ty, default });
+    }
+    out
+}
+
+/// How the variables form takes a value of a declared type.
+#[derive(Debug, PartialEq)]
+pub enum Input {
+    /// String, ID: what's typed is the string.
+    Text,
+    /// Int, Float: the number as typed, so `{{count}}` goes in unquoted and arrives a number.
+    Number {
+        whole: bool,
+    },
+    Boolean,
+    /// An enum's values; known once the schema is.
+    Choice(Vec<String>),
+    /// Lists and input objects: JSON as typed.
+    Json,
+    /// A type nothing tells about (a custom scalar, or no schema yet): JSON when it reads
+    /// as JSON other than a string, else a string.
+    Loose,
+}
+
+impl Input {
+    pub fn of(ty: &str, schema: Option<&Schema>) -> Input {
+        if ty.starts_with('[') {
+            return Input::Json;
+        }
+        let base = ty.trim_end_matches('!');
+        match base {
+            "String" | "ID" => Input::Text,
+            "Int" => Input::Number { whole: true },
+            "Float" => Input::Number { whole: false },
+            "Boolean" => Input::Boolean,
+            _ => match schema.and_then(|s| s.types.get(base)) {
+                Some(t) if t.kind == "ENUM" => {
+                    Input::Choice(t.fields.iter().map(|f| f.name.clone()).collect())
+                }
+                Some(t) if t.kind == "INPUT_OBJECT" => Input::Json,
+                _ => Input::Loose,
+            },
+        }
+    }
+
+    /// What the form shows for a value's JSON text: a string without its quotes, nothing
+    /// for null.
+    pub fn shown(&self, raw: &str) -> String {
+        if raw == "null" {
+            return String::new();
+        }
+        let string = || serde_json::from_str::<String>(raw).ok();
+        match self {
+            Input::Text | Input::Loose | Input::Choice(_) => string().unwrap_or(raw.to_owned()),
+            Input::Number { .. } | Input::Json | Input::Boolean => raw.to_owned(),
+        }
+    }
+
+    /// The JSON text for what was typed or picked; None leaves the variable out.
+    pub fn stored(&self, typed: &str) -> Option<String> {
+        if typed.trim().is_empty() {
+            return None;
+        }
+        let quoted = || Value::from(typed).to_string();
+        Some(match self {
+            Input::Text | Input::Choice(_) => quoted(),
+            Input::Number { .. } | Input::Json | Input::Boolean => typed.trim().to_owned(),
+            Input::Loose => match serde_json::from_str::<Value>(typed) {
+                Ok(v) if !v.is_string() => typed.trim().to_owned(),
+                _ => quoted(),
+            },
+        })
+    }
+
+    /// Whether a value's JSON text can be sent as this type, `{{variables}}` aside.
+    pub fn valid(&self, raw: &str) -> bool {
+        let value = serde_json::from_str::<Value>(&without_variables(raw));
+        match self {
+            Input::Number { whole: true } => {
+                value.is_ok_and(|v| v.is_null() || v.is_i64() || v.is_u64())
+            }
+            Input::Number { whole: false } => value.is_ok_and(|v| v.is_null() || v.is_number()),
+            Input::Json => value.is_ok(),
+            _ => true,
+        }
+    }
+}
+
+/// `text` with every `{{variable}}` a `0`, which is JSON in a string and out of one, to
+/// check JSON that is only filled in when sent.
+pub fn without_variables(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let Some(close) = rest[open..].find("}}") else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push('0');
+        rest = &rest[open + close + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A JSON object's members as (name, value text), read loosely: a value may be a
+/// `{{variable}}` or half typed (a value left open takes the rest). None when the text
+/// isn't an object. No text is no members.
+pub fn members(text: &str) -> Option<Vec<(String, String)>> {
+    let body = text.trim();
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    let body = body.strip_prefix('{')?.strip_suffix('}')?;
+    let b = body.as_bytes();
+    let (mut out, mut i) = (Vec::new(), 0);
+    loop {
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b',') {
+            i += 1;
+        }
+        if i == b.len() {
+            return Some(out);
+        }
+        if b[i] != b'"' {
+            return None;
+        }
+        let end = string_end(b, i);
+        let name = serde_json::from_str(&body[i..end]).ok()?;
+        i = end;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        let (start, mut depth) = (i + 1, 0);
+        i = start;
+        while i < b.len() {
+            match b[i] {
+                b'"' => {
+                    i = string_end(b, i);
+                    continue;
+                }
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth -= 1,
+                b',' if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push((name, body[start..i].trim().to_owned()));
+    }
+}
+
+/// Past the JSON string that starts at `i`, or the end if it isn't closed.
+fn string_end(b: &[u8], mut i: usize) -> usize {
+    i += 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// `members` as an object's text, one a line, the values as they are; none is no text.
+pub fn object(members: &[(String, String)]) -> String {
+    if members.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<_> = (members.iter())
+        .map(|(name, value)| format!("  {}: {value}", Value::from(name.as_str())))
+        .collect();
+    format!("{{\n{}\n}}", lines.join(",\n"))
+}
+
+impl Schema {
+    /// A value of type `ty` for the form to fill in: an input object with its scalar and
+    /// enum fields, and the input fields it requires. Optional inputs are left out: filter
+    /// inputs (`where: { AND: [...] }`) hold themselves and would fill a page.
+    pub fn sample(&self, ty: &str) -> Value {
+        self.sample_in(ty, 0)
+    }
+
+    fn sample_in(&self, ty: &str, depth: usize) -> Value {
+        let ty = ty.trim_end_matches('!');
+        if let Some(inner) = ty.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+            return Value::Array(vec![self.sample_in(inner, depth)]);
+        }
+        match ty {
+            "Int" => 0.into(),
+            "Float" => 0.0.into(),
+            "Boolean" => false.into(),
+            "String" | "ID" => "".into(),
+            _ => match self.types.get(ty) {
+                Some(t) if t.kind == "ENUM" => {
+                    (t.fields.first()).map_or(Value::Null, |f| f.name.clone().into())
+                }
+                Some(t) if t.kind == "INPUT_OBJECT" && depth < SELECT_DEPTH => {
+                    let fields = (t.fields.iter())
+                        .filter(|f| f.ty.ends_with('!') || !self.is_input(&f.ty))
+                        .map(|f| (f.name.clone(), self.sample_in(&f.ty, depth + 1)))
+                        .collect();
+                    Value::Object(fields)
+                }
+                _ => Value::Null,
+            },
+        }
+    }
+
+    /// Whether `ty`'s named type is an input object.
+    pub fn is_input(&self, ty: &str) -> bool {
+        let base = ty.trim_matches(|c| matches!(c, '[' | ']' | '!'));
+        self.types
+            .get(base)
+            .is_some_and(|t| t.kind == "INPUT_OBJECT")
+    }
+}
+
 /// A selection set in a query's text: where its `}` is, and its fields.
 struct Selection {
     close: usize,
@@ -816,6 +1112,124 @@ pub(crate) mod tests {
             ]
         }}})
         .to_string()
+    }
+
+    #[test]
+    fn declared_variables_come_with_their_types_and_defaults() {
+        let query = "fragment F on User { id }\n\
+            query Users($first: Int = 10, $role: Role!, $ids: [ID!]! = [\"a\", \"b\"] \
+            $input: UserInput @deprecated) {\n  query: users(first: $first) { ...F }\n}";
+        let d = declared(query);
+        let got: Vec<_> = (d.iter())
+            .map(|d| (d.name.as_str(), d.ty.as_str(), d.default.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("first", "Int", Some("10")),
+                ("role", "Role!", None),
+                ("ids", "[ID!]!", Some("[\"a\", \"b\"]")),
+                ("input", "UserInput", None),
+            ]
+        );
+        // A default satisfies a required type.
+        assert!(!d[0].required() && d[1].required() && !d[2].required());
+        assert!(declared("{ users { id } }").is_empty());
+        assert!(declared("query { users { id } }").is_empty());
+        assert!(declared("").is_empty());
+    }
+
+    #[test]
+    fn the_variables_form_types_values_by_their_declaration() {
+        let schema = parse(&sample()).unwrap();
+        let of = |ty| Input::of(ty, Some(&schema));
+        // A string is typed bare and kept quoted; nothing typed leaves the variable out.
+        let text = of("ID!");
+        assert_eq!(text, Input::Text);
+        assert_eq!(text.stored("a\"b").as_deref(), Some(r#""a\"b""#));
+        assert_eq!(text.shown(r#""a\"b""#), "a\"b");
+        assert_eq!(text.stored("  "), None);
+        assert_eq!(text.shown("null"), "");
+        // A number goes in as typed, a variable unquoted, so it arrives a number.
+        let int = of("Int");
+        assert_eq!(int.stored("{{count}}").as_deref(), Some("{{count}}"));
+        assert!(int.valid("{{count}}") && int.valid("12") && int.valid("null"));
+        assert!(!int.valid("1.5") && !int.valid("abc"));
+        assert!(of("Float").valid("1.5"));
+        assert_eq!(of("Boolean"), Input::Boolean);
+        // An enum picks from its values once the schema is known; before, a guess.
+        assert_eq!(
+            of("Role!"),
+            Input::Choice(vec!["ADMIN".into(), "GUEST".into()])
+        );
+        assert_eq!(of("Role").stored("ADMIN").as_deref(), Some("\"ADMIN\""));
+        assert_eq!(Input::of("Role", None), Input::Loose);
+        // Lists and inputs are JSON, checked with their variables left out.
+        assert_eq!(of("[ID!]"), Input::Json);
+        assert_eq!(of("UserInput!"), Input::Json);
+        assert!(of("UserInput").valid(r#"{"name": "{{user}}", "n": {{n}}}"#));
+        assert!(!of("UserInput").valid(r#"{"name": "#));
+        // A custom scalar: JSON if it reads as such, else a string.
+        let loose = of("DateTime");
+        assert_eq!(
+            loose.stored("2026-10-12").as_deref(),
+            Some("\"2026-10-12\"")
+        );
+        assert_eq!(loose.stored("{\"a\": 1}").as_deref(), Some("{\"a\": 1}"));
+        assert_eq!(loose.stored("\"x\"").as_deref(), Some(r#""\"x\"""#));
+    }
+
+    #[test]
+    fn variables_text_reads_loosely_and_goes_back_as_it_was() {
+        let text = "{\n  \"id\": \"a,}\",\n  \"n\": {{count}},\n  \
+            \"input\": {\n    \"tags\": [1, 2]\n  }\n}";
+        let m = members(text).unwrap();
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(
+            m,
+            [
+                pair("id", "\"a,}\""),
+                pair("n", "{{count}}"),
+                pair("input", "{\n    \"tags\": [1, 2]\n  }"),
+            ]
+        );
+        assert_eq!(object(&m), text);
+        // Half typed: a value left open takes the rest, and goes back as it was.
+        let half = "{\n  \"input\": {\"name\": \"ad\n}";
+        let m = members(half).unwrap();
+        assert_eq!(m, [pair("input", "{\"name\": \"ad")]);
+        assert_eq!(object(&m), half);
+        assert_eq!(members(""), Some(vec![]));
+        assert_eq!(members(" {} "), Some(vec![]));
+        assert_eq!(object(&[]), "");
+        assert_eq!(members("[1]"), None);
+        assert_eq!(members("{ id: 1 }"), None);
+    }
+
+    #[test]
+    fn an_input_fills_in_without_running_away() {
+        let mut doc: Value = serde_json::from_str(&sample()).unwrap();
+        let types = doc["data"]["__schema"]["types"].as_array_mut().unwrap();
+        types.push(serde_json::json!({ "kind": "INPUT_OBJECT", "name": "Filter",
+            "inputFields": [
+                { "name": "role", "type": named("ENUM", "Role") },
+                { "name": "and", "type": wrap("LIST", named("INPUT_OBJECT", "Filter")) },
+                { "name": "not", "type": named("INPUT_OBJECT", "Filter") },
+                { "name": "user", "type": wrap("NON_NULL", named("INPUT_OBJECT", "UserInput")) },
+                { "name": "after", "type": named("SCALAR", "Int") }
+            ]
+        }));
+        let schema = parse(&doc.to_string()).unwrap();
+        // Optional inputs stay out; the required one comes with its fields.
+        assert_eq!(
+            schema.sample("Filter!"),
+            serde_json::json!({ "role": "ADMIN", "user": { "name": "" }, "after": 0 })
+        );
+        assert_eq!(
+            schema.sample("[UserInput!]"),
+            serde_json::json!([{ "name": "" }])
+        );
+        assert!(schema.is_input("[Filter!]!") && !schema.is_input("User"));
     }
 
     #[test]

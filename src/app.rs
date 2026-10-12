@@ -494,6 +494,8 @@ struct Explorer {
     /// A clicked root field starts the query over, instead of joining it (kept in the
     /// workspace state).
     replace: bool,
+    /// Variables as JSON text instead of the form.
+    vars_json: bool,
 }
 
 struct ResponseView {
@@ -8054,29 +8056,39 @@ fn graphql_editor(
             },
         );
         ui.horizontal(|ui| {
-            ui.label(t("Variables (JSON)"));
+            ui.label(t("Variables"));
+            ui.add_space(4.0);
+            sub_tab(ui, &mut ex.vars_json, false, t("Form"), false);
+            sub_tab(ui, &mut ex.vars_json, true, "JSON", false);
+            // Checked as sent: `{{n}}` may stand unquoted for a number.
+            let text = graphql::without_variables(variables);
             if !variables.trim().is_empty()
-                && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(variables)
+                && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(&text)
             {
                 ui.colored_label(ORANGE, tf("Not valid JSON: {}", &[&e]));
             }
         });
-        var_edit(
-            ui,
-            egui::Id::new("gql-variables"),
-            variables,
-            vars,
-            egui::TextStyle::Monospace,
-            true,
-            Some(Lang::Json),
-            Complete::None,
-            |e| {
-                e.code_editor()
-                    .hint_text("{ \"id\": \"{{userId}}\" }")
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY)
-            },
-        );
+        if ex.vars_json {
+            var_edit(
+                ui,
+                egui::Id::new("gql-variables"),
+                variables,
+                vars,
+                egui::TextStyle::Monospace,
+                true,
+                Some(Lang::Json),
+                Complete::None,
+                |e| {
+                    e.code_editor()
+                        .hint_text("{ \"id\": \"{{userId}}\" }")
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                },
+            );
+        } else {
+            let schema = ex.schema.as_ref().and_then(|s| s.as_ref().ok());
+            variables_form(ui, query, variables, vars, schema);
+        }
 
         let ui = &mut cols[1];
         ui.horizontal(|ui| {
@@ -8198,6 +8210,192 @@ fn graphql_editor(
         }
     }
     fetch
+}
+
+/// GraphQL variables as a form: a row for each variable the query declares, taking its
+/// value by its type (enums and inputs by the schema too), written back into the JSON
+/// text, which stays the one copy. A member the query doesn't declare gets a row too, to
+/// edit or remove.
+fn variables_form(
+    ui: &mut egui::Ui,
+    query: &str,
+    variables: &mut String,
+    vars: &HashMap<String, String>,
+    schema: Option<&graphql::Schema>,
+) {
+    use graphql::Input;
+    let Some(mut members) = graphql::members(variables) else {
+        ui.colored_label(
+            ORANGE,
+            t("These variables aren't a JSON object: fix them under JSON."),
+        );
+        return;
+    };
+    let declared = graphql::declared(query);
+    let not_declared = t("not in the query");
+    // (name, type, default, required, declared)
+    let mut rows: Vec<(&str, &str, Option<&str>, bool, bool)> = (declared.iter())
+        .map(|d| {
+            (
+                &d.name[..],
+                &d.ty[..],
+                d.default.as_deref(),
+                d.required(),
+                true,
+            )
+        })
+        .collect();
+    for (name, _) in &members {
+        if !declared.iter().any(|d| d.name == *name) {
+            rows.push((name, not_declared, None, false, false));
+        }
+    }
+    if rows.is_empty() {
+        ui.weak(t(
+            "The query declares no variables. Declare them as in query Users($first: Int), or click a field with arguments in the schema.",
+        ));
+        return;
+    }
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let (text_color, weak) = (ui.visuals().text_color(), ui.visuals().weak_text_color());
+    let label = |name: &str, ty: &str, color: Color32| {
+        let mut job = egui::text::LayoutJob::default();
+        let format = |c| egui::TextFormat::simple(font.clone(), c);
+        job.append(&format!("${name}"), 0.0, format(color));
+        job.append(&format!(" {ty}"), 4.0, format(weak));
+        job
+    };
+    // Names and types in a column as wide as the widest, the values lined up after it.
+    let widest = (rows.iter())
+        .map(|r| {
+            ui.painter()
+                .layout_job(label(r.0, r.1, text_color))
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    let label_width = widest.min(ui.available_width() * 0.5);
+    let side = button_height(ui);
+    let mut edit = None;
+    for &(name, ty, default, required, known) in &rows {
+        let raw = members.iter().find(|m| m.0 == name).map(|m| &m.1[..]);
+        let input = match known {
+            true => Input::of(ty, schema),
+            false => Input::Json,
+        };
+        let missing = required && raw.is_none_or(|r| r == "null");
+        let shown = input.shown(raw.unwrap_or_default());
+        let invalid = raw.is_some_and(|r| !input.valid(r));
+        let fill = schema.filter(|s| known && shown.is_empty() && s.is_input(ty));
+        let mut typed = None;
+        ui.horizontal(|ui| {
+            let size = egui::vec2(label_width, side);
+            let layout = egui::Layout::left_to_right(egui::Align::Center);
+            let color = if missing { ORANGE } else { text_color };
+            let r = ui.allocate_ui_with_layout(size, layout, |ui| {
+                // Not shrunk to the text: the values start in one column.
+                ui.set_width(label_width);
+                ui.add(egui::Label::new(label(name, ty, color)).truncate())
+            });
+            if missing {
+                r.inner
+                    .on_hover_text(t("Required: the server refuses the query without it."));
+            }
+            let trailing = [invalid, fill.is_some(), !known]
+                .iter()
+                .filter(|b| **b)
+                .count();
+            let width =
+                ui.available_width() - trailing as f32 * (side + ui.spacing().item_spacing.x);
+            let id = egui::Id::new(("gql-var", name));
+            let options: Vec<&str> = match &input {
+                Input::Boolean => vec!["true", "false"],
+                Input::Choice(values) => values.iter().map(String::as_str).collect(),
+                _ => Vec::new(),
+            };
+            if !options.is_empty() {
+                let unset = t("(not set)");
+                let current = if shown.is_empty() { unset } else { &shown[..] };
+                egui::ComboBox::from_id_salt(id)
+                    .selected_text(RichText::new(current).monospace())
+                    .width(width)
+                    .show_ui(ui, |ui| {
+                        for value in std::iter::once("").chain(options) {
+                            let text = if value.is_empty() { unset } else { value };
+                            if ui.selectable_label(shown == value, text).clicked() {
+                                typed = Some(value.to_owned());
+                            }
+                        }
+                    });
+            } else {
+                let mut text = shown.clone();
+                let hint = default.map_or(String::new(), |d| tf("{} (default)", &[&d]));
+                // Lists and inputs may run over several lines.
+                let json = input == Input::Json;
+                let r = var_edit(
+                    ui,
+                    id,
+                    &mut text,
+                    vars,
+                    egui::TextStyle::Monospace,
+                    json,
+                    json.then_some(Lang::Json),
+                    Complete::None,
+                    |e| e.hint_text(hint).desired_rows(1).desired_width(width),
+                );
+                if r.changed() {
+                    typed = Some(text);
+                }
+            }
+            if invalid {
+                let why = match input {
+                    Input::Number { whole: true } => t("Not a whole number"),
+                    Input::Number { whole: false } => t("Not a number"),
+                    _ => t("Not valid JSON"),
+                };
+                let (rect, r) =
+                    ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+                let font = egui::TextStyle::Button.resolve(ui.style());
+                (ui.painter()).text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon::WARNING,
+                    font,
+                    ORANGE,
+                );
+                r.on_hover_text(why);
+            }
+            if let Some(s) = fill
+                && icon_button(ui, icon::MAGIC_WAND, t("Fill in its fields"), None)
+                    .on_hover_text(t("Fill in its fields"))
+                    .clicked()
+            {
+                typed = Some(s.sample(ty).to_string());
+            }
+            if !known
+                && icon_button(ui, icon::TRASH, t("Remove"), None)
+                    .on_hover_text(t("Remove"))
+                    .clicked()
+            {
+                typed = Some(String::new());
+            }
+        });
+        if let Some(typed) = typed {
+            edit = Some((name.to_owned(), input.stored(&typed)));
+        }
+    }
+    let Some((name, value)) = edit else {
+        return;
+    };
+    match (members.iter().position(|m| m.0 == name), value) {
+        (Some(i), Some(v)) => members[i].1 = v,
+        (Some(i), None) => {
+            members.remove(i);
+        }
+        (None, Some(v)) => members.push((name, v)),
+        (None, None) => {}
+    }
+    *variables = graphql::object(&members);
 }
 
 fn code_editor(
@@ -13943,6 +14141,99 @@ mod ui_tests {
         h.key_press(Key::Enter);
         h.run();
         assert_eq!(query(&h), "{ users { name\n");
+    }
+
+    /// Postman and Bruno take argument values in fields, not as hand-written JSON: each
+    /// declared variable gets a row taking its type's values, written into the JSON.
+    #[test]
+    fn graphql_variables_fill_in_as_a_form() {
+        let mut h = with_request("gql-vars");
+        let picker = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("GET");
+        h.get(picker).click();
+        h.run();
+        h.get_by_label("GraphQL").click();
+        h.run();
+        h.state_mut().explorer.schema =
+            Some(crate::graphql::parse(&crate::graphql::tests::sample()));
+        if let Body::GraphQL { query, .. } = &mut h.state_mut().open.as_mut().unwrap().draft.body {
+            *query = "query Q($id: ID!, $first: Int = 10, $role: Role, $input: UserInput, \
+                $on: Boolean) { user(id: $id) { id } }"
+                .into();
+        }
+        h.run();
+        let variables = |h: &Harness<'_, App>| match &draft(h).body {
+            Body::GraphQL { variables, .. } => variables.clone(),
+            _ => panic!("not GraphQL"),
+        };
+        // The field, or picker, on a variable's row.
+        fn on_row<'h>(h: &'h Harness<'_, App>, label: &str, role: Role) -> egui_kittest::Node<'h> {
+            let y = h.get_by_label(label).rect().center().y;
+            (h.get_all_by_role(role))
+                .find(|n| (n.rect().center().y - y).abs() < 6.0)
+                .unwrap_or_else(|| panic!("no {role:?} beside {label}"))
+        }
+        on_row(&h, "$id ID!", Role::TextInput).click();
+        h.run();
+        on_row(&h, "$id ID!", Role::TextInput).type_text("u1");
+        h.run();
+        assert_eq!(variables(&h), "{\n  \"id\": \"u1\"\n}");
+        // A number goes in unquoted, a variable too, so it arrives a number; the default
+        // shows until then.
+        let first = on_row(&h, "$first Int", Role::TextInput);
+        assert_eq!(first.accesskit_node().placeholder(), Some("10 (default)"));
+        first.click();
+        h.run();
+        on_row(&h, "$first Int", Role::TextInput).type_text("{{n}}");
+        h.run();
+        // Below the fold of the short stacked pane, so not by pointer.
+        on_row(&h, "$role Role", Role::ComboBox).click_accesskit();
+        h.run();
+        h.get_by_label("ADMIN").click();
+        h.run();
+        on_row(&h, "$on Boolean", Role::ComboBox).click_accesskit();
+        h.run();
+        h.get_by_label("true").click();
+        h.run();
+        // An input object fills in from the schema.
+        h.get_by_label("Fill in its fields").click_accesskit();
+        h.run();
+        // Side by side, the whole form shows.
+        h.set_size(egui::vec2(1600.0, 900.0));
+        h.run();
+        shot(&mut h, "74-graphql-variables-form");
+        h.set_size(egui::vec2(1200.0, 800.0));
+        h.run();
+        assert_eq!(
+            variables(&h),
+            "{\n  \"id\": \"u1\",\n  \"first\": {{n}},\n  \"role\": \"ADMIN\",\n  \
+             \"on\": true,\n  \"input\": {\"name\":\"\"}\n}"
+        );
+        assert!(h.query_by_label("Fill in its fields").is_none(), "filled");
+        // Emptied, a variable is left out.
+        on_row(&h, "$id ID!", Role::TextInput).click();
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.key_press(Key::Backspace);
+        h.run();
+        assert!(!variables(&h).contains("\"id\""), "{}", variables(&h));
+        // One the query doesn't declare can be removed.
+        if let Body::GraphQL { variables, .. } =
+            &mut h.state_mut().open.as_mut().unwrap().draft.body
+        {
+            *variables = "{\"old\": 1, \"first\": 2}".into();
+        }
+        h.run();
+        h.get_by_label("$old not in the query");
+        h.get_by_label("Remove").click_accesskit();
+        h.run();
+        assert_eq!(variables(&h), "{\n  \"first\": 2\n}");
+        // The JSON stays a click away.
+        h.get_by_label("JSON").click();
+        h.run();
+        assert!(h.state().explorer.vars_json);
+        h.get_all_by_role(Role::MultilineTextInput).nth(1).unwrap();
     }
 
     #[test]

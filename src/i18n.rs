@@ -66,6 +66,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("  · server stream", "  · 伺服器串流"),
     (" and 1 environment", "，以及 1 個環境"),
     (" and {} environments", "，以及 {} 個環境"),
+    ("(not set)", "(未設定)"),
     ("(top level)", "（最上層）"),
     ("*.corp.com or host:8443", "*.corp.com 或 host:8443"),
     (
@@ -576,6 +577,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("File not found: {}", "找不到檔案：{}"),
     ("File path", "檔案路徑"),
+    ("Fill in its fields", "填入欄位"),
     ("Fill body", "填入內容"),
     ("Filter by name", "依名稱篩選"),
     ("Filter fields", "篩選欄位"),
@@ -811,6 +813,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("None", "無"),
     ("not a PDF it can read", "不是可讀取的 PDF"),
+    ("not in the query", "查詢裡沒有"),
     (
         "Not Acceptable: nothing matches the Accept headers.",
         "Not Acceptable：沒有符合 Accept 標頭的內容。",
@@ -828,6 +831,9 @@ const ZH_TW: &[(&str, &str)] = &[
         "Not Modified: the cached copy is still good.",
         "Not Modified：快取的副本仍然有效。",
     ),
+    ("Not a number", "不是數字"),
+    ("Not a whole number", "不是整數"),
+    ("Not valid JSON", "不是有效的 JSON"),
     ("Not valid JSON: {}", "不是有效的 JSON：{}"),
     (
         "Note: the runner uses saved files; unsaved edits are not included.",
@@ -956,6 +962,10 @@ const ZH_TW: &[(&str, &str)] = &[
     (
         "Reloaded {}: changed on disk",
         "已重新載入 {}：磁碟上的檔案已變更",
+    ),
+    (
+        "Required: the server refuses the query without it.",
+        "必填：少了它伺服器會拒絕這個查詢。",
     ),
     ("Remove", "移除"),
     ("Rename", "重新命名"),
@@ -1218,7 +1228,15 @@ const ZH_TW: &[(&str, &str)] = &[
         "一律信任作業系統的憑證存放區；這些是額外加入的。",
     ),
     ("the page linking here", "連到這裡的頁面"),
+    (
+        "The query declares no variables. Declare them as in query Users($first: Int), or click a field with arguments in the schema.",
+        "查詢沒有宣告變數。可以像 query Users($first: Int) 這樣宣告，或在結構裡點有參數的欄位。",
+    ),
     ("The request isn't open any more", "這個請求已經沒有開啟"),
+    (
+        "These variables aren't a JSON object: fix them under JSON.",
+        "這些變數不是 JSON 物件：請切到 JSON 修正。",
+    ),
     (
         "The response beside the request instead of under it",
         "回應放在請求旁邊，而不是下方",
@@ -1326,7 +1344,6 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Values for this request", "這個請求的值"),
     ("Variables", "變數"),
     ("Vars", "回應變數"),
-    ("Variables (JSON)", "變數 (JSON)"),
     ("Variables ({})", "變數 ({})"),
     (
         "Variables are filled in; scripts don't run.",
@@ -1384,6 +1401,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "{{private_key}} or -----BEGIN PRIVATE KEY-----…",
         "{{private_key}} 或 -----BEGIN PRIVATE KEY-----…",
     ),
+    ("{} (default)", "{} (預設)"),
     ("{} (cut)", "{} (已截斷)"),
     ("{} added on Send", "傳送時加入 {} 個"),
     (
