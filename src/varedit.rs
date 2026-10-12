@@ -1,13 +1,14 @@
 //! Text fields that understand `{{variables}}`: defined names are green, undefined red,
 //! hovering shows the resolved text, and typing `{{` opens an autocomplete list
-//! (↑/↓ to pick, Enter or click to insert, Esc to dismiss).
+//! (↑/↓ to pick, Enter or click to insert, Esc to dismiss). Right-click edits the
+//! selection or stores it as a variable.
 
 use std::collections::HashMap;
 
 use eframe::egui::text::{CCursor, CCursorRange, LayoutJob};
-use eframe::egui::{self, Color32, FontId, Id, Key, Modifiers, RichText, TextStyle};
+use eframe::egui::{self, Color32, FontId, Id, Key, Modifiers, PointerButton, RichText, TextStyle};
 
-use crate::i18n::t;
+use crate::i18n::{t, tf};
 use crate::model::{self, DYNAMIC};
 use crate::syntax::{self, Lang};
 
@@ -27,6 +28,37 @@ pub enum Complete<'a> {
 }
 
 pub type CompleteAt<'a> = dyn Fn(&str, usize) -> Option<(usize, Vec<(String, String)>)> + 'a;
+
+/// Where the right-click menu can store a selection: the active environment, if any, then
+/// the globals (`None`), each with its variable names.
+pub type Scopes = Vec<(Option<String>, Vec<String>)>;
+
+/// What the right-click menu leaves for the window, which owns the environments and the
+/// status bar.
+#[derive(Clone)]
+pub enum Picked {
+    /// Store `value` as `name` in `env` (`None`: the globals); without a name, ask for one.
+    Set {
+        env: Option<String>,
+        name: Option<String>,
+        value: String,
+    },
+    Status(String),
+}
+
+const SCOPES: &str = "var-scopes";
+const PICKED: &str = "var-picked";
+
+/// Set each frame before the fields are drawn: their menus can't see the window's state.
+pub fn offer(ctx: &egui::Context, scopes: Scopes) {
+    ctx.data_mut(|d| d.insert_temp(Id::new(SCOPES), scopes));
+}
+
+pub fn picked(ctx: &egui::Context) -> Option<Picked> {
+    // In an Option: `remove_temp` wants a Default.
+    ctx.data_mut(|d| d.remove_temp::<Option<Picked>>(Id::new(PICKED)))
+        .flatten()
+}
 
 #[derive(Clone, Copy, Default)]
 struct Popup {
@@ -146,6 +178,15 @@ pub fn var_edit(
         job.wrap.max_width = wrap_width;
         ui.painter().layout_job(job)
     };
+    let right_click = ui.input(|i| i.pointer.button_pressed(PointerButton::Secondary));
+    let selected = right_click
+        .then(|| {
+            egui::TextEdit::load_state(ui.ctx(), id)?
+                .cursor
+                .char_range()
+        })
+        .flatten()
+        .filter(|r| !r.is_empty());
     let edit = if multiline {
         egui::TextEdit::multiline(text)
     } else {
@@ -154,6 +195,22 @@ pub fn var_edit(
     let output = configure(edit.id(id).layouter(&mut layouter)).show(ui);
     let mut response = output.response.response;
     let focused = focused_before || response.has_focus();
+
+    // egui moves the cursor to a right-click as to a left one, dropping the selection the
+    // menu is for. It's put back, and kept for the menu: a click on a menu item takes focus
+    // from the field, and egui collapses an unfocused field's selection.
+    let kept = id.with("menu-selection");
+    if right_click && response.hovered() {
+        if let Some(range) = selected {
+            let mut state = output.state.clone();
+            state.cursor.set_char_range(Some(range));
+            state.store(ui.ctx(), id);
+        }
+        let chars = selected
+            .map(|r| r.as_sorted_char_range())
+            .map(|r| [r.start.0, r.end.0]);
+        ui.data_mut(|d| d.insert_temp(kept, chars));
+    }
 
     let cursor = output
         .cursor_range
@@ -264,6 +321,15 @@ pub fn var_edit(
         ui.data_mut(|d| d.remove::<Popup>(popup_id));
     }
 
+    let mut edited = false;
+    response.context_menu(|ui| {
+        let chars = ui.data(|d| d.get_temp(kept)).flatten();
+        edited = selection_menu(ui, id, text, chars);
+    });
+    if edited {
+        response.mark_changed();
+    }
+
     // A URL's preview also fills its path variables, which only the caller has.
     if !focused && text.contains("{{") && lang != Some(Lang::Url) {
         response = response.on_hover_ui(|ui| {
@@ -277,6 +343,140 @@ pub fn var_edit(
         });
     }
     response
+}
+
+/// The right-click menu, over the selection as char indices (start, end). Returns whether
+/// the text changed.
+fn selection_menu(ui: &mut egui::Ui, id: Id, text: &mut String, chars: Option<[usize; 2]>) -> bool {
+    let byte = |c: usize| text.char_indices().nth(c).map_or(text.len(), |(b, _)| b);
+    let bytes = chars.map(|[a, b]| byte(a)..byte(b));
+    let selected = bytes.clone().map(|r| text[r].to_owned());
+    let has = selected.is_some();
+    let ctx = ui.ctx().clone();
+    // Back in the field with `chars` selected, as a native menu leaves it.
+    let refocus = |chars: Option<[usize; 2]>| {
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        if let Some([a, b]) = chars {
+            let range = CCursorRange::two(CCursor::new(a), CCursor::new(b));
+            state.cursor.set_char_range(Some(range));
+        }
+        state.store(&ctx, id);
+        ctx.memory_mut(|m| m.request_focus(id));
+        ctx.request_repaint();
+    };
+    let cut = ui.add_enabled(has, egui::Button::new(t("Cut"))).clicked();
+    let copy = ui.add_enabled(has, egui::Button::new(t("Copy"))).clicked();
+    // Only the platform reads the clipboard: it answers with a paste event, which the
+    // field, focused again with the selection, takes like Ctrl+V.
+    if ui.button(t("Paste")).clicked() {
+        refocus(chars);
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+    }
+    if ui.button(t("Select all")).clicked() {
+        refocus(Some([0, text.chars().count()]));
+    }
+    ui.separator();
+    let encode = (ui.add_enabled(has, egui::Button::new(t("Encode URI component")))).clicked();
+    let decode = (ui.add_enabled(has, egui::Button::new(t("Decode URI component")))).clicked();
+    let scopes: Scopes = ctx
+        .data(|d| d.get_temp(Id::new(SCOPES)))
+        .unwrap_or_default();
+    if !scopes.is_empty() {
+        ui.separator();
+    }
+    // Like Postman, the selection stays as it is rather than becoming `{{name}}`: the same
+    // action from a read-only response can't replace anything, and the value is often
+    // wanted as is (a token for other requests) without this request turning unsaved.
+    for (env, names) in scopes {
+        let scope = env.as_deref().unwrap_or(t("Globals"));
+        let mut name = None;
+        ui.add_enabled_ui(has, |ui| {
+            ui.menu_button(tf("Set as variable in {}", &[&scope]), |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        for n in &names {
+                            if ui.button(n.as_str()).clicked() {
+                                name = Some(Some(n.clone()));
+                            }
+                        }
+                    });
+                if !names.is_empty() {
+                    ui.separator();
+                }
+                if ui.button(t("New variable…")).clicked() {
+                    name = Some(None);
+                }
+            })
+        });
+        if let (Some(name), Some(value)) = (name, selected.clone()) {
+            hand(&ctx, Picked::Set { env, name, value });
+        }
+    }
+
+    let Some(selected) = selected else {
+        return false;
+    };
+    if cut || copy {
+        ctx.copy_text(selected.clone());
+    }
+    let new = if cut {
+        String::new()
+    } else if encode {
+        encode_component(&selected)
+    } else if let Some(decoded) = decode.then(|| decode_component(&selected)) {
+        let Some(decoded) = decoded else {
+            let why = t("Not decoded: the selection isn't valid URI encoding");
+            hand(&ctx, Picked::Status(why.into()));
+            return false;
+        };
+        decoded
+    } else {
+        if copy {
+            refocus(chars);
+        }
+        return false;
+    };
+    let (Some([start, _]), Some(bytes)) = (chars, bytes) else {
+        return false;
+    };
+    text.replace_range(bytes, &new);
+    // The replacement stays selected, so a decode can be undone by an encode.
+    refocus(Some([start, start + new.chars().count()]));
+    true
+}
+
+fn hand(ctx: &egui::Context, picked: Picked) {
+    ctx.data_mut(|d| d.insert_temp(Id::new(PICKED), Some(picked)));
+}
+
+/// As JavaScript's encodeURIComponent: UTF-8 bytes as `%XX`, except letters, digits and
+/// `-_.!~*'()`. (sigv4's `uri_encode` is RFC 3986's set, which escapes `!*'()` too.)
+fn encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(b as char),
+            b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// As JavaScript's decodeURIComponent, which throws where this is `None`: a `%` without
+/// two hex digits after it, or bytes that aren't UTF-8. `+` stays `+`.
+fn decode_component(s: &str) -> Option<String> {
+    let hex = |c: Option<u8>| (c? as char).to_digit(16);
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        out.push(match b {
+            b'%' => (hex(bytes.next())? * 16 + hex(bytes.next())?) as u8,
+            b => b,
+        });
+    }
+    String::from_utf8(out).ok()
 }
 
 fn highlight(
@@ -441,6 +641,22 @@ mod tests {
             ]
         );
         assert_eq!(runs[runs.len() - 2], ("\"{{\"", str));
+    }
+
+    /// What a browser's encodeURIComponent/decodeURIComponent give, so a value encoded here
+    /// is what a server or a pm.* script expects; where JavaScript throws, nothing changes.
+    #[test]
+    fn uri_components_encode_and_decode_as_javascript_does() {
+        let plain = "a b&c/d?=#+:@,;$é€😀-_.!~*'()";
+        let encoded =
+            "a%20b%26c%2Fd%3F%3D%23%2B%3A%40%2C%3B%24%C3%A9%E2%82%AC%F0%9F%98%80-_.!~*'()";
+        assert_eq!(encode_component(plain), encoded);
+        assert_eq!(decode_component(encoded).as_deref(), Some(plain));
+        // Lower-case hex, reserved characters and a literal `+` decode as JavaScript does.
+        assert_eq!(decode_component("%c3%a9%2F+").as_deref(), Some("é/+"));
+        for bad in ["%", "50%", "%2", "%zz", "%+1", "%E2%82", "%C3%28"] {
+            assert_eq!(decode_component(bad), None, "{bad}");
+        }
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::script::{Changes, TestResult};
 use crate::store::{self, HistoryEntry, Node, State, Synced, Workspace};
 use crate::stream::{self, Event};
 use crate::syntax::{Kind, Lang};
-use crate::varedit::{Complete, clip, var_edit};
+use crate::varedit::{self, Complete, Picked, clip, var_edit};
 use egui_phosphor::regular as icon;
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
@@ -664,6 +664,11 @@ enum NameKind {
     },
     NewEnv,
     DuplicateEnv(String),
+    /// A selection to store as a new variable in `env` (`None`: the globals).
+    NewVar {
+        env: Option<String>,
+        value: String,
+    },
 }
 
 enum Next {
@@ -2506,6 +2511,14 @@ impl App {
         }
     }
 
+    /// A selection stored from a field's right-click menu; `env` `None` is the globals.
+    fn set_var(&mut self, env: Option<&str>, name: &str, value: &str) -> Result<(), String> {
+        self.ws.set_var(env, name, value)?;
+        self.reload_vars();
+        self.status = tf("Set {} in {}", &[&name, &env.unwrap_or(t("Globals"))]);
+        Ok(())
+    }
+
     /// Everything `{{name}}` can resolve to, with the same precedence as the runner.
     fn all_vars(&self) -> HashMap<String, String> {
         let mut all = self.globals.clone();
@@ -2619,6 +2632,11 @@ impl App {
             NameKind::SaveAs { old, folder } => {
                 let (old, folder) = (old.clone(), folder.clone());
                 self.save_as(&old, &folder, &name).map(|_| None)
+            }
+            NameKind::NewVar { .. } if name.is_empty() => Err(t("A variable needs a name").into()),
+            NameKind::NewVar { env, value } => {
+                let (env, value) = (env.clone(), value.clone());
+                self.set_var(env.as_deref(), &name, &value).map(|()| None)
             }
         };
         let Some(Dialog::Name { kind, error, .. }) = &mut self.dialog else {
@@ -3254,6 +3272,23 @@ impl eframe::App for App {
                 .frame(egui::Frame::NONE.fill(color))
                 .show(ui, |_| {});
         }
+        // Where the fields' right-click menus can store a selection. None under the
+        // environment editor: its Save writes back what it loaded, over a value set meanwhile.
+        let scopes = match self.env_editor {
+            Some(_) => Vec::new(),
+            None => {
+                let names = |vars: &HashMap<String, String>| {
+                    let mut names: Vec<String> = vars.keys().cloned().collect();
+                    names.sort_by_key(|n| n.to_lowercase());
+                    names
+                };
+                let env = (self.active_env.clone()).map(|e| (Some(e), names(&self.vars)));
+                env.into_iter()
+                    .chain([(None, names(&self.globals))])
+                    .collect()
+            }
+        };
+        varedit::offer(ui.ctx(), scopes);
         self.status_bar(ui);
         if !self.hide_sidebar {
             egui::Panel::left("sidebar")
@@ -3261,6 +3296,27 @@ impl eframe::App for App {
                 .show(ui, |ui| self.sidebar(ui));
         }
         egui::CentralPanel::default().show(ui, |ui| self.main_area(ui));
+        if let Some(picked) = varedit::picked(ui.ctx()) {
+            match picked {
+                Picked::Set {
+                    env,
+                    name: Some(name),
+                    value,
+                } => {
+                    if let Err(e) = self.set_var(env.as_deref(), &name, &value) {
+                        self.status = e;
+                    }
+                }
+                Picked::Set {
+                    env,
+                    name: None,
+                    value,
+                } => self.dialog = Some(Dialog::name(NameKind::NewVar { env, value }, "")),
+                Picked::Status(s) => self.status = s,
+            }
+            // The status bar is already drawn.
+            ui.ctx().request_repaint();
+        }
         // Only a focused field can be typed in, so these are all that have history.
         if let Some(id) = ui.memory(|m| m.focused())
             && !self.edited.contains(&id)
@@ -4973,7 +5029,11 @@ impl App {
                         NameKind::SaveAs { .. } => t("Save as"),
                         NameKind::NewEnv => t("New environment"),
                         NameKind::DuplicateEnv(_) => t("Duplicate environment"),
+                        NameKind::NewVar { .. } => t("New variable"),
                     });
+                    if let NameKind::NewVar { value, .. } = kind {
+                        ui.label(RichText::new(clip(value, 120)).monospace().weak());
+                    }
                     if let NameKind::SaveAs { folder, .. } | NameKind::NewRequest(folder) = kind {
                         let shown = (folders.iter())
                             .find(|(_, p)| p == folder)
@@ -12859,6 +12919,109 @@ mod ui_tests {
             Some("/users/x"),
             "kept in dev"
         );
+    }
+
+    /// Text selected in the URL bar and right-clicked: encoded and decoded in place, then
+    /// stored as a new global and as an existing environment variable, in the workspace on
+    /// disk, with the URL left as it was.
+    #[test]
+    fn a_selection_is_encoded_decoded_and_stored_as_a_variable() {
+        let mut h = with_request("sel-menu");
+        type_into(&mut h, 0, "http://h.test/?q=a b");
+        let url = |h: &Harness<'_, App>| draft(h).url.clone();
+        assert_eq!(url(&h), "http://h.test/?q=a b");
+        // `n` characters from `from`, picked from the keyboard.
+        let select = |h: &mut Harness<'_, App>, from: usize, n: usize| {
+            text_input(h, 0).click();
+            h.run();
+            h.key_press(Key::Home);
+            (0..from).for_each(|_| h.key_press(Key::ArrowRight));
+            (0..n).for_each(|_| h.key_press_modifiers(Modifiers::SHIFT, Key::ArrowRight));
+            h.run();
+        };
+        let selection = |h: &Harness<'_, App>| {
+            let state = egui::TextEdit::load_state(&h.ctx, egui::Id::new("url")).unwrap();
+            let range = state.cursor.char_range().unwrap().as_sorted_char_range();
+            (range.start.0, range.end.0)
+        };
+        // Press and release in frames of their own, as by hand: egui moves the cursor on the
+        // press, and the release opens the menu.
+        let click = |h: &mut Harness<'_, App>, pos: egui::Pos2, button: egui::PointerButton| {
+            h.hover_at(pos);
+            for pressed in [true, false] {
+                let modifiers = Modifiers::NONE;
+                h.event(egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers,
+                });
+                h.run();
+            }
+        };
+        let right_click = |h: &mut Harness<'_, App>| {
+            let at = text_input(h, 0).rect().center();
+            click(h, at, egui::PointerButton::Secondary);
+        };
+        let pick = |h: &mut Harness<'_, App>, label: &str| {
+            let by = egui_kittest::kittest::By::new().role(Role::Button);
+            let at = h.get(by.label_contains(label)).rect().center();
+            click(h, at, egui::PointerButton::Primary);
+        };
+        let menu = |h: &mut Harness<'_, App>, path: &[&str]| {
+            right_click(h);
+            path.iter().for_each(|label| pick(h, label));
+        };
+        select(&mut h, 17, 3);
+        right_click(&mut h);
+        shot(&mut h, "93-selection-menu");
+        assert_eq!(
+            selection(&h),
+            (17, 20),
+            "the right-click kept the selection"
+        );
+        pick(&mut h, "Encode URI component");
+        assert_eq!(url(&h), "http://h.test/?q=a%20b");
+        // What was encoded stays selected, so it decodes right back.
+        menu(&mut h, &["Decode URI component"]);
+        assert_eq!(url(&h), "http://h.test/?q=a b");
+
+        menu(&mut h, &["Set as variable in Globals", "New variable…"]);
+        assert!(matches!(
+            &h.state().dialog,
+            Some(Dialog::Name { kind: NameKind::NewVar { env: None, value }, .. }) if value == "a b"
+        ));
+        h.event(egui::Event::Text("q".into()));
+        h.run();
+        h.key_press(Key::Enter);
+        h.run();
+        assert!(h.state().dialog.is_none(), "{}", h.state().status);
+        let ws = &h.state().ws;
+        let (shared, secret) = ws.load_env(None).unwrap();
+        assert!(shared.is_empty(), "a new value stays on this machine");
+        assert_eq!(secret, [KeyValue::new("q", "a b")]);
+
+        select(&mut h, 7, 6);
+        menu(&mut h, &["Set as variable in dev", "host"]);
+        assert_eq!(h.state().vars["host"], "h.test");
+        let (shared, secret) = h.state().ws.load_env(Some("dev")).unwrap();
+        assert_eq!(shared, [KeyValue::new("host", "h.test")], "still shared");
+        assert!(secret.is_empty());
+        assert_eq!(url(&h), "http://h.test/?q=a b", "the URL is left as it was");
+
+        // Not from the environment editor's own fields: its Save would write back what it
+        // loaded, over the value just set.
+        h.state_mut().open_env_editor(Some("dev".into()), &[]);
+        h.run();
+        let at = (h.get_all_by_role(Role::TextInput))
+            .find(|n| n.value().as_deref() == Some("host"))
+            .unwrap()
+            .rect()
+            .center();
+        click(&mut h, at, egui::PointerButton::Secondary);
+        assert!(h.query_by_label("Cut").is_some(), "the menu is open");
+        let set = h.query_all_by_label_contains("Set as variable").count();
+        assert_eq!(set, 0, "no Set as variable under the environment editor");
     }
 
     /// A request moved or deleted since the order was set drops out of it; one added since

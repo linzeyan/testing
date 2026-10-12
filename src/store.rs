@@ -714,6 +714,24 @@ impl Workspace {
         self.save_env(env, &shared, &secret)
     }
 
+    /// A value from a field's right-click menu, set where the variable is: a secret stays
+    /// sealed on the secret side (the side in effect when it's on both), a shared one changes
+    /// in place, files for git included. A new one goes to the secret side, as a script's
+    /// write would: selections are often tokens, which mustn't reach git unasked. Enabled,
+    /// so `{{key}}` gives the value.
+    pub fn set_var(&self, env: Option<&str>, key: &str, value: &str) -> Result<(), String> {
+        let (mut shared, mut secret) = self.load_env(env)?;
+        if !shared.iter().chain(&secret).any(|kv| kv.key == key) {
+            secret.push(KeyValue::new(key, ""));
+        }
+        // From the end, as `env_vars` lets the last row win.
+        let row = (shared.iter_mut().chain(&mut secret).rev())
+            .find(|kv| kv.key == key)
+            .expect("added above if missing");
+        (row.value, row.enabled) = (value.to_owned(), true);
+        self.save_env(env, &shared, &secret)
+    }
+
     pub fn tree(&self) -> Vec<Node> {
         let db = self.db();
         let rows = |query: &str| -> rusqlite::Result<Vec<(String, String)>> {
@@ -1917,6 +1935,36 @@ mod tests {
         // A second handle (the MCP server next to the app) sees the same data.
         let other = Workspace::open(root.clone()).unwrap();
         assert_eq!(other.env_vars(Some("dev")).unwrap()["token"], "new");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A value set from a selection is what `{{name}}` then gives, and lands on the side the
+    /// variable is on: a secret never moves to the shared side (written to files for git),
+    /// and a new one starts as a secret.
+    #[test]
+    fn a_variable_is_set_where_it_lives() {
+        let root = fresh("set-var");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let off = KeyValue {
+            enabled: false,
+            ..KeyValue::new("off", "x")
+        };
+        let shared = [KeyValue::new("host", "a"), KeyValue::new("both", "s"), off];
+        let secret = [KeyValue::new("token", "t"), KeyValue::new("both", "s2")];
+        for env in [Some("dev"), None] {
+            ws.save_env(env, &shared, &secret).unwrap();
+            for key in ["host", "token", "both", "off", "new"] {
+                ws.set_var(env, key, &format!("{key}!")).unwrap();
+            }
+            let want = ["host", "token", "both", "off", "new"].map(|k| (k.into(), format!("{k}!")));
+            assert_eq!(ws.env_vars(env).unwrap(), HashMap::from(want), "{env:?}");
+            let (shared, secret) = ws.load_env(env).unwrap();
+            let keys = |kvs: &[KeyValue]| kvs.iter().map(|kv| kv.key.clone()).collect::<Vec<_>>();
+            assert_eq!(keys(&shared), ["host", "both", "off"], "{env:?}");
+            assert_eq!(keys(&secret), ["token", "both", "new"], "{env:?}");
+            // The secret side's copy of `both` is the one in effect, so the one that changed.
+            assert_eq!(shared[1].value, "s");
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
