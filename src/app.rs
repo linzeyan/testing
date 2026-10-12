@@ -13347,11 +13347,7 @@ mod ui_tests {
         h.get(by.label("first")).click();
         h.run();
         assert_eq!(run(&mut h, "Run again"), ["first", "second"]);
-        assert_eq!(
-            run(&mut h, "Run"),
-            ["second"],
-            "the ticks as they are now"
-        );
+        assert_eq!(run(&mut h, "Run"), ["second"], "the ticks as they are now");
 
         let want = RunOptions {
             keep_vars: false,
