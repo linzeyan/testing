@@ -82,6 +82,15 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
         Auth::Jwt(j) => Some(format!("JWT Bearer, signed with {}", j.algorithm)),
         Auth::Basic { .. } => Some("Basic".into()),
         Auth::Digest { .. } => Some("Digest".into()),
+        Auth::Hawk(h) => Some(format!(
+            "Hawk, {}",
+            match h.algorithm.as_str() {
+                "" => "sha256",
+                a => a,
+            }
+        )),
+        Auth::EdgeGrid(_) => Some("Akamai EdgeGrid".into()),
+        Auth::Ntlm(_) => Some("NTLM".into()),
         Auth::AwsV4(a) => Some(format!(
             "AWS Signature v4, service `{}`, region `{}`",
             a.service, a.region

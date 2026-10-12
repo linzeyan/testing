@@ -405,6 +405,78 @@ pub enum Auth {
     /// A token signed per request and sent as a Bearer token.
     #[serde(rename = "jwt")]
     Jwt(Jwt),
+    /// Signed per request over the method, URL and host, and the body if asked.
+    #[serde(rename = "hawk")]
+    Hawk(Hawk),
+    /// Akamai's: signed per request over the method, URL, chosen headers and a POST's body.
+    #[serde(rename = "edgegrid")]
+    EdgeGrid(EdgeGrid),
+    /// Windows sign-in (IIS on an intranet): a handshake on one connection, so it costs
+    /// one extra round trip.
+    #[serde(rename = "ntlm")]
+    Ntlm(Ntlm),
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Hawk {
+    pub id: String,
+    pub key: String,
+    /// "sha256" or "sha1"; empty is sha256.
+    pub algorithm: String,
+    /// Postman's "User": kept for the round trip, never signed (Hawk has no such field).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub user: String,
+    /// Empty: a fresh one per send. Set only to reproduce a signature.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub nonce: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ext: String,
+    /// Oz's application and delegation ids.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub app: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub dlg: String,
+    /// Unix seconds; empty is now.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub payload_hash: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct EdgeGrid {
+    pub access_token: String,
+    pub client_token: String,
+    pub client_secret: String,
+    /// Empty: a fresh one per send.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub nonce: String,
+    /// `20140321T19:34:21+0000`; empty is now.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub timestamp: String,
+    /// Its host is signed instead of the URL's, for a request sent through another host.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub base_url: String,
+    /// Comma separated, in the order they're signed.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub headers_to_sign: String,
+    /// How much of a POST body is signed, in bytes; empty is 131072.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub max_body: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Ntlm {
+    /// With `domain` empty, `DOMAIN\user` and `user@domain` are split, as in Postman.
+    pub username: String,
+    pub password: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub domain: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub workstation: String,
 }
 
 /// ponytail: no callback/verifier fields, so the three-legged token dance is done
@@ -519,6 +591,15 @@ impl Auth {
                 }
             }
             Self::Jwt(j) => j.secret.is_empty() && j.payload == JWT_CLAIMS,
+            Self::Hawk(h) => {
+                *h == Hawk {
+                    algorithm: h.algorithm.clone(),
+                    payload_hash: h.payload_hash,
+                    ..Default::default()
+                }
+            }
+            Self::EdgeGrid(e) => *e == EdgeGrid::default(),
+            Self::Ntlm(n) => *n == Ntlm::default(),
         }
     }
 }
@@ -817,6 +898,34 @@ impl Request {
                     algorithm: j.algorithm.clone(),
                     secret: r(&j.secret),
                     payload: r(&j.payload),
+                }),
+                Auth::Hawk(h) => Auth::Hawk(Hawk {
+                    id: r(&h.id),
+                    key: r(&h.key),
+                    algorithm: h.algorithm.clone(),
+                    user: r(&h.user),
+                    nonce: r(&h.nonce),
+                    ext: r(&h.ext),
+                    app: r(&h.app),
+                    dlg: r(&h.dlg),
+                    timestamp: r(&h.timestamp),
+                    payload_hash: h.payload_hash,
+                }),
+                Auth::EdgeGrid(e) => Auth::EdgeGrid(EdgeGrid {
+                    access_token: r(&e.access_token),
+                    client_token: r(&e.client_token),
+                    client_secret: r(&e.client_secret),
+                    nonce: r(&e.nonce),
+                    timestamp: r(&e.timestamp),
+                    base_url: r(&e.base_url),
+                    headers_to_sign: r(&e.headers_to_sign),
+                    max_body: r(&e.max_body),
+                }),
+                Auth::Ntlm(n) => Auth::Ntlm(Ntlm {
+                    username: r(&n.username),
+                    password: r(&n.password),
+                    domain: r(&n.domain),
+                    workstation: r(&n.workstation),
                 }),
             },
             // Scripts have already run by the time a request is resolved for the wire.
@@ -1285,5 +1394,54 @@ mod tests {
         };
         req.inherited.auth = Some(("api".into(), folder.clone()));
         assert_eq!(req.effective_auth(), &folder);
+    }
+
+    /// Hawk, EdgeGrid and NTLM picked and left blank inherit and save as inherit, choices
+    /// aside, like the other types; one typed field makes them a setting that survives a save.
+    #[test]
+    fn hawk_edgegrid_and_ntlm_left_blank_are_not_set() {
+        let plain = Request::default();
+        let with = |auth: Auth| Request {
+            auth,
+            ..Default::default()
+        };
+        let blank = [
+            Auth::Hawk(Hawk {
+                algorithm: "sha1".into(),
+                payload_hash: true,
+                ..Default::default()
+            }),
+            Auth::EdgeGrid(EdgeGrid::default()),
+            Auth::Ntlm(Ntlm::default()),
+        ];
+        for auth in blank {
+            let picked = with(auth);
+            assert!(
+                picked.same_as(&plain) && plain.same_as(&picked),
+                "{picked:?}"
+            );
+            let saved = toml::to_string_pretty(&picked).unwrap();
+            assert_eq!(saved, toml::to_string_pretty(&plain).unwrap());
+        }
+        let typed = [
+            Auth::Hawk(Hawk {
+                id: "id".into(),
+                ..Default::default()
+            }),
+            Auth::EdgeGrid(EdgeGrid {
+                headers_to_sign: "X-A".into(),
+                ..Default::default()
+            }),
+            Auth::Ntlm(Ntlm {
+                domain: "CORP".into(),
+                ..Default::default()
+            }),
+        ];
+        for auth in typed {
+            let req = with(auth.clone());
+            assert!(!req.same_as(&plain), "{req:?}");
+            let saved = toml::to_string_pretty(&req).unwrap();
+            assert_eq!(toml::from_str::<Request>(&saved).unwrap().auth, auth);
+        }
     }
 }

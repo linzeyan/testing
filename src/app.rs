@@ -8475,6 +8475,18 @@ fn auth_editor(
                 payload: model::JWT_CLAIMS.into(),
             }),
         ),
+        (
+            t("Hawk"),
+            Auth::Hawk(model::Hawk {
+                algorithm: "sha256".into(),
+                ..Default::default()
+            }),
+        ),
+        (
+            t("Akamai EdgeGrid"),
+            Auth::EdgeGrid(model::EdgeGrid::default()),
+        ),
+        (t("NTLM"), Auth::Ntlm(model::Ntlm::default())),
     ];
     let label_of = |a: &Auth| {
         let d = std::mem::discriminant(a);
@@ -8616,6 +8628,54 @@ fn auth_editor(
                 );
                 ui.end_row();
             }
+            Auth::Hawk(h) => {
+                text(ui, t("Auth ID"), &mut h.id, "");
+                secret(ui, t("Auth key"), &mut h.key);
+                ui.label(t("Algorithm"));
+                egui::ComboBox::from_id_salt("hawk-alg")
+                    .selected_text(h.algorithm.as_str())
+                    .show_ui(ui, |ui| {
+                        for alg in crate::hawk::ALGORITHMS {
+                            ui.selectable_value(&mut h.algorithm, alg.to_owned(), alg);
+                        }
+                    });
+                ui.end_row();
+                text(ui, t("User"), &mut h.user, t("optional"));
+                text(ui, t("Nonce"), &mut h.nonce, t("random on each Send"));
+                text(ui, t("Extra data"), &mut h.ext, t("optional"));
+                text(ui, t("App"), &mut h.app, t("optional"));
+                text(ui, t("Delegation"), &mut h.dlg, t("optional"));
+                text(ui, t("Timestamp"), &mut h.timestamp, t("now on each Send"));
+                ui.label("");
+                ui.checkbox(&mut h.payload_hash, t("Include payload hash"));
+                ui.end_row();
+            }
+            Auth::EdgeGrid(e) => {
+                text(ui, t("Access token"), &mut e.access_token, "akab-…");
+                text(ui, t("Client token"), &mut e.client_token, "akab-…");
+                secret(ui, t("Client secret"), &mut e.client_secret);
+                text(
+                    ui,
+                    t("Base URL"),
+                    &mut e.base_url,
+                    t("optional: the host to sign, if not the URL's"),
+                );
+                text(
+                    ui,
+                    t("Headers to sign"),
+                    &mut e.headers_to_sign,
+                    "X-Header-1, X-Header-2",
+                );
+                text(ui, t("Max body"), &mut e.max_body, "131072");
+                text(ui, t("Nonce"), &mut e.nonce, t("random on each Send"));
+                text(ui, t("Timestamp"), &mut e.timestamp, t("now on each Send"));
+            }
+            Auth::Ntlm(n) => {
+                text(ui, t("Username"), &mut n.username, "DOMAIN\\user");
+                secret(ui, t("Password"), &mut n.password);
+                text(ui, t("Domain"), &mut n.domain, t("optional"));
+                text(ui, t("Workstation"), &mut n.workstation, t("optional"));
+            }
             Auth::ApiKey {
                 key,
                 value,
@@ -8734,6 +8794,28 @@ fn auth_editor(
                 "Each Send is signed over its URL, headers and body. A signature lasts 15 \
                  minutes, so a copied snippet stops working after that. A body streamed from a \
                  file is sent as UNSIGNED-PAYLOAD, which S3 accepts.",
+            ));
+        }
+        Auth::Hawk(_) => {
+            ui.weak(t(
+                "Each Send is signed over its method, URL and host with a fresh nonce and \
+                 timestamp; the payload hash adds the body and its content type. A body \
+                 streamed from a file isn't hashed.",
+            ));
+        }
+        Auth::EdgeGrid(_) => {
+            ui.weak(t(
+                "Each Send is signed over its method, URL, the headers to sign and a POST's \
+                 body (up to max body) with a fresh nonce and timestamp. The tokens and host \
+                 are in your .edgerc.",
+            ));
+        }
+        Auth::Ntlm(_) => {
+            ui.weak(t(
+                "Send signs in with NTLMv2 over HTTP/1.1: a challenge and answer on one \
+                 connection, so the body goes twice. Through a proxy only https:// URLs work \
+                 (a plain HTTP proxy may switch connections), and servers that only offer \
+                 Kerberos aren't supported.",
             ));
         }
         _ => {
@@ -16081,6 +16163,38 @@ mod ui_tests {
         h.key_press_modifiers(Modifiers::COMMAND, Key::S);
         h.run();
         assert_eq!((blue(&h), orange(&h)), (1, 0));
+    }
+
+    /// NTLM picked and filled in on the Auth tab signs in to a server that checks the
+    /// whole handshake: the fields reach the request, and Send takes the NTLM path.
+    #[test]
+    fn ntlm_picked_on_the_auth_tab_signs_in() {
+        let (url, _) = crate::ntlm::tests::iis("Password");
+        let mut h = with_request("ntlm");
+        type_into(&mut h, 0, &url);
+        h.get_by_label("Auth").click();
+        h.run();
+        let picker = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("Inherit from parent");
+        h.get(picker).click();
+        h.run();
+        // Last in the list, below the popup's fold: scrolled to, as a user would.
+        h.get_by_label("NTLM").scroll_to_me();
+        h.run();
+        h.get_by_label("NTLM").click();
+        h.run();
+        type_into(&mut h, 1, "CORP\\User");
+        h.get_by_role(Role::PasswordInput).click();
+        h.run();
+        h.get_by_role(Role::PasswordInput).type_text("Password");
+        h.run();
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| app.response.is_some());
+        let response = h.state().response.as_ref().unwrap();
+        let shown = response.result.as_ref().unwrap();
+        let got = (shown.head.status, shown.text.as_str());
+        assert_eq!(got, (200, "CORP\\User"));
     }
 
     /// Every protocol against public servers, through the same Send and Connect as a click:

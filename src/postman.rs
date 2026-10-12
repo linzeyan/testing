@@ -7,8 +7,8 @@ use std::path::Path;
 use serde_json::{Map, Value, json};
 
 use crate::model::{
-    self, Auth, AwsV4, Body, Example, Folder, Grant, Jwt, KeyValue, OAuth1, OAuth2, Request,
-    Settings,
+    self, Auth, AwsV4, Body, EdgeGrid, Example, Folder, Grant, Hawk, Jwt, KeyValue, Ntlm, OAuth1,
+    OAuth2, Request, Settings,
 };
 use crate::store::{Node, Workspace, escape_name, folder_name, safe_name, unescape_name};
 
@@ -363,6 +363,34 @@ fn auth(v: &Value) -> Result<Auth, String> {
             service: p("service"),
             session_token: p("sessionToken"),
         }),
+        "hawk" => Auth::Hawk(Hawk {
+            id: p("authId"),
+            key: p("authKey"),
+            algorithm: p("algorithm"),
+            user: p("user"),
+            nonce: p("nonce"),
+            ext: p("extraData"),
+            app: p("app"),
+            dlg: p("delegation"),
+            timestamp: p("timestamp"),
+            payload_hash: p("includePayloadHash") == "true",
+        }),
+        "edgegrid" => Auth::EdgeGrid(EdgeGrid {
+            access_token: p("accessToken"),
+            client_token: p("clientToken"),
+            client_secret: p("clientSecret"),
+            nonce: p("nonce"),
+            timestamp: p("timestamp"),
+            base_url: p("baseURL"),
+            headers_to_sign: p("headersToSign"),
+            max_body: p("maxBodySize"),
+        }),
+        "ntlm" => Auth::Ntlm(Ntlm {
+            username: p("username"),
+            password: p("password"),
+            domain: p("domain"),
+            workstation: p("workstation"),
+        }),
         other => return Err(other.into()),
     })
 }
@@ -710,6 +738,46 @@ fn auth_json(auth: &Auth) -> Option<Value> {
                 ("sessionToken", a.session_token.as_str()),
             ],
         ),
+        Auth::Hawk(h) => {
+            let mut rows = vec![
+                ("authId", h.id.as_str()),
+                ("authKey", h.key.as_str()),
+                ("algorithm", h.algorithm.as_str()),
+                ("user", h.user.as_str()),
+                ("nonce", h.nonce.as_str()),
+                ("extraData", h.ext.as_str()),
+                ("app", h.app.as_str()),
+                ("delegation", h.dlg.as_str()),
+                ("timestamp", h.timestamp.as_str()),
+            ];
+            // Only when on: Postman reads any string here, "false" too, as on.
+            if h.payload_hash {
+                rows.push(("includePayloadHash", "true"));
+            }
+            typed("hawk", &rows)
+        }
+        Auth::EdgeGrid(e) => typed(
+            "edgegrid",
+            &[
+                ("accessToken", e.access_token.as_str()),
+                ("clientToken", e.client_token.as_str()),
+                ("clientSecret", e.client_secret.as_str()),
+                ("nonce", e.nonce.as_str()),
+                ("timestamp", e.timestamp.as_str()),
+                ("baseURL", e.base_url.as_str()),
+                ("headersToSign", e.headers_to_sign.as_str()),
+                ("maxBodySize", e.max_body.as_str()),
+            ],
+        ),
+        Auth::Ntlm(n) => typed(
+            "ntlm",
+            &[
+                ("username", n.username.as_str()),
+                ("password", n.password.as_str()),
+                ("domain", n.domain.as_str()),
+                ("workstation", n.workstation.as_str()),
+            ],
+        ),
         Auth::OAuth2(o) => {
             let grant = match o.grant {
                 Grant::ClientCredentials => "client_credentials",
@@ -830,7 +898,7 @@ mod tests {
         { "name": "login",
           "request": { "method": "POST", "url": "{{base}}/login",
             "body": { "mode": "urlencoded", "urlencoded": [{ "key": "user", "value": "{{user}}" }] },
-            "auth": { "type": "ntlm", "ntlm": [] } } },
+            "auth": { "type": "asap", "asap": [] } } },
         { "name": "feed", "request": { "method": "GET", "url": "{{base}}/feed?x=1",
             "auth": { "type": "apikey", "apikey": [{ "key": "key", "value": "api_key" },
                       { "key": "value", "value": "k" }, { "key": "in", "value": "query" }] } } },
@@ -967,7 +1035,7 @@ mod tests {
 
         // What couldn't come over is said, not dropped quietly.
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].starts_with("login: ntlm auth"), "{warnings:?}");
+        assert!(warnings[0].starts_with("login: asap auth"), "{warnings:?}");
         let file = Body::File {
             path: "x.bin".into(),
         };
@@ -1298,5 +1366,83 @@ mod tests {
             assert_eq!(back[name.strip_prefix("api/").unwrap()], saved, "{name}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Hawk, EdgeGrid and NTLM as Postman writes them (a real boolean for the payload hash),
+    /// and back the same, every field kept.
+    #[test]
+    fn hawk_edgegrid_and_ntlm_go_both_ways() {
+        let rows = |kind: &str, rows: Value| json!({ "type": kind, kind: rows });
+        let hawk = rows(
+            "hawk",
+            json!([
+                { "key": "authId", "value": "dh37fgj492je" },
+                { "key": "authKey", "value": "{{hawkKey}}" },
+                { "key": "algorithm", "value": "sha1" },
+                { "key": "user", "value": "u" },
+                { "key": "nonce", "value": "j4h3g2" },
+                { "key": "extraData", "value": "x" },
+                { "key": "app", "value": "a" },
+                { "key": "delegation", "value": "d" },
+                { "key": "timestamp", "value": "1353832234" },
+                { "key": "includePayloadHash", "value": true, "type": "boolean" }
+            ]),
+        );
+        let expected = Auth::Hawk(Hawk {
+            id: "dh37fgj492je".into(),
+            key: "{{hawkKey}}".into(),
+            algorithm: "sha1".into(),
+            user: "u".into(),
+            nonce: "j4h3g2".into(),
+            ext: "x".into(),
+            app: "a".into(),
+            dlg: "d".into(),
+            timestamp: "1353832234".into(),
+            payload_hash: true,
+        });
+        assert_eq!(auth(&hawk), Ok(expected));
+        let edgegrid = rows(
+            "edgegrid",
+            json!([
+                { "key": "accessToken", "value": "akab-access" },
+                { "key": "clientToken", "value": "akab-client" },
+                { "key": "clientSecret", "value": "{{secret}}" },
+                { "key": "baseURL", "value": "https://akab-host.luna.akamaiapis.net" },
+                { "key": "headersToSign", "value": "X-A,X-B" },
+                { "key": "maxBodySize", "value": "2048" }
+            ]),
+        );
+        let Ok(Auth::EdgeGrid(e)) = auth(&edgegrid) else {
+            panic!("not EdgeGrid");
+        };
+        let fields = [&e.access_token, &e.client_secret, &e.base_url, &e.max_body];
+        let host = "https://akab-host.luna.akamaiapis.net";
+        assert_eq!(fields, ["akab-access", "{{secret}}", host, "2048"]);
+        let ntlm = rows(
+            "ntlm",
+            json!([
+                { "key": "username", "value": "u" },
+                { "key": "password", "value": "{{pw}}" },
+                { "key": "domain", "value": "CORP" },
+                { "key": "workstation", "value": "PC1" }
+            ]),
+        );
+        let n = Ntlm {
+            username: "u".into(),
+            password: "{{pw}}".into(),
+            domain: "CORP".into(),
+            workstation: "PC1".into(),
+        };
+        assert_eq!(auth(&ntlm), Ok(Auth::Ntlm(n)));
+
+        for v in [hawk, edgegrid, ntlm] {
+            let a = auth(&v).unwrap();
+            assert_eq!(auth(&auth_json(&a).unwrap()), Ok(a.clone()), "{a:?}");
+        }
+        // Off is left out: Postman reads any string there, "false" too, as on.
+        let off = Auth::Hawk(Hawk::default());
+        let row = |r: &Value| r["key"] == "includePayloadHash";
+        let rows = auth_json(&off).unwrap()["hawk"].as_array().unwrap().clone();
+        assert!(!rows.iter().any(row));
     }
 }

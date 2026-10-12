@@ -76,9 +76,33 @@ pub struct Wire {
     /// A Binary body: the snippet reads this file, as Send does.
     file: Option<String>,
     parts: Vec<(String, Part)>,
-    /// Answered by the tool itself where it can, as curl --digest does.
-    digest: Option<(String, String)>,
+    challenge: Option<Challenge>,
     settings: Settings,
+}
+
+/// Auth that answers the server's 401 challenge: done by the tool itself where it can, as
+/// curl --digest and --ntlm do.
+struct Challenge {
+    /// "Digest" or "NTLM", as the snippets' comments name it.
+    scheme: &'static str,
+    user: String,
+    pass: String,
+    /// NTLM's, for the APIs that take it apart; `login` folds it in for the rest.
+    domain: String,
+}
+
+impl Challenge {
+    fn ntlm(&self) -> bool {
+        self.scheme == "NTLM"
+    }
+
+    /// `DOMAIN\user`, as curl, wget, PowerShell, requests_ntlm and PHP take an NTLM login.
+    fn login(&self) -> String {
+        match self.domain.as_str() {
+            "" => self.user.clone(),
+            domain => format!("{domain}\\{}", self.user),
+        }
+    }
 }
 
 enum Part {
@@ -122,10 +146,25 @@ impl Wire {
                 Vec::new()
             }
         };
-        // OAuth 2.0 needs a token fetched by Send; Digest needs the server's challenge.
-        let mut digest = None;
+        // OAuth 2.0 needs a token fetched by Send; Digest and NTLM the server's challenge.
+        let mut challenge = None;
         match std::mem::take(&mut req.auth) {
-            Auth::Digest { username, password } => digest = Some((username, password)),
+            Auth::Digest { username, password } => {
+                challenge = Some(Challenge {
+                    scheme: "Digest",
+                    user: username,
+                    pass: password,
+                    domain: String::new(),
+                })
+            }
+            Auth::Ntlm(n) => {
+                challenge = Some(Challenge {
+                    scheme: "NTLM",
+                    user: n.username,
+                    pass: n.password,
+                    domain: n.domain,
+                })
+            }
             Auth::OAuth2(o) => req.auth = fetched_token(&o),
             auth => req.auth = auth,
         }
@@ -150,7 +189,7 @@ impl Wire {
             body,
             file,
             parts,
-            digest,
+            challenge,
             settings,
         })
     }
@@ -298,8 +337,10 @@ fn curl(w: &Wire) -> String {
     if let Some(s) = w.timeout_secs() {
         let _ = write!(out, " --max-time {s}");
     }
-    if let Some((user, pass)) = &w.digest {
-        let _ = write!(out, " --digest -u {}", sh(&format!("{user}:{pass}")));
+    if let Some(c) = &w.challenge {
+        let flag = if c.ntlm() { "--ntlm" } else { "--digest" };
+        let login = sh(&format!("{}:{}", c.login(), c.pass));
+        let _ = write!(out, " {flag} -u {login}");
     }
     let _ = write!(out, " {}", sh(w.url.as_str()));
     for (k, v) in &w.headers {
@@ -345,8 +386,8 @@ fn wget(w: &Wire) -> String {
     if let Some(s) = w.timeout_secs() {
         let _ = write!(out, " --timeout {s}");
     }
-    if let Some((user, pass)) = &w.digest {
-        let _ = write!(out, " --user {} --password {}", sh(user), sh(pass));
+    if let Some(c) = &w.challenge {
+        let _ = write!(out, " --user {} --password {}", sh(&c.login()), sh(&c.pass));
     }
     for (k, v) in &w.headers {
         let _ = write!(out, " \\\n  --header {}", sh(&format!("{k}: {v}")));
@@ -375,12 +416,11 @@ fn httpie(w: &Wire) -> String {
     if let Some(s) = w.timeout_secs() {
         let _ = write!(out, " --timeout {s}");
     }
-    if let Some((user, pass)) = &w.digest {
-        let _ = write!(
-            out,
-            " --auth-type digest --auth {}",
-            sh(&format!("{user}:{pass}"))
-        );
+    if let Some(c) = &w.challenge {
+        // NTLM comes from the httpie-ntlm plugin.
+        let kind = if c.ntlm() { "ntlm" } else { "digest" };
+        let login = sh(&format!("{}:{}", c.login(), c.pass));
+        let _ = write!(out, " --auth-type {kind} --auth {login}");
     }
     if !w.parts.is_empty() {
         out.push_str(" --multipart");
@@ -462,13 +502,13 @@ fn powershell(w: &Wire) -> String {
         out.push_str("    HttpVersion = '2.0'\n");
     }
     out.push_str("}\n");
-    if let Some((user, pass)) = &w.digest {
+    if let Some(c) = &w.challenge {
         let _ = write!(
             out,
             "$password = ConvertTo-SecureString {} -AsPlainText -Force\n\
              $params.Credential = New-Object PSCredential({}, $password)\n",
-            ps_str(pass),
-            ps_str(user)
+            ps_str(&c.pass),
+            ps_str(&c.login())
         );
         // 7 won't send credentials over http:// without it, and 5.1 doesn't know it.
         if !w.https() {
@@ -539,8 +579,10 @@ fn raw(w: &Wire) -> String {
 
 fn python(w: &Wire) -> String {
     let mut out = String::from("import requests\n");
-    if w.digest.is_some() {
-        out.push_str("from requests.auth import HTTPDigestAuth\n");
+    match &w.challenge {
+        Some(c) if c.ntlm() => out.push_str("from requests_ntlm import HttpNtlmAuth\n"),
+        Some(_) => out.push_str("from requests.auth import HTTPDigestAuth\n"),
+        None => {}
     }
     let _ = write!(out, "\nurl = {}\n", dq(w.url.as_str()));
     if !w.headers.is_empty() {
@@ -587,8 +629,13 @@ fn python(w: &Wire) -> String {
     if !w.parts.is_empty() {
         args.push("files=files".into());
     }
-    if let Some((user, pass)) = &w.digest {
-        args.push(format!("auth=HTTPDigestAuth({}, {})", dq(user), dq(pass)));
+    if let Some(c) = &w.challenge {
+        let auth = if c.ntlm() {
+            "HttpNtlmAuth"
+        } else {
+            "HTTPDigestAuth"
+        };
+        args.push(format!("auth={auth}({}, {})", dq(&c.login()), dq(&c.pass)));
     }
     if !w.follows() {
         args.push("allow_redirects=False".into());
@@ -652,8 +699,12 @@ fn fetch(w: &Wire) -> String {
             "// Node: run with NODE_TLS_REJECT_UNAUTHORIZED=0 to skip the certificate check.\n",
         );
     }
-    if w.digest.is_some() {
-        out.push_str("// Digest auth isn't built into fetch; answer the 401 challenge yourself.\n");
+    if let Some(c) = &w.challenge {
+        let _ = writeln!(
+            out,
+            "// {} auth isn't built into fetch; answer the 401 challenge yourself.",
+            c.scheme
+        );
     }
     let _ = writeln!(
         out,
@@ -723,9 +774,11 @@ fn axios(w: &Wire) -> String {
     if !w.parts.is_empty() {
         out.push_str("    data: form,\n");
     }
-    if w.digest.is_some() {
-        out.push_str(
-            "    // Digest auth isn't built into axios; answer the 401 challenge yourself.\n",
+    if let Some(c) = &w.challenge {
+        let _ = writeln!(
+            out,
+            "    // {} auth isn't built into axios; answer the 401 challenge yourself.",
+            c.scheme
         );
     }
     match (w.follows(), w.settings.max_redirects) {
@@ -828,9 +881,11 @@ fn go(w: &Wire) -> String {
     if !w.parts.is_empty() {
         out.push_str("\treq.Header.Set(\"Content-Type\", writer.FormDataContentType())\n");
     }
-    if w.digest.is_some() {
-        out.push_str(
-            "\t// Digest auth isn't built into net/http; answer the 401 challenge yourself.\n",
+    if let Some(c) = &w.challenge {
+        let _ = writeln!(
+            out,
+            "\t// {} auth isn't built into net/http; answer the 401 challenge yourself.",
+            c.scheme
         );
     }
     if w.settings.http_version != HttpVersion::Auto {
@@ -900,8 +955,12 @@ fn java(w: &Wire) -> String {
     if w.insecure() {
         out.push_str("        // Skipping the certificate check needs a custom SSLContext.\n");
     }
-    if w.digest.is_some() {
-        out.push_str("        // Digest auth isn't built into HttpClient; answer the 401 challenge yourself.\n");
+    if let Some(c) = &w.challenge {
+        let _ = writeln!(
+            out,
+            "        // {} auth isn't built into HttpClient; answer the 401 challenge yourself.",
+            c.scheme
+        );
     }
     out.push_str("        HttpClient client = HttpClient.newBuilder()\n");
     // HttpClient never follows unless told.
@@ -963,12 +1022,16 @@ fn csharp(w: &Wire) -> String {
             "handler.ServerCertificateCustomValidationCallback =\n    HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;\n",
         );
     }
-    if let Some((user, pass)) = &w.digest {
+    if let Some(c) = &w.challenge {
+        let domain = match c.domain.as_str() {
+            "" => String::new(),
+            domain => format!(", {}", dq(domain)),
+        };
         let _ = writeln!(
             out,
-            "handler.Credentials = new NetworkCredential({}, {});",
-            dq(user),
-            dq(pass)
+            "handler.Credentials = new NetworkCredential({}, {}{domain});",
+            dq(&c.user),
+            dq(&c.pass)
         );
     }
     out.push_str("using var client = new HttpClient(handler);\n");
@@ -1098,13 +1161,15 @@ fn php(w: &Wire) -> String {
             "CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE".into(),
         ),
     }
-    if let Some((user, pass)) = &w.digest {
-        opt(&mut out, "CURLOPT_HTTPAUTH", "CURLAUTH_DIGEST".into());
-        opt(
-            &mut out,
-            "CURLOPT_USERPWD",
-            php_str(&format!("{user}:{pass}")),
-        );
+    if let Some(c) = &w.challenge {
+        let kind = if c.ntlm() {
+            "CURLAUTH_NTLM"
+        } else {
+            "CURLAUTH_DIGEST"
+        };
+        opt(&mut out, "CURLOPT_HTTPAUTH", kind.into());
+        let login = format!("{}:{}", c.login(), c.pass);
+        opt(&mut out, "CURLOPT_USERPWD", php_str(&login));
     }
     if !w.headers.is_empty() {
         out.push_str("    CURLOPT_HTTPHEADER => [\n");
@@ -1178,10 +1243,14 @@ fn ruby(w: &Wire) -> String {
         }
         out.push_str("], \"multipart/form-data\")\n");
     }
-    if w.digest.is_some() {
-        out.push_str(
+    match &w.challenge {
+        Some(c) if c.ntlm() => {
+            out.push_str("# NTLM auth: Net::HTTP needs the rubyntlm gem for the 401 challenge.\n")
+        }
+        Some(_) => out.push_str(
             "# Digest auth: Net::HTTP needs the net-http-digest_auth gem for the 401 challenge.\n",
-        );
+        ),
+        None => {}
     }
     if w.follows() {
         out.push_str(
@@ -1278,9 +1347,11 @@ fn rust(w: &Wire) -> String {
     if !w.parts.is_empty() {
         out.push_str("\n        .multipart(form)");
     }
-    if w.digest.is_some() {
-        out.push_str(
-            "\n        // Digest auth isn't built into reqwest; answer the 401 challenge yourself.",
+    if let Some(c) = &w.challenge {
+        let _ = write!(
+            out,
+            "\n        // {} auth isn't built into reqwest; answer the 401 challenge yourself.",
+            c.scheme
         );
     }
     out.push_str(
@@ -1300,8 +1371,12 @@ fn swift(w: &Wire) -> String {
             "// Skipping redirects or the certificate check needs a URLSessionDelegate.\n",
         );
     }
-    if w.digest.is_some() {
-        out.push_str("// Digest auth: answer the challenge in a URLSessionTaskDelegate.\n");
+    if let Some(c) = &w.challenge {
+        let _ = writeln!(
+            out,
+            "// {} auth: answer the challenge in a URLSessionTaskDelegate.",
+            c.scheme
+        );
     }
     let _ = write!(
         out,
@@ -1413,8 +1488,12 @@ fn kotlin(w: &Wire) -> String {
     if w.insecure() {
         out.push_str("// Skipping the certificate check needs a custom X509TrustManager.\n");
     }
-    if w.digest.is_some() {
-        out.push_str("// Digest auth: add an okhttp-digest Authenticator.\n");
+    match &w.challenge {
+        Some(c) if c.ntlm() => {
+            out.push_str("// NTLM auth isn't built into OkHttp; add an Authenticator for it.\n")
+        }
+        Some(_) => out.push_str("// Digest auth: add an okhttp-digest Authenticator.\n"),
+        None => {}
     }
     out.push_str("fun main() {\n    val client = OkHttpClient.Builder()\n");
     if !w.follows() {
@@ -2585,7 +2664,45 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            ("ntlm", ntlm()),
         ]
+    }
+
+    fn ntlm() -> Request {
+        Request {
+            url: "http://echo.test:8080/intranet".into(),
+            auth: Auth::Ntlm(crate::model::Ntlm {
+                username: "u".into(),
+                password: "p".into(),
+                domain: "CORP".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// NTLM is a handshake no header can stand for: the tools that do it are told to,
+    /// with the domain where each expects it, and the rest say they can't.
+    #[test]
+    fn ntlm_is_left_to_the_tools_that_do_the_handshake() {
+        let code = |target: &str| generate(target, ntlm()).unwrap();
+        let curl = code("cURL");
+        assert!(curl.contains(r"--ntlm -u 'CORP\u:p'"), "{curl}");
+        assert!(!curl.contains("uthorization"), "{curl}");
+        let python = code("Python (requests)");
+        assert!(
+            python.contains(r#"auth=HttpNtlmAuth("CORP\\u", "p")"#),
+            "{python}"
+        );
+        let cs = code("C# (HttpClient)");
+        assert!(
+            cs.contains(r#"NetworkCredential("u", "p", "CORP")"#),
+            "{cs}"
+        );
+        let php = code("PHP (cURL)");
+        assert!(php.contains("CURLAUTH_NTLM"), "{php}");
+        let go = code("Go (net/http)");
+        assert!(go.contains("NTLM auth isn't built into net/http"), "{go}");
     }
 
     #[test]

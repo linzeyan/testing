@@ -8,7 +8,9 @@ use std::sync::LazyLock;
 use regex::{Captures, Regex};
 use serde_json::{Value, json};
 
-use crate::model::{Auth, AwsV4, Body, Folder, Grant, KeyValue, OAuth1, OAuth2, Request};
+use crate::model::{
+    Auth, AwsV4, Body, Folder, Grant, Hawk, KeyValue, Ntlm, OAuth1, OAuth2, Request,
+};
 use crate::postman::Import;
 use crate::store::{escape_name, safe_name};
 
@@ -394,6 +396,20 @@ fn auth(a: &Value) -> Result<Auth, String> {
             token_secret: s("tokenSecret"),
             realm: s("realm"),
         }),
+        "hawk" => Auth::Hawk(Hawk {
+            id: s("id"),
+            key: s("key"),
+            algorithm: s("algorithm"),
+            ext: s("ext"),
+            payload_hash: a["validatePayload"] == true,
+            ..Default::default()
+        }),
+        // Insomnia has no domain field: `DOMAIN\user` in the name, which NTLM splits.
+        "ntlm" => Auth::Ntlm(Ntlm {
+            username: s("username"),
+            password: s("password"),
+            ..Default::default()
+        }),
         "apikey" => return Err("cookie API key".into()),
         kind => return Err(kind.to_owned()),
     })
@@ -510,7 +526,7 @@ mod tests {
           {"_id": "req_0", "parentId": "fld_1", "_type": "request", "metaSortKey": 1,
            "name": "Query", "method": "POST", "url": "https://x.test/graphql",
            "body": {"mimeType": "application/graphql", "text": "{\"query\":\"{ me }\",\"variables\":{\"a\":1}}"},
-           "authentication": {"type": "ntlm"}},
+           "authentication": {"type": "asap"}},
           {"_id": "grpc_1", "parentId": "fld_1", "_type": "grpc_request", "name": "Hello",
            "protoMethodName": "/hello.Hello/Say"},
           {"_id": "fld_1", "parentId": "wrk_1", "_type": "request_group", "name": "Top Level",
@@ -597,10 +613,33 @@ mod tests {
             warnings,
             [
                 "Top Level/Hello: gRPC requests aren't imported; left out",
-                "Top Level/Query: ntlm auth isn't supported; set to none",
+                "Top Level/Query: asap auth isn't supported; set to none",
                 "template tag {% response 'body', 'req_2', '$.id' %} has no counterpart; left as it is",
             ]
         );
+    }
+
+    /// Insomnia's Hawk and NTLM, as its exports write them.
+    #[test]
+    fn hawk_and_ntlm_come_over() {
+        let hawk = json!({"type": "hawk", "id": "dh37fgj492je", "key": "k", "algorithm": "sha1",
+                          "ext": "x", "validatePayload": true});
+        let expected = Hawk {
+            id: "dh37fgj492je".into(),
+            key: "k".into(),
+            algorithm: "sha1".into(),
+            ext: "x".into(),
+            payload_hash: true,
+            ..Default::default()
+        };
+        assert_eq!(auth(&hawk), Ok(Auth::Hawk(expected)));
+        let ntlm = json!({"type": "ntlm", "username": "CORP\\u", "password": "p"});
+        let expected = Ntlm {
+            username: "CORP\\u".into(),
+            password: "p".into(),
+            ..Default::default()
+        };
+        assert_eq!(auth(&ntlm), Ok(Auth::Ntlm(expected)));
     }
 
     #[test]

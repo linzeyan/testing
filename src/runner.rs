@@ -224,6 +224,10 @@ pub async fn send(client: &net::Clients, mut req: Request) -> Result<http::Respo
         // The gRPC client speaks only HTTP/2; the token endpoint gets the regular one.
         http::with_token(&client.http, &mut req, false).await?;
         grpc::call(client.grpc_for(&req.url)?, req).await
+    } else if let crate::model::Auth::Ntlm(_) = req.auth {
+        // `_over` lives until the handshake is done, see `ntlm_for`.
+        let (ntlm, _over) = client.ntlm_for(&req.settings, &req.url)?;
+        http::execute(ntlm, req).await
     } else {
         http::execute(client.for_settings(&req.settings, &req.url)?, req).await
     }

@@ -191,7 +191,8 @@ impl From<&Settings> for Variant {
 }
 
 struct Variants {
-    build: Box<dyn Fn(Variant) -> Result<reqwest::Client, String> + Send + Sync>,
+    /// The second value makes a client for one NTLM handshake (see `ntlm_for`).
+    build: Box<dyn Fn(Variant, Option<Handshake>) -> Result<reqwest::Client, String> + Send + Sync>,
     built: Mutex<HashMap<Variant, reqwest::Client>>,
     /// For picking the certificate by host.
     net: Network,
@@ -216,6 +217,28 @@ impl Clients {
         self.for_settings(&settings, url)
     }
 
+    /// A client for one NTLM handshake to `url`, never cached: NTLM signs in a connection,
+    /// so the handshake must stay on one, and a shared pool could hand it another
+    /// handshake's. HTTP/1.1, as HTTP/2 multiplexes requests from anywhere on one
+    /// connection. The handshake is over when the second value drops.
+    pub fn ntlm_for(
+        &self,
+        s: &Settings,
+        url: &str,
+    ) -> Result<(reqwest::Client, tokio::sync::watch::Sender<()>), String> {
+        let (over, waiting) = tokio::sync::watch::channel(());
+        let v = Variant {
+            version: HttpVersion::Http1,
+            cert: self.variants.net.host_cert(url),
+            ..s.into()
+        };
+        let handshake = Handshake {
+            opened: Default::default(),
+            over: waiting,
+        };
+        Ok(((self.variants.build)(v, Some(handshake))?, over))
+    }
+
     /// The HTTP/2 client for a gRPC call to `url`.
     pub fn grpc_for(&self, url: &str) -> Result<reqwest::Client, String> {
         let cert = self.variants.net.host_cert(url);
@@ -235,7 +258,7 @@ impl Clients {
         if let Some(c) = self.variants.built.lock().unwrap().get(&v) {
             return Ok(c.clone());
         }
-        let c = (self.variants.build)(v)?;
+        let c = (self.variants.build)(v, None)?;
         self.variants.built.lock().unwrap().insert(v, c.clone());
         Ok(c)
     }
@@ -318,7 +341,7 @@ pub async fn build_client_with_jar(
         .collect::<Result<Vec<_>, _>>()?;
     let picking = net.clone();
 
-    let build = move |v: Variant| {
+    let build = move |v: Variant, ntlm: Option<Handshake>| {
         let mut b = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(Duration::from_secs(net.timeout_secs.max(1)))
@@ -357,6 +380,12 @@ pub async fn build_client_with_jar(
             b = b.identity(id.clone());
         }
         b = b.connector_layer(tower_layer::layer_fn(TimeConnect));
+        if let Some(h) = ntlm {
+            b = b.connector_layer(tower_layer::layer_fn(move |inner| OneConnection {
+                inner,
+                handshake: h.clone(),
+            }));
+        }
         b = b.dns_resolver(TimeDns);
         b = match v.version {
             HttpVersion::Auto => b,
@@ -367,8 +396,8 @@ pub async fn build_client_with_jar(
         b.build().map_err(|e| error_chain(&e))
     };
     Ok(Clients {
-        http: build(Variant::from(&Settings::default()))?,
-        grpc: build(grpc_variant())?,
+        http: build(Variant::from(&Settings::default()), None)?,
+        grpc: build(grpc_variant(), None)?,
         note,
         route,
         jar: scripts_jar,
@@ -730,6 +759,66 @@ where
     }
 }
 
+/// One NTLM handshake's connections; see `OneConnection`.
+#[derive(Clone)]
+struct Handshake {
+    opened: Arc<std::sync::atomic::AtomicBool>,
+    /// Closes when `ntlm_for`'s sender drops, at the handshake's end.
+    over: tokio::sync::watch::Receiver<()>,
+}
+
+/// Keeps an NTLM handshake on one connection. hyper's pool doesn't: when the connection
+/// that took the negotiate message isn't back in the pool yet (it goes back from a
+/// spawned task), the next request races a new connect against waiting for it, and the
+/// new one can win. So a connect after the first waits: for the handshake's end, which
+/// means hyper got the first connection back and only finishes this one in the
+/// background (it then fails, unused); or for `NTLM_WAIT`, which means the server closed
+/// the first, and the request goes out on a new one (the server answers 401).
+#[derive(Clone)]
+struct OneConnection<S> {
+    inner: S,
+    handshake: Handshake,
+}
+
+const NTLM_WAIT: Duration = Duration::from_secs(2);
+
+impl<R, S> tower_service::Service<R> for OneConnection<S>
+where
+    S: tower_service::Service<R>,
+    S::Future: Send + 'static,
+    S::Error: From<&'static str>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), S::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: R) -> Self::Future {
+        use std::sync::atomic::Ordering::SeqCst;
+        // Not started until polled: reqwest's connector is an async block.
+        let connecting = self.inner.call(req);
+        let first = !self.handshake.opened.swap(true, SeqCst);
+        let mut over = self.handshake.over.clone();
+        Box::pin(async move {
+            if !first
+                && tokio::time::timeout(NTLM_WAIT, over.changed())
+                    .await
+                    .is_ok()
+            {
+                return Err("NTLM handshake over; connection not needed".into());
+            }
+            connecting.await
+        })
+    }
+}
+
 /// ring, with `HelloAt` drawing its random numbers. Installing is idempotent: the first
 /// install wins, so every place that installs one goes through here.
 pub fn install_provider() {
@@ -793,6 +882,69 @@ fn my_ip_address() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts the connections it opens.
+    struct Dial(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tower_service::Service<()> for Dial {
+        type Response = ();
+        type Error = String;
+        type Future =
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), String>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: ()) -> Self::Future {
+            let dialed = self.0.clone();
+            Box::pin(async move {
+                dialed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// An authenticate message on a new connection is refused, so while a handshake lasts
+    /// its client opens no second one; only a first connection the server closed (no end
+    /// of the handshake within `NTLM_WAIT`) lets one through. Deterministic, where the
+    /// handshake test only fails when hyper's pool happens to lose the race.
+    #[test]
+    fn an_ntlm_handshake_dials_once_while_it_lasts() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use tower_service::Service as _;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dialed = Arc::new(AtomicUsize::new(0));
+        let gate = |opened: bool, over| OneConnection {
+            inner: Dial(dialed.clone()),
+            handshake: Handshake {
+                opened: Arc::new(AtomicBool::new(opened)),
+                over,
+            },
+        };
+        rt.block_on(async {
+            let (over, waiting) = tokio::sync::watch::channel(());
+            let mut handshake = gate(false, waiting);
+            handshake.call(()).await.unwrap();
+            let second = tokio::spawn(handshake.call(()));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(dialed.load(SeqCst), 1, "the second connect waits");
+            drop(over);
+            assert!(second.await.unwrap().is_err());
+            assert_eq!(
+                dialed.load(SeqCst),
+                1,
+                "and never dials once the handshake ends"
+            );
+
+            let (_over, waiting) = tokio::sync::watch::channel(());
+            gate(true, waiting).call(()).await.unwrap();
+            assert_eq!(dialed.load(SeqCst), 2, "dials after NTLM_WAIT");
+        });
+    }
 
     #[test]
     fn pac_routes_like_a_corporate_script() {
