@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::model::{self, Request};
 use crate::net::{Clients, Network};
-use crate::runner::{self, Info, RunPlan, Vars};
+use crate::runner::{self, Info, RunOptions, RunPlan, Vars};
 use crate::store::{Node, Workspace};
 use crate::stream::Event;
 
@@ -689,6 +689,12 @@ impl Server {
             iterations: args["iterations"].as_u64().unwrap_or(1).max(1) as usize,
             delay: std::time::Duration::ZERO,
             bail: args["bail"].as_bool().unwrap_or(false),
+            options: RunOptions {
+                keep_vars: args["keep_variable_values"].as_bool().unwrap_or(true),
+                empty_jar: args["empty_cookie_jar"].as_bool().unwrap_or(false),
+                save_cookies: args["save_cookies"].as_bool().unwrap_or(true),
+                save_responses: false,
+            },
         };
         let vars = self.vars(env.as_deref())?;
         let client = self.client()?;
@@ -697,7 +703,7 @@ impl Server {
             self.rt
                 .block_on(runner::run_collection(client, plan, vars, |item| {
                     items.push(item)
-                }));
+                }))?;
         let mut globals = globals;
         match &env {
             Some(name) => self.ws.apply_changes(Some(name), &env_changes)?,
@@ -1313,6 +1319,9 @@ fn tools(window: bool) -> Value {
                     "iterations": { "type": "integer", "minimum": 1 },
                     "data_file": { "type": "string", "description": "CSV or JSON array file, relative to the workspace" },
                     "bail": { "type": "boolean", "description": "Stop at the first request that fails" },
+                    "keep_variable_values": { "type": "boolean", "description": "Save the variables the run sets (default true); false leaves the environment and globals as they were" },
+                    "empty_cookie_jar": { "type": "boolean", "description": "Start without this session's cookies (default false)" },
+                    "save_cookies": { "type": "boolean", "description": "Keep the cookies the run ends with for this session (default true)" },
                 },
             },
             "annotations": { "openWorldHint": true },

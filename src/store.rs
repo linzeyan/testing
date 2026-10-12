@@ -166,6 +166,8 @@ pub struct State {
     /// What the collection runner runs, by scope (`Workspace::key`): its requests in run
     /// order, each ticked or not. Only scopes that differ from the tree with all ticked.
     pub run_orders: HashMap<String, Vec<(String, bool)>>,
+    /// Its options by scope, like `run_orders`: only scopes that differ from the defaults.
+    pub run_options: HashMap<String, crate::runner::RunOptions>,
     pub appearance: crate::appearance::Appearance,
     pub updates: crate::update::Updates,
     /// MCP clients may operate the window (Settings).

@@ -190,8 +190,12 @@ impl From<&Settings> for Variant {
     }
 }
 
+type Build =
+    dyn Fn(Variant, &Arc<crate::cookies::Jar>) -> Result<reqwest::Client, String> + Send + Sync;
+
 struct Variants {
-    build: Box<dyn Fn(Variant) -> Result<reqwest::Client, String> + Send + Sync>,
+    /// Shared with the clients `with_jar` makes, which differ only in the jar.
+    build: Arc<Build>,
     built: Mutex<HashMap<Variant, reqwest::Client>>,
     /// For picking the certificate by host.
     net: Network,
@@ -225,6 +229,24 @@ impl Clients {
         })
     }
 
+    /// The same network setup sending from `jar`: a collection run that keeps its cookies
+    /// apart from the app's (`runner::RunOptions`).
+    pub fn with_jar(&self, jar: Arc<crate::cookies::Jar>) -> Result<Clients, String> {
+        let build = &self.variants.build;
+        Ok(Clients {
+            http: build(Variant::from(&Settings::default()), &jar)?,
+            grpc: build(grpc_variant(), &jar)?,
+            note: self.note.clone(),
+            route: self.route.clone(),
+            jar,
+            variants: Arc::new(Variants {
+                build: build.clone(),
+                built: Default::default(),
+                net: self.variants.net.clone(),
+            }),
+        })
+    }
+
     fn variant(&self, v: Variant) -> Result<reqwest::Client, String> {
         if v == Variant::from(&Settings::default()) {
             return Ok(self.http.clone());
@@ -235,7 +257,7 @@ impl Clients {
         if let Some(c) = self.variants.built.lock().unwrap().get(&v) {
             return Ok(c.clone());
         }
-        let c = (self.variants.build)(v)?;
+        let c = (self.variants.build)(v, &self.jar)?;
         self.variants.built.lock().unwrap().insert(v, c.clone());
         Ok(c)
     }
@@ -262,7 +284,6 @@ pub async fn build_client_with_jar(
     // clang; aws-lc-rs needs cmake/nasm). Installing is idempotent, and doing it here covers
     // every client, including the PAC fetcher below.
     install_provider();
-    let scripts_jar = jar.clone();
 
     // Any explicit `.proxy()` turns off reqwest's own system-proxy lookup.
     let mut note = None;
@@ -318,7 +339,7 @@ pub async fn build_client_with_jar(
         .collect::<Result<Vec<_>, _>>()?;
     let picking = net.clone();
 
-    let build = move |v: Variant| {
+    let build = move |v: Variant, jar: &Arc<crate::cookies::Jar>| {
         let mut b = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(Duration::from_secs(net.timeout_secs.max(1)))
@@ -367,13 +388,13 @@ pub async fn build_client_with_jar(
         b.build().map_err(|e| error_chain(&e))
     };
     Ok(Clients {
-        http: build(Variant::from(&Settings::default()))?,
-        grpc: build(grpc_variant())?,
+        http: build(Variant::from(&Settings::default()), &jar)?,
+        grpc: build(grpc_variant(), &jar)?,
         note,
         route,
-        jar: scripts_jar,
+        jar,
         variants: Arc::new(Variants {
-            build: Box::new(build),
+            build: Arc::new(build),
             built: Default::default(),
             net: picking,
         }),
