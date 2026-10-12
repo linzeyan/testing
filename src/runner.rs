@@ -229,8 +229,9 @@ pub async fn send(client: &net::Clients, mut req: Request) -> Result<http::Respo
     }
 }
 
-/// One row of the collection runner's results. Bodies are deliberately not kept:
-/// a long data-driven run must not accumulate megabytes per request.
+/// One row of the collection runner's results. Bodies are kept only with
+/// `RunOptions::save_responses`, and cut: a long data-driven run must not accumulate
+/// megabytes per request.
 pub struct RunItem {
     pub iteration: usize,
     pub name: String,
@@ -238,7 +239,13 @@ pub struct RunItem {
     /// (status code, elapsed ms) or the request error.
     pub status: Result<(u16, u128), String>,
     pub tests: Vec<TestResult>,
+    /// Its headers and body at most `MAX_SAVED` each; no binary body, nor what was sent.
+    pub response: Option<Box<http::Response>>,
 }
+
+/// What a saved response keeps of its headers and of its body, as history keeps of a
+/// request body: the pane holds up to 1000 rows, so at most about 64 MiB in all.
+pub const MAX_SAVED: usize = 32 * 1024;
 
 impl RunItem {
     pub fn failed(&self) -> bool {
@@ -254,6 +261,33 @@ pub struct RunPlan {
     pub delay: Duration,
     /// Stop at the first request that fails (an error or a failed test), as newman's --bail.
     pub bail: bool,
+    pub options: RunOptions,
+}
+
+/// Postman's runner options. The defaults are what a run did before they existed.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct RunOptions {
+    /// Hand the variables the run sets back to be stored; off, they still carry from
+    /// request to request, and the environment and globals stay as they were.
+    pub keep_vars: bool,
+    /// Start from an empty cookie jar rather than the client's.
+    pub empty_jar: bool,
+    /// What the run's jar ends with goes into the client's.
+    pub save_cookies: bool,
+    /// Each result keeps its response (`RunItem::response`).
+    pub save_responses: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            keep_vars: true,
+            empty_jar: false,
+            save_cookies: true,
+            save_responses: false,
+        }
+    }
 }
 
 /// Runs every request for every iteration, chaining variable writes between requests.
@@ -263,7 +297,20 @@ pub async fn run_collection(
     plan: RunPlan,
     mut vars: Vars,
     mut on_item: impl FnMut(RunItem),
-) -> (Changes, Changes) {
+) -> Result<(Changes, Changes), String> {
+    // A run has always sent from the client's own jar, the one Send uses, and what it set
+    // or cleared was there at once: so with the defaults (stored cookies, saved) it still
+    // does, sharing that jar. Any other choice runs on a jar of its own, empty or a copy of
+    // the client's. Saved, an empty one's cookies then go into the client's jar over those
+    // with the same domain, path and name, the rest staying; not saved, it is dropped and
+    // the client's jar is as before. A cancelled run saves none, as with its variables.
+    let shared = client.jar.clone();
+    let opts = &plan.options;
+    let client = match (opts.empty_jar, opts.save_cookies) {
+        (false, true) => client,
+        (true, _) => client.with_jar(Default::default())?,
+        (false, false) => client.with_jar(std::sync::Arc::new(shared.copy()))?,
+    };
     let (mut env, mut globals) = (Changes::new(), Changes::new());
     let count = if plan.data.is_empty() {
         plan.iterations.max(1)
@@ -271,7 +318,7 @@ pub async fn run_collection(
         plan.data.len()
     };
     let mut first = true;
-    for iteration in 0..count {
+    'run: for iteration in 0..count {
         vars.data = plan.data.get(iteration).cloned().unwrap_or_default();
         let mut at = 0;
         while let Some((name, req)) = plan.requests.get(at) {
@@ -320,22 +367,43 @@ pub async fn run_collection(
             }
             // Postman leaves skipped requests out of the results too.
             if !out.skipped || tests.iter().any(|t| !t.passed) {
+                let status = (out.response.as_ref())
+                    .map(|r| (r.status, r.elapsed.as_millis()))
+                    .map_err(Clone::clone);
                 let item = RunItem {
                     iteration,
                     name: name.clone(),
                     method: req.method.clone(),
-                    status: out.response.map(|r| (r.status, r.elapsed.as_millis())),
+                    status,
                     tests,
+                    response: (out.response.ok())
+                        .filter(|_| opts.save_responses)
+                        .map(|mut r| {
+                            clip(&mut r.body, MAX_SAVED);
+                            let mut room = MAX_SAVED;
+                            r.headers.retain(|(k, v)| {
+                                room = room.saturating_sub(k.len() + v.len());
+                                room > 0
+                            });
+                            (r.bytes, r.sent) = (None, Default::default());
+                            Box::new(r)
+                        }),
                 };
                 let stop = plan.bail && item.failed();
                 on_item(item);
                 if stop {
-                    return (env, globals);
+                    break 'run;
                 }
             }
         }
     }
-    (env, globals)
+    if opts.empty_jar && opts.save_cookies {
+        shared.store_all(&client.jar);
+    }
+    if !opts.keep_vars {
+        (env, globals) = Default::default();
+    }
+    Ok((env, globals))
 }
 
 /// A JUnit XML report of these `junit_suite`s.
@@ -848,11 +916,14 @@ mod tests {
             iterations: 99, // ignored: data rows decide the count
             delay: Duration::ZERO,
             bail: false,
+            options: Default::default(),
         };
         let mut items = Vec::new();
-        let (env, _) = rt.block_on(run_collection(client, plan, Vars::default(), |item| {
-            items.push(item)
-        }));
+        let (env, _) = rt
+            .block_on(run_collection(client, plan, Vars::default(), |item| {
+                items.push(item)
+            }))
+            .unwrap();
 
         let order: Vec<_> = items
             .iter()
@@ -948,14 +1019,17 @@ mod tests {
             iterations: 1,
             delay: Duration::ZERO,
             bail: false,
+            options: Default::default(),
         };
         let mut items = Vec::new();
-        let (env, _) = rt.block_on(run_collection(
-            client.clone(),
-            plan,
-            Vars::default(),
-            |item| items.push(item),
-        ));
+        let (env, _) = rt
+            .block_on(run_collection(
+                client.clone(),
+                plan,
+                Vars::default(),
+                |item| items.push(item),
+            ))
+            .unwrap();
         let order: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(order, ["start", "jobs/poll", "jobs/poll", "jobs/poll"]);
         assert!(items.iter().all(|i| !i.failed()));
@@ -973,11 +1047,13 @@ mod tests {
             iterations: 1,
             delay: Duration::ZERO,
             bail: false,
+            options: Default::default(),
         };
         let mut items = Vec::new();
         rt.block_on(run_collection(client, plan, Vars::default(), |item| {
             items.push(item)
-        }));
+        }))
+        .unwrap();
         assert_eq!(items.len(), 1, "an unknown name stops the run");
         assert!(
             items[0].tests[0]
@@ -1068,6 +1144,7 @@ mod tests {
             iterations: 2,
             delay: Duration::ZERO,
             bail,
+            options: Default::default(),
         };
         for (bail, ran) in [
             (false, &["a", "b", "c", "a", "b", "c"][..]),
@@ -1079,8 +1156,175 @@ mod tests {
                 plan(bail),
                 Vars::default(),
                 |i| names.push(i.name),
-            ));
+            ))
+            .unwrap();
             assert_eq!(names, ran, "bail: {bail}");
+        }
+    }
+
+    /// Keep variable values off: what the run sets still carries from one request to the
+    /// next, but none of it is handed back to be stored.
+    #[test]
+    fn without_keep_variable_values_a_run_stores_nothing() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt.block_on(build_client(Network::default())).unwrap();
+        let base = crate::http::tests::echo_server();
+        let set = Request {
+            url: format!("{base}/set"),
+            tests: r#"pm.environment.set("token", "t1"); pm.globals.set("g", "1");"#.into(),
+            ..Default::default()
+        };
+        let reads = Request {
+            url: format!("{base}/{{{{token}}}}"),
+            tests: r#"pm.test("chained", function () {
+                pm.expect(pm.response.text()).to.include("/users/t1 ");
+            });"#
+                .into(),
+            ..Default::default()
+        };
+        for keep_vars in [true, false] {
+            let plan = RunPlan {
+                requests: vec![("set".into(), set.clone()), ("reads".into(), reads.clone())],
+                data: vec![],
+                iterations: 1,
+                delay: Duration::ZERO,
+                bail: false,
+                options: RunOptions {
+                    keep_vars,
+                    ..Default::default()
+                },
+            };
+            let mut items = Vec::new();
+            let (env, globals) = rt
+                .block_on(run_collection(client.clone(), plan, Vars::default(), |i| {
+                    items.push(i)
+                }))
+                .unwrap();
+            assert!(items.iter().all(|i| !i.failed()), "keep: {keep_vars}");
+            assert_eq!(env.contains_key("token"), keep_vars);
+            assert_eq!(globals.contains_key("g"), keep_vars);
+        }
+    }
+
+    /// The two cookie options: the defaults share the jar Send uses, as runs always did;
+    /// an empty jar sends none of its cookies; saved, what the run set lands in it, and
+    /// not saved, the jar is left as it was.
+    #[test]
+    fn the_cookie_options_choose_the_jar_a_run_uses() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let addr = crate::http::tests::serve(|raw| match raw.split(' ').nth(1).unwrap_or("") {
+            "/login" => (
+                "200 OK\r\nset-cookie: run=new; Path=/".into(),
+                String::new(),
+            ),
+            _ => ("200 OK".into(), raw.to_lowercase()),
+        });
+        let req = |path: &str| Request {
+            url: format!("http://{addr}{path}"),
+            ..Default::default()
+        };
+        let site = reqwest::Url::parse(&format!("http://{addr}/")).unwrap();
+        for (empty_jar, save_cookies) in
+            [(false, true), (true, false), (false, false), (true, true)]
+        {
+            let client = rt.block_on(build_client(Network::default())).unwrap();
+            client.jar.set(&site, "stored", "1").unwrap();
+            let plan = RunPlan {
+                requests: vec![
+                    ("echo".into(), req("/echo")),
+                    ("login".into(), req("/login")),
+                ],
+                data: vec![],
+                iterations: 1,
+                delay: Duration::ZERO,
+                bail: false,
+                options: RunOptions {
+                    empty_jar,
+                    save_cookies,
+                    save_responses: true,
+                    ..Default::default()
+                },
+            };
+            let mut items = Vec::new();
+            rt.block_on(run_collection(client.clone(), plan, Vars::default(), |i| {
+                items.push(i)
+            }))
+            .unwrap();
+            let sent = &items[0].response.as_ref().unwrap().body;
+            let case = format!("empty: {empty_jar}, save: {save_cookies}");
+            assert_eq!(
+                sent.contains("cookie: stored=1"),
+                !empty_jar,
+                "{case}: {sent}"
+            );
+            let jar: Vec<_> = (client.jar.rows().into_iter())
+                .map(|r| format!("{}={}", r.name, r.value))
+                .collect();
+            let want = match save_cookies {
+                true => ["run=new", "stored=1"].as_slice(),
+                false => &["stored=1"],
+            };
+            assert_eq!(jar, want, "{case}");
+        }
+    }
+
+    /// Saved responses are cut where they enter: a run of 1000 rows with megabyte bodies
+    /// would otherwise keep gigabytes. Off, nothing is kept.
+    #[test]
+    fn saved_responses_are_cut_and_only_kept_when_asked() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt.block_on(build_client(Network::default())).unwrap();
+        let big = "x".repeat(MAX_SAVED * 3);
+        let header = format!(
+            "200 OK\r\nx-first: 1\r\nx-big: {}\r\nx-after: 1",
+            "h".repeat(MAX_SAVED)
+        );
+        let addr = crate::http::tests::serve(move |_| (header.clone(), big.clone()));
+        for save_responses in [true, false] {
+            let plan = RunPlan {
+                requests: vec![(
+                    "big".into(),
+                    Request {
+                        url: format!("http://{addr}/"),
+                        ..Default::default()
+                    },
+                )],
+                data: vec![],
+                iterations: 1,
+                delay: Duration::ZERO,
+                bail: false,
+                options: RunOptions {
+                    save_responses,
+                    ..Default::default()
+                },
+            };
+            let mut items = Vec::new();
+            rt.block_on(run_collection(client.clone(), plan, Vars::default(), |i| {
+                items.push(i)
+            }))
+            .unwrap();
+            let Some(r) = &items[0].response else {
+                assert!(!save_responses, "kept, as asked");
+                continue;
+            };
+            assert!(save_responses, "nothing kept unless asked");
+            assert_eq!(r.status, 200);
+            assert!(r.body.len() < MAX_SAVED + 32, "{}", r.body.len());
+            assert!(r.body.ends_with("bytes in all)"), "says it was cut");
+            let names: Vec<_> = r.headers.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(names, ["x-first"], "the headers up to the cap");
         }
     }
 

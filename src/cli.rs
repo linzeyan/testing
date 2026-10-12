@@ -133,6 +133,9 @@ fn run(args: Vec<String>) -> Result<bool, String> {
         iterations,
         delay: Duration::from_millis(delay),
         bail,
+        // Moot here, like newman: the jar is new to this process and never stored, and the
+        // variables the run sets aren't either.
+        options: Default::default(),
     };
     let vars = Vars {
         env,
@@ -166,7 +169,7 @@ fn run(args: Vec<String>) -> Result<bool, String> {
                 println!("       ✗ {} — {why}", t.name);
             }
         }
-    }));
+    }))?;
     println!("\n{total} requests, {failed} failed; {tests} tests, {tests_failed} failed");
     if crate::auth::grants() != grants {
         ws.save_tokens(&crate::auth::export())?;

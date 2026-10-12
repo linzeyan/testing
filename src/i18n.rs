@@ -1456,6 +1456,30 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Keyboard shortcuts", "鍵盤快速鍵"),
     ("Larger text", "放大文字"),
     ("Smaller text", "縮小文字"),
+    // Runner options
+    ("Keep variable values", "保留變數值"),
+    (
+        "Off, what the run sets still carries from request to request, but the environment and globals stay as they were",
+        "關閉時，執行中設定的值仍會在請求之間傳遞，但環境與全域變數維持原樣",
+    ),
+    ("Run without stored cookies", "不使用已儲存的 Cookie 執行"),
+    ("Start from an empty cookie jar", "從空的 Cookie 罐開始"),
+    ("Save cookies after the run", "執行後儲存 Cookie"),
+    (
+        "Off, the cookie jar is left as it was before the run",
+        "關閉時，Cookie 罐維持執行前的樣子",
+    ),
+    ("Save responses", "儲存回應"),
+    (
+        "Keep each response, with up to 32 KiB of its body, to open from the results",
+        "保留每個回應（內容最多 32 KiB），可從結果中開啟",
+    ),
+    ("Run again", "再執行一次"),
+    (
+        "What these results ran: the same requests in the same order, with the same settings",
+        "再執行一次這些結果所跑的內容：相同的請求、相同的順序與相同的設定",
+    ),
+    ("Show or hide the response", "顯示或隱藏回應"),
 ];
 
 #[cfg(test)]

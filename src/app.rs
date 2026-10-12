@@ -17,7 +17,7 @@ use crate::loadtest::{self, Stats};
 use crate::logfile::redact;
 use crate::model::{self, Auth, Body, Example, Folder, Inherited, KeyValue, METHODS, Request};
 use crate::net::{self, Network, ProxyMode};
-use crate::runner::{self, Outcome, RunItem, RunPlan, Vars};
+use crate::runner::{self, Outcome, RunItem, RunOptions, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
 use crate::store::{self, HistoryEntry, Node, State, Synced, Workspace};
 use crate::stream::{self, Event};
@@ -791,9 +791,40 @@ struct RunnerView {
     /// The scope's requests in run order, each ticked to run or not.
     order: Vec<(PathBuf, bool)>,
     bail: bool,
+    /// Kept by scope in `App::run_options`.
+    options: RunOptions,
     only_failures: bool,
     error: String,
     run: Option<RunState>,
+}
+
+impl RunnerView {
+    fn setup(&self) -> RunSetup {
+        RunSetup {
+            paths: (self.order.iter().filter(|(_, on)| *on))
+                .map(|(p, _)| p.clone())
+                .collect(),
+            data_path: self.data_path.clone(),
+            iterations: self.iterations,
+            delay_ms: self.delay_ms,
+            bail: self.bail,
+            options: self.options.clone(),
+        }
+    }
+}
+
+/// What a run starts from: the pane's settings, or for Run again the shown run's, which
+/// the pane may have been changed from since.
+#[derive(Clone, Default)]
+struct RunSetup {
+    /// The ticked requests in run order; loaded from disk as each run starts.
+    paths: Vec<PathBuf>,
+    data_path: String,
+    iterations: usize,
+    delay_ms: u64,
+    /// Ends at the first failure (`RunPlan::bail`).
+    bail: bool,
+    options: RunOptions,
 }
 
 struct RunState {
@@ -807,8 +838,9 @@ struct RunState {
     failed: usize,
     /// Passed, run.
     tests: (usize, usize),
-    /// Ends at the first failure (`RunPlan::bail`).
-    bail: bool,
+    setup: RunSetup,
+    /// The row in `items` showing its saved response.
+    open: Option<usize>,
     abort: tokio::task::AbortHandle,
 }
 
@@ -831,6 +863,8 @@ impl RunState {
         if self.items.len() > MAX_RUN_ROWS {
             let oldest = self.items.iter().position(|i| !i.failed()).unwrap_or(0);
             self.items.remove(oldest);
+            // The open row stays open as rows above it go, and closes with its own.
+            self.open = (self.open.filter(|&o| o != oldest)).map(|o| o - usize::from(o > oldest));
         }
     }
 }
@@ -964,6 +998,8 @@ pub struct App {
     runner: Option<RunnerView>,
     /// `State::run_orders`.
     run_orders: HashMap<String, Vec<(String, bool)>>,
+    /// `State::run_options`.
+    run_options: HashMap<String, RunOptions>,
     next_run_id: u64,
     network: Network,
     network_editor: Option<Network>,
@@ -1064,6 +1100,7 @@ impl App {
             folder_editor: None,
             runner: None,
             run_orders: state.run_orders.clone(),
+            run_options: state.run_options.clone(),
             next_run_id: 0,
             network: state.network,
             network_editor: None,
@@ -1304,6 +1341,7 @@ impl App {
             raw_types: self.raw_types.clone(),
             gql_replace: self.explorer.replace,
             run_orders: self.run_orders.clone(),
+            run_options: self.run_options.clone(),
             appearance: self.appearance.clone(),
             updates: self.updates.clone(),
             mcp_window: self.mcp_window,
@@ -5836,6 +5874,7 @@ impl App {
             .filter_map(|(key, on)| Some((self.ws.request_path(key).ok()?, *on)))
             .collect();
         let order = run_order(&tree_requests(&self.tree, &scope), &kept);
+        let options = self.run_options.get(&self.ws.key(&scope)).cloned();
         self.runner = Some(RunnerView {
             scope,
             title,
@@ -5847,6 +5886,7 @@ impl App {
             delay_ms: prev.as_ref().map_or(0, |p| p.delay_ms),
             order,
             bail: prev.as_ref().is_some_and(|p| p.bail),
+            options: options.unwrap_or_default(),
             only_failures: false,
             error: String::new(),
             run: None,
@@ -5854,18 +5894,17 @@ impl App {
     }
 
     /// "Folder/Request" relative to the collections root, without the extension.
-    fn start_run(&mut self, ctx: &egui::Context) {
+    fn start_run(&mut self, ctx: &egui::Context, setup: RunSetup) {
         let Some(view) = &self.runner else { return };
-        let paths = view.order.iter().filter(|(_, on)| *on).map(|(p, _)| p);
         let mut requests = Vec::new();
         let mut error = String::new();
-        for path in paths {
+        for path in &setup.paths {
             match self.ws.load_request(path) {
                 Ok(req) => requests.push((self.ws.display_name(path), req)),
                 Err(e) => error = e,
             }
         }
-        let data = match view.data_path.trim() {
+        let data = match setup.data_path.trim() {
             "" => Ok(Vec::new()),
             p => runner::load_data(Path::new(p)).and_then(|rows| {
                 if rows.is_empty() {
@@ -5899,16 +5938,17 @@ impl App {
                 t("Note: the runner uses saved files; unsaved edits are not included.").into();
         }
         let count = if data.is_empty() {
-            view.iterations.max(1)
+            setup.iterations.max(1)
         } else {
             data.len()
         };
         let plan = RunPlan {
             requests,
             data,
-            iterations: view.iterations,
-            delay: Duration::from_millis(view.delay_ms),
-            bail: view.bail,
+            iterations: setup.iterations,
+            delay: Duration::from_millis(setup.delay_ms),
+            bail: setup.bail,
+            options: setup.options.clone(),
         };
         let total = plan.requests.len() * count;
 
@@ -5939,11 +5979,15 @@ impl App {
                 }
             };
             let (item_tx, item_ctx) = (tx.clone(), ctx.clone());
-            let (env, globals) = runner::run_collection(client, plan, vars, move |item| {
+            let ran = runner::run_collection(client, plan, vars, move |item| {
                 let _ = item_tx.send(Msg::RunItem(id, item));
                 item_ctx.request_repaint_after(BATCHED);
             })
             .await;
+            let (env, globals) = ran.unwrap_or_else(|e| {
+                let _ = tx.send(Msg::Status(fill(failed, &[&e])));
+                Default::default()
+            });
             let _ = tx.send(Msg::RunDone(id, env, globals));
             ctx.request_repaint();
         });
@@ -5956,14 +6000,17 @@ impl App {
             done: 0,
             failed: 0,
             tests: (0, 0),
-            bail: view.bail,
+            setup,
+            open: None,
             abort: task.abort_handle(),
         });
     }
 
     fn runner_ui(&mut self, ui: &mut egui::Ui) {
         let (mut start, mut close, mut export) = (false, false, None);
+        let (mut again, mut toggled) = (false, None);
         let Some(view) = &mut self.runner else { return };
+        let options = view.options.clone();
         let running = view.run.as_ref().is_some_and(RunState::running);
         // The tree may have changed since the pane opened: new requests join at the end.
         let tree = tree_requests(&self.tree, &view.scope);
@@ -6000,8 +6047,35 @@ impl App {
                 ui.label("");
                 ui.checkbox(&mut view.bail, t("Stop at the first failure"));
                 ui.end_row();
+                let o = &mut view.options;
+                ui.label("");
+                ui.checkbox(&mut o.keep_vars, t("Keep variable values")).on_hover_text(t(
+                    "Off, what the run sets still carries from request to request, \
+                     but the environment and globals stay as they were",
+                ));
+                ui.end_row();
+                ui.label(t("Cookies"));
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut o.empty_jar, t("Run without stored cookies"))
+                        .on_hover_text(t("Start from an empty cookie jar"));
+                    ui.checkbox(&mut o.save_cookies, t("Save cookies after the run"))
+                        .on_hover_text(t("Off, the cookie jar is left as it was before the run"));
+                });
+                ui.end_row();
+                ui.label("");
+                ui.checkbox(&mut o.save_responses, t("Save responses")).on_hover_text(t(
+                    "Keep each response, with up to 32 KiB of its body, to open from the results",
+                ));
+                ui.end_row();
             });
         });
+        if view.options != options {
+            let key = self.ws.key(&view.scope);
+            match view.options == RunOptions::default() {
+                true => self.run_options.remove(&key),
+                false => self.run_options.insert(key, view.options.clone()),
+            };
+        }
         if !view.error.is_empty() {
             ui.colored_label(RED, view.error.as_str());
         }
@@ -6022,6 +6096,14 @@ impl App {
                 start = ui
                     .add(egui::Button::new((play, label)).fill(Color32::from_rgb(40, 110, 200)))
                     .clicked();
+                if view.run.is_some() {
+                    again = (ui.add(icon_text(ui, icon::REFRESH, t("Run again"))))
+                        .on_hover_text(t(
+                            "What these results ran: the same requests in the same order, \
+                             with the same settings",
+                        ))
+                        .clicked();
+                }
             }
             ui.checkbox(&mut view.only_failures, t("Failures only"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -6093,7 +6175,7 @@ impl App {
                 if run.finished.is_some() && done < run.total {
                     ui.separator();
                     // A bailing run ends at its first failure; any other ends early by Cancel.
-                    match run.bail && failed > 0 {
+                    match run.setup.bail && failed > 0 {
                         true => ui.colored_label(ORANGE, t("stopped at the first failure")),
                         false => ui.colored_label(ORANGE, t("cancelled")),
                     };
@@ -6115,18 +6197,23 @@ impl App {
                 .auto_shrink(false)
                 .stick_to_bottom(running)
                 .show(ui, |ui| {
-                    for item in run
-                        .items
-                        .iter()
-                        .filter(|i| !view.only_failures || i.failed())
+                    for (i, item) in (run.items.iter().enumerate())
+                        .filter(|(_, i)| !view.only_failures || i.failed())
                     {
-                        run_item_ui(ui, item);
+                        if run_item_ui(ui, item, run.open == Some(i)) {
+                            toggled = Some(i);
+                        }
                     }
                 });
         } else {
             ui.weak(t(
                 "The ticked requests run in the order on the left, with the selected environment.",
             ));
+        }
+        if let Some(i) = toggled
+            && let Some(run) = &mut view.run
+        {
+            run.open = (run.open != Some(i)).then_some(i);
         }
 
         if close {
@@ -6139,8 +6226,13 @@ impl App {
                 run.abort.abort();
             }
             self.runner = None;
-        } else if start {
-            self.start_run(ui.ctx());
+        } else if start || again {
+            let view = self.runner.as_ref().expect("runner open");
+            let setup = match (again, &view.run) {
+                (true, Some(run)) => run.setup.clone(),
+                _ => view.setup(),
+            };
+            self.start_run(ui.ctx(), setup);
         } else if let Some(path) = export {
             self.export_run(Path::new(&path));
         }
@@ -6845,11 +6937,22 @@ fn run_order_ui(
     changed
 }
 
-fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
+/// One row of the runner's results, its saved response under it when `open`; true when
+/// its name was clicked to open or close that.
+fn run_item_ui(ui: &mut egui::Ui, item: &RunItem, open: bool) -> bool {
+    let mut clicked = false;
     ui.horizontal(|ui| {
         ui.weak(format!("#{:<3}", item.iteration + 1));
         method_badge(ui, &item.method, 5);
-        ui.label(item.name.as_str());
+        match item.response {
+            Some(_) => {
+                let name = ui.selectable_label(open, item.name.as_str());
+                clicked = name.on_hover_text(t("Show or hide the response")).clicked();
+            }
+            None => {
+                ui.label(item.name.as_str());
+            }
+        }
         match &item.status {
             Ok((code, ms)) => {
                 ui.label(
@@ -6887,6 +6990,24 @@ fn run_item_ui(ui: &mut egui::Ui, item: &RunItem) {
             ui.add(egui::Label::new(RichText::new(text).monospace().color(RED)).selectable(true));
         });
     }
+    if let Some(r) = item.response.as_deref().filter(|_| open) {
+        // As `curl -i` shows it, all in one text to select and copy.
+        let mut text = format!("{} {} {}\n", r.version, r.status, r.reason);
+        for (k, v) in &r.headers {
+            text.push_str(&format!("{k}: {v}\n"));
+        }
+        text.push('\n');
+        text.push_str(&http::pretty_json(&r.body).unwrap_or_else(|| r.body.clone()));
+        ui.indent("run-response", |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("run-response")
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(RichText::new(text).monospace()).selectable(true));
+                });
+        });
+    }
+    clicked
 }
 
 #[derive(Clone)]
@@ -13103,6 +13224,108 @@ mod ui_tests {
         );
     }
 
+    /// The runner's options as a user sets them: with Keep variable values off, what the
+    /// run's scripts set stays out of the environment on disk, and on, it lands there; with
+    /// Save responses a result opens on what the server answered; Run again runs what the
+    /// results ran, though the ticks changed since. The options stay with the scope.
+    #[test]
+    fn the_runner_options_keep_variables_save_responses_and_run_again() {
+        let ws = workspace("run-options");
+        let top = ws.collections();
+        let base = crate::http::tests::echo_server();
+        for name in ["first", "second"] {
+            let path = ws.create_request(&top, name).unwrap();
+            let req = Request {
+                url: format!("{base}/{name}"),
+                tests: format!(r#"pm.environment.set("last", "{name}");"#),
+                ..Default::default()
+            };
+            ws.save_request(&path, &req).unwrap();
+        }
+        ws.save_env(Some("dev"), &[], &[]).unwrap();
+        ws.save_state(&State {
+            active_env: Some("dev".into()),
+            ..Default::default()
+        });
+        let mut h = harness(ws);
+        h.run();
+        h.state_mut().open_runner(top.clone());
+        h.run();
+        // The run this click starts, not the one already shown; 15 s, as other builds may
+        // be loading the machine (5 s once ran out).
+        let run = |h: &mut Harness<'_, App>, label: &str| -> Vec<String> {
+            let before = h.state().next_run_id;
+            button(h, label).click();
+            for _ in 0..1500 {
+                h.step();
+                let view = h.state().runner.as_ref().unwrap();
+                let ended = |r: &&RunState| r.id > before && !r.running();
+                if let Some(run) = view.run.as_ref().filter(ended) {
+                    return run.items.iter().map(|i| i.name.clone()).collect();
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the run didn't finish");
+        };
+        let last = |h: &Harness<'_, App>| {
+            let dev = h.state().ws.env_vars(Some("dev")).unwrap();
+            dev.get("last").cloned()
+        };
+
+        h.get_by_label("Keep variable values").click();
+        h.get_by_label("Save responses").click();
+        h.run();
+        assert_eq!(run(&mut h, "▶ Run"), ["first", "second"]);
+        h.run();
+        assert_eq!(last(&h), None, "not kept");
+        assert_eq!(h.state().vars.get("last"), None);
+
+        // The result's name opens what the server answered (the echo server's request line).
+        // The last: the sidebar's row comes first.
+        let result = |h: &Harness<'_, App>| {
+            let by = egui_kittest::kittest::By::new().role(Role::Button);
+            h.get_all(by.label("second")).last().unwrap().click();
+        };
+        result(&h);
+        h.run();
+        shot(&mut h, "95-runner-response");
+        assert!(
+            h.query_by_label_contains("GET /users/second HTTP/1.1")
+                .is_some()
+        );
+        result(&h);
+        h.run();
+        assert!(h.query_by_label_contains("GET /users/second").is_none());
+
+        let by = egui_kittest::kittest::By::new().role(Role::CheckBox);
+        h.get(by.label("first")).click();
+        h.run();
+        assert_eq!(run(&mut h, "Run again"), ["first", "second"]);
+        assert_eq!(
+            run(&mut h, "▶ Run"),
+            ["second"],
+            "the ticks as they are now"
+        );
+
+        let want = RunOptions {
+            keep_vars: false,
+            save_responses: true,
+            ..Default::default()
+        };
+        h.state().save_state();
+        assert_eq!(h.state().ws.load_state().run_options[""], want);
+        h.state_mut().runner = None;
+        h.state_mut().open_runner(top);
+        h.run();
+        assert_eq!(h.state().runner.as_ref().unwrap().options, want);
+
+        h.get_by_label("Keep variable values").click();
+        h.run();
+        assert_eq!(run(&mut h, "▶ Run"), ["second"]);
+        h.run();
+        assert_eq!(last(&h).as_deref(), Some("second"), "kept");
+    }
+
     /// A long data-driven run keeps a bounded list, but the counts cover every row and
     /// no failure is pushed out by passes.
     #[test]
@@ -13117,7 +13340,8 @@ mod ui_tests {
             done: 0,
             failed: 0,
             tests: (0, 0),
-            bail: false,
+            setup: Default::default(),
+            open: None,
             abort: rt.spawn(async {}).abort_handle(),
         };
         for i in 0..3 * MAX_RUN_ROWS {
@@ -13131,8 +13355,14 @@ mod ui_tests {
                     passed: i % 100 != 0,
                     error: None,
                 }],
+                response: None,
             });
+            if i == 100 {
+                run.open = Some(run.items.len() - 1);
+            }
         }
+        // A row opened while the run goes on stays the one open as rows above it go.
+        assert_eq!(run.items[run.open.unwrap()].iteration, 100);
         assert_eq!(run.items.len(), MAX_RUN_ROWS);
         assert_eq!((run.done, run.failed), (3 * MAX_RUN_ROWS, 30));
         assert_eq!(run.tests, (3 * MAX_RUN_ROWS - 30, 3 * MAX_RUN_ROWS));

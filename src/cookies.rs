@@ -138,6 +138,22 @@ impl Jar {
         }
     }
 
+    /// A jar of its own holding what this one does now.
+    pub fn copy(&self) -> Self {
+        Self(RwLock::new(self.read().clone()))
+    }
+
+    /// Each of `other`'s cookies in place of this jar's with the same domain, path and
+    /// name (an expired one expires it); the others stay.
+    pub fn store_all(&self, other: &Jar) {
+        let mut store = self.write();
+        let all: Vec<_> = (store.iter_any().chain(other.read().iter_any()))
+            .cloned()
+            .collect();
+        *store =
+            CookieStore::from_cookies(all.into_iter().map(Ok::<_, ()>), true).unwrap_or_default();
+    }
+
     pub fn remove(&self, row: &Row) {
         self.write().remove(&row.domain, &row.path, &row.name);
     }
