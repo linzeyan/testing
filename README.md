@@ -80,7 +80,8 @@ beside it puts a kept one back in the box.
   import and export.
 - Right-click selected text in a box that takes `{{variables}}`: cut, copy, paste, encode or
   decode it as a URI component, or put it in a variable (new or existing, in the active environment
-  or the globals); the text itself stays as it is, as in Postman.
+  or the globals); the text itself stays as it is, as in Postman. A new variable is secret
+  (kept on this machine) unless its Secret box is unticked.
 - Header names and Content-Type values complete while typing. The Headers tab folds out what
   Send adds (Host, auth, Content-Type…) and where each comes from.
 - All 120 of Postman's dynamic variables (`{{$guid}}`, `{{$timestamp}}`, `{{$randomEmail}}`,
@@ -187,6 +188,8 @@ The Tests tab filters All / Passed / Failed, with counts.
 **Keeping**
 
 - Save… writes the body to a file (binary bodies byte for byte).
+- Select text in the body and right-click it to set it as a variable, as in a request's text
+  boxes.
 - The History menu in the response bar: the last 10 responses of each request, kept on disk
   with 1 MiB of body each. Request history and saved response examples too.
 
