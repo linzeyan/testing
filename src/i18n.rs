@@ -1500,6 +1500,21 @@ const ZH_TW: &[(&str, &str)] = &[
         "A JSON body is sent as the auth payload when joining the namespace.",
         "加入命名空間時，JSON 內容會作為驗證 payload 送出。",
     ),
+    // Selection menu
+    ("A variable needs a name", "變數需要名稱"),
+    ("Cut", "剪下"),
+    ("Decode URI component", "URI 元件解碼"),
+    ("Encode URI component", "URI 元件編碼"),
+    ("New variable", "新增變數"),
+    ("New variable…", "新增變數…"),
+    (
+        "Not decoded: the selection isn't valid URI encoding",
+        "未解碼：選取的文字不是有效的 URI 編碼",
+    ),
+    ("Paste", "貼上"),
+    ("Select all", "全選"),
+    ("Set as variable in {}", "設為變數：{}"),
+    ("Set {} in {}", "已將 {} 設定於 {}"),
 ];
 
 #[cfg(test)]
