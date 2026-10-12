@@ -143,7 +143,7 @@ pub async fn websocket(
                     emit(Event::Out(text));
                 }
                 None => {
-                    let _ = sink.send(Message::Close { code: CloseCode::Normal, reason: String::new() }).await;
+                    hang_up(&mut sink, &mut stream).await;
                     return emit(Event::Closed("disconnected".into()));
                 }
             },
@@ -159,6 +159,32 @@ pub async fn websocket(
             },
         }
     }
+}
+
+/// Sends a Close and reads on until the server's, as the closing handshake has it. A socket
+/// dropped with the server's last messages unread in it is reset, and on Windows a reset
+/// makes the server lose what it hadn't read yet: the Close, or Socket.IO's disconnect.
+/// Half a second at most, for a server that never answers.
+async fn hang_up<K, S, E>(sink: &mut K, stream: &mut S)
+where
+    K: futures_util::Sink<Message> + Unpin,
+    S: futures_util::Stream<Item = Result<Message, E>> + Unpin,
+{
+    let close = Message::Close {
+        code: CloseCode::Normal,
+        reason: String::new(),
+    };
+    if sink.send(close).await.is_err() {
+        return;
+    }
+    let answered = async {
+        while let Some(Ok(m)) = stream.next().await {
+            if matches!(m, Message::Close { .. }) {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), answered).await;
 }
 
 /// A GraphQL subscription: graphql-transport-ws (the graphql-ws library, what servers
@@ -246,12 +272,7 @@ pub async fn graphql(client: reqwest::Client, req: Request, emit: impl Fn(Event)
                 return emit(Event::Error(pretty(&msg["payload"])));
             }
             "complete" => {
-                let _ = sink
-                    .send(Message::Close {
-                        code: CloseCode::Normal,
-                        reason: String::new(),
-                    })
-                    .await;
+                hang_up(&mut sink, &mut stream).await;
                 return emit(Event::Closed("subscription complete".into()));
             }
             _ => emit(Event::In(text)),
@@ -335,7 +356,7 @@ pub async fn socketio(
                 Some(text) => pending.push(text),
                 None => {
                     let _ = sink.send(Message::Text(format!("41{prefix}"))).await;
-                    let _ = sink.send(Message::Close { code: CloseCode::Normal, reason: String::new() }).await;
+                    hang_up(&mut sink, &mut stream).await;
                     return emit(Event::Closed("disconnected".into()));
                 }
             },
@@ -615,6 +636,59 @@ pub mod tests {
             matches!(events.last(), Some(Event::Closed(_))),
             "{events:?}"
         );
+    }
+
+    /// Hanging up waits for the server's Close: a socket dropped with the server's last
+    /// messages unread in it is reset, and on Windows a reset makes the server lose what
+    /// it hadn't read yet, the Close (or Socket.IO's disconnect) included.
+    #[test]
+    fn hanging_up_finishes_the_closing_handshake() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(s).unwrap();
+            let mut got = Vec::new();
+            let end = loop {
+                match ws.read() {
+                    Ok(m) if m.to_text().is_ok_and(|t| t == "bye") => {
+                        got.push("bye".to_owned());
+                        // Still talking as the client hangs up, then slow to read on.
+                        for _ in 0..200 {
+                            let _ = ws.send(tungstenite::Message::text("x".repeat(1024)));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    Ok(m) if m.is_close() => got.push("close".to_owned()),
+                    Ok(_) => {}
+                    Err(e) => break e,
+                }
+            };
+            (got, matches!(end, tungstenite::Error::ConnectionClosed))
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        let client = rt.block_on(crate::net::build_client(net)).unwrap().http;
+        let req = Request {
+            method: "WS".into(),
+            url: format!("ws://{addr}/"),
+            ..Default::default()
+        };
+        // Queued and hung up before connecting, as MCP's stream_request does.
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send("bye".into()).unwrap();
+        drop(tx);
+        rt.block_on(websocket(client, req, rx, |_| {}));
+        drop(rt);
+        let (got, clean) = server.join().unwrap();
+        assert_eq!(got, ["bye", "close"]);
+        assert!(clean, "the closing handshake finished");
     }
 
     #[test]
