@@ -1137,6 +1137,14 @@ fn tools(window: bool) -> Value {
                     "timeout_ms": { "type": "integer", "default": 0, "description": "0 = the network settings' timeout" },
                 },
             },
+            "socketio": {
+                "type": "object",
+                "description": "SOCKETIO only; omit for the defaults. The URL's path is the namespace; a json body is the CONNECT auth payload (v3/v4)",
+                "properties": {
+                    "path": { "type": "string", "description": "Where the server mounts Socket.IO; empty = /socket.io/" },
+                    "v2": { "type": "boolean", "default": false, "description": "A Socket.IO 2.x server (Engine.IO 3) instead of 3.x/4.x. v2 has no auth payload: the body isn't sent; use query parameters" },
+                },
+            },
         },
         "required": ["method", "url"],
     });
@@ -1676,5 +1684,37 @@ mod tests {
         assert_eq!(history[0]["url"], "http://h.test/sent");
         assert_eq!(history[0]["status"], 204);
         assert!(history[0].get("request").is_none(), "only with full");
+    }
+
+    /// A Socket.IO request's path and version reach the wire from MCP as from the window:
+    /// the server is a 2.x one mounted at /rt/ that drops clients that don't ping.
+    #[test]
+    fn stream_request_honours_the_socketio_path_and_version() {
+        let dir = std::env::temp_dir().join(format!("apitool-mcp-sio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = Workspace::open(dir).unwrap();
+        let (addr, server) = crate::stream::tests::socketio_v2_server("/chat");
+        let replies = session(
+            ws,
+            &[call(
+                0,
+                "stream_request",
+                json!({ "request": { "method": "SOCKETIO", "url": format!("http://{addr}/chat"),
+                                     "socketio": { "path": "/rt", "v2": true } },
+                        "seconds": 0.5 }),
+            )],
+        );
+        let events = text(&replies[0])["events"].clone();
+        let kinds: Vec<(&str, &str)> = (events.as_array().unwrap().iter())
+            .map(|e| (e["kind"].as_str().unwrap(), e["text"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            kinds[..2],
+            [("open", "connected to /chat"), ("in", r#"welcome {"n":1}"#)],
+            "{kinds:?}"
+        );
+        let (pings, got) = server.join().unwrap();
+        assert!(pings >= 2, "{pings} pings");
+        assert_eq!(got, ["40/chat,", "41/chat,", ""]);
     }
 }

@@ -59,6 +59,8 @@ pub struct Request {
     pub settings: Settings,
     #[serde(skip_serializing_if = "Mqtt::is_default")]
     pub mqtt: Mqtt,
+    #[serde(skip_serializing_if = "SocketIo::is_default")]
+    pub socketio: SocketIo,
     /// Messages kept to send again on a stream (WebSocket, Socket.IO, MQTT, gRPC), as
     /// Postman's saved messages.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -168,6 +170,35 @@ impl Default for Mqtt {
 impl Mqtt {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+/// Socket.IO only: where the server mounts it and which client it expects, as in
+/// Postman's Socket.IO request settings.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct SocketIo {
+    /// Empty: /socket.io/. The namespace is still the URL's path.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    /// A Socket.IO 2.x server (Engine.IO 3) instead of 3.x/4.x: v3 and v4 clients speak
+    /// the same protocol, v2's differs.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub v2: bool,
+}
+
+impl SocketIo {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// As socket.io-client and python-socketio spell it: one leading and one trailing
+    /// slash, which servers match on.
+    pub fn handshake_path(&self) -> String {
+        match self.path.trim() {
+            "" => "/socket.io/".into(),
+            p => format!("/{}/", p.trim_matches('/')).replace("//", "/"),
+        }
     }
 }
 
@@ -282,6 +313,7 @@ impl Default for Request {
             tests: String::new(),
             settings: Settings::default(),
             mqtt: Mqtt::default(),
+            socketio: SocketIo::default(),
             asserts: Vec::new(),
             response_vars: Vec::new(),
             messages: Vec::new(),
@@ -837,6 +869,10 @@ impl Request {
                 will_payload: r(&self.mqtt.will_payload),
                 ..self.mqtt.clone()
             },
+            socketio: SocketIo {
+                path: r(&self.socketio.path),
+                ..self.socketio.clone()
+            },
             asserts: Vec::new(),
             response_vars: Vec::new(),
             messages: Vec::new(),
@@ -896,6 +932,7 @@ impl Request {
             response_vars,
             settings,
             mqtt,
+            socketio,
             messages,
             examples,
             inherited: _,
@@ -906,7 +943,7 @@ impl Request {
             && (headers, pre_request, tests) == (&other.headers, &other.pre_request, &other.tests)
             && (asserts, settings, mqtt) == (&other.asserts, &other.settings, &other.mqtt)
             && (examples, response_vars) == (&other.examples, &other.response_vars)
-            && messages == &other.messages
+            && (messages, socketio) == (&other.messages, &other.socketio)
             && (body == &other.body || body.is_empty() && other.body.is_empty())
             && (auth == &other.auth || auth.is_unset() && other.auth.is_unset())
     }
@@ -1189,6 +1226,10 @@ mod tests {
                 will_qos: 2,
                 will_retain: true,
             },
+            socketio: SocketIo {
+                path: "/{{prefix}}/rt".into(),
+                v2: true,
+            },
             examples: vec![Example {
                 name: "found".into(),
                 status: 200,
@@ -1212,6 +1253,46 @@ mod tests {
             toml::from_str::<Request>(&toml::to_string_pretty(&form).unwrap()).unwrap(),
             form
         );
+    }
+
+    /// Every Socket.IO request saved before these settings existed must stay byte for
+    /// byte the same, or opening and saving it would show up in git. Set, they're an edit,
+    /// take variables, and reach the wire.
+    #[test]
+    fn socketio_settings_stay_out_of_the_file_until_set() {
+        let plain = Request {
+            method: "SOCKETIO".into(),
+            url: "http://h.test:3000/chat".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            toml::to_string_pretty(&plain).unwrap(),
+            "method = \"SOCKETIO\"\nurl = \"http://h.test:3000/chat\"\n"
+        );
+        let set = Request {
+            socketio: SocketIo {
+                path: "/{{app}}/rt".into(),
+                v2: true,
+            },
+            ..plain.clone()
+        };
+        assert!(!set.same_as(&plain));
+        let vars = HashMap::from([("app".to_owned(), "shop".to_owned())]);
+        let wire = set.resolved(&vars).0.socketio;
+        assert_eq!(
+            (wire.handshake_path().as_str(), wire.v2),
+            ("/shop/rt/", true)
+        );
+        let path = |p: &str| {
+            SocketIo {
+                path: p.into(),
+                v2: false,
+            }
+            .handshake_path()
+        };
+        assert_eq!(path(" "), "/socket.io/");
+        assert_eq!(path("rt"), "/rt/");
+        assert_eq!(path("/"), "/");
     }
 
     /// A body or auth type picked and left empty is the same request as none picked: not
