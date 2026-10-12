@@ -387,7 +387,17 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
         return Err("+ and # are for subscribing; a last will goes to one topic".into());
     }
     let insecure = net.insecure || !req.settings.verify_tls;
-    let tls = || tls_config(net, &req.url, insecure).map(TlsConfiguration::Rustls);
+    let tls = || {
+        let ring = rustls::crypto::ring::default_provider();
+        let config = tls_config(
+            net,
+            net.cert_for(&req.url),
+            insecure,
+            ring,
+            rustls::DEFAULT_VERSIONS,
+        );
+        config.map(|c| TlsConfiguration::Rustls(Arc::new(c)))
+    };
     let transport = match wire {
         Wire::Tcp => Transport::Tcp,
         Wire::Tls => Transport::tls_with_config(tls()?),
@@ -475,15 +485,18 @@ fn proxy(route: &Route, wire: &Wire, address: &str, port: u16) -> Result<Option<
 }
 
 /// As for https: the system's trust store plus the CA file, the client certificate, and
-/// `insecure` for "accept any certificate".
-fn tls_config(
+/// `insecure` for "accept any certificate". Also how an HTTP request with its own TLS
+/// versions or cipher suites connects (`net::custom_tls`), hence `provider` and `versions`.
+pub(crate) fn tls_config(
     net: &Network,
-    url: &str,
+    (cert, password): (&str, &str),
     insecure: bool,
-) -> Result<Arc<rustls::ClientConfig>, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    provider: rustls::crypto::CryptoProvider,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> Result<rustls::ClientConfig, String> {
+    let provider = Arc::new(provider);
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(versions)
         .map_err(|e| e.to_string())?
         .dangerous();
     let builder = if insecure {
@@ -501,10 +514,9 @@ fn tls_config(
             .map_err(|e| format!("system certificates: {e}"))?;
         builder.with_custom_certificate_verifier(Arc::new(verifier))
     };
-    let (cert, password) = net.cert_for(url);
     let cert = cert.trim();
     if cert.is_empty() {
-        return Ok(Arc::new(builder.with_no_client_auth()));
+        return Ok(builder.with_no_client_auth());
     }
     let pem = crate::net::identity_pem(std::path::Path::new(cert), password)?;
     let bad = |e: String| format!("client certificate {cert}: {e}");
@@ -515,8 +527,7 @@ fn tls_config(
         return Err(bad("no certificate in it".into()));
     }
     let key = PrivateKeyDer::from_pem_slice(&pem).map_err(|e| bad(e.to_string()))?;
-    let config = (builder.with_client_auth_cert(chain, key)).map_err(|e| bad(e.to_string()))?;
-    Ok(Arc::new(config))
+    (builder.with_client_auth_cert(chain, key)).map_err(|e| bad(e.to_string()))
 }
 
 /// "Accept any certificate", as reqwest has it: the certificate isn't checked, the

@@ -1515,6 +1515,51 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Select all", "全選"),
     ("Set as variable in {}", "設為變數：{}"),
     ("Set {} in {}", "已將 {} 設定於 {}"),
+    // Request settings
+    ("Follow original HTTP method", "沿用原本的 HTTP 方法"),
+    (
+        "Keep the method and body on a 301, 302 or 303",
+        "遇到 301、302 或 303 時保留原本的方法與內容",
+    ),
+    ("Follow Authorization header", "保留 Authorization 標頭"),
+    (
+        "Keep it when a redirect goes to another host",
+        "重新導向到其他主機時仍然送出",
+    ),
+    (
+        "Remove referer header on redirect",
+        "重新導向時移除 Referer 標頭",
+    ),
+    (
+        "Don't tell the next host which URL redirected",
+        "不讓下一個主機知道是哪個網址轉過來的",
+    ),
+    ("Disabled TLS versions", "停用的 TLS 版本"),
+    (
+        "apitool's TLS (rustls) has only TLS 1.2 and 1.3: SSL, TLS 1.0 and 1.1 are never offered and can't be turned on.",
+        "apitool 的 TLS（rustls）只有 TLS 1.2 與 1.3：SSL、TLS 1.0 與 1.1 一律不提供，也無法開啟。",
+    ),
+    (
+        "No TLS version is left: https requests fail",
+        "沒有可用的 TLS 版本：https 請求會失敗",
+    ),
+    (
+        "Only for servers that mishandle one of them",
+        "只在伺服器處理不好其中一個版本時使用",
+    ),
+    ("Cipher suites", "加密套件"),
+    (
+        "Offered in the order checked; none checked offers all",
+        "依勾選順序提供；都不勾則全部提供",
+    ),
+    ("Not available here, skipped: {}", "這裡沒有，已略過：{}"),
+    ("Enable strict HTTP parser", "啟用嚴格 HTTP 解析"),
+    (
+        "Off accepts responses with malformed headers",
+        "關閉時接受標頭格式不正確的回應",
+    ),
+    ("All", "全部"),
+    ("{} chosen", "已選 {} 個"),
 ];
 
 #[cfg(test)]

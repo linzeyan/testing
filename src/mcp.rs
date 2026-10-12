@@ -1135,6 +1135,13 @@ fn tools(window: bool) -> Value {
                     "verify_tls": { "type": "boolean", "default": true },
                     "cookies": { "type": "boolean", "default": true, "description": "Send and store cookies" },
                     "timeout_ms": { "type": "integer", "default": 0, "description": "0 = the network settings' timeout" },
+                    "follow_original_method": { "type": "boolean", "default": false, "description": "A 301/302/303 keeps the method and body instead of switching to GET" },
+                    "follow_auth_header": { "type": "boolean", "default": false, "description": "Keep Authorization when a redirect goes to another host" },
+                    "remove_referer": { "type": "boolean", "default": false, "description": "No Referer header on redirects" },
+                    "disable_tls12": { "type": "boolean", "default": false, "description": "Don't offer TLS 1.2 (only 1.2 and 1.3 exist here)" },
+                    "disable_tls13": { "type": "boolean", "default": false, "description": "Don't offer TLS 1.3" },
+                    "ciphers": { "type": "array", "items": { "type": "string" }, "description": "Cipher suites offered, in order, by OpenSSL name (e.g. ECDHE-RSA-AES128-GCM-SHA256, TLS_AES_128_GCM_SHA256); empty = all" },
+                    "insecure_parser": { "type": "boolean", "default": false, "description": "Accept responses with malformed headers" },
                 },
             },
             "socketio": {

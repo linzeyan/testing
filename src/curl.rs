@@ -158,6 +158,23 @@ pub fn from_curl(cmd: &str) -> Result<Request, String> {
                 req.settings.max_redirects =
                     v.parse().map_err(|_| format!("{flag} {v} isn't a count"))?;
             }
+            "--location-trusted" => req.settings.follow_auth_header = true,
+            // Each keeps a POST on its status; Send keeps the method on all three or none.
+            "--post301" | "--post302" | "--post303" => req.settings.follow_original_method = true,
+            // Lower minimums are what rustls has anyway (1.2).
+            "--tlsv1.3" => req.settings.disable_tls12 = true,
+            "--tls-max" => match value()?.as_str() {
+                "1.0" | "1.1" => {
+                    (req.settings.disable_tls12, req.settings.disable_tls13) = (true, true)
+                }
+                "1.2" => req.settings.disable_tls13 = true,
+                _ => {}
+            },
+            "--ciphers" | "--tls13-ciphers" => {
+                let list = value()?;
+                let names = list.split([':', ',', ' ']).filter(|n| !n.is_empty());
+                req.settings.ciphers.extend(names.map(str::to_owned));
+            }
             f if IGNORED_WITH_VALUE.contains(&f) => {
                 value()?;
             }
@@ -479,6 +496,45 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(to_curl(req).unwrap(), "curl --http1.1 'http://h/'");
+
+        // Redirect and TLS settings curl has flags for. TLS 1.3 suites go first: curl
+        // takes them apart, so that's the order they come back in.
+        let settings = Settings {
+            follow_auth_header: true,
+            follow_original_method: true,
+            disable_tls12: true,
+            ciphers: vec![
+                "TLS_CHACHA20_POLY1305_SHA256".into(),
+                "ECDHE-RSA-AES128-GCM-SHA256".into(),
+                "ECDHE-ECDSA-AES256-GCM-SHA384".into(),
+            ],
+            ..Default::default()
+        };
+        let req = Request {
+            url: "https://h/".into(),
+            settings: settings.clone(),
+            ..Default::default()
+        };
+        let exported = to_curl(req).unwrap();
+        assert_eq!(
+            exported,
+            "curl --location-trusted --post301 --post302 --post303 --tlsv1.3 \
+             --tls13-ciphers 'TLS_CHACHA20_POLY1305_SHA256' \
+             --ciphers 'ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384' 'https://h/'"
+        );
+        assert_eq!(from_curl(&exported).unwrap().settings, settings);
+        let settings = Settings {
+            disable_tls13: true,
+            ..Default::default()
+        };
+        let req = Request {
+            url: "https://h/".into(),
+            settings: settings.clone(),
+            ..Default::default()
+        };
+        let exported = to_curl(req).unwrap();
+        assert_eq!(exported, "curl --location --tls-max 1.2 'https://h/'");
+        assert_eq!(from_curl(&exported).unwrap().settings, settings);
     }
 
     #[test]

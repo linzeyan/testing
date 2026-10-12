@@ -392,6 +392,24 @@ fn settings(p: &Value) -> Settings {
     if let Some(b) = p["disableCookies"].as_bool() {
         s.cookies = !b;
     }
+    let flag = |key: &str| p[key].as_bool().unwrap_or(false);
+    s.follow_original_method = flag("followOriginalHttpMethod");
+    s.follow_auth_header = flag("followAuthorizationHeader");
+    s.remove_referer = flag("removeRefererHeaderOnRedirect");
+    s.insecure_parser = flag("insecureHTTPParser");
+    // TLSv1 and TLSv1_1 are never offered here anyway.
+    let off = |version: &str| {
+        let list = p["tlsDisabledProtocols"].as_array();
+        list.is_some_and(|l| l.iter().any(|v| v == version))
+    };
+    s.disable_tls12 = off("TLSv1_2");
+    s.disable_tls13 = off("TLSv1_3");
+    if let Some(list) = p["tlsCipherSelection"].as_array() {
+        s.ciphers = list
+            .iter()
+            .filter_map(|c| Some(c.as_str()?.to_owned()))
+            .collect();
+    }
     s
 }
 
@@ -763,6 +781,26 @@ fn behavior_json(s: &Settings) -> Map<String, Value> {
     if s.cookies != d.cookies {
         p.insert("disableCookies".into(), json!(!s.cookies));
     }
+    for (key, on) in [
+        ("followOriginalHttpMethod", s.follow_original_method),
+        ("followAuthorizationHeader", s.follow_auth_header),
+        ("removeRefererHeaderOnRedirect", s.remove_referer),
+        ("insecureHTTPParser", s.insecure_parser),
+    ] {
+        if on {
+            p.insert(key.into(), json!(true));
+        }
+    }
+    let off: Vec<&str> = [("TLSv1_2", s.disable_tls12), ("TLSv1_3", s.disable_tls13)]
+        .into_iter()
+        .filter_map(|(version, off)| off.then_some(version))
+        .collect();
+    if !off.is_empty() {
+        p.insert("tlsDisabledProtocols".into(), json!(off));
+    }
+    if !s.ciphers.is_empty() {
+        p.insert("tlsCipherSelection".into(), json!(s.ciphers));
+    }
     p
 }
 
@@ -818,7 +856,11 @@ mod tests {
             { "name": "Get User", "request": "{{base}}/users/me" }
           ] },
         { "name": "create",
-          "protocolProfileBehavior": { "followRedirects": false, "strictSSL": false, "disableCookies": true },
+          "protocolProfileBehavior": { "followRedirects": false, "strictSSL": false, "disableCookies": true,
+            "followOriginalHttpMethod": true, "followAuthorizationHeader": true,
+            "removeRefererHeaderOnRedirect": true, "insecureHTTPParser": true,
+            "tlsDisabledProtocols": ["TLSv1", "TLSv1_1", "TLSv1_2"],
+            "tlsCipherSelection": ["ECDHE-RSA-AES128-GCM-SHA256", "TLS_AES_128_GCM_SHA256"] },
           "request": { "method": "post", "url": "{{base}}/items", "header": [],
             "body": { "mode": "raw", "raw": "{\"a\": 1}", "options": { "raw": { "language": "json" } } },
             "auth": { "type": "apikey", "apikey": [{ "key": "key", "value": "X-Api-Key" },
@@ -949,6 +991,14 @@ mod tests {
         assert_eq!(create.auth, key, "the key replaces the folder's auth");
         let s = &create.settings;
         assert!(!s.follow_redirects && !s.verify_tls && !s.cookies);
+        assert!(s.follow_original_method && s.follow_auth_header && s.remove_referer);
+        assert!(s.insecure_parser);
+        // TLS 1.0 and 1.1 are never offered here anyway.
+        assert!(s.disable_tls12 && !s.disable_tls13);
+        assert_eq!(
+            s.ciphers,
+            ["ECDHE-RSA-AES128-GCM-SHA256", "TLS_AES_128_GCM_SHA256"]
+        );
         // Stays an auth setting, so the URL isn't touched.
         assert_eq!(r["feed"].url, "{{base}}/feed?x=1");
         assert!(matches!(
@@ -1091,6 +1141,17 @@ mod tests {
                         max_redirects: 3,
                         verify_tls: false,
                         cookies: false,
+                        follow_original_method: true,
+                        follow_auth_header: true,
+                        remove_referer: true,
+                        disable_tls13: true,
+                        // One Postman has and apitool doesn't comes back too.
+                        ciphers: vec![
+                            "TLS_AES_128_GCM_SHA256".into(),
+                            "ECDHE-RSA-AES128-GCM-SHA256".into(),
+                            "DHE-RSA-AES256-SHA".into(),
+                        ],
+                        insecure_parser: true,
                         ..Default::default()
                     },
                     examples: vec![Example {
@@ -1116,6 +1177,10 @@ mod tests {
                     },
                     auth: Auth::Bearer {
                         token: "{{t}}".into(),
+                    },
+                    settings: Settings {
+                        disable_tls12: true,
+                        ..Default::default()
                     },
                     ..Default::default()
                 },
@@ -1268,6 +1333,22 @@ mod tests {
             ws.save_request(&ws.request_path(name).unwrap(), req)
                 .unwrap();
         }
+        // In Postman's own names and values, not only symmetric with the import.
+        assert_eq!(
+            Value::Object(behavior_json(&requests[0].1.settings)),
+            json!({
+                "followRedirects": false, "maxRedirects": 3, "strictSSL": false,
+                "disableCookies": true, "followOriginalHttpMethod": true,
+                "followAuthorizationHeader": true, "removeRefererHeaderOnRedirect": true,
+                "insecureHTTPParser": true, "tlsDisabledProtocols": ["TLSv1_3"],
+                "tlsCipherSelection": ["TLS_AES_128_GCM_SHA256", "ECDHE-RSA-AES128-GCM-SHA256",
+                                       "DHE-RSA-AES256-SHA"],
+            })
+        );
+        assert_eq!(
+            behavior_json(&requests[1].1.settings)["tlsDisabledProtocols"],
+            json!(["TLSv1_2"])
+        );
 
         let (json, count, skipped) = collection(&ws, &api).unwrap();
         assert_eq!(
