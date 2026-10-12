@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use eframe::egui::gui_zoom::kb_shortcuts::{ZOOM_IN, ZOOM_IN_SECONDARY, ZOOM_OUT, ZOOM_RESET};
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
 use crate::appearance::Appearance;
@@ -48,7 +49,7 @@ const NEXT_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::T
 const PREV_TAB: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab);
 /// What Ctrl+K also offers, by key.
-const KEYED_ACTIONS: [(KeyboardShortcut, Action); 4] = [
+const KEYED_ACTIONS: [(KeyboardShortcut, Action); 5] = [
     (
         KeyboardShortcut::new(SHIFT_COMMAND, Key::N),
         Action::NewFolder,
@@ -64,6 +65,10 @@ const KEYED_ACTIONS: [(KeyboardShortcut, Action); 4] = [
     (
         KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::V),
         Action::SideBySide,
+    ),
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::Slash),
+        Action::Shortcuts,
     ),
 ];
 #[cfg(test)]
@@ -707,6 +712,8 @@ enum Dialog {
         values: Vec<(String, String)>,
         download: Option<PathBuf>,
     },
+    /// Ctrl+/: the empty response pane's list, for when a response hides it.
+    Shortcuts,
 }
 
 impl Dialog {
@@ -1125,6 +1132,7 @@ impl App {
     /// The keys added after the first ones (#15), taken before Ctrl+S, Ctrl+Enter and
     /// Ctrl+N in `ui`: a shortcut also matches with Shift held, so the longer go first.
     fn shortcuts(&mut self, ui: &mut egui::Ui) {
+        use crate::appearance::{DEFAULT_SIZE, SIZES};
         let pressed = |key: &KeyboardShortcut| ui.input_mut(|i| i.consume_shortcut(key));
         let free =
             self.dialog.is_none() && self.env_editor.is_none() && self.folder_editor.is_none();
@@ -1160,6 +1168,23 @@ impl App {
         if pressed(&EDIT_ENV) && free {
             // The active environment's variables, or the globals when none is.
             self.open_env_editor(self.active_env.clone(), &[]);
+        }
+        // Zoom steps the text size (Settings > General) a point a press, so there is one
+        // scale, kept with the rest of the appearance. egui's own keyboard zoom (off in
+        // `appearance::apply`) scaled the whole UI but was never kept, and eframe saves the
+        // window's size divided by it, so a zoomed window came back resized at the next start.
+        // ⌘= too: "+" unshifted on US keyboards.
+        let size = self.appearance.size;
+        for (key, step) in [(ZOOM_IN, 1.0), (ZOOM_IN_SECONDARY, 1.0), (ZOOM_OUT, -1.0)] {
+            if pressed(&key) && free {
+                self.appearance.size = (size + step).clamp(*SIZES.start(), *SIZES.end());
+            }
+        }
+        if pressed(&ZOOM_RESET) && free {
+            self.appearance.size = DEFAULT_SIZE;
+        }
+        if self.appearance.size != size {
+            self.save_state();
         }
         // Ctrl+1…8 go to that tab, Ctrl+9 to the last, as in browsers.
         let keys = [
@@ -4961,8 +4986,13 @@ impl App {
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0]);
             modal = modal.area(area);
         }
+        // Room for the list's two columns side by side, as on the pane.
+        let width = match dialog {
+            Dialog::Shortcuts => 720.0,
+            _ => 360.0,
+        };
         let modal = modal.show(ctx, |ui| {
-            ui.set_width(360.0);
+            ui.set_width(width);
             match dialog {
                 Dialog::Name { kind, name, error } => {
                     ui.heading(match kind {
@@ -5383,6 +5413,11 @@ impl App {
                         }
                         cancel = ui.button(t("Close")).clicked();
                     });
+                }
+                Dialog::Shortcuts => {
+                    ui.heading(t("Keyboard shortcuts"));
+                    shortcut_list(ui);
+                    cancel = ui.button(t("Close")).clicked();
                 }
             }
         });
@@ -6862,9 +6897,10 @@ enum Action {
     Sidebar,
     SideBySide,
     Settings,
+    Shortcuts,
 }
 
-const ACTIONS: [(&str, Action); 11] = [
+const ACTIONS: [(&str, Action); 12] = [
     (n_("New request"), Action::NewRequest),
     (n_("New collection"), Action::NewFolder),
     (n_("New environment"), Action::NewEnv),
@@ -6879,6 +6915,7 @@ const ACTIONS: [(&str, Action); 11] = [
     (n_("Show or hide the sidebar"), Action::Sidebar),
     (n_("Side by side or stacked"), Action::SideBySide),
     (n_("Settings (theme, fonts, text size)"), Action::Settings),
+    (n_("Keyboard shortcuts"), Action::Shortcuts),
 ];
 
 impl App {
@@ -6929,6 +6966,7 @@ impl App {
                 self.save_state();
             }
             Action::Settings => self.settings = true,
+            Action::Shortcuts => self.dialog = Some(Dialog::Shortcuts),
         }
     }
 }
@@ -8998,6 +9036,10 @@ fn shortcut_list(ui: &mut egui::Ui) {
         (t("Import…"), key(&KEYED_ACTIONS[1].0)),
         (t("Sidebar"), key(&KEYED_ACTIONS[2].0)),
         (t("Side by side"), key(&KEYED_ACTIONS[3].0)),
+        (t("Larger text"), key(&ZOOM_IN)),
+        (t("Smaller text"), key(&ZOOM_OUT)),
+        (t("Default text size"), key(&ZOOM_RESET)),
+        (t("Keyboard shortcuts"), key(&KEYED_ACTIONS[4].0)),
     ];
     // Two lists side by side when there's room, one under the other when there isn't.
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -15307,6 +15349,102 @@ mod ui_tests {
         assert_eq!(h.state().hide_sidebar, shown);
         press(&mut h, CODE);
         assert!(h.state().code);
+
+        // Zoom is the text size, shown at once; ⌘= is ⌘+ unshifted.
+        let size = |h: &Harness<'_, App>| {
+            let body = h.ctx.global_style().text_styles[&egui::TextStyle::Body].size;
+            (h.state().appearance.size, body.round())
+        };
+        press(&mut h, ZOOM_IN);
+        assert_eq!(size(&h), (14.0, 14.0));
+        press(&mut h, ZOOM_IN_SECONDARY);
+        assert_eq!(size(&h), (15.0, 15.0));
+        press(&mut h, ZOOM_OUT);
+        assert_eq!(size(&h), (14.0, 14.0));
+        press(&mut h, ZOOM_RESET);
+        assert_eq!(size(&h), (13.0, 13.0));
+        assert_eq!(
+            h.ctx.zoom_factor(),
+            1.0,
+            "one scale: egui's own zoom stays out"
+        );
+        press(&mut h, KEYED_ACTIONS[4].0);
+        assert!(matches!(h.state().dialog, Some(Dialog::Shortcuts)));
+        // Like the other keys, not while a dialog is open.
+        press(&mut h, ZOOM_IN);
+        assert_eq!(size(&h), (13.0, 13.0));
+    }
+
+    /// Zoom keys can't go past what Settings offers, and the size they leave is the one
+    /// the next start comes up with.
+    #[test]
+    fn zoom_is_clamped_and_kept_across_a_restart() {
+        let root = workspace("zoom").root.clone();
+        let start = || {
+            let mut h = harness(Workspace::open(root.clone()).unwrap());
+            h.run();
+            h
+        };
+        let press = |h: &mut Harness<'_, App>, key: KeyboardShortcut, times: usize| {
+            for _ in 0..times {
+                h.key_press_modifiers(key.modifiers, key.logical_key);
+                h.run();
+            }
+            h.state().appearance.size
+        };
+        let body = |h: &Harness<'_, App>| {
+            (h.ctx.global_style().text_styles[&egui::TextStyle::Body].size).round()
+        };
+        let mut h = start();
+        assert_eq!(press(&mut h, ZOOM_IN, 20), 24.0);
+        drop(h);
+        let mut h = start();
+        assert_eq!((h.state().appearance.size, body(&h)), (24.0, 24.0));
+        assert_eq!(press(&mut h, ZOOM_OUT, 20), 9.0);
+        assert_eq!(press(&mut h, ZOOM_RESET, 1), 13.0);
+        drop(h);
+        let h = start();
+        assert_eq!((h.state().appearance.size, body(&h)), (13.0, 13.0));
+    }
+
+    /// Ctrl+/ shows the empty response pane's list, for when a response covers it; Ctrl+K
+    /// finds it too.
+    #[test]
+    fn shortcut_help_lists_the_keys_and_esc_closes_it() {
+        let mut h = harness(workspace("shortcut-help"));
+        h.run();
+        let known = "Go to a request, folder or action";
+        assert!(
+            h.query_by_label(known).is_none(),
+            "no request open: no pane list"
+        );
+        let help = KEYED_ACTIONS[4].0;
+        h.key_press_modifiers(help.modifiers, help.logical_key);
+        h.run();
+        shot(&mut h, "97-keyboard-shortcuts");
+        assert!(h.query_by_label(known).is_some());
+        let key = |k: &KeyboardShortcut| h.ctx.format_shortcut(k);
+        assert!(h.query_by_label(&key(&SWITCH)).is_some(), "with its key");
+        assert!(
+            h.query_by_label(&key(&help)).is_some(),
+            "its own key listed too"
+        );
+        h.key_press(Key::Escape);
+        h.run();
+        assert!(h.state().dialog.is_none());
+        assert!(h.query_by_label(known).is_none());
+
+        h.key_press_modifiers(SWITCH.modifiers, SWITCH.logical_key);
+        h.run();
+        let hint = Some("Go to a request, folder, environment or action");
+        (h.get_all_by_role(Role::TextInput))
+            .find(|n| n.accesskit_node().placeholder() == hint)
+            .unwrap()
+            .type_text("keyboard");
+        h.run();
+        h.key_press(Key::Enter);
+        h.run();
+        assert!(matches!(h.state().dialog, Some(Dialog::Shortcuts)));
     }
 
     /// New requests land where the user is in the tree: the folder last clicked, else the

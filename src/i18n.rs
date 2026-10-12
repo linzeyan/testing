@@ -1453,6 +1453,11 @@ const ZH_TW: &[(&str, &str)] = &[
     ("… and {} more", "…還有 {} 個"),
     ("▶ Run", "▶ 執行"),
     ("▶ Start", "▶ 開始"),
+    // Zoom and shortcut help
+    ("Default text size", "預設文字大小"),
+    ("Keyboard shortcuts", "鍵盤快速鍵"),
+    ("Larger text", "放大文字"),
+    ("Smaller text", "縮小文字"),
 ];
 
 #[cfg(test)]

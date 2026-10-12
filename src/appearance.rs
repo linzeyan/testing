@@ -58,6 +58,8 @@ pub fn apply(ctx: &egui::Context, a: &Appearance) -> Result<(), String> {
     });
     // On Windows `title_bar` does it: winit's way leaves the title bar stale.
     ctx.options_mut(|o| o.sync_window_theme = !cfg!(windows));
+    // Zoom keys step `size` instead (app.rs `shortcuts`): one scale, and a kept one.
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
     let base = egui::Style::default().text_styles;
     let scale = a.size.clamp(*SIZES.start(), *SIZES.end()) / DEFAULT_SIZE;
     ctx.all_styles_mut(|style| {
