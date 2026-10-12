@@ -378,41 +378,7 @@ fn selection_menu(ui: &mut egui::Ui, id: Id, text: &mut String, chars: Option<[u
     ui.separator();
     let encode = (ui.add_enabled(has, egui::Button::new(t("Encode URI component")))).clicked();
     let decode = (ui.add_enabled(has, egui::Button::new(t("Decode URI component")))).clicked();
-    let scopes: Scopes = ctx
-        .data(|d| d.get_temp(Id::new(SCOPES)))
-        .unwrap_or_default();
-    if !scopes.is_empty() {
-        ui.separator();
-    }
-    // Like Postman, the selection stays as it is rather than becoming `{{name}}`: the same
-    // action from a read-only response can't replace anything, and the value is often
-    // wanted as is (a token for other requests) without this request turning unsaved.
-    for (env, names) in scopes {
-        let scope = env.as_deref().unwrap_or(t("Globals"));
-        let mut name = None;
-        ui.add_enabled_ui(has, |ui| {
-            ui.menu_button(tf("Set as variable in {}", &[&scope]), |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(300.0)
-                    .show(ui, |ui| {
-                        for n in &names {
-                            if ui.button(n.as_str()).clicked() {
-                                name = Some(Some(n.clone()));
-                            }
-                        }
-                    });
-                if !names.is_empty() {
-                    ui.separator();
-                }
-                if ui.button(t("New variable…")).clicked() {
-                    name = Some(None);
-                }
-            })
-        });
-        if let (Some(name), Some(value)) = (name, selected.clone()) {
-            hand(&ctx, Picked::Set { env, name, value });
-        }
-    }
+    set_as_variable(ui, selected.as_deref());
 
     let Some(selected) = selected else {
         return false;
@@ -444,6 +410,144 @@ fn selection_menu(ui: &mut egui::Ui, id: Id, text: &mut String, chars: Option<[u
     // The replacement stays selected, so a decode can be undone by an encode.
     refocus(Some([start, start + new.chars().count()]));
     true
+}
+
+/// "Set as variable in …" for each scope offered, storing `selected`; disabled without it.
+fn set_as_variable(ui: &mut egui::Ui, selected: Option<&str>) {
+    let ctx = ui.ctx().clone();
+    let scopes: Scopes = ctx
+        .data(|d| d.get_temp(Id::new(SCOPES)))
+        .unwrap_or_default();
+    if !scopes.is_empty() {
+        ui.separator();
+    }
+    // Like Postman, the selection stays as it is rather than becoming `{{name}}`: the same
+    // action from a read-only response can't replace anything, and the value is often
+    // wanted as is (a token for other requests) without this request turning unsaved.
+    for (env, names) in scopes {
+        let scope = env.as_deref().unwrap_or(t("Globals"));
+        let mut name = None;
+        ui.add_enabled_ui(selected.is_some(), |ui| {
+            ui.menu_button(tf("Set as variable in {}", &[&scope]), |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        for n in &names {
+                            if ui.button(n.as_str()).clicked() {
+                                name = Some(Some(n.clone()));
+                            }
+                        }
+                    });
+                if !names.is_empty() {
+                    ui.separator();
+                }
+                if ui.button(t("New variable…")).clicked() {
+                    name = Some(None);
+                }
+            })
+        });
+        if let (Some(name), Some(value)) = (name, selected) {
+            let value = value.to_owned();
+            hand(&ctx, Picked::Set { env, name, value });
+        }
+    }
+}
+
+const GRAB: &str = "label-grab";
+const GRABBED: &str = "label-grabbed";
+const SELECTED: &str = "label-selected";
+const MENU_TEXT: &str = "label-menu-text";
+
+/// Keeps track of the text selected in labels drawn after it in this frame (the response
+/// body), for `label_menu`. egui keeps a label selection to itself and hands it out only
+/// as a copy to the clipboard, and a right-click on a label collapses it before any menu
+/// opens. So while there is a selection each frame sends egui a Copy, and `LabelGrab`
+/// takes the copy back out of the output before it reaches the clipboard; a right-click
+/// keeps what the frames before it saw.
+pub fn track_label_selection(ui: &egui::Ui) {
+    let ctx = ui.ctx();
+    // egui copies a whole label when nothing in it is selected, so the copy can't tell a
+    // click from a selected line: what made the selection is followed here instead. A
+    // click leaves none; a drag, a double or triple click or a shift-click make one.
+    let mut selected: bool = ctx.data(|d| d.get_temp(Id::new(SELECTED))).unwrap_or(false);
+    let (pressed, right, copying) = ui.input(|i| {
+        let p = &i.pointer;
+        if p.button_pressed(PointerButton::Primary) {
+            selected = i.modifiers.shift;
+        }
+        let moved =
+            (p.press_origin().zip(p.interact_pos())).is_some_and(|(a, b)| a.distance(b) > 2.0);
+        selected |= p.primary_down() && moved;
+        selected |= p.button_double_clicked(PointerButton::Primary)
+            || p.button_triple_clicked(PointerButton::Primary);
+        let copying = (i.events.iter()).any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut));
+        (
+            p.any_pressed(),
+            p.button_pressed(PointerButton::Secondary),
+            copying,
+        )
+    });
+    ctx.data_mut(|d| d.insert_temp(Id::new(SELECTED), selected));
+    if right && ui.rect_contains_pointer(ui.max_rect()) {
+        let text: Option<String> = ctx.data(|d| d.get_temp(Id::new(GRABBED))).flatten();
+        ctx.data_mut(|d| d.insert_temp(Id::new(MENU_TEXT), text));
+    }
+    // A press moves the selection; the user's own copy goes to the clipboard untouched.
+    if pressed || copying {
+        return;
+    }
+    let selecting = (ctx.plugin::<egui::text_selection::LabelSelectionState>())
+        .lock()
+        .has_selection();
+    if !(selected && selecting) {
+        ctx.data_mut(|d| d.remove_temp::<Option<String>>(Id::new(GRABBED)));
+        return;
+    }
+    if ctx.plugin_opt::<LabelGrab>().is_none() {
+        ctx.add_plugin(LabelGrab);
+    }
+    ctx.input_mut(|i| i.events.push(egui::Event::Copy));
+    ctx.data_mut(|d| d.insert_temp(Id::new(GRAB), true));
+}
+
+/// See `track_label_selection`.
+struct LabelGrab;
+
+impl egui::Plugin for LabelGrab {
+    fn debug_name(&self) -> &'static str {
+        "LabelGrab"
+    }
+
+    fn output_hook(&mut self, ctx: &egui::Context, output: &mut egui::FullOutput) {
+        if !ctx
+            .data_mut(|d| d.remove_temp::<bool>(Id::new(GRAB)))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        // The label selection's copy is made at the end of the pass, so it comes last; a
+        // focused text field may have copied its own selection on the same Copy before it.
+        let mut copied = None;
+        (output.platform_output.commands).retain(|c| match c {
+            egui::OutputCommand::CopyText(text) => {
+                copied = Some(text.clone());
+                false
+            }
+            _ => true,
+        });
+        ctx.data_mut(|d| d.insert_temp(Id::new(GRABBED), copied));
+    }
+}
+
+/// The right-click menu of labels tracked by `track_label_selection`: what was selected
+/// when it opened, to set as a variable.
+pub fn label_menu(ui: &mut egui::Ui) {
+    let text: Option<String> = ui.data(|d| d.get_temp(Id::new(MENU_TEXT))).flatten();
+    match &text {
+        Some(text) => ui.label(RichText::new(clip(text, 60)).monospace().weak()),
+        None => ui.weak(t("Select text to set it as a variable")),
+    };
+    set_as_variable(ui, text.as_deref());
 }
 
 fn hand(ctx: &egui::Context, picked: Picked) {

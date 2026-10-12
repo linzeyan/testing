@@ -1513,6 +1513,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Paste", "貼上"),
     ("Select all", "全選"),
+    (
+        "Select text to set it as a variable",
+        "選取文字即可設為變數",
+    ),
     ("Set as variable in {}", "設為變數：{}"),
     ("Set {} in {}", "已將 {} 設定於 {}"),
     // Request settings

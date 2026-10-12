@@ -669,10 +669,12 @@ enum NameKind {
     },
     NewEnv,
     DuplicateEnv(String),
-    /// A selection to store as a new variable in `env` (`None`: the globals).
+    /// A selection to store as a new variable in `env` (`None`: the globals), on the
+    /// secret side or the shared one.
     NewVar {
         env: Option<String>,
         value: String,
+        secret: bool,
     },
 }
 
@@ -2574,9 +2576,16 @@ impl App {
         }
     }
 
-    /// A selection stored from a field's right-click menu; `env` `None` is the globals.
-    fn set_var(&mut self, env: Option<&str>, name: &str, value: &str) -> Result<(), String> {
-        self.ws.set_var(env, name, value)?;
+    /// A selection stored from a right-click menu; `env` `None` is the globals. `secret`
+    /// is the side a new variable goes to.
+    fn set_var(
+        &mut self,
+        env: Option<&str>,
+        name: &str,
+        value: &str,
+        secret: bool,
+    ) -> Result<(), String> {
+        self.ws.set_var(env, name, value, secret)?;
         self.reload_vars();
         self.status = tf("Set {} in {}", &[&name, &env.unwrap_or(t("Globals"))]);
         Ok(())
@@ -2697,9 +2706,10 @@ impl App {
                 self.save_as(&old, &folder, &name).map(|_| None)
             }
             NameKind::NewVar { .. } if name.is_empty() => Err(t("A variable needs a name").into()),
-            NameKind::NewVar { env, value } => {
-                let (env, value) = (env.clone(), value.clone());
-                self.set_var(env.as_deref(), &name, &value).map(|()| None)
+            NameKind::NewVar { env, value, secret } => {
+                let (env, value, secret) = (env.clone(), value.clone(), *secret);
+                self.set_var(env.as_deref(), &name, &value, secret)
+                    .map(|()| None)
             }
         };
         let Some(Dialog::Name { kind, error, .. }) = &mut self.dialog else {
@@ -3371,7 +3381,8 @@ impl eframe::App for App {
                     name: Some(name),
                     value,
                 } => {
-                    if let Err(e) = self.set_var(env.as_deref(), &name, &value) {
+                    // Picked from the names there, so it stays on its side.
+                    if let Err(e) = self.set_var(env.as_deref(), &name, &value, true) {
                         self.status = e;
                     }
                 }
@@ -3379,7 +3390,16 @@ impl eframe::App for App {
                     env,
                     name: None,
                     value,
-                } => self.dialog = Some(Dialog::name(NameKind::NewVar { env, value }, "")),
+                } => {
+                    // Secret unless unticked: selections are often tokens, which mustn't
+                    // reach git unasked.
+                    let kind = NameKind::NewVar {
+                        env,
+                        value,
+                        secret: true,
+                    };
+                    self.dialog = Some(Dialog::name(kind, ""));
+                }
                 Picked::Status(s) => self.status = s,
             }
             // The status bar is already drawn.
@@ -5108,8 +5128,12 @@ impl App {
                         NameKind::DuplicateEnv(_) => t("Duplicate environment"),
                         NameKind::NewVar { .. } => t("New variable"),
                     });
-                    if let NameKind::NewVar { value, .. } = kind {
+                    if let NameKind::NewVar { value, secret, .. } = kind {
                         ui.label(RichText::new(clip(value, 120)).monospace().weak());
+                        ui.checkbox(secret, t("Secret")).on_hover_text(t(
+                            "Kept on this machine only (in apitool.db), never written to the files. \
+                     Overrides shared values; values set by scripts land here.",
+                        ));
                     }
                     if let NameKind::SaveAs { folder, .. } | NameKind::NewRequest(folder) = kind {
                         let shown = (folders.iter())
@@ -10725,6 +10749,7 @@ fn response_ui(
             }
             let weak = ui.visuals().weak_text_color();
             let mut toggle = None;
+            crate::varedit::track_label_selection(ui);
             area.show_rows(ui, row_height, count, |ui, range| {
                 for i in range.map(|v| unhide(&hidden, v)) {
                     let (start, end, line, in_string) = match *wrap {
@@ -10791,7 +10816,8 @@ fn response_ui(
                         }
                         ui.add(
                             egui::Label::new(highlighted(ui, view, start..end, in_string)).extend(),
-                        );
+                        )
+                        .context_menu(crate::varedit::label_menu);
                         if folded {
                             let close = match view.text[start..end].ends_with('{') {
                                 true => "… }",
@@ -13464,7 +13490,7 @@ mod ui_tests {
         menu(&mut h, &["Set as variable in Globals", "New variable…"]);
         assert!(matches!(
             &h.state().dialog,
-            Some(Dialog::Name { kind: NameKind::NewVar { env: None, value }, .. }) if value == "a b"
+            Some(Dialog::Name { kind: NameKind::NewVar { env: None, value, secret: true }, .. }) if value == "a b"
         ));
         h.event(egui::Event::Text("q".into()));
         h.run();
@@ -15243,6 +15269,109 @@ mod ui_tests {
     /// The response toolbar: Raw shows the body as received and Pretty brings the
     /// indented one back; Wrap is kept across restarts; Save… writes what the server
     /// sent to the path given, Enter confirming.
+    /// A word double-clicked in the response body is what its right-click menu stores, here
+    /// as a new shared global; the clipboard, which egui's label selection only hands its
+    /// text to, is left alone.
+    #[test]
+    fn a_response_selection_is_set_as_a_variable() {
+        let mut h = with_request("resp-set-var");
+        show_response(&mut h, "application/json", r#"{"token":"abc123"}"#.into());
+        let copies = |h: &Harness<'_, App>| {
+            (h.output().platform_output.commands.iter())
+                .filter(|c| matches!(c, egui::OutputCommand::CopyText(_)))
+                .count()
+        };
+        // Press and release in frames of their own, as by hand.
+        let click = |h: &mut Harness<'_, App>, pos: egui::Pos2, button: egui::PointerButton| {
+            h.hover_at(pos);
+            for pressed in [true, false] {
+                let modifiers = Modifiers::NONE;
+                h.event(egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers,
+                });
+                h.run();
+                assert_eq!(copies(h), 0, "nothing copied");
+            }
+        };
+        let by = egui_kittest::kittest::By::new();
+        let line = (h.get(by.clone().role(Role::Label).label_contains("abc123")))
+            .rect()
+            .left_center();
+        // `x(c)`: before the char `c` of `  "token": "abc123"`; `at` is over its `c`.
+        let font = egui::TextStyle::Monospace.resolve(&h.ctx.global_style());
+        let char_w = h.ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
+        let x = |c: f32| line + egui::vec2(char_w * c, 0.0);
+        let at = x(14.5);
+        let menu_text = |h: &Harness<'_, App>| {
+            let id = egui::Id::new("label-menu-text");
+            h.ctx.data(|d| d.get_temp::<Option<String>>(id)).flatten()
+        };
+
+        // A click selects nothing (egui would still copy the whole line).
+        click(&mut h, at, egui::PointerButton::Secondary);
+        assert_eq!(menu_text(&h), None);
+        h.get_by_label("Select text to set it as a variable");
+        h.key_press(Key::Escape);
+        h.run();
+        click(&mut h, at, egui::PointerButton::Primary);
+        click(&mut h, at, egui::PointerButton::Secondary);
+        assert_eq!(menu_text(&h), None, "a click selects nothing");
+        h.key_press(Key::Escape);
+        h.run();
+        // Dragged across `abc123`, from the cursor before it to the one after.
+        let press = |h: &mut Harness<'_, App>, pos: egui::Pos2, pressed: bool| {
+            let (button, modifiers) = (egui::PointerButton::Primary, Modifiers::NONE);
+            h.event(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers,
+            });
+            h.run();
+        };
+        h.hover_at(x(12.0));
+        press(&mut h, x(12.0), true);
+        h.hover_at(x(15.0));
+        h.run();
+        h.hover_at(x(18.0));
+        h.run();
+        press(&mut h, x(18.0), false);
+        h.run();
+        assert_eq!(copies(&h), 0, "the selection's text isn't copied");
+        click(&mut h, at, egui::PointerButton::Secondary);
+        shot(&mut h, "94-response-selection-menu");
+        assert_eq!(menu_text(&h).as_deref(), Some("abc123"));
+        for label in ["Set as variable in Globals", "New variable…"] {
+            let at = h
+                .get(by.clone().role(Role::Button).label_contains(label))
+                .rect()
+                .center();
+            click(&mut h, at, egui::PointerButton::Primary);
+        }
+        assert!(matches!(
+            &h.state().dialog,
+            Some(Dialog::Name { kind: NameKind::NewVar { env: None, value, secret: true }, .. })
+                if value == "abc123"
+        ));
+        h.get_by_label("Secret").click();
+        h.run();
+        h.event(egui::Event::Text("token".into()));
+        h.run();
+        h.key_press(Key::Enter);
+        h.run();
+        assert!(h.state().dialog.is_none(), "{}", h.state().status);
+        let (shared, secret) = h.state().ws.load_env(None).unwrap();
+        assert_eq!(
+            shared,
+            [KeyValue::new("token", "abc123")],
+            "unticked: shared"
+        );
+        assert!(secret.is_empty());
+    }
+
     #[test]
     fn response_body_switches_wraps_and_saves() {
         let mut h = with_request("resp-tools");
