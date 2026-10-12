@@ -224,13 +224,26 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
             sign_last = Some(Box::new(move |w| crate::oauth1::sign(w, &o, now)));
             b
         }
+        Auth::Hawk(h) => {
+            sign_last = Some(Box::new(move |w| crate::hawk::sign(w, &h, now)));
+            b
+        }
+        Auth::EdgeGrid(e) => {
+            sign_last = Some(Box::new(move |w| crate::edgegrid::sign(w, &e, now)));
+            b
+        }
         Auth::Bearer { token } => b.bearer_auth(token),
         Auth::Jwt(j) => b.bearer_auth(crate::jwt::sign(&j)?),
         Auth::Basic { username, password } => b.basic_auth(username, Some(password)),
-        // Both need a round trip first; `execute` and `with_token` take care of it.
+        // These need a round trip first; `execute` and `with_token` take care of it.
         Auth::Digest { .. } => {
             return Err(
                 "Digest auth works for plain HTTP requests only, not WebSocket, SSE or gRPC".into(),
+            );
+        }
+        Auth::Ntlm(_) => {
+            return Err(
+                "NTLM auth works for plain HTTP requests only, not WebSocket, SSE or gRPC".into(),
             );
         }
         Auth::OAuth2(_) => {
@@ -324,7 +337,7 @@ pub async fn with_token(
     Ok(())
 }
 
-/// Sends a resolved request, doing the extra round trip Digest and OAuth 2.0 need.
+/// Sends a resolved request, doing the extra round trip Digest, NTLM and OAuth 2.0 need.
 pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, String> {
     match req.auth.clone() {
         Auth::OAuth2(_) => {
@@ -365,6 +378,35 @@ pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, 
             let cnonce = crate::auth::cnonce();
             let value =
                 crate::auth::digest(challenge, method, &uri, &username, &password, &cnonce)?;
+            req.headers.push(KeyValue::new("Authorization", value));
+            send_once(&client, req).await
+        }
+        // Negotiates straight away, as curl does, rather than waiting to be asked; the body
+        // goes with both messages, so a server that needs no sign-in still gets all of it.
+        // `client` must come from `net::Clients::ntlm_for`, which keeps both on one
+        // connection.
+        Auth::Ntlm(n) => {
+            let mut req = Request {
+                auth: Auth::None,
+                ..req
+            };
+            let mut negotiate = req.clone();
+            let opening = crate::ntlm::negotiate();
+            negotiate
+                .headers
+                .push(KeyValue::new("Authorization", opening));
+            let first = send_once(&client, negotiate).await?;
+            let challenge = first.headers.iter().find_map(|(k, v)| {
+                let token = (v.trim_start().split_once(' '))
+                    .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("ntlm"))?
+                    .1;
+                k.eq_ignore_ascii_case("www-authenticate")
+                    .then(|| token.trim().to_owned())
+            });
+            let (401, Some(challenge)) = (first.status, challenge) else {
+                return Ok(first);
+            };
+            let value = crate::ntlm::authenticate(&n, &challenge)?;
             req.headers.push(KeyValue::new("Authorization", value));
             send_once(&client, req).await
         }
@@ -595,6 +637,13 @@ pub fn auto_headers(mut req: Request, own: &[KeyValue]) -> Vec<(String, String, 
             later = Some((
                 "authorization".to_owned(),
                 "Digest … (answers the server's challenge)".to_owned(),
+            ));
+            req.auth = Auth::None;
+        }
+        Auth::Ntlm(_) => {
+            later = Some((
+                "authorization".to_owned(),
+                "NTLM … (a handshake with the server)".to_owned(),
             ));
             req.auth = Auth::None;
         }
@@ -888,7 +937,7 @@ pub(crate) mod tests {
     }
 
     /// The whole request: a streamed body can arrive after the headers.
-    fn read_request(stream: &mut impl Read) -> String {
+    pub(crate) fn read_request(stream: &mut impl Read) -> String {
         let (mut req, mut buf) = (Vec::new(), [0; 16 * 1024]);
         loop {
             let n = stream.read(&mut buf).unwrap_or(0);

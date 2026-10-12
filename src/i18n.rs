@@ -1560,6 +1560,42 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("All", "全部"),
     ("{} chosen", "已選 {} 個"),
+    // Hawk, NTLM, EdgeGrid auth
+    ("Hawk", "Hawk"),
+    ("Akamai EdgeGrid", "Akamai EdgeGrid"),
+    ("NTLM", "NTLM"),
+    ("Auth ID", "驗證 ID"),
+    ("Auth key", "驗證金鑰"),
+    ("User", "使用者"),
+    ("Nonce", "Nonce"),
+    ("random on each Send", "每次傳送隨機產生"),
+    ("Extra data", "額外資料（ext）"),
+    ("App", "應用程式（app）"),
+    ("Delegation", "委派（dlg）"),
+    ("Timestamp", "時間戳記"),
+    ("now on each Send", "每次傳送取當下時間"),
+    ("Include payload hash", "納入內容雜湊"),
+    ("Client token", "用戶端權杖"),
+    ("Base URL", "基底網址"),
+    (
+        "optional: the host to sign, if not the URL's",
+        "選填：要簽章的主機（若與網址不同）",
+    ),
+    ("Headers to sign", "要簽章的標頭"),
+    ("Max body", "內容上限（位元組）"),
+    ("Workstation", "工作站"),
+    (
+        "Each Send is signed over its method, URL and host with a fresh nonce and timestamp; the payload hash adds the body and its content type. A body streamed from a file isn't hashed.",
+        "每次傳送都會以新的 nonce 與時間戳記，對方法、網址與主機簽章；內容雜湊會再納入內容與其 Content-Type。從檔案串流的內容不會納入雜湊。",
+    ),
+    (
+        "Each Send is signed over its method, URL, the headers to sign and a POST's body (up to max body) with a fresh nonce and timestamp. The tokens and host are in your .edgerc.",
+        "每次傳送都會以新的 nonce 與時間戳記，對方法、網址、要簽章的標頭與 POST 內容（最多到內容上限）簽章。權杖與主機都在你的 .edgerc 裡。",
+    ),
+    (
+        "Send signs in with NTLMv2 over HTTP/1.1: a challenge and answer on one connection, so the body goes twice. Through a proxy only https:// URLs work (a plain HTTP proxy may switch connections), and servers that only offer Kerberos aren't supported.",
+        "傳送時以 NTLMv2 透過 HTTP/1.1 登入：挑戰與回應走同一條連線，因此內容會送出兩次。經由代理伺服器時只有 https:// 網址可用（一般 HTTP 代理可能換連線），也不支援只提供 Kerberos 的伺服器。",
+    ),
 ];
 
 #[cfg(test)]
