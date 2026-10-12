@@ -86,6 +86,29 @@ pub struct Settings {
     pub cookies: bool,
     /// 0 is the network settings' timeout.
     pub timeout_ms: u64,
+    // The fields below are left out at their defaults, so a request saved before they
+    // existed saves unchanged.
+    /// A 301/302/303 keeps the method and body instead of switching to GET.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub follow_original_method: bool,
+    /// Authorization still goes along when a redirect leads to another host.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub follow_auth_header: bool,
+    /// No Referer on the request a redirect leads to.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub remove_referer: bool,
+    /// TLS 1.2 and 1.3 are the only versions rustls speaks; each can be turned off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub disable_tls12: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub disable_tls13: bool,
+    /// Cipher suites offered, in order, by OpenSSL's names as Postman keeps them (see
+    /// `net::ciphers`); empty offers all. Names apitool doesn't have are kept but skipped.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ciphers: Vec<String>,
+    /// Accepts responses with malformed headers, as Postman's `insecureHTTPParser`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub insecure_parser: bool,
 }
 
 impl Default for Settings {
@@ -97,6 +120,13 @@ impl Default for Settings {
             verify_tls: true,
             cookies: true,
             timeout_ms: 0,
+            follow_original_method: false,
+            follow_auth_header: false,
+            remove_referer: false,
+            disable_tls12: false,
+            disable_tls13: false,
+            ciphers: Vec::new(),
+            insecure_parser: false,
         }
     }
 }
@@ -104,6 +134,13 @@ impl Default for Settings {
 impl Settings {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// reqwest's redirect policy turns a POST into a GET on 301/302 and drops
+    /// Authorization on another host, with no way to ask otherwise; for these settings
+    /// apitool follows redirects itself (`http::follow`) and the client follows none.
+    pub fn follows_itself(&self) -> bool {
+        self.follow_redirects && (self.follow_original_method || self.follow_auth_header)
     }
 }
 
@@ -915,6 +952,26 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request saved with settings from before the redirect, TLS and parser ones existed
+    /// saves byte for byte as it did (the store keeps JSON, Sync writes TOML): new fields
+    /// at their defaults are left out, so untouched requests show no diff.
+    #[test]
+    fn settings_untouched_by_newer_fields_save_as_before() {
+        let s = Settings {
+            timeout_ms: 1500,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"http_version":"auto","follow_redirects":true,"max_redirects":10,"verify_tls":true,"cookies":true,"timeout_ms":1500}"#
+        );
+        assert_eq!(
+            toml::to_string(&s).unwrap(),
+            "http_version = \"auto\"\nfollow_redirects = true\nmax_redirects = 10\nverify_tls = true\ncookies = true\ntimeout_ms = 1500\n"
+        );
+        assert!(Settings::default().is_default());
+    }
 
     #[test]
     fn resolve_substitutes_and_reports_missing() {

@@ -8932,6 +8932,22 @@ fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_s
             );
             ui.end_row();
 
+            let follows = s.follow_redirects;
+            ui.label(t("Follow original HTTP method"));
+            ui.add_enabled(follows, egui::Checkbox::new(&mut s.follow_original_method, ""));
+            ui.weak(t("Keep the method and body on a 301, 302 or 303"));
+            ui.end_row();
+
+            ui.label(t("Follow Authorization header"));
+            ui.add_enabled(follows, egui::Checkbox::new(&mut s.follow_auth_header, ""));
+            ui.weak(t("Keep it when a redirect goes to another host"));
+            ui.end_row();
+
+            ui.label(t("Remove referer header on redirect"));
+            ui.add_enabled(follows, egui::Checkbox::new(&mut s.remove_referer, ""));
+            ui.weak(t("Don't tell the next host which URL redirected"));
+            ui.end_row();
+
             ui.label(t("Verify TLS certificate"));
             ui.checkbox(&mut s.verify_tls, "");
             if s.verify_tls {
@@ -8960,6 +8976,43 @@ fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_s
             );
             ui.weak(t("0 uses the network settings' timeout"));
             ui.end_row();
+
+            // Rarely needed, so below the ones that are.
+            ui.label(t("Disabled TLS versions")).on_hover_text(t(
+                "apitool's TLS (rustls) has only TLS 1.2 and 1.3: SSL, TLS 1.0 and 1.1 are never offered and can't be turned on.",
+            ));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.disable_tls12, "TLS 1.2");
+                ui.checkbox(&mut s.disable_tls13, "TLS 1.3");
+            });
+            if s.disable_tls12 && s.disable_tls13 {
+                ui.colored_label(RED, t("No TLS version is left: https requests fail"));
+            } else {
+                ui.weak(t("Only for servers that mishandle one of them"));
+            }
+            ui.end_row();
+
+            ui.label(t("Cipher suites"));
+            cipher_picker(ui, &mut s.ciphers);
+            let unknown: Vec<&str> = (s.ciphers.iter())
+                .filter(|c| net::cipher(c).is_none())
+                .map(String::as_str)
+                .collect();
+            if unknown.is_empty() {
+                ui.weak(t("Offered in the order checked; none checked offers all"));
+            } else {
+                let names = unknown.join(", ");
+                ui.colored_label(ORANGE, tf("Not available here, skipped: {}", &[&names]));
+            }
+            ui.end_row();
+
+            ui.label(t("Enable strict HTTP parser"));
+            let mut strict = !s.insecure_parser;
+            if ui.checkbox(&mut strict, "").changed() {
+                s.insecure_parser = !strict;
+            }
+            ui.weak(t("Off accepts responses with malformed headers"));
+            ui.end_row();
         });
     ui.add_space(8.0);
     if ui
@@ -8967,6 +9020,45 @@ fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_s
         .clicked()
     {
         *s = model::Settings::default();
+    }
+}
+
+/// The suites apitool has, checked in the order they're offered: checking one adds it at
+/// the end. Names it doesn't have (from an import) are listed checked, to be removed.
+fn cipher_picker(ui: &mut egui::Ui, ciphers: &mut Vec<String>) {
+    let shown = match ciphers.len() {
+        0 => t("All").to_owned(),
+        n => tf("{} chosen", &[&n]),
+    };
+    let canonical = |c: &str| net::cipher(c).map(|c| c.0);
+    // The order the list can't show.
+    let order = ciphers.join("\n");
+    let picker = egui::ComboBox::from_id_salt("ciphers")
+        .selected_text(shown)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show_ui(ui, |ui| {
+            for (name, _) in net::ciphers() {
+                let mut on = ciphers.iter().any(|c| canonical(c) == Some(name));
+                if ui.checkbox(&mut on, name).changed() {
+                    match on {
+                        true => ciphers.push(name.to_owned()),
+                        false => ciphers.retain(|c| canonical(c) != Some(name)),
+                    }
+                }
+            }
+            let mut gone = None;
+            let unknown = (ciphers.iter().enumerate()).filter(|(_, c)| canonical(c).is_none());
+            for (i, c) in unknown {
+                if ui.checkbox(&mut true, c.as_str()).changed() {
+                    gone = Some(i);
+                }
+            }
+            if let Some(i) = gone {
+                ciphers.remove(i);
+            }
+        });
+    if !order.is_empty() {
+        picker.response.on_hover_text(order);
     }
 }
 

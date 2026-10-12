@@ -271,11 +271,18 @@ fn ruby_str(s: &str) -> String {
 /// POSIX shell quoting.
 fn curl(w: &Wire) -> String {
     let mut out = String::from("curl");
+    let s = &w.settings;
     // curl stays on a 3xx unless told; Send follows by default.
     if w.follows() {
-        out.push_str(" --location");
-        if w.settings.max_redirects != Settings::default().max_redirects {
-            let _ = write!(out, " --max-redirs {}", w.settings.max_redirects);
+        out.push_str(match s.follow_auth_header {
+            true => " --location-trusted",
+            false => " --location",
+        });
+        if s.max_redirects != Settings::default().max_redirects {
+            let _ = write!(out, " --max-redirs {}", s.max_redirects);
+        }
+        if s.follow_original_method {
+            out.push_str(" --post301 --post302 --post303");
         }
     }
     match w.method.as_str() {
@@ -288,6 +295,21 @@ fn curl(w: &Wire) -> String {
     }
     if w.insecure() {
         out.push_str(" --insecure");
+    }
+    if s.disable_tls12 {
+        out.push_str(" --tlsv1.3");
+    }
+    if s.disable_tls13 {
+        out.push_str(" --tls-max 1.2");
+    }
+    // curl takes TLS 1.3 suites apart; a name apitool doesn't know goes with the others.
+    let (tls13, tls12): (Vec<&str>, Vec<&str>) = (s.ciphers.iter().map(String::as_str))
+        .partition(|n| crate::net::cipher(n).is_some_and(|c| c.1.tls13().is_some()));
+    if !tls13.is_empty() {
+        let _ = write!(out, " --tls13-ciphers {}", sh(&tls13.join(":")));
+    }
+    if !tls12.is_empty() {
+        let _ = write!(out, " --ciphers {}", sh(&tls12.join(":")));
     }
     match (w.settings.http_version, w.https()) {
         (HttpVersion::Auto, _) => {}

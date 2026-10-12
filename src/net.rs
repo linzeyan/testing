@@ -166,26 +166,48 @@ impl Route {
 
 /// What request settings change about the connection itself (the timeout is set per
 /// request instead). reqwest fixes these per client, so each combination in use gets
-/// its own, built once.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// its own, built once. Settings that don't matter for a combination are left at their
+/// defaults, so it shares a client with the others that differ only there.
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct Variant {
     version: HttpVersion,
-    /// None doesn't follow.
+    /// None doesn't follow, or `http::follow` does.
     redirects: Option<u32>,
+    /// A Referer on the redirects reqwest follows.
+    referer: bool,
     insecure: bool,
     cookies: bool,
     /// Which of `host_certs` to present; None is the default certificate.
     cert: Option<usize>,
+    no_tls12: bool,
+    no_tls13: bool,
+    /// The suites offered, by `ciphers` name; None offers all.
+    ciphers: Option<Vec<&'static str>>,
+    /// Accepts malformed response headers.
+    lenient: bool,
 }
 
 impl From<&Settings> for Variant {
     fn from(s: &Settings) -> Self {
+        let redirects = (s.follow_redirects && !s.follows_itself()).then_some(s.max_redirects);
         Self {
             version: s.http_version,
-            redirects: s.follow_redirects.then_some(s.max_redirects),
+            redirects,
+            referer: !(s.remove_referer && redirects.is_some()),
             insecure: !s.verify_tls,
             cookies: s.cookies,
             cert: None,
+            no_tls12: s.disable_tls12,
+            no_tls13: s.disable_tls13,
+            // Unknown names are skipped; none known is Some(empty), refused when built.
+            ciphers: (!s.ciphers.is_empty()).then(|| {
+                s.ciphers
+                    .iter()
+                    .filter_map(|n| cipher(n))
+                    .map(|c| c.0)
+                    .collect()
+            }),
+            lenient: s.insecure_parser,
         }
     }
 }
@@ -235,7 +257,7 @@ impl Clients {
         if let Some(c) = self.variants.built.lock().unwrap().get(&v) {
             return Ok(c.clone());
         }
-        let c = (self.variants.build)(v)?;
+        let c = (self.variants.build)(v.clone())?;
         self.variants.built.lock().unwrap().insert(v, c.clone());
         Ok(c)
     }
@@ -364,6 +386,17 @@ pub async fn build_client_with_jar(
             // Over TLS this offers only h2; over plain TCP it is h2c.
             HttpVersion::Http2 => b.http2_prior_knowledge(),
         };
+        b = b.referer(v.referer);
+        if v.lenient {
+            // What Node's insecureHTTPParser lets through, which Postman's setting turns on.
+            b = b
+                .http1_ignore_invalid_headers_in_responses(true)
+                .http1_allow_spaces_after_header_name_in_responses(true)
+                .http1_allow_obsolete_multiline_headers_in_responses(true);
+        }
+        if v.no_tls12 || v.no_tls13 || v.ciphers.is_some() {
+            b = b.tls_backend_preconfigured(custom_tls(&net, &v)?);
+        }
         b.build().map_err(|e| error_chain(&e))
     };
     Ok(Clients {
@@ -377,6 +410,112 @@ pub async fn build_client_with_jar(
             built: Default::default(),
             net: picking,
         }),
+    })
+}
+
+/// A request's TLS versions and cipher suites. reqwest takes these only as a whole rustls
+/// config (its own is built from the process-wide provider), so this one is built as
+/// reqwest builds its own: the trust store and CA file, the client certificate, ALPN for
+/// the HTTP version, and `HelloAt` for the TLS time.
+fn custom_tls(net: &Network, v: &Variant) -> Result<rustls::ClientConfig, String> {
+    let suites = match &v.ciphers {
+        None => rustls::crypto::ring::ALL_CIPHER_SUITES.to_vec(),
+        Some(names) => names
+            .iter()
+            .filter_map(|n| cipher(n))
+            .map(|c| c.1)
+            .collect(),
+    };
+    if suites.is_empty() {
+        return Err("none of the request's cipher suites is one apitool has".into());
+    }
+    let versions: Vec<_> = [
+        (&rustls::version::TLS12, v.no_tls12),
+        (&rustls::version::TLS13, v.no_tls13),
+    ]
+    .into_iter()
+    .filter_map(|(version, off)| (!off).then_some(version))
+    .collect();
+    if versions.is_empty() {
+        return Err(
+            "the request disables both TLS 1.2 and 1.3, the only versions apitool has".into(),
+        );
+    }
+    let cert = match v.cert {
+        Some(i) => (
+            net.host_certs[i].cert.as_str(),
+            net.host_certs[i].password.as_str(),
+        ),
+        None => (net.client_cert.as_str(), net.client_cert_password.as_str()),
+    };
+    let provider = rustls::crypto::CryptoProvider {
+        cipher_suites: suites,
+        ..provider()
+    };
+    let insecure = net.insecure || v.insecure;
+    let mut tls = crate::mqtt::tls_config(net, cert, insecure, provider, &versions)?;
+    tls.alpn_protocols = match v.version {
+        HttpVersion::Auto => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        HttpVersion::Http1 => vec![b"http/1.1".to_vec()],
+        HttpVersion::Http2 => vec![b"h2".to_vec()],
+    };
+    Ok(tls)
+}
+
+/// OpenSSL's names for the suites ring has, which Postman (`tlsCipherSelection`) and
+/// curl (`--ciphers`) take.
+const CIPHER_NAMES: &[(&str, rustls::CipherSuite)] = {
+    use rustls::CipherSuite as C;
+    &[
+        ("TLS_AES_256_GCM_SHA384", C::TLS13_AES_256_GCM_SHA384),
+        ("TLS_AES_128_GCM_SHA256", C::TLS13_AES_128_GCM_SHA256),
+        (
+            "TLS_CHACHA20_POLY1305_SHA256",
+            C::TLS13_CHACHA20_POLY1305_SHA256,
+        ),
+        (
+            "ECDHE-ECDSA-AES256-GCM-SHA384",
+            C::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        ),
+        (
+            "ECDHE-ECDSA-AES128-GCM-SHA256",
+            C::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        ),
+        (
+            "ECDHE-ECDSA-CHACHA20-POLY1305",
+            C::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        ),
+        (
+            "ECDHE-RSA-AES256-GCM-SHA384",
+            C::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        ),
+        (
+            "ECDHE-RSA-AES128-GCM-SHA256",
+            C::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        ),
+        (
+            "ECDHE-RSA-CHACHA20-POLY1305",
+            C::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        ),
+    ]
+};
+
+/// The cipher suites a request can pick: ring's, in rustls's order of preference.
+pub fn ciphers() -> impl Iterator<Item = (&'static str, rustls::SupportedCipherSuite)> {
+    rustls::crypto::ring::ALL_CIPHER_SUITES
+        .iter()
+        .filter_map(|s| {
+            let (name, _) = CIPHER_NAMES.iter().find(|(_, id)| *id == s.suite())?;
+            Some((*name, *s))
+        })
+}
+
+/// A suite by OpenSSL's name, or IANA's as rustls spells it.
+pub fn cipher(name: &str) -> Option<(&'static str, rustls::SupportedCipherSuite)> {
+    let name = name.trim();
+    ciphers().find(|(openssl, s)| {
+        openssl.eq_ignore_ascii_case(name)
+            || (s.suite().as_str()).is_some_and(|iana| iana.eq_ignore_ascii_case(name))
     })
 }
 
@@ -733,11 +872,15 @@ where
 /// ring, with `HelloAt` drawing its random numbers. Installing is idempotent: the first
 /// install wins, so every place that installs one goes through here.
 pub fn install_provider() {
-    let _ = rustls::crypto::CryptoProvider {
+    let _ = provider().install_default();
+}
+
+/// What `install_provider` installs; a request with its own cipher suites starts from it.
+fn provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::CryptoProvider {
         secure_random: &HelloAt,
         ..rustls::crypto::ring::default_provider()
     }
-    .install_default();
 }
 
 /// Marks when a TLS handshake starts, for the time hover's TCP/TLS split. reqwest's

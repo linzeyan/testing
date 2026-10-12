@@ -373,6 +373,7 @@ pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, 
 }
 
 async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, String> {
+    let settings = req.settings.clone();
     let wire = build(client, req)?.build().map_err(|e| error_chain(&e))?;
     let body_len = wire.body().and_then(|b| b.as_bytes()).map(<[u8]>::len);
     let mut sent = Sent {
@@ -393,11 +394,11 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
     };
     let started = Instant::now();
     let send = async {
-        let resp = client.execute(wire).await;
+        let resp = follow(client, wire, &settings).await;
         (resp, TRACE.with(|t| t.take()))
     };
     let (resp, trace) = TRACE.scope(Default::default(), send).await;
-    let resp = resp.map_err(|e| error_chain(&e))?;
+    let resp = resp?;
     sent.waited = Some(started.elapsed());
     sent.added(trace.cookie, body_len);
     sent.hops = trace.hops;
@@ -421,6 +422,107 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
         truncated,
         sent,
     })
+}
+
+/// Sends `wire` and follows its redirects. reqwest's policy does it, unless the settings
+/// ask for what it can't (`Settings::follows_itself`): then the client follows none
+/// (`net::Variant`) and this does it as reqwest would apart from what was asked, noting
+/// each hop for the Timeline as the policy does, and sending each through the client so
+/// the cookie jar and the connect timing see it.
+async fn follow(
+    client: &reqwest::Client,
+    wire: reqwest::Request,
+    s: &crate::model::Settings,
+) -> Result<reqwest::Response, String> {
+    use reqwest::Method;
+    use reqwest::header::*;
+    let failed = |e: reqwest::Error| error_chain(&e);
+    if !s.follows_itself() {
+        return client.execute(wire).await.map_err(failed);
+    }
+    let (mut method, version) = (wire.method().clone(), wire.version());
+    // What every hop starts from, so a change made on the way holds for the hops after
+    // it: the body once dropped, as in reqwest, and credentials once another host was
+    // reached (reqwest compares each hop with the one before only, as Postman doesn't).
+    let mut headers = wire.headers().clone();
+    // Some(None): streamed from files, so it can't go out a second time.
+    let mut body = wire.body().map(|b| b.as_bytes().map(<[u8]>::to_vec));
+    // ponytail: only the request's own timeout spans all hops; the network settings' one
+    // starts over at each, as the client doesn't say what it is.
+    let deadline = wire.timeout().map(|t| Instant::now() + *t);
+    let mut resp = client.execute(wire).await.map_err(failed)?;
+    let mut followed = 0;
+    loop {
+        let status = resp.status().as_u16();
+        let location = (resp.headers().get(LOCATION))
+            .filter(|_| matches!(status, 301 | 302 | 303 | 307 | 308))
+            .and_then(|l| std::str::from_utf8(l.as_bytes()).ok());
+        let Some(to) = location.and_then(|l| resp.url().join(l).ok()) else {
+            return Ok(resp);
+        };
+        let from = resp.url().clone();
+        let stop = |why| format!("error following redirect for url ({from})\n  caused by: {why}");
+        if followed >= s.max_redirects {
+            return Err(stop("too many redirects"));
+        }
+        if !matches!(to.scheme(), "http" | "https") {
+            return Err(stop("URL scheme is not allowed"));
+        }
+        let to_get = !s.follow_original_method
+            && match status {
+                301 | 302 => method == Method::POST,
+                303 => true,
+                _ => false,
+            };
+        if to_get {
+            if method != Method::HEAD {
+                method = Method::GET;
+            }
+            body = None;
+            for h in [
+                CONTENT_TYPE,
+                CONTENT_LENGTH,
+                CONTENT_ENCODING,
+                TRANSFER_ENCODING,
+            ] {
+                headers.remove(h);
+            }
+        }
+        let next_body = match &body {
+            None => None,
+            Some(Some(bytes)) => Some(reqwest::Body::from(bytes.clone())),
+            // As reqwest does: the 3xx is the answer.
+            Some(None) => return Ok(resp),
+        };
+        let site = |u: &reqwest::Url| (u.scheme().to_owned(), u.port_or_known_default());
+        if from.host_str() != to.host_str() || site(&from) != site(&to) {
+            for h in [COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE] {
+                headers.remove(h);
+            }
+            headers.remove("cookie2");
+            if !s.follow_auth_header {
+                headers.remove(AUTHORIZATION);
+            }
+        }
+        let mut next = reqwest::Request::new(method.clone(), to.clone());
+        *next.headers_mut() = headers.clone();
+        // reqwest's: where it came from, without credentials, and never from https to http.
+        if !s.remove_referer && !(from.scheme() == "https" && to.scheme() == "http") {
+            let mut referer = from.clone();
+            let _ = referer.set_username("");
+            let _ = referer.set_password(None);
+            referer.set_fragment(None);
+            if let Ok(v) = HeaderValue::from_str(referer.as_str()) {
+                next.headers_mut().insert(REFERER, v);
+            }
+        }
+        *next.version_mut() = version;
+        *next.timeout_mut() = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        *next.body_mut() = next_body;
+        trace(|t| t.hops.push((status, to.to_string())));
+        resp = client.execute(next).await.map_err(failed)?;
+        followed += 1;
+    }
 }
 
 impl Sent {
@@ -1647,5 +1749,357 @@ pub(crate) mod tests {
         assert_eq!(ours.replace("-3e2", "-300.0"), theirs);
         assert_eq!(pretty_json("[1,"), None, "not JSON: shown as it came");
         assert_eq!(pretty_json("\"x\"").unwrap(), "\"x\"");
+    }
+
+    /// The clients Send picks from: a request's settings choose (and cache) its client.
+    fn clients(rt: &tokio::runtime::Runtime) -> crate::net::Clients {
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        rt.block_on(crate::net::build_client(net)).unwrap()
+    }
+
+    fn send(
+        rt: &tokio::runtime::Runtime,
+        clients: &crate::net::Clients,
+        req: Request,
+    ) -> Result<Response, String> {
+        rt.block_on(crate::runner::send(clients, req))
+    }
+
+    /// Postman's "Follow original HTTP method": a POST answered 302 stays a POST, body and
+    /// all, only when asked. apitool then follows redirects itself, which must keep what
+    /// reqwest's own following does: the Timeline's hops, the Referer, the jar's cookies
+    /// on each hop, the limit and its error.
+    #[test]
+    fn a_redirected_post_stays_a_post_only_when_asked() {
+        use crate::model::Settings;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let addr = serve(|req| match req.split(' ').nth(1).unwrap_or("") {
+            "/a" => (
+                "302 Found\r\nlocation: /b\r\nset-cookie: sid=1".into(),
+                String::new(),
+            ),
+            "/loop" => ("302 Found\r\nlocation: /loop".into(), String::new()),
+            _ => ("200 OK".into(), req.to_owned()),
+        });
+        // A fresh jar each time, so each path has to take the cookie from the hop itself.
+        let via = |method: &str, path: &str, settings: Settings| {
+            let req = Request {
+                method: method.into(),
+                url: format!("http://{addr}{path}"),
+                headers: vec![KeyValue::new("X-Trace", "1")],
+                body: match method {
+                    "POST" => Body::Json {
+                        text: "{\"n\":1}".into(),
+                    },
+                    _ => Body::None,
+                },
+                settings,
+                ..Default::default()
+            };
+            send(&rt, &clients(&rt), req)
+        };
+        let ours = Settings {
+            follow_auth_header: true,
+            ..Default::default()
+        };
+        assert!(ours.follows_itself());
+        let (theirs, mine) = (
+            via("GET", "/a", Settings::default()).unwrap(),
+            via("GET", "/a", ours.clone()).unwrap(),
+        );
+        assert_eq!(received(&mine), received(&theirs));
+        assert!(received(&mine).contains(&("cookie".into(), "sid=1".into())));
+        assert!(received(&mine).iter().any(|(k, _)| k == "referer"));
+        assert_eq!(mine.sent.hops, [(302, format!("http://{addr}/b"))]);
+        assert_eq!(mine.sent.hops, theirs.sent.hops);
+        assert_eq!(shown(&mine), shown(&theirs));
+        let few = |s: Settings| Settings {
+            max_redirects: 3,
+            ..s
+        };
+        let theirs = via("GET", "/loop", few(Settings::default())).err().unwrap();
+        let mine = via("GET", "/loop", few(ours)).err().unwrap();
+        assert!(mine.contains("too many redirects"), "{mine}");
+        assert_eq!(mine, theirs);
+
+        let became_get = via("POST", "/a", Settings::default()).unwrap();
+        assert!(
+            became_get.body.starts_with("GET /b "),
+            "{}",
+            became_get.body
+        );
+        assert!(!became_get.body.contains("{\"n\":1}"));
+        let kept = Settings {
+            follow_original_method: true,
+            ..Default::default()
+        };
+        let stayed = via("POST", "/a", kept.clone()).unwrap();
+        assert!(stayed.body.starts_with("POST /b "), "{}", stayed.body);
+        assert!(
+            stayed.body.ends_with("\r\n\r\n{\"n\":1}"),
+            "{}",
+            stayed.body
+        );
+        // Not following stays not following.
+        let stay = Settings {
+            follow_redirects: false,
+            ..kept
+        };
+        assert_eq!(via("POST", "/a", stay).unwrap().status, 302);
+    }
+
+    /// Postman's "Follow Authorization header": the token goes on to another host only
+    /// when asked (here another port, which reqwest counts as another site too).
+    #[test]
+    fn authorization_follows_to_another_host_only_when_asked() {
+        use crate::model::Settings;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let clients = clients(&rt);
+        let other = serve(|req| ("200 OK".into(), req.to_owned()));
+        let first = serve(move |_| {
+            let to = format!("302 Found\r\nlocation: http://{other}/b");
+            (to, String::new())
+        });
+        let get = |settings: Settings| {
+            let req = Request {
+                url: format!("http://{first}/a"),
+                auth: Auth::Bearer {
+                    token: "t0k".into(),
+                },
+                settings,
+                ..Default::default()
+            };
+            received(&send(&rt, &clients, req).unwrap())
+        };
+        let token = ("authorization".to_owned(), "Bearer t0k".to_owned());
+        assert!(!get(Settings::default()).contains(&token));
+        let trusted = Settings {
+            follow_auth_header: true,
+            ..Default::default()
+        };
+        assert!(get(trusted).contains(&token));
+    }
+
+    /// Postman's "Remove referer header on redirect", whichever follows the redirect.
+    #[test]
+    fn the_referer_on_a_redirect_goes_unless_removed() {
+        use crate::model::Settings;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let clients = clients(&rt);
+        let addr = serve(|req| match req.starts_with("GET /a ") {
+            true => ("302 Found\r\nlocation: /b".into(), String::new()),
+            false => ("200 OK".into(), req.to_owned()),
+        });
+        let referer = |settings: Settings| {
+            let req = Request {
+                url: format!("http://{addr}/a"),
+                settings,
+                ..Default::default()
+            };
+            let resp = send(&rt, &clients, req).unwrap();
+            (received(&resp).into_iter()).find_map(|(k, v)| (k == "referer").then_some(v))
+        };
+        let from = Some(format!("http://{addr}/a"));
+        let (removed, ours) = (
+            Settings {
+                remove_referer: true,
+                ..Default::default()
+            },
+            Settings {
+                follow_original_method: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(referer(Settings::default()), from);
+        assert_eq!(referer(removed.clone()), None);
+        assert_eq!(referer(ours.clone()), from);
+        let both = Settings {
+            remove_referer: true,
+            ..ours
+        };
+        assert_eq!(referer(both), None);
+        assert_eq!(referer(removed), None, "a cached client keeps its setting");
+    }
+
+    /// An https server that answers with the TLS version and cipher suite it agreed on.
+    /// Its certificate is self-signed (ECDSA), so requests skip verification.
+    fn tls_server(versions: &[&'static rustls::SupportedProtocolVersion]) -> String {
+        crate::net::install_provider();
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(own.signing_key.serialize_der());
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![own.cert.der().clone()], key.unwrap())
+            .unwrap();
+        let config = std::sync::Arc::new(config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut conn = rustls::ServerConnection::new(config.clone()).unwrap();
+                let mut tls = rustls::Stream::new(&mut conn, &mut s);
+                read_request(&mut tls);
+                let agreed = format!(
+                    "{:?} {:?}",
+                    tls.conn.protocol_version(),
+                    tls.conn.negotiated_cipher_suite().map(|c| c.suite())
+                );
+                let head = "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length";
+                let _ = write!(tls, "{head}: {}\r\n\r\n{agreed}", agreed.len());
+            }
+        });
+        format!("https://{addr}/")
+    }
+
+    fn unverified(s: crate::model::Settings) -> crate::model::Settings {
+        crate::model::Settings {
+            verify_tls: false,
+            ..s
+        }
+    }
+
+    /// Postman's "TLS/SSL protocols disabled during handshake", for the two versions
+    /// rustls has.
+    #[test]
+    fn a_disabled_tls_version_is_not_offered() {
+        use crate::model::Settings;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let clients = clients(&rt);
+        let get = |url: &str, settings: Settings| {
+            let req = Request {
+                url: url.into(),
+                settings: unverified(settings),
+                ..Default::default()
+            };
+            send(&rt, &clients, req)
+        };
+        let only_12 = tls_server(&[&rustls::version::TLS12]);
+        let no_12 = Settings {
+            disable_tls12: true,
+            ..Default::default()
+        };
+        let agreed = get(&only_12, Settings::default()).unwrap().body;
+        assert!(agreed.starts_with("Some(TLSv1_2)"), "{agreed}");
+        let refused = get(&only_12, no_12.clone()).err().unwrap();
+        assert!(refused.to_lowercase().contains("protocol"), "{refused}");
+
+        let both = tls_server(&[&rustls::version::TLS13, &rustls::version::TLS12]);
+        let no_13 = Settings {
+            disable_tls13: true,
+            ..Default::default()
+        };
+        let agreed = get(&both, Settings::default()).unwrap().body;
+        assert!(agreed.starts_with("Some(TLSv1_3)"), "{agreed}");
+        let agreed = get(&both, no_13.clone()).unwrap().body;
+        assert!(agreed.starts_with("Some(TLSv1_2)"), "{agreed}");
+        let agreed = get(&both, no_12.clone()).unwrap().body;
+        assert!(agreed.starts_with("Some(TLSv1_3)"), "{agreed}");
+
+        let none = Settings {
+            disable_tls13: true,
+            ..no_12
+        };
+        let refused = get(&both, none).err().unwrap();
+        assert!(refused.contains("both TLS 1.2 and 1.3"), "{refused}");
+    }
+
+    /// Postman's "Cipher suite selection", by OpenSSL's names: the server takes what the
+    /// request offers.
+    #[test]
+    fn the_chosen_cipher_suites_are_the_ones_offered() {
+        use crate::model::Settings;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let clients = clients(&rt);
+        let server = tls_server(&[&rustls::version::TLS13, &rustls::version::TLS12]);
+        let get = |ciphers: &[&str]| {
+            let settings = Settings {
+                ciphers: ciphers.iter().map(|c| c.to_string()).collect(),
+                ..Default::default()
+            };
+            let req = Request {
+                url: server.clone(),
+                settings: unverified(settings),
+                ..Default::default()
+            };
+            send(&rt, &clients, req)
+        };
+        let agreed = get(&[]).unwrap().body;
+        assert!(
+            agreed.ends_with("Some(TLS13_AES_256_GCM_SHA384)"),
+            "{agreed}"
+        );
+        let chacha = get(&["TLS_CHACHA20_POLY1305_SHA256"]).unwrap();
+        assert!(
+            chacha
+                .body
+                .ends_with("Some(TLS13_CHACHA20_POLY1305_SHA256)"),
+            "{}",
+            chacha.body
+        );
+        assert!(chacha.sent.tls.is_some(), "the TLS time is still taken");
+        // Only TLS 1.2 suites: TLS 1.2 it is. The unknown name is skipped.
+        let agreed = get(&["RC4-MD5", "ECDHE-ECDSA-CHACHA20-POLY1305"])
+            .unwrap()
+            .body;
+        assert_eq!(
+            agreed,
+            "Some(TLSv1_2) Some(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)"
+        );
+        let refused = get(&["RC4-MD5"]).err().unwrap();
+        assert!(refused.contains("cipher suites"), "{refused}");
+    }
+
+    /// Postman's "Enable strict HTTP parser", on by default as hyper is: each kind of
+    /// malformed header Node's lenient parser takes is refused, and taken when it's off.
+    #[test]
+    fn malformed_response_headers_pass_only_when_not_strict() {
+        use crate::model::Settings;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let clients = clients(&rt);
+        let addr = serve(|req| {
+            let head = match req.split(' ').nth(1).unwrap_or("") {
+                "/space" => "200 OK\r\nx-a : 1",
+                "/folded" => "200 OK\r\nx-a: 1\r\n  2",
+                _ => "200 OK\r\nx[a]: 1\r\nx-b: 2",
+            };
+            (head.into(), "ok".into())
+        });
+        let get = |path: &str, insecure_parser| {
+            let req = Request {
+                url: format!("http://{addr}{path}"),
+                settings: Settings {
+                    insecure_parser,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            send(&rt, &clients, req)
+        };
+        let header = |resp: Response, name: &str| {
+            let found = resp.headers.into_iter().find(|(k, _)| k == name);
+            found.map(|(_, v)| v)
+        };
+        for path in ["/space", "/folded", "/invalid"] {
+            let err = get(path, false).err().unwrap();
+            assert!(err.contains("parse"), "{path}: {err}");
+        }
+        assert_eq!(
+            header(get("/space", true).unwrap(), "x-a").as_deref(),
+            Some("1")
+        );
+        let folded = header(get("/folded", true).unwrap(), "x-a").unwrap();
+        assert!(
+            folded.starts_with('1') && folded.ends_with('2'),
+            "{folded:?}"
+        );
+        // The bad line is dropped; the rest of the response stands.
+        let invalid = get("/invalid", true).unwrap();
+        assert_eq!(header(invalid, "x-b").as_deref(), Some("2"));
     }
 }
