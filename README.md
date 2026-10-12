@@ -373,3 +373,8 @@ entry by entry: sends on two machines add up, secret values changed on both are 
 and cookies and tokens changed on both keep each machine's.
 
 Other files in the repository are left alone.
+
+## Credits
+
+Interface icons are from [Lucide](https://lucide.dev) (ISC licence, in
+`assets/icons/LICENSE`).

@@ -349,3 +349,7 @@ DPAPI、macOS 用登入鑰匙圈中的金鑰；Linux 上不加密），因此資
 會詢問，兩邊都改過的 Cookie 與 token 則各自保留本機的版本。
 
 儲存庫中的其他檔案不會被動到。
+
+## 致謝
+
+介面圖示來自 [Lucide](https://lucide.dev)（ISC 授權，見 `assets/icons/LICENSE`）。

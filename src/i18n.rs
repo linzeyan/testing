@@ -73,9 +73,9 @@ const ZH_TW: &[(&str, &str)] = &[
         "+ and # are for subscribing; publish to one topic",
         "+ 和 # 只用於訂閱；發布時請指定單一主題",
     ),
-    ("+ Certificate for a host", "+ 為主機加入憑證"),
-    ("+ File…", "+ 檔案…"),
-    ("+ Topic", "+ 主題"),
+    ("Certificate for a host", "為主機加入憑證"),
+    ("File…", "檔案…"),
+    ("Topic", "主題"),
     (", the redirect included", "，含重新導向"),
     (", {} redirects included", "，含 {} 次重新導向"),
     (
@@ -779,6 +779,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("New request", "新增請求"),
     ("New request ({})", "新增請求 ({})"),
     ("Next", "下一個"),
+    ("Next match ({})", "下一個符合項 ({})"),
     ("Next page", "下一頁"),
     ("Next tab", "下一個分頁"),
     ("No auth", "不驗證"),
@@ -803,10 +804,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("no request is open", "沒有開啟的請求"),
     ("No requests to run here.", "這裡沒有可執行的請求。"),
     ("no requests under {}", "{} 底下沒有請求"),
-    (
-        "No requests yet. Click {} to add one.",
-        "還沒有請求。按 {} 新增一個。",
-    ),
+    ("No requests yet.", "還沒有請求。"),
     (
         "No variables yet. Add some to an environment or to Globals.",
         "還沒有變數。可以加到環境或全域變數裡。",
@@ -918,6 +916,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Pretty", "美化"),
     ("Prev", "上一個"),
     ("Preview", "預覽"),
+    ("Previous match ({})", "上一個符合項 ({})"),
     ("Previous page", "上一頁"),
     ("Previous tab", "上一個分頁"),
     ("Private key", "私密金鑰"),
@@ -1067,7 +1066,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "See Other：請用 GET 從另一個 URL 取得結果。",
     ),
     (
-        "Select a request on the left, or create one with {}.",
+        "Select a request on the left, or press {} for a new one.",
         "從左側選一個請求，或按 {} 新增。",
     ),
     ("Select method", "選擇方法"),
@@ -1451,8 +1450,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("· {} events", "· {} 個事件"),
     ("· {} of {} events", "· {} 個事件（共 {} 個）"),
     ("… and {} more", "…還有 {} 個"),
-    ("▶ Run", "▶ 執行"),
-    ("▶ Start", "▶ 開始"),
+    ("Start", "開始"),
 ];
 
 #[cfg(test)]

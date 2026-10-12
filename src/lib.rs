@@ -14,6 +14,7 @@ mod grpc;
 mod har;
 mod http;
 mod i18n;
+mod icons;
 mod import;
 mod insomnia;
 mod jsonpath;

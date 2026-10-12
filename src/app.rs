@@ -11,6 +11,7 @@ use crate::cookies::Jar;
 use crate::graphql::{self, Operation};
 use crate::http;
 use crate::i18n::{fill, n_, t, tf};
+use crate::icons::{self as icon, Icon};
 use crate::loadtest::{self, Stats};
 use crate::logfile::redact;
 use crate::model::{self, Auth, Body, Example, Folder, Inherited, KeyValue, METHODS, Request};
@@ -21,7 +22,6 @@ use crate::store::{self, HistoryEntry, Node, State, Synced, Workspace};
 use crate::stream::{self, Event};
 use crate::syntax::{Kind, Lang};
 use crate::varedit::{Complete, clip, var_edit};
-use egui_phosphor::regular as icon;
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 /// Below this workbench width (logical px) the response goes under the request: each half
@@ -2675,7 +2675,10 @@ fn browse(ui: &mut egui::Ui, path: &mut String, filters: &[(&str, &[&str])], sav
     } else {
         t("Choose a file")
     };
-    if !ui.button("…").on_hover_text(hint).clicked() {
+    if !icon_button(ui, icon::FOLDER_OPEN, hint, None)
+        .on_hover_text(hint)
+        .clicked()
+    {
         return false;
     }
     let chosen = pick_file(path, filters, save);
@@ -2833,7 +2836,9 @@ fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView, recent: &mut Vec<Strin
             .on_hover_text(t("Filters used before"));
         }
         if !view.filter.is_empty()
-            && ui.small_button("×").on_hover_text(t("Show the whole body")).clicked()
+            && icon_button(ui, icon::X, t("Show the whole body"), None)
+                .on_hover_text(t("Show the whole body"))
+                .clicked()
         {
             view.filter.clear();
             view.apply_filter();
@@ -3290,14 +3295,14 @@ impl App {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let shortcut = ui.ctx().format_shortcut(&SETTINGS);
-                if icon_button(ui, icon::GEAR_SIX, t("App settings"), None)
+                if icon_button(ui, icon::SETTINGS, t("App settings"), None)
                     .on_hover_text(tf("Settings ({})", &[&shortcut]))
                     .clicked()
                 {
                     self.settings = true;
                 }
                 if self.remote.is_set() {
-                    let shape = if self.syncing { icon::HOURGLASS } else { icon::ARROWS_CLOCKWISE };
+                    let shape = if self.syncing { icon::HOURGLASS } else { icon::REFRESH };
                     let hint = tf(
                         "Sync with {} on {}",
                         &[&self.remote.path(), &self.remote.provider.name()],
@@ -3312,8 +3317,8 @@ impl App {
                     _ => None,
                 };
                 if let Some((version, hint)) = news {
-                    let text = RichText::new(format!("{} {version}", icon::ARROW_CIRCLE_UP));
-                    let button = named(ui.button(text.color(GREEN)), t("Update"), None);
+                    let text = RichText::new(version).color(GREEN);
+                    let button = named(ui.add(icon_text(ui, icon::UPDATE, text)), t("Update"), None);
                     if button.on_hover_text(tf(hint, &[version])).clicked() {
                         (self.settings, self.settings_tab) = (true, SettingsTab::Updates);
                     }
@@ -3328,15 +3333,15 @@ impl App {
                     Some(Ok(c)) => c.note.as_deref(),
                     _ => None,
                 };
-                let mut label = RichText::new(format!("{} {proxy}", icon::GLOBE));
+                let mut label = RichText::new(proxy);
                 if note.is_some() {
-                    label = RichText::new(format!("{} {proxy} · {}", icon::GLOBE, t("direct"))).color(ORANGE);
+                    label = RichText::new(format!("{proxy} · {}", t("direct"))).color(ORANGE);
                 }
                 if self.network.insecure {
-                    label = RichText::new(format!("{} {proxy} · {}", icon::GLOBE, t("TLS verify OFF"))).color(RED);
+                    label = RichText::new(format!("{proxy} · {}", t("TLS verify OFF"))).color(RED);
                 }
                 if ui
-                    .button(label)
+                    .add(icon_text(ui, icon::GLOBE, label))
                     .on_hover_text(note.unwrap_or(t("Network settings")))
                     .clicked()
                 {
@@ -3346,7 +3351,7 @@ impl App {
                 let shown = !self.hide_sidebar;
                 let hint = t("Show or hide collections and history, for more room");
                 let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[2].0);
-                if icon_button(ui, icon::SIDEBAR_SIMPLE, t("Sidebar"), Some(shown))
+                if icon_button(ui, icon::SIDEBAR, t("Sidebar"), Some(shown))
                     .on_hover_text(format!("{hint} ({key})"))
                     .clicked()
                 {
@@ -3461,7 +3466,7 @@ impl App {
                 self.set_env(env);
             }
             if let Some(name) = self.active_env.clone() {
-                let colour = icon_button(ui, "", t("Environment colour"), None)
+                let colour = square_button(ui, t("Environment colour"), None)
                     .on_hover_text(t("Colour this environment, e.g. prod in red"));
                 let fill = self.env_color().unwrap_or(Color32::GRAY);
                 (ui.painter()).circle_filled(colour.rect.center(), DOT + 1.0, fill);
@@ -3487,7 +3492,7 @@ impl App {
                 });
             }
             if let Some(name) = self.active_env.clone()
-                && icon_button(ui, icon::PENCIL_SIMPLE, t("Edit"), None)
+                && icon_button(ui, icon::PENCIL, t("Edit"), None)
                     .on_hover_text(format!(
                         "{} ({})",
                         t("Edit this environment's variables"),
@@ -3533,7 +3538,7 @@ impl App {
             }
             // A collection is a top-level folder: its settings, Run, mock and Postman copy
             // are a collection's, and a Postman import lands as one.
-            if icon_button(ui, icon::STACK_PLUS, t("New collection"), None)
+            if icon_button(ui, icon::LAYERS_PLUS, t("New collection"), None)
                 .on_hover_text(t(
                     "New collection: requests with their own variables, auth and scripts",
                 ))
@@ -3541,8 +3546,8 @@ impl App {
             {
                 self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
             }
-            let more = icon_button(ui, icon::DOTS_THREE, t("More"), None)
-                .on_hover_text(t("All collections"));
+            let more =
+                icon_button(ui, icon::MORE, t("More"), None).on_hover_text(t("All collections"));
             egui::Popup::menu(&more).show(|ui| {
                 if ui.button(t("Copy docs as Markdown")).clicked() {
                     self.copy_docs(&root, ui.ctx());
@@ -3571,7 +3576,7 @@ impl App {
                     ui.close();
                 }
             });
-            if icon_button(ui, icon::PLAY, t("Run"), None)
+            if icon_button(ui, icon::PLAY, t("Run all collections"), None)
                 .on_hover_text(t("Run all collections"))
                 .clicked()
             {
@@ -3582,7 +3587,9 @@ impl App {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let clear = !self.tree_filter.is_empty()
-                        && ui.small_button("×").on_hover_text(t("Clear")).clicked();
+                        && icon_button(ui, icon::X, t("Clear"), None)
+                            .on_hover_text(t("Clear"))
+                            .clicked();
                     let filter = ui.add(
                         egui::TextEdit::singleline(&mut self.tree_filter)
                             // Not an auto id: the × appearing would change it and drop focus.
@@ -3614,14 +3621,15 @@ impl App {
         let reveal = self.reveal.take();
         let expand =
             |p: &Path| !query.is_empty() || reveal.as_ref().is_some_and(|r| r.starts_with(p));
+        let mut create = false;
         let tree = egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
                 if self.tree.is_empty() {
-                    ui.weak(tf(
-                        "No requests yet. Click {} to add one.",
-                        &[&icon::FILE_PLUS],
-                    ));
+                    ui.weak(t("No requests yet."));
+                    create = ui
+                        .add(icon_text(ui, icon::FILE_PLUS, t("New request")))
+                        .clicked();
                 } else if nodes.is_empty() {
                     ui.weak(t("Nothing matches."));
                 }
@@ -3640,6 +3648,9 @@ impl App {
                 let rest = ui.allocate_response(size, egui::Sense::hover());
                 tree_drop(ui, &rows, rest.rect, &self.ws.collections(), &mut actions);
             });
+        if create {
+            self.new_request();
+        }
         let click = ui.input(|i| {
             i.pointer
                 .primary_clicked()
@@ -3906,7 +3917,11 @@ impl App {
         let mut restore = None;
         ui.horizontal(|ui| {
             ui.weak(t("Click to load what was sent."));
-            if !self.history.is_empty() && ui.small_button(t("Clear")).clicked() {
+            if !self.history.is_empty()
+                && icon_button(ui, icon::TRASH, t("Clear"), None)
+                    .on_hover_text(t("Clear history"))
+                    .clicked()
+            {
                 match self.ws.clear_history() {
                     Ok(()) => self.history.clear(),
                     Err(e) => self.status = e,
@@ -4028,9 +4043,9 @@ impl App {
                             menu = Some((i, Menu::Reopen));
                         }
                     });
-                    let x = ui
-                        .small_button("×")
-                        .on_hover_text(tf("Close ({})", &[&ui.ctx().format_shortcut(&CLOSE_TAB)]));
+                    let key = ui.ctx().format_shortcut(&CLOSE_TAB);
+                    let x = icon_button(ui, icon::X, t("Close tab"), None)
+                        .on_hover_text(tf("Close ({})", &[&key]));
                     if x.clicked() || label.middle_clicked() {
                         close = Some(tab.path.clone());
                     }
@@ -4073,9 +4088,10 @@ impl App {
         let all_vars = self.all_vars();
         let Some(open) = &mut self.open else {
             ui.centered_and_justified(|ui| {
+                let key = ui.ctx().format_shortcut(&NEW_REQUEST);
                 ui.weak(tf(
-                    "Select a request on the left, or create one with {}.",
-                    &[&icon::FILE_PLUS],
+                    "Select a request on the left, or press {} for a new one.",
+                    &[&key],
                 ))
             });
             return;
@@ -4151,7 +4167,10 @@ impl App {
                                 }
                             });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("✕").on_hover_text(t("Close")).clicked() {
+                            if icon_button(ui, icon::X, t("Close"), None)
+                                .on_hover_text(t("Close"))
+                                .clicked()
+                            {
                                 self.code = false;
                             }
                             if let Ok(code) = &code
@@ -4202,7 +4221,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Right to left: this lands to the right of Save.
-                    let more = icon_button(ui, icon::CARET_DOWN, t("More save options"), None);
+                    let more = icon_button(ui, icon::CHEVRON_DOWN, t("More save options"), None);
                     egui::Popup::menu(&more)
                         .id(egui::Id::new("save-more"))
                         .show(|ui| {
@@ -4268,22 +4287,7 @@ impl App {
                 });
             });
             ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("method")
-                    .selected_text(method_text(&open.draft.method).strong())
-                    .width(110.0)
-                    // All 16 at once: at the default height the stream types scrolled away.
-                    .height(f32::INFINITY)
-                    .show_ui(ui, |ui| {
-                        for m in METHODS {
-                            let on = open.draft.method == *m;
-                            let r = ui.selectable_value(
-                                &mut open.draft.method,
-                                (*m).to_owned(),
-                                method_text(m),
-                            );
-                            named(r, method_name(m), Some(on));
-                        }
-                    });
+                method_picker(ui, &mut open.draft.method);
                 // GRAPHQL is a POST whose body is always a query; open the query editor.
                 if open.draft.method == "GRAPHQL"
                     && !matches!(open.draft.body, Body::GraphQL { .. })
@@ -4375,7 +4379,9 @@ impl App {
                 if downloadable {
                     // As tall as Send beside it.
                     let caret =
-                        egui::Button::new(icon::CARET_DOWN).min_size(egui::vec2(22.0, 22.0));
+                        egui::Button::new(icon::CHEVRON_DOWN.image(ui.ctx(), icon_size(ui)))
+                            .image_tint_follows_text_color(true)
+                            .min_size(egui::vec2(22.0, 22.0));
                     let button = ui.add_enabled(pending.is_none(), caret);
                     let button = named(button, t("More send options"), None);
                     egui::Popup::menu(&button)
@@ -4641,7 +4647,7 @@ impl App {
                 // No spinner: it draws every frame, and on a software renderer (WARP on
                 // the VDI) each frame is CPU. A count of seconds needs one a second.
                 ui.horizontal(|ui| {
-                    ui.label(icon::HOURGLASS);
+                    icon_label(ui, icon::HOURGLASS, None);
                     ui.label(tf("Sending… {} s", &[&format!("{:.0}", p.started.elapsed().as_secs_f32())]));
                 });
                 ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -5678,7 +5684,7 @@ impl App {
                                 domain = &r.domain;
                             }
                             ui.horizontal(|ui| {
-                                if named(ui.small_button(icon::TRASH), t("Delete"), None)
+                                if icon_button(ui, icon::TRASH, t("Delete"), None)
                                     .on_hover_text(t("Delete"))
                                     .clicked()
                                 {
@@ -5931,7 +5937,9 @@ impl App {
         ui.horizontal(|ui| {
             ui.heading(tf("Run: {}", &[&view.title]));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                close = ui.button(t("Close")).clicked();
+                close = icon_button(ui, icon::X, t("Close"), None)
+                    .on_hover_text(t("Close"))
+                    .clicked();
             });
         });
         ui.add_enabled_ui(!running, |ui| {
@@ -5972,9 +5980,12 @@ impl App {
                         t("Run cancelled; variable changes from it were discarded.").into();
                 }
             } else {
-                let label = RichText::new(t("▶ Run")).strong().color(Color32::WHITE);
+                let label = RichText::new(t("Run")).strong().color(Color32::WHITE);
+                let play = icon::PLAY
+                    .image(ui.ctx(), icon_size(ui))
+                    .tint(Color32::WHITE);
                 start = ui
-                    .add(egui::Button::new(label).fill(Color32::from_rgb(40, 110, 200)))
+                    .add(egui::Button::new((play, label)).fill(Color32::from_rgb(40, 110, 200)))
                     .clicked();
             }
             ui.checkbox(&mut view.only_failures, t("Failures only"));
@@ -6206,7 +6217,10 @@ impl App {
                             ui.horizontal(|ui| {
                                 let slider = egui::Slider::new(&mut a.size, SIZES).step_by(0.5);
                                 ui.add(slider.suffix(" pt"));
-                                if a.size != DEFAULT_SIZE && ui.small_button(t("Reset")).clicked()
+                                if a.size != DEFAULT_SIZE
+                                    && icon_button(ui, icon::RESET, t("Reset"), None)
+                                        .on_hover_text(t("Reset"))
+                                        .clicked()
                                 {
                                     a.size = DEFAULT_SIZE;
                                 }
@@ -6251,7 +6265,7 @@ impl App {
                                     ui.weak(format!("apitool {}", crate::update::CURRENT));
                                 }
                                 Update::Checking => {
-                                    ui.label(icon::HOURGLASS);
+                                    icon_label(ui, icon::HOURGLASS, None);
                                 }
                                 Update::UpToDate => {
                                     ui.label(tf(
@@ -6267,7 +6281,7 @@ impl App {
                                     ui.hyperlink_to(t("Release notes"), &r.page);
                                 }
                                 Update::Installing(v) => {
-                                    ui.label(icon::HOURGLASS);
+                                    icon_label(ui, icon::HOURGLASS, None);
                                     ui.label(tf("Installing {}…", &[v]));
                                 }
                                 Update::Installed(v) => {
@@ -6635,7 +6649,7 @@ impl App {
                     if pfx(&c.cert) {
                         ui.add(egui::TextEdit::singleline(&mut c.password).password(true).hint_text(t("PFX password")).desired_width(100.0));
                     }
-                    if named(ui.small_button(icon::TRASH), t("Remove"), None).on_hover_text(t("Remove")).clicked() {
+                    if icon_button(ui, icon::TRASH, t("Remove"), None).on_hover_text(t("Remove")).clicked() {
                         removed = Some(i);
                     }
                 });
@@ -6643,7 +6657,7 @@ impl App {
             if let Some(i) = removed {
                 net.host_certs.remove(i);
             }
-            if ui.button(t("+ Certificate for a host")).on_hover_text(t("Checked in order before the one above")).clicked() {
+            if ui.add(icon_text(ui, icon::PLUS, t("Certificate for a host"))).on_hover_text(t("Checked in order before the one above")).clicked() {
                 net.host_certs.push(Default::default());
             }
             ui.checkbox(&mut net.insecure, t("Skip TLS certificate verification"));
@@ -6726,7 +6740,7 @@ fn run_order_ui(
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let reset = t("Reset to the tree's order, all ticked");
-            if icon_button(ui, icon::ARROW_COUNTER_CLOCKWISE, reset, None).clicked() {
+            if icon_button(ui, icon::RESET, reset, None).clicked() {
                 *order = tree.iter().map(|(p, _)| (p.clone(), true)).collect();
                 changed = true;
             }
@@ -6741,9 +6755,10 @@ fn run_order_ui(
         .show(ui, |ui| {
             for (i, (path, on)) in order.iter_mut().enumerate() {
                 let row = ui.horizontal(|ui| {
-                    let grip = RichText::new(icon::DOTS_SIX_VERTICAL).weak();
-                    let grip = egui::Label::new(grip).selectable(false);
-                    let grip = (ui.add(grip.sense(egui::Sense::drag())))
+                    let size = egui::vec2(icon_size(ui), button_height(ui));
+                    let (rect, grip) = ui.allocate_exact_size(size, egui::Sense::drag());
+                    icon::GRIP.paint(ui, rect, size.x, ui.visuals().weak_text_color());
+                    let grip = named(grip, t("Drag to change the order"), None)
                         .on_hover_cursor(egui::CursorIcon::Grab)
                         .on_hover_text(t("Drag to change the order"));
                     let name = ws.display_name(path);
@@ -7090,17 +7105,16 @@ fn tree_ui(
                 }
                 let open = state.is_open();
                 let caret = if open {
-                    icon::CARET_DOWN
+                    icon::CHEVRON_DOWN
                 } else {
-                    icon::CARET_RIGHT
+                    icon::CHEVRON_RIGHT
                 };
                 let collection = path.parent() == Some(view.root);
                 let lead = |ui: &mut egui::Ui| {
-                    ui.add(egui::Label::new(RichText::new(caret).weak()).selectable(false));
+                    let weak = Some(ui.visuals().weak_text_color());
+                    icon_label(ui, caret, weak);
                     if collection {
-                        ui.add(
-                            egui::Label::new(RichText::new(icon::STACK).weak()).selectable(false),
-                        );
+                        icon_label(ui, icon::LAYERS, weak);
                     }
                 };
                 let picked = match view.picked.is_empty() {
@@ -7475,7 +7489,12 @@ fn more_button(
     let rect =
         egui::Rect::from_min_size(egui::pos2(row.rect.right() - size.x, row.rect.top()), size);
     let button = named(
-        ui.put(rect, egui::Button::new(icon::DOTS_THREE).small()),
+        ui.put(
+            rect,
+            egui::Button::new(icon::MORE.image(ui.ctx(), icon_size(ui)))
+                .image_tint_follows_text_color(true)
+                .small(),
+        ),
         t("More"),
         None,
     );
@@ -7668,7 +7687,7 @@ fn kv_table(
                 );
             }
             if real
-                && named(ui.small_button(icon::TRASH), t("Remove"), None)
+                && icon_button(ui, icon::TRASH, t("Remove"), None)
                     .on_hover_text(t("Remove"))
                     .clicked()
             {
@@ -7867,7 +7886,7 @@ fn body_editor(
             ui.weak(t("A value starting with @ uploads that file, e.g. @files/photo.png (relative to the workspace). Or drop files here."));
             let mut files = dropped_files(ui);
             if ui
-                .small_button(t("+ File…"))
+                .add(icon_text(ui, icon::PLUS, t("File…")).small())
                 .on_hover_text(t("Add a file part"))
                 .clicked()
                 && let Some(file) = pick_file("", &[], false)
@@ -8094,15 +8113,14 @@ fn graphql_editor(
         ui.horizontal(|ui| {
             ui.strong(t("Schema"));
             if ex.loading {
-                ui.label(icon::HOURGLASS);
+                icon_label(ui, icon::HOURGLASS, None);
             } else {
-                let label = if ex.schema.is_some() {
-                    t("Refresh")
+                let button = if ex.schema.is_some() {
+                    icon_button(ui, icon::REFRESH, t("Refresh"), None)
                 } else {
-                    t("Fetch schema")
+                    ui.small_button(t("Fetch schema"))
                 };
-                fetch = ui
-                    .small_button(label)
+                fetch = button
                     .on_hover_text(t("Introspect using this request's URL, headers and auth"))
                     .clicked();
             }
@@ -8353,20 +8371,10 @@ fn variables_form(
                     Input::Number { whole: false } => t("Not a number"),
                     _ => t("Not valid JSON"),
                 };
-                let (rect, r) =
-                    ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
-                let font = egui::TextStyle::Button.resolve(ui.style());
-                (ui.painter()).text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    icon::WARNING,
-                    font,
-                    ORANGE,
-                );
-                r.on_hover_text(why);
+                icon_label(ui, icon::WARNING, Some(ORANGE)).on_hover_text(why);
             }
             if let Some(s) = fill
-                && icon_button(ui, icon::MAGIC_WAND, t("Fill in its fields"), None)
+                && icon_button(ui, icon::WAND, t("Fill in its fields"), None)
                     .on_hover_text(t("Fill in its fields"))
                     .clicked()
             {
@@ -8796,7 +8804,7 @@ fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) 
         ui.horizontal(|ui| {
             done |= ui.checkbox(&mut t.enabled, "").changed();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if named(ui.small_button(icon::TRASH), crate::i18n::t("Remove"), None)
+                if icon_button(ui, icon::TRASH, crate::i18n::t("Remove"), None)
                     .on_hover_text(crate::i18n::t("Remove"))
                     .clicked()
                 {
@@ -8818,7 +8826,10 @@ fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) 
         topics.remove(i);
         done = true;
     }
-    if ui.small_button(t("+ Topic")).clicked() {
+    if ui
+        .add(icon_text(ui, icon::PLUS, t("Topic")).small())
+        .clicked()
+    {
         topics.push(model::Topic::default());
     }
     done
@@ -9260,7 +9271,7 @@ fn grpc_bar(
             &[("Protocol Buffers", &["proto"])],
             false,
         );
-        let reload = icon_button(ui, icon::ARROWS_CLOCKWISE, t("Reload"), None)
+        let reload = icon_button(ui, icon::REFRESH, t("Reload"), None)
             .on_hover_text(match reflection {
                 true => t("Ask the server for its methods (gRPC reflection)"),
                 false => t("Reload .proto"),
@@ -9343,7 +9354,7 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
                 }
             }
         } else {
-            start = ui.button(t("▶ Start")).clicked();
+            start = ui.add(icon_text(ui, icon::PLAY, t("Start"))).clicked();
         }
     });
     ui.weak(t(
@@ -9505,7 +9516,10 @@ fn stream_ui(
             true => ui.weak(tf("· {} of {} events", &[&shown, &total])),
             false => ui.weak(tf("· {} events", &[&total])),
         };
-        if ui.small_button(t("Clear")).clicked() {
+        if icon_button(ui, icon::ERASER, t("Clear"), None)
+            .on_hover_text(t("Clear"))
+            .clicked()
+        {
             s.log.lock().unwrap().clear();
             s.selected = None;
         }
@@ -9585,7 +9599,10 @@ fn stream_ui(
             .default_size(160.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.small_button(t("Copy")).clicked() {
+                    if icon_button(ui, icon::COPY, t("Copy"), None)
+                        .on_hover_text(t("Copy"))
+                        .clicked()
+                    {
                         ui.ctx().copy_text(text.clone());
                     }
                     ui.weak(human_size(text.len()));
@@ -9672,7 +9689,7 @@ fn stream_ui(
 fn saved_messages(ui: &mut egui::Ui, compose: &mut String, saved: &mut Vec<String>) {
     let new = !compose.trim().is_empty() && !saved.contains(compose);
     let save = t("Save this message in the request");
-    if (ui.add_enabled_ui(new, |ui| icon_button(ui, icon::BOOKMARK_SIMPLE, save, None)))
+    if (ui.add_enabled_ui(new, |ui| icon_button(ui, icon::BOOKMARK, save, None)))
         .inner
         .clicked()
     {
@@ -9727,16 +9744,13 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
         return;
     }
     let (text, label) = match past.list.iter().find(|m| Some(m.id) == shown) {
-        Some(m) => (
-            format!("{} {}", icon::CLOCK_COUNTER_CLOCKWISE, ago(m.at)),
-            tf("History: {}", &[&ago(m.at)]),
-        ),
-        None => (
-            icon::CLOCK_COUNTER_CLOCKWISE.to_owned(),
-            t("History").into(),
-        ),
+        Some(m) => (ago(m.at), tf("History: {}", &[&ago(m.at)])),
+        None => (String::new(), t("History").into()),
     };
-    let menu = ui.menu_button(text, |ui| {
+    let image = icon::HISTORY
+        .image(ui.ctx(), icon_size(ui))
+        .tint(ui.visuals().text_color());
+    let menu = ui.menu_button((image, text), |ui| {
         for m in &past.list {
             let text = RichText::new(format!("{}  ·  {} ms  ·  {}", m.status, m.ms, ago(m.at)))
                 .color(status_color(m.status));
@@ -9752,8 +9766,7 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
                 {
                     past.pick = Some(m.id);
                 }
-                if ui
-                    .small_button("×")
+                if icon_button(ui, icon::X, t("Delete this response"), None)
                     .on_hover_text(t("Delete this response"))
                     .clicked()
                 {
@@ -9904,14 +9917,14 @@ fn response_ui(
                     };
                     ui.ctx().copy_text(text);
                 }
-                if icon_button(ui, icon::DOWNLOAD_SIMPLE, t("Save…"), None)
+                if icon_button(ui, icon::DOWNLOAD, t("Save…"), None)
                     .on_hover_text(t("Save the body to a file, as received"))
                     .clicked()
                 {
                     *save_file = true;
                 }
                 if external_type(&view.head).is_some()
-                    && icon_button(ui, icon::ARROW_SQUARE_OUT, t("Open in browser"), None)
+                    && icon_button(ui, icon::EXTERNAL, t("Open in browser"), None)
                         .on_hover_text(t("Show it in your browser, or the system's PDF viewer"))
                         .clicked()
                 {
@@ -9919,7 +9932,7 @@ fn response_ui(
                 }
                 // Examples hold text.
                 if !binary
-                    && icon_button(ui, icon::BOOKMARK_SIMPLE, t("Save as example"), None)
+                    && icon_button(ui, icon::BOOKMARK, t("Save as example"), None)
                         .on_hover_text(t("Save as example: keep this response with the request"))
                         .clicked()
                 {
@@ -9950,7 +9963,7 @@ fn response_ui(
             {
                 let svg = external_type(&view.head) == Some("svg");
                 if !view.preview
-                    && (ui.add(egui::Button::new(t("Wrap")).selected(*wrap)))
+                    && icon_button(ui, icon::WRAP, t("Wrap"), Some(*wrap))
                         .on_hover_text(t("Wrap long lines"))
                         .clicked()
                 {
@@ -9984,7 +9997,7 @@ fn response_ui(
                 }
                 let shortcut = ui.ctx().format_shortcut(&FIND);
                 if !view.preview
-                    && icon_button(ui, icon::MAGNIFYING_GLASS, t("Find"), Some(view.find.open))
+                    && icon_button(ui, icon::SEARCH, t("Find"), Some(view.find.open))
                         .on_hover_text(tf("Find ({})", &[&shortcut]))
                         .clicked()
                 {
@@ -10316,8 +10329,8 @@ fn response_ui(
                             };
                             if opens {
                                 let (arrow, what) = match view.folds.contains_key(&(at - 1)) {
-                                    true => ("⏵", t("Unfold")),
-                                    false => ("⏷", t("Fold")),
+                                    true => (icon::CHEVRON_RIGHT, t("Unfold")),
+                                    false => (icon::CHEVRON_DOWN, t("Fold")),
                                 };
                                 click.widget_info(|| {
                                     egui::WidgetInfo::labeled(egui::WidgetType::Button, true, what)
@@ -10327,13 +10340,7 @@ fn response_ui(
                                 } else {
                                     weak
                                 };
-                                ui.painter().text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    arrow,
-                                    font.clone(),
-                                    color,
-                                );
+                                arrow.paint(ui, rect, font.size.round(), color);
                                 if click.clicked() {
                                     toggle = Some(at - 1);
                                 }
@@ -10376,7 +10383,7 @@ fn examples_editor(ui: &mut egui::Ui, examples: &mut Vec<Example>) {
                     ui.text_edit_singleline(&mut ex.name);
                     ui.label(t("Status"));
                     ui.add(egui::DragValue::new(&mut ex.status).range(100..=599));
-                    if named(ui.small_button(icon::TRASH), t("Delete example"), None)
+                    if icon_button(ui, icon::TRASH, t("Delete example"), None)
                         .on_hover_text(t("Delete example"))
                         .clicked()
                     {
@@ -10426,10 +10433,17 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
         (&mut find.word, "W", t("Whole word")),
         (&mut find.regex, ".*", t("Regular expression")),
     ] {
-        if icon_button(ui, glyph, glyph, Some(*on))
-            .on_hover_text(hover)
-            .clicked()
-        {
+        let r = square_button(ui, glyph, Some(*on));
+        let color = ui.style().interact_selectable(&r, *on).text_color();
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        (ui.painter()).text(
+            r.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            font,
+            color,
+        );
+        if r.on_hover_text(hover).clicked() {
             *on = !*on;
         }
     }
@@ -10476,8 +10490,12 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
             if n == 0 { 0 } else { find.current + 1 }
         ));
     }
-    let prev = ui.button(t("Prev")).on_hover_text("Shift+Enter").clicked();
-    let next = ui.button(t("Next")).on_hover_text("Enter").clicked();
+    let prev = icon_button(ui, icon::ARROW_UP, t("Prev"), None)
+        .on_hover_text(tf("Previous match ({})", &[&"Shift+Enter"]))
+        .clicked();
+    let next = icon_button(ui, icon::ARROW_DOWN, t("Next"), None)
+        .on_hover_text(tf("Next match ({})", &[&"Enter"]))
+        .clicked();
     let close = icon_button(ui, icon::X, t("Close"), None)
         .on_hover_text(t("Close (Esc)"))
         .clicked();
@@ -10766,7 +10784,20 @@ fn button_height(ui: &egui::Ui) -> f32 {
 /// Every icon button is this one square with its background, so icons side by side are
 /// the same size and height (small_button, menu_button and toggle_value each had their
 /// own padding). `on` makes it a toggle, drawn selected while on.
-fn icon_button(ui: &mut egui::Ui, glyph: &str, label: &str, on: Option<bool>) -> egui::Response {
+fn icon_button(ui: &mut egui::Ui, icon: Icon, label: &str, on: Option<bool>) -> egui::Response {
+    let r = square_button(ui, label, on);
+    if ui.is_rect_visible(r.rect) {
+        let v = match on {
+            Some(true) => ui.style().interact_selectable(&r, true),
+            _ => *ui.style().interact(&r),
+        };
+        icon.paint(ui, r.rect, icon_size(ui), v.text_color());
+    }
+    r
+}
+
+/// `icon_button`'s square and background, for something else painted on it.
+fn square_button(ui: &mut egui::Ui, label: &str, on: Option<bool>) -> egui::Response {
     let side = button_height(ui);
     let (rect, r) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::click());
     if ui.is_rect_visible(rect) {
@@ -10774,25 +10805,37 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, label: &str, on: Option<bool>) ->
             Some(true) => ui.style().interact_selectable(&r, true),
             _ => *ui.style().interact(&r),
         };
-        let (painter, fill) = (ui.painter(), v.weak_bg_fill);
-        let rect = rect.expand(v.expansion);
-        painter.rect(
-            rect,
+        ui.painter().rect(
+            rect.expand(v.expansion),
             v.corner_radius,
-            fill,
+            v.weak_bg_fill,
             v.bg_stroke,
             egui::StrokeKind::Inside,
         );
-        let font = egui::TextStyle::Button.resolve(ui.style());
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            font,
-            v.text_color(),
-        );
     }
     named(r, label, on)
+}
+
+/// An icon in a button one line of text tall, with room around it.
+fn icon_size(ui: &egui::Ui) -> f32 {
+    (button_height(ui) * 0.75).round()
+}
+
+/// A text button with an icon before the text, tinted as the text.
+fn icon_text<'a>(ui: &egui::Ui, icon: Icon, text: impl Into<egui::WidgetText>) -> egui::Button<'a> {
+    let image = icon.image(ui.ctx(), icon_size(ui));
+    egui::Button::new((image, text.into())).image_tint_follows_text_color(true)
+}
+
+/// An icon on its own in a label's place, in the text's colour unless given one.
+fn icon_label(ui: &mut egui::Ui, icon: Icon, color: Option<Color32>) -> egui::Response {
+    let size = icon_size(ui);
+    let (rect, r) =
+        ui.allocate_exact_size(egui::vec2(size, button_height(ui)), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        icon.paint(ui, rect, size, color.unwrap_or(ui.visuals().text_color()));
+    }
+    r
 }
 
 /// Radius of a status dot: drawn, not a "●" glyph, which a CJK font makes big.
@@ -10868,12 +10911,12 @@ fn sub_tab<T: PartialEq>(
 }
 
 /// Streams and RPCs go by icon; HTTP methods by name, as everywhere.
-fn method_icon(m: &str) -> Option<&'static str> {
+fn method_icon(m: &str) -> Option<Icon> {
     Some(match m {
         // Both ways at once.
-        "WS" => icon::ARROWS_LEFT_RIGHT,
+        "WS" => icon::BOTH_WAYS,
         "SOCKETIO" => icon::LIGHTNING,
-        "MQTT" => icon::BROADCAST,
+        "MQTT" => icon::RADIO,
         "SSE" => icon::RSS,
         "GRAPHQL" => icon::GRAPH,
         // A remote procedure call.
@@ -10892,13 +10935,56 @@ fn method_name(m: &str) -> &str {
     }
 }
 
-/// For the method picker: the icon and name, or the HTTP method.
-fn method_text(m: &str) -> RichText {
-    let text = match method_icon(m) {
-        Some(i) => format!("{i} {}", method_name(m)),
-        None => m.to_owned(),
+/// For the method picker's list: the icon and name, or the HTTP method, in its colour.
+fn method_item(ui: &mut egui::Ui, m: &str, on: bool) -> egui::Response {
+    let text = RichText::new(method_name(m)).color(method_color(m));
+    let item = match method_icon(m) {
+        Some(i) => {
+            let image = i.image(ui.ctx(), icon_size(ui)).tint(method_color(m));
+            egui::Button::selectable(on, (image, text))
+        }
+        None => egui::Button::selectable(on, text),
     };
-    RichText::new(text).color(method_color(m))
+    ui.add(item)
+}
+
+/// The method picker, a combo box showing the method's icon before its name.
+fn method_picker(ui: &mut egui::Ui, method: &mut String) {
+    let (size, color) = (icon_size(ui), method_color(method));
+    // The name leaves room for the icon, painted on top: a combo box takes text only.
+    let lead = match method_icon(method) {
+        Some(_) => size + ui.spacing().icon_spacing,
+        None => 0.0,
+    };
+    let mut job = egui::text::LayoutJob::default();
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    job.append(
+        method_name(method),
+        lead,
+        egui::TextFormat::simple(font, color),
+    );
+    let r = egui::ComboBox::from_id_salt("method")
+        .selected_text(job)
+        .width(110.0)
+        // All 16 at once: at the default height the stream types scrolled away.
+        .height(f32::INFINITY)
+        .show_ui(ui, |ui| {
+            for m in METHODS {
+                let on = *method == *m;
+                if named(method_item(ui, m, on), method_name(m), Some(on)).clicked() {
+                    (*m).clone_into(method);
+                }
+            }
+        })
+        .response;
+    if let Some(i) = method_icon(method) {
+        let left = r.rect.left() + ui.spacing().button_padding.x;
+        let at = egui::Rect::from_min_size(
+            egui::pos2(left, r.rect.top()),
+            egui::vec2(size, r.rect.height()),
+        );
+        i.paint(ui, at, size, color);
+    }
 }
 
 /// The method in `cols` monospace columns, or its own width if wider, so the names after
@@ -10910,28 +10996,30 @@ fn method_badge(ui: &mut egui::Ui, m: &str, cols: usize) -> egui::Response {
     let column = ui
         .painter()
         .layout_no_wrap(" ".repeat(cols), mono.clone(), color);
+    let height = ui.text_style_height(&egui::TextStyle::Small);
+    // Small text is too small for an icon.
+    let side = (size * 1.4).round();
     let galley = match method_icon(m) {
-        // Small text is too small for an icon.
-        Some(i) => {
-            ui.painter()
-                .layout_no_wrap(i.to_owned(), egui::FontId::proportional(size * 1.2), color)
-        }
-        None => ui
-            .painter()
-            .layout_no_wrap(short_method(m).to_owned(), mono, color),
+        Some(_) => None,
+        None => Some((ui.painter()).layout_no_wrap(short_method(m).to_owned(), mono, color)),
     };
-    let width = column.size().x.max(galley.size().x);
-    let height = galley
-        .size()
-        .y
-        .max(ui.text_style_height(&egui::TextStyle::Small));
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let top = rect.center().y - galley.size().y / 2.0;
-    ui.painter()
-        .galley(egui::pos2(rect.left(), top), galley, color);
-    match method_icon(m) {
-        Some(_) => resp.on_hover_text(method_name(m)),
-        None => resp,
+    let own = galley.as_ref().map_or(side, |g| g.size().x);
+    let width = column.size().x.max(own);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(width, height.max(side)), egui::Sense::hover());
+    match (galley, method_icon(m)) {
+        (Some(galley), _) => {
+            let top = rect.center().y - galley.size().y / 2.0;
+            ui.painter()
+                .galley(egui::pos2(rect.left(), top), galley, color);
+            resp
+        }
+        (None, Some(i)) => {
+            let at = egui::Rect::from_min_size(rect.min, egui::vec2(side, rect.height()));
+            i.paint(ui, at, side, color);
+            resp.on_hover_text(method_name(m))
+        }
+        (None, None) => resp,
     }
 }
 
@@ -11228,7 +11316,8 @@ mod ui_tests {
         h.run();
         assert!(h.state().dialog.is_none() && h.state().tree.is_empty());
 
-        h.get_by_label("New request").click();
+        // The toolbar's, not the one in the empty tree.
+        h.get_all_by_label("New request").next().unwrap().click();
         h.run();
         type_into(&mut h, 0, "r1");
         h.key_press(Key::Enter);
@@ -11493,7 +11582,10 @@ mod ui_tests {
         h.run();
         assert_eq!(h.state().unsaved(), ["b"]);
         // Closing the edited tab asks, with it in front so Save saves what's shown.
-        h.get_all_by_label("×").next().unwrap().click();
+        let close = egui_kittest::kittest::By::new()
+            .role(Role::Button)
+            .label("Close tab");
+        h.get_all(close).next().unwrap().click();
         h.run();
         assert_eq!(draft(&h).url, "http://edited");
         h.get_by_label("Discard").click();
@@ -12906,7 +12998,7 @@ mod ui_tests {
         h.run();
         // A row by its grip to just past the middle of another: down, then up.
         let drag = |h: &mut Harness<'_, App>, from: usize, onto: usize, dy: f32| {
-            let grips: Vec<_> = (h.get_all_by_label(icon::DOTS_SIX_VERTICAL))
+            let grips: Vec<_> = (h.get_all_by_label("Drag to change the order"))
                 .map(|n| n.rect().center())
                 .collect();
             let (from, to) = (grips[from], grips[onto] + egui::vec2(0.0, dy));
@@ -12926,7 +13018,9 @@ mod ui_tests {
         assert_eq!(order(&h), [row("c", true), row("b", false), row("a", true)]);
 
         let run = |h: &mut Harness<'_, App>| -> Vec<String> {
-            button(h, "▶ Run").click();
+            // Exactly: the toolbar's "Run all collections" contains it.
+            let by = egui_kittest::kittest::By::new().role(Role::Button);
+            h.get(by.label("Run")).click();
             for _ in 0..500 {
                 h.step();
                 let view = h.state().runner.as_ref().unwrap();
@@ -13226,8 +13320,7 @@ mod ui_tests {
         h.get_by_label("Save as example").click();
         h.run();
         assert!(draft(&h).examples[0].body.contains("\"items\""));
-        // The filter's ×, drawn after the tab strip's.
-        h.get_all_by_label("×").last().unwrap().click();
+        h.get_by_label("Show the whole body").click();
         h.run();
         assert!(view(&h).0.starts_with("{\n  \"items\""), "{}", view(&h).0);
         // Kept once typing was done (clicking Raw took the focus), not every prefix of it.
@@ -13607,8 +13700,11 @@ mod ui_tests {
         // longer one History can bring back.
         h.get_by_label("History: just now").click();
         h.run();
-        // The last ×: the tab strip has its own, and the oldest row comes last.
-        h.get_all_by_label("×").last().unwrap().click();
+        // The oldest row comes last.
+        h.get_all_by_label("Delete this response")
+            .last()
+            .unwrap()
+            .click();
         h.run();
         let left = h.state().ws.responses(&path);
         assert_eq!(left.len(), 1);
