@@ -12327,7 +12327,7 @@ mod ui_tests {
         let shop = r#"{ "info": { "name": "Shop" }, "item": [
             { "name": "list", "request": { "method": "GET", "url": "{{base}}/items" } },
             { "name": "signed", "request": { "method": "GET", "url": "{{base}}/s",
-                                             "auth": { "type": "ntlm", "ntlm": [] } } } ] }"#;
+                                             "auth": { "type": "asap", "asap": [] } } } ] }"#;
         std::fs::write(&file, shop).unwrap();
         h.get_all_by_label("More").next().unwrap().click();
         h.run();
@@ -12343,7 +12343,7 @@ mod ui_tests {
         let Some(Dialog::Paste { note, .. }) = &app.dialog else {
             panic!("the dialog stays to say what didn't come over");
         };
-        assert!(note.contains("signed: ntlm auth"), "{note}");
+        assert!(note.contains("signed: asap auth"), "{note}");
         assert_eq!(draft(&h).body, parts);
 
         // A second import of the same environment never replaces the first, which may
@@ -13638,7 +13638,9 @@ mod ui_tests {
         // be loading the machine (5 s once ran out).
         let run = |h: &mut Harness<'_, App>, label: &str| -> Vec<String> {
             let before = h.state().next_run_id;
-            button(h, label).click();
+            // Exactly: the toolbar's "Run all collections" contains "Run".
+            let by = egui_kittest::kittest::By::new().role(Role::Button);
+            h.get(by.label(label)).click();
             for _ in 0..1500 {
                 h.step();
                 let view = h.state().runner.as_ref().unwrap();
