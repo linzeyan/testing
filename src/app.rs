@@ -4491,12 +4491,9 @@ impl App {
                     tab(asserts, t("Asserts")),
                     false,
                 );
-                // How a single HTTP exchange goes out, or MQTT's connection; other
-                // streams and gRPC have none.
-                if !matches!(
-                    open.draft.method.as_str(),
-                    "WS" | "SSE" | "GRPC" | "SOCKETIO"
-                ) {
+                // How a single HTTP exchange goes out, MQTT's connection or Socket.IO's
+                // handshake; other streams and gRPC have none.
+                if !matches!(open.draft.method.as_str(), "WS" | "SSE" | "GRPC") {
                     let default = match mqtt {
                         true => {
                             open.draft.mqtt.client_id.is_empty()
@@ -4504,6 +4501,9 @@ impl App {
                                 && open.draft.mqtt.keep_alive_secs == 60
                                 && open.draft.mqtt.clean_session
                                 && open.draft.mqtt.will_topic.trim().is_empty()
+                        }
+                        false if open.draft.method == "SOCKETIO" => {
+                            open.draft.socketio.is_default()
                         }
                         false => open.draft.settings.is_default(),
                     };
@@ -4597,6 +4597,9 @@ impl App {
                     }
                     ReqTab::Settings if open.draft.method == "MQTT" => {
                         mqtt_settings(ui, &mut open.draft.mqtt)
+                    }
+                    ReqTab::Settings if open.draft.method == "SOCKETIO" => {
+                        socketio_settings(ui, &mut open.draft.socketio)
                     }
                     ReqTab::Settings => {
                         settings_editor(ui, &mut open.draft.settings, self.network.timeout_secs)
@@ -8896,6 +8899,49 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
         });
     ui.add_space(8.0);
     ui.weak(t("Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// use the certificate settings in Network settings, and the connection goes through its proxy."));
+}
+
+fn socketio_settings(ui: &mut egui::Ui, s: &mut model::SocketIo) {
+    egui::Grid::new("socketio-settings")
+        .num_columns(3)
+        .spacing([16.0, 10.0])
+        .show(ui, |ui| {
+            ui.label(t("Handshake path"));
+            // A grid column is as wide as last frame's widest cell: with only the version
+            // box beside it, a desired width alone shrank the field to that box.
+            ui.add(
+                egui::TextEdit::singleline(&mut s.path)
+                    .hint_text("/socket.io/")
+                    .font(egui::TextStyle::Monospace)
+                    .min_size(egui::vec2(240.0, 0.0)),
+            );
+            ui.weak(t(
+                "Where the server mounts Socket.IO; the URL's path is still the namespace",
+            ));
+            ui.end_row();
+
+            ui.label(t("Client version"));
+            // v3 and v4 clients speak the same protocol (Engine.IO 4, Socket.IO 5).
+            egui::ComboBox::from_id_salt("socketio-version")
+                .width(80.0)
+                .selected_text(if s.v2 { "v2" } else { "v3, v4" })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut s.v2, false, "v3, v4");
+                    ui.selectable_value(&mut s.v2, true, "v2");
+                });
+            ui.weak(match s.v2 {
+                true => t("Socket.IO 2.x servers"),
+                false => t("Socket.IO 3.x and 4.x servers"),
+            });
+            ui.end_row();
+        });
+    ui.add_space(8.0);
+    ui.weak(match s.v2 {
+        true => t(
+            "v2 has no auth payload: a JSON body isn't sent. Put what the server checks in Params; they go on the handshake's query.",
+        ),
+        false => t("A JSON body is sent as the auth payload when joining the namespace."),
+    });
 }
 
 fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_secs: u64) {
@@ -13940,6 +13986,49 @@ mod ui_tests {
     fn got(app: &App, text: &str) -> bool {
         let events = app.stream.as_ref().unwrap().events();
         (events.iter()).any(|(_, e)| matches!(e, Event::In(t) if t == text))
+    }
+
+    /// Socket.IO has a Settings tab of its own: the path typed and the v2 picked there
+    /// reach a 2.x server mounted elsewhere (it drops clients that don't ping), and v2
+    /// says a JSON body won't go as auth.
+    #[test]
+    fn socketio_settings_reach_a_v2_server_mounted_elsewhere() {
+        let (addr, server) = crate::stream::tests::socketio_v2_server("/chat");
+        let mut h = with_request("sio-v2");
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        (d.method, d.url) = ("SOCKETIO".into(), format!("http://{addr}/chat"));
+        h.run();
+        h.get_by_label("Settings").click();
+        h.run();
+        fn path<'h>(h: &'h Harness<'_, App>) -> egui_kittest::Node<'h> {
+            let mut fields = h.get_all_by_role(Role::TextInput);
+            (fields.find(|n| n.accesskit_node().placeholder() == Some("/socket.io/"))).unwrap()
+        }
+        path(&h).click();
+        h.run();
+        path(&h).type_text("/rt");
+        h.run();
+        let picker = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("v3, v4");
+        h.get(picker).click();
+        h.run();
+        h.get_by_label("v2").click();
+        h.run();
+        let want = model::SocketIo {
+            path: "/rt".into(),
+            v2: true,
+        };
+        assert_eq!(draft(&h).socketio, want);
+        assert!(h.query_by_label_contains("no auth payload").is_some());
+        shot(&mut h, "68-socketio-settings");
+        h.get_by_label("Connect").click();
+        wait_live(&mut h, |app| got(app, r#"welcome {"n":1}"#));
+        h.get_by_label("Disconnect").click();
+        h.run();
+        let (pings, sent) = server.join().unwrap();
+        assert!(pings >= 2, "{pings} pings");
+        assert_eq!(sent, ["40/chat,", "41/chat,", ""]);
     }
 
     /// Topics subscribe on Connect, Send publishes where the request says, and a topic

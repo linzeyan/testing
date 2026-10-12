@@ -1453,6 +1453,26 @@ const ZH_TW: &[(&str, &str)] = &[
     ("… and {} more", "…還有 {} 個"),
     ("▶ Run", "▶ 執行"),
     ("▶ Start", "▶ 開始"),
+    // Socket.IO path and version
+    ("Handshake path", "交握路徑"),
+    (
+        "Where the server mounts Socket.IO; the URL's path is still the namespace",
+        "伺服器掛載 Socket.IO 的位置；URL 的路徑仍是命名空間",
+    ),
+    ("Client version", "用戶端版本"),
+    ("Socket.IO 2.x servers", "適用 Socket.IO 2.x 伺服器"),
+    (
+        "Socket.IO 3.x and 4.x servers",
+        "適用 Socket.IO 3.x 與 4.x 伺服器",
+    ),
+    (
+        "v2 has no auth payload: a JSON body isn't sent. Put what the server checks in Params; they go on the handshake's query.",
+        "v2 沒有驗證 payload：不會送出 JSON 內容。伺服器要檢查的值請放在「參數」，會附在交握的查詢字串上。",
+    ),
+    (
+        "A JSON body is sent as the auth payload when joining the namespace.",
+        "加入命名空間時，JSON 內容會作為驗證 payload 送出。",
+    ),
 ];
 
 #[cfg(test)]

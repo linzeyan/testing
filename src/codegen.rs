@@ -1815,11 +1815,19 @@ fn sio_parts(s: &Stream) -> (String, String) {
 }
 
 fn sio_node(s: &Stream) -> String {
-    let mut out = format!(
-        "import {{ io }} from \"socket.io-client\";\n\nconst socket = io({}, {{\n  \
-         transports: [\"websocket\"],\n",
-        dq(&s.http_url())
-    );
+    let sio = &s.req.socketio;
+    // 2.x exports `io` only as the module itself, and has no auth or onAny.
+    let mut out = match sio.v2 {
+        true => "// A Socket.IO 2.x server takes only socket.io-client 2 (npm install \
+                 socket.io-client@2).\nimport io from \"socket.io-client\";\n\n"
+            .to_owned(),
+        false => "import { io } from \"socket.io-client\";\n\n".to_owned(),
+    };
+    let _ = writeln!(out, "const socket = io({}, {{", dq(&s.http_url()));
+    if !sio.path.trim().is_empty() {
+        let _ = writeln!(out, "  path: {},", dq(&sio.handshake_path()));
+    }
+    out.push_str("  transports: [\"websocket\"],\n");
     if !s.headers.is_empty() {
         out.push_str("  extraHeaders: {\n");
         for (k, v) in &s.headers {
@@ -1828,39 +1836,58 @@ fn sio_node(s: &Stream) -> String {
         out.push_str("  },\n");
     }
     // The JSON body is the CONNECT payload, as in the app; JSON is a JavaScript literal.
-    if !s.body_text().is_empty() {
+    if !sio.v2 && !s.body_text().is_empty() {
         let _ = writeln!(out, "  auth: {},", s.body_text());
     }
     let _ = write!(
         out,
         "}});\nsocket.on(\"connect\", () => {{\n  console.log(\"connected\", socket.id);\n  \
          socket.emit(\"message\", {});\n}});\n\
-         socket.on(\"connect_error\", (err) => console.error(err.message));\n\
-         socket.onAny((event, ...args) => console.log(event, ...args));\n",
+         socket.on(\"connect_error\", (err) => console.error(err.message));\n",
         dq(MESSAGE)
     );
+    out.push_str(match sio.v2 {
+        true => "socket.on(\"message\", (...args) => console.log(\"message\", ...args));\n",
+        false => "socket.onAny((event, ...args) => console.log(event, ...args));\n",
+    });
     out
 }
 
 fn sio_python(s: &Stream) -> String {
     let (server, ns) = sio_parts(s);
-    let auth = s.body_text();
+    let sio = &s.req.socketio;
+    // 4.x has no auth and no "*" handler.
+    let auth = if sio.v2 { "" } else { s.body_text() };
     let mut out = String::new();
+    if sio.v2 {
+        out.push_str(
+            "# A Socket.IO 2.x server takes only python-socketio 4\n\
+             # (pip install \"python-socketio[client]<5\").\n",
+        );
+    }
     if !auth.is_empty() {
         out.push_str("import json\n\n");
     }
+    let (on, handler) = match sio.v2 {
+        true => ("message", "message(*args):\n    print(\"message\", *args)"),
+        false => ("*", "any_event(event, *args):\n    print(event, *args)"),
+    };
     let _ = write!(
         out,
         "import socketio\n\nNAMESPACE = {}\nsio = socketio.Client()\n\n\n\
          @sio.on(\"connect\", namespace=NAMESPACE)\ndef connect():\n    print(\"connected\")\n    \
          sio.emit(\"message\", {}, namespace=NAMESPACE)\n\n\n\
-         @sio.on(\"*\", namespace=NAMESPACE)\ndef any_event(event, *args):\n    \
-         print(event, *args)\n\n\nsio.connect(\n    {},\n    namespaces=[NAMESPACE],\n    \
-         transports=[\"websocket\"],\n",
+         @sio.on({}, namespace=NAMESPACE)\ndef {handler}\n\n\nsio.connect(\n    {},\n    \
+         namespaces=[NAMESPACE],\n    transports=[\"websocket\"],\n",
         dq(&ns),
         dq(MESSAGE),
+        dq(on),
         dq(&server)
     );
+    if !sio.path.trim().is_empty() {
+        let path = sio.handshake_path();
+        let _ = writeln!(out, "    socketio_path={},", dq(path.trim_matches('/')));
+    }
     if !s.headers.is_empty() {
         out.push_str("    headers={\n");
         for (k, v) in &s.headers {
@@ -2745,6 +2772,49 @@ mod tests {
         let grpcurl = generate("grpcurl", req()).unwrap();
         assert!(grpcurl.contains("-plaintext"), "{grpcurl}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A server mounted elsewhere needs the path in the snippet too, and a 2.x server a
+    /// client of its era: the snippet names that major and leaves out what it lacks (the
+    /// auth payload, catch-all listeners, socket.io-client's named `io` export).
+    #[test]
+    fn socketio_snippets_carry_the_path_and_the_client_a_v2_server_needs() {
+        let req = |path: &str, v2| Request {
+            method: "SOCKETIO".into(),
+            url: "http://h.test:3000/admin".into(),
+            body: Body::Json {
+                text: r#"{"room": "a"}"#.into(),
+            },
+            socketio: crate::model::SocketIo {
+                path: path.into(),
+                v2,
+            },
+            ..Default::default()
+        };
+        let both = |req: Request| {
+            let node = generate("Node.js (socket.io-client)", req.clone()).unwrap();
+            (node, generate("Python (python-socketio)", req).unwrap())
+        };
+        let (node, python) = both(req("", false));
+        assert!(!node.contains("path:"), "{node}");
+        assert!(!python.contains("socketio_path"), "{python}");
+
+        let (node, python) = both(req("rt", false));
+        assert!(node.contains(r#"path: "/rt/","#), "{node}");
+        assert!(node.contains("auth:") && node.contains("onAny"), "{node}");
+        assert!(python.contains(r#"socketio_path="rt","#), "{python}");
+        assert!(python.contains("auth=") && python.contains(r#"@sio.on("*""#));
+
+        let (node, python) = both(req("rt", true));
+        assert!(node.contains(r#"path: "/rt/","#), "{node}");
+        assert!(node.contains("socket.io-client@2") && node.contains("import io from"));
+        assert!(!node.contains("auth") && !node.contains("onAny"), "{node}");
+        assert!(python.contains(r#"socketio_path="rt","#), "{python}");
+        assert!(python.contains("python-socketio[client]<5"), "{python}");
+        assert!(
+            !python.contains("auth") && !python.contains(r#""*""#),
+            "{python}"
+        );
     }
 
     /// The picker keeps the language last picked as requests of other kinds are opened.

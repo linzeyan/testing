@@ -260,11 +260,12 @@ pub async fn graphql(client: reqwest::Client, req: Request, emit: impl Fn(Event)
     emit(Event::Closed("connection closed".into()))
 }
 
-/// Socket.IO 4 (Engine.IO 4) over its WebSocket transport. The URL's path is the
-/// namespace, a JSON body the CONNECT auth payload. Each outgoing message is an event:
-/// `name {"json": "arg"}`, or the wire's own `["name", arg, …]` array.
-// ponytail: the handshake path is always /socket.io/ and long-polling isn't spoken; add a
-// path setting when a server mounts it elsewhere.
+/// Socket.IO 3/4 (Engine.IO 4), or 2 (Engine.IO 3) when `socketio.v2`, over its WebSocket
+/// transport at `socketio.path`. The URL's path is the namespace, a JSON body the CONNECT
+/// auth payload (v3+ only). Each outgoing message is an event: `name {"json": "arg"}`, or
+/// the wire's own `["name", arg, …]` array.
+// ponytail: long-polling isn't spoken, only the websocket transport; add it when a server
+// turns websocket-only clients away.
 pub async fn socketio(
     client: reqwest::Client,
     req: Request,
@@ -279,12 +280,14 @@ pub async fn socketio(
         "" => String::new(),
         p => p.to_owned(),
     };
-    url.set_path("/socket.io/");
+    let v2 = req.socketio.v2;
+    url.set_path(&req.socketio.handshake_path());
     url.query_pairs_mut()
-        .append_pair("EIO", "4")
+        .append_pair("EIO", if v2 { "3" } else { "4" })
         .append_pair("transport", "websocket");
+    // Socket.IO 2's CONNECT has no payload; its servers read the handshake's query.
     let auth = match &req.body {
-        Body::Json { text } if !text.trim().is_empty() => text.trim().to_owned(),
+        Body::Json { text } if !v2 && !text.trim().is_empty() => text.trim().to_owned(),
         _ => String::new(),
     };
     let mut upgrade = Request {
@@ -314,8 +317,16 @@ pub async fn socketio(
         true => String::new(),
         false => format!("{ns},"),
     };
+    // Engine.IO 3 has the client ping every pingInterval, or the server hangs up; from 4
+    // on the server pings instead.
+    let mut pings: Option<tokio::time::Interval> = None;
     loop {
         tokio::select! {
+            _ = async { pings.as_mut().unwrap().tick().await }, if pings.is_some() => {
+                if let Err(e) = sink.send(Message::Text("2".into())).await {
+                    return emit(Event::Error(error_chain(&e)));
+                }
+            },
             out = outgoing.recv() => match out {
                 Some(text) => {
                     let args = match event_args(&text) {
@@ -346,9 +357,20 @@ pub async fn socketio(
                 // Engine.IO: 0 open, 2 ping, 4 a Socket.IO packet.
                 match text.as_bytes().first() {
                     Some(b'0') => {
-                        let connect = format!("40{prefix}{auth}");
-                        if let Err(e) = sink.send(Message::Text(connect)).await {
-                            return emit(Event::Error(error_chain(&e)));
+                        if v2 {
+                            let open: serde_json::Value =
+                                serde_json::from_str(&text[1..]).unwrap_or_default();
+                            let every = open["pingInterval"].as_u64().unwrap_or(25_000);
+                            let every = std::time::Duration::from_millis(every.max(1));
+                            let first = tokio::time::Instant::now() + every;
+                            pings = Some(tokio::time::interval_at(first, every));
+                        }
+                        // Socket.IO 2 joins "/" unasked, and the server says so with a 40.
+                        if !(v2 && ns.is_empty()) {
+                            let connect = format!("40{prefix}{auth}");
+                            if let Err(e) = sink.send(Message::Text(connect)).await {
+                                return emit(Event::Error(error_chain(&e)));
+                            }
                         }
                     }
                     Some(b'2') => {
@@ -356,6 +378,8 @@ pub async fn socketio(
                             return emit(Event::Error(error_chain(&e)));
                         }
                     }
+                    // That unasked "/" isn't the namespace asked for.
+                    Some(b'4') if v2 && !ns.is_empty() && text == "40" => {}
                     Some(b'4') => match socketio_packet(&text[1..]) {
                         Packet::Connected => {
                             let at = if ns.is_empty() { "/" } else { &ns };
@@ -501,7 +525,7 @@ impl SseParser {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]
@@ -914,6 +938,247 @@ mod tests {
         assert_eq!(event_args("ping").unwrap(), r#"["ping"]"#);
         assert_eq!(event_args("say hi there").unwrap(), r#"["say","hi there"]"#);
         assert!(event_args("[1, 2]").is_err() && event_args("  ").is_err());
+    }
+
+    /// What a server answers a handshake at a path it doesn't serve.
+    fn not_found() -> tungstenite::handshake::server::ErrorResponse {
+        let mut resp = tungstenite::handshake::server::ErrorResponse::new(None);
+        *resp.status_mut() = tungstenite::http::StatusCode::NOT_FOUND;
+        // Else the client may keep this connection, which the server then drops, for its
+        // next handshake.
+        resp.headers_mut()
+            .insert("connection", "close".parse().unwrap());
+        resp
+    }
+
+    fn sio_runtime() -> (tokio::runtime::Runtime, reqwest::Client) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let net = crate::net::Network::default();
+        let client = rt.block_on(crate::net::build_client(net)).unwrap().http;
+        (rt, client)
+    }
+
+    /// A server mounted elsewhere (`path: "/rt"` on socket.io's side) turns /socket.io/
+    /// away: the default can't reach it, the path set can, and the namespace still comes
+    /// from the URL.
+    // tungstenite's handshake callback type fixes the error type the lint objects to.
+    #[allow(clippy::result_large_err)]
+    #[test]
+    fn socketio_handshakes_at_the_path_set_and_nowhere_else() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for s in listener.incoming().take(2).flatten() {
+                let mut uri = String::new();
+                let mounted = |req: &tungstenite::handshake::server::Request, resp| {
+                    uri = req.uri().to_string();
+                    match req.uri().path() {
+                        "/rt/" => Ok(resp),
+                        _ => Err(not_found()),
+                    }
+                };
+                let accepted = tungstenite::accept_hdr(s, mounted).ok();
+                seen.push(uri);
+                let Some(mut ws) = accepted else { continue };
+                let open = r#"0{"sid":"e1","upgrades":[],"pingInterval":25000,"pingTimeout":20000,"maxPayload":1000000}"#;
+                ws.send(tungstenite::Message::text(open)).unwrap();
+                while let Ok(msg) = ws.read() {
+                    let t = msg.to_text().unwrap_or_default().to_owned();
+                    if t == "40/chat," {
+                        let ok = r#"40/chat,{"sid":"s1"}"#;
+                        ws.send(tungstenite::Message::text(ok)).unwrap();
+                    }
+                    seen.push(t);
+                }
+            }
+            seen
+        });
+        let (rt, client) = sio_runtime();
+        let connect = |path: &str| {
+            let req = Request {
+                method: "SOCKETIO".into(),
+                url: format!("http://{addr}/chat"),
+                socketio: crate::model::SocketIo {
+                    path: path.into(),
+                    v2: false,
+                },
+                ..Default::default()
+            };
+            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            let tx = std::sync::Mutex::new(Some(tx));
+            let events = std::sync::Mutex::new(Vec::new());
+            rt.block_on(socketio(client.clone(), req, rx, |e| {
+                drop(tx.lock().unwrap().take()); // hang up once connected
+                events.lock().unwrap().push(e);
+            }));
+            events.into_inner().unwrap()
+        };
+        let default = connect("");
+        assert!(
+            matches!(&default[..], [Event::Error(e)] if e.contains("404")),
+            "{default:?}"
+        );
+        assert_eq!(
+            connect("rt"),
+            [
+                Event::Open("connected to /chat".into()),
+                Event::Closed("disconnected".into())
+            ]
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "/socket.io/?EIO=4&transport=websocket",
+                "/rt/?EIO=4&transport=websocket",
+                "40/chat,",
+                "41/chat,",
+                ""
+            ]
+        );
+    }
+
+    /// A Socket.IO 2 server (Engine.IO 3) mounted at /rt/ (with `path: "/rt"`). It says
+    /// 40 for "/" unasked, answers the client's pings, and drops a client that misses
+    /// them for pingInterval + pingTimeout, as engine.io 3 does; after two pings it
+    /// greets `ns` and acks an event. Returns the pings and, apart from them, what the
+    /// client sent.
+    // tungstenite's handshake callback type fixes the error type the lint objects to.
+    #[allow(clippy::result_large_err)]
+    pub fn socketio_v2_server(
+        ns: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<(usize, Vec<String>)>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mounted = |req: &tungstenite::handshake::server::Request, resp| {
+                let eio3 = req.uri().query().is_some_and(|q| q.contains("EIO=3"));
+                match req.uri().path() {
+                    "/rt/" if eio3 => Ok(resp),
+                    _ => Err(not_found()),
+                }
+            };
+            let mut ws = tungstenite::accept_hdr(s, mounted).unwrap();
+            let missed = std::time::Duration::from_millis(100 + 400);
+            ws.get_mut().set_read_timeout(Some(missed)).unwrap();
+            let send = |ws: &mut tungstenite::WebSocket<_>, t: &str| {
+                ws.send(tungstenite::Message::text(t)).unwrap()
+            };
+            let prefix = match ns {
+                "" => String::new(),
+                ns => format!("{ns},"),
+            };
+            send(
+                &mut ws,
+                r#"0{"sid":"e1","upgrades":[],"pingInterval":100,"pingTimeout":400}"#,
+            );
+            send(&mut ws, "40");
+            let (mut pings, mut got) = (0, Vec::new());
+            loop {
+                let t = match ws.read() {
+                    Ok(msg) => msg.to_text().unwrap_or_default().to_owned(),
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        got.push("<dropped: no ping in time>".into());
+                        break;
+                    }
+                    Err(_) => break,
+                };
+                match t.as_str() {
+                    "2" => {
+                        send(&mut ws, "3");
+                        pings += 1;
+                        if pings == 2 {
+                            send(&mut ws, &format!(r#"42{prefix}["welcome",{{"n":1}}]"#));
+                        }
+                        continue;
+                    }
+                    t if !ns.is_empty() && t == format!("40{prefix}") => send(&mut ws, t),
+                    t if t.starts_with(&format!("42{prefix}[")) => {
+                        send(&mut ws, &format!(r#"43{prefix}7["ok"]"#))
+                    }
+                    _ => {}
+                }
+                got.push(t);
+            }
+            (pings, got)
+        });
+        (addr, server)
+    }
+
+    /// Socket.IO 2: the client pings or is dropped, is in "/" without asking, asks for any
+    /// other namespace with a bare CONNECT (no auth payload: the JSON body isn't sent),
+    /// and frames events and acks as v3+ does.
+    #[test]
+    fn socketio_v2_pings_and_connects_the_v2_way() {
+        for ns in ["/chat", ""] {
+            let (addr, server) = socketio_v2_server(ns);
+            let (rt, client) = sio_runtime();
+            let req = Request {
+                method: "SOCKETIO".into(),
+                url: format!("http://{addr}{ns}"),
+                body: Body::Json {
+                    text: r#"{"token": "t"}"#.into(),
+                },
+                socketio: crate::model::SocketIo {
+                    path: "/rt".into(),
+                    v2: true,
+                },
+                ..Default::default()
+            };
+            let (tx, rx) = mpsc::unbounded_channel();
+            let tx = std::sync::Mutex::new(Some(tx));
+            let events = std::sync::Mutex::new(Vec::new());
+            rt.block_on(socketio(client, req, rx, |e| {
+                match &e {
+                    Event::In(t) if t.starts_with("welcome") => {
+                        let tx = tx.lock().unwrap();
+                        tx.as_ref()
+                            .unwrap()
+                            .send(r#"say {"text": "hi"}"#.into())
+                            .unwrap();
+                    }
+                    Event::In(t) if t.starts_with("ack") => drop(tx.lock().unwrap().take()),
+                    _ => {}
+                }
+                events.lock().unwrap().push(e);
+            }));
+            let (pings, got) = server.join().unwrap();
+            let prefix = if ns.is_empty() { "" } else { "/chat," };
+            let mut sent = vec![
+                format!(r#"42{prefix}["say",{{"text":"hi"}}]"#),
+                format!("41{prefix}"),
+                String::new(),
+            ];
+            if !ns.is_empty() {
+                sent.insert(0, "40/chat,".into());
+            }
+            assert_eq!(got, sent, "{ns}");
+            assert!(pings >= 2, "{ns}: {pings} pings");
+            let at = if ns.is_empty() { "/" } else { ns };
+            assert_eq!(
+                events.into_inner().unwrap(),
+                [
+                    Event::Open(format!("connected to {at}")),
+                    Event::In(r#"welcome {"n":1}"#.into()),
+                    Event::Out(r#"["say",{"text":"hi"}]"#.into()),
+                    Event::In(r#"ack 7 ["ok"]"#.into()),
+                    Event::Closed("disconnected".into()),
+                ],
+                "{ns}"
+            );
+        }
     }
 
     /// A server that never ends a line can't fill RAM: the line keeps its first MiB and
