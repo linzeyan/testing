@@ -44,7 +44,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | GraphQL | Once the schema is fetched, fields complete as you type the query; variables fill in as a form, a row per `$variable` the query declares (enum and Boolean pickers, numbers that may be `{{variables}}`, inputs filled in from the schema), or as JSON; a `subscription` connects over WebSocket (graphql-transport-ws or the older graphql-ws) and streams each result |
 | WebSocket | |
 | SSE | |
-| Socket.IO 4 | The URL's path is the namespace and a JSON body the auth payload; send `event {"json": "arg"}` or a `["event", …]` array; acks are shown |
+| Socket.IO 2, 3 and 4 | The URL's path is the namespace and a JSON body the auth payload (v2 has none: Params go on the handshake's query); Settings sets the handshake path (`/socket.io/` if empty) and the client version; send `event {"json": "arg"}` or a `["event", …]` array; acks are shown |
 | MQTT 3.1.1 and 5 | Over TCP, TLS or WebSocket (`mqtt://`, `mqtts://`, `ws://`, `wss://`), see below |
 | gRPC | Methods from a `.proto` loaded at run time or, with none set, from server reflection (v1 or v1alpha, asked on ↻ or the first send). Streaming methods connect like a WebSocket; a JSON array body sends several messages |
 
@@ -78,6 +78,9 @@ beside it puts a kept one back in the box.
 - Path variables: `/users/:id` (or OpenAPI's `/users/{id}`, as copied from Swagger UI) gets
   an `id` row under Params, is coloured in the URL bar, filled in on Send and kept on Postman
   import and export.
+- Right-click selected text in a box that takes `{{variables}}`: cut, copy, paste, encode or
+  decode it as a URI component, or put it in a variable (new or existing, in the active environment
+  or the globals) and leave `{{name}}` in its place.
 - Header names and Content-Type values complete while typing. The Headers tab folds out what
   Send adds (Host, auth, Content-Type…) and where each comes from.
 - All 120 of Postman's dynamic variables (`{{$guid}}`, `{{$timestamp}}`, `{{$randomEmail}}`,
@@ -105,6 +108,11 @@ beside it puts a kept one back in the box.
   big; a failed or cancelled one leaves no partial file.
 - Send ⏷ "Repeat every N s" sends again on that interval, never two at once, until Stop
   repeat, Cancel or another tab.
+- A request's Settings, as in Postman: keep the method and body on a 301, 302 or 303; keep
+  Authorization when a redirect goes to another host; drop the Referer on redirects; turn
+  off TLS 1.2 or 1.3; pick the cipher suites offered; turn off the strict HTTP parser for
+  servers that send malformed headers. Postman's `protocolProfileBehavior` and curl's
+  `--post301`, `--location-trusted`, `--tlsv1.3`, `--ciphers` carry them.
 
 ## Authentication
 
@@ -116,6 +124,9 @@ beside it puts a kept one back in the box.
 | OAuth 1.0a | HMAC-SHA1/256/512, RSA-SHA256/512, PLAINTEXT; signed over method, URL, query and form body; Postman and Insomnia import |
 | JWT Bearer | HS/RS/PS/ES 256–512 and EdDSA, signed on each send from a JSON payload with variables; Postman's jwt both ways |
 | OAuth 2.0 | Client credentials, password, implicit, and authorization code with PKCE |
+| Hawk | SHA-256 or SHA-1, a fresh nonce and timestamp per send, optionally the payload hash; Postman both ways, Insomnia import |
+| Akamai EdgeGrid | Signed over the method, URL, chosen headers and a POST's body; Postman both ways |
+| NTLM | NTLMv2 over HTTP/1.1, the challenge and answer on one connection; through a proxy only for https:// |
 
 For authorization code and implicit, Send opens the browser to sign in and catches the
 redirect on 127.0.0.1. An expired token is renewed with the refresh token when the provider
@@ -234,6 +245,9 @@ lists these too.
 | Go to tab 1–8, the last | `Ctrl+1`…`9` |
 | Sidebar | `Ctrl+\` |
 | Side by side | `Ctrl+Alt+V` |
+| Larger / smaller text | `Ctrl+=` / `Ctrl+-` |
+| Default text size | `Ctrl+0` |
+| Keyboard shortcuts | `Ctrl+/` |
 
 Ctrl+K finds a request by folder and name (letters in order are enough) or by part of its URL, a folder (its
 settings) or an environment, and does what a button does (new request, network settings,
@@ -276,6 +290,10 @@ right-click a folder > "Copy docs as Markdown", or `apitool-cli docs`.
   failures and the latest 1000 results. Tick the requests to run and drag them into the
   order wanted (kept per folder on this machine; ↺ goes back to the tree's). "Stop at the
   first failure" ends the run there. The export icon writes the results as JUnit XML.
+  Options as in Postman: keep the variables a run sets (off, the environment and globals
+  stay as they were), start from an empty cookie jar, save the cookies after the run, and
+  keep each response (32 KiB of body) to open from the results. Run again repeats a shown
+  run with its requests, order and options.
 - **Load test** pane. Response bodies are read and dropped, so many users cost no RAM.
 - **Mock server** answering with saved examples: right-click a folder > "Start mock server",
   or `apitool-cli mock`. An `x-mock-response-name` or `x-mock-response-code` header picks

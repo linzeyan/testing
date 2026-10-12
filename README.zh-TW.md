@@ -42,7 +42,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | GraphQL | 取得 schema 後，輸入查詢時會補全欄位；變數以表單填寫，查詢宣告的每個 `$變數` 一列（enum 與 Boolean 用下拉、數字可用 `{{變數}}`、input 可依 schema 填入欄位），也可切成 JSON；`subscription` 透過 WebSocket 連線（graphql-transport-ws 或較舊的 graphql-ws），逐筆串流結果 |
 | WebSocket | |
 | SSE | |
-| Socket.IO 4 | URL 的路徑即 namespace，JSON 內容即 auth payload；以 `event {"json": "arg"}` 或 `["event", …]` 陣列送出；會顯示 ack |
+| Socket.IO 2、3 與 4 | URL 的路徑即 namespace，JSON 內容即 auth payload（v2 沒有 auth payload，「參數」會附在交握的查詢字串上）；「設定」可指定交握路徑（空白即 `/socket.io/`）與用戶端版本；以 `event {"json": "arg"}` 或 `["event", …]` 陣列送出；會顯示 ack |
 | MQTT 3.1.1 與 5 | 透過 TCP、TLS 或 WebSocket（`mqtt://`、`mqtts://`、`ws://`、`wss://`），詳見下方 |
 | gRPC | 方法來自執行時載入的 `.proto`；未指定時改用伺服器反射（v1 或 v1alpha，按 ↻ 或第一次傳送時查詢）。串流方法像 WebSocket 一樣連線；JSON 陣列內容會送出多則訊息 |
 
@@ -72,6 +72,8 @@ MQTT：
 
 - 每個參數、標頭與表單欄位都能加說明；「批次編輯」以 `key: value` 逐行編輯這些表格。
 - 路徑變數：`/users/:id`（或從 Swagger UI 複製來的 OpenAPI 寫法 `/users/{id}`）會在「參數」下產生一列 `id`，在網址列上色，傳送時代入；Postman 匯入與匯出都會保留。
+- 在可用 `{{變數}}` 的輸入框中選取文字後按右鍵：剪下、複製、貼上、URI 元件編碼或解碼，或把它
+  存成變數（新增或既有的，存在目前的環境或全域變數中），原處換成 `{{name}}`。
 - 輸入時自動完成標頭名稱與 Content-Type 值。「標頭」分頁可展開查看傳送時自動加上的標頭（Host、
   驗證、Content-Type…）及各自的來源。
 - 支援 Postman 全部 120 個動態變數（`{{$guid}}`、`{{$timestamp}}`、`{{$randomEmail}}`、
@@ -98,6 +100,10 @@ MQTT：
   不完整的檔案。
 - 「傳送 ⏷ > 每隔一段時間重送」依設定的秒數重複傳送，同一時間只會有一個請求在跑，直到按
   「停止重送」、取消或切換到其他分頁為止。
+- 請求的「設定」，同 Postman：遇到 301、302、303 時保留原本的方法與內容；重新導向到其他主機時
+  保留 Authorization；重新導向時移除 Referer；停用 TLS 1.2 或 1.3；指定提供的加密套件；伺服器
+  回傳格式不正確的標頭時，可關閉嚴格 HTTP 解析。Postman 的 `protocolProfileBehavior` 與 curl 的
+  `--post301`、`--location-trusted`、`--tlsv1.3`、`--ciphers` 都會帶上這些設定。
 
 ## 驗證
 
@@ -109,6 +115,9 @@ MQTT：
 | OAuth 1.0a | HMAC-SHA1/256/512、RSA-SHA256/512、PLAINTEXT；對方法、URL、查詢字串與表單內容簽章；可從 Postman 與 Insomnia 匯入 |
 | JWT Bearer | HS/RS/PS/ES 256–512 與 EdDSA；每次傳送時以含變數的 JSON payload 簽發；與 Postman 的 jwt 雙向互通 |
 | OAuth 2.0 | Client credentials、password、implicit，以及搭配 PKCE 的 authorization code |
+| Hawk | SHA-256 或 SHA-1，每次傳送都用新的 nonce 與時間戳記，可選擇納入內容雜湊；與 Postman 雙向互通，可從 Insomnia 匯入 |
+| Akamai EdgeGrid | 對方法、URL、指定的標頭與 POST 內容簽章；與 Postman 雙向互通 |
+| NTLM | 透過 HTTP/1.1 的 NTLMv2，挑戰與回應走同一條連線；經由代理伺服器時只支援 https:// |
 
 使用 authorization code 與 implicit 時，按傳送會開啟瀏覽器登入，並在 127.0.0.1 接收重新導向。
 token 過期時，若提供者有給 refresh token 就自動換新，不必重新登入。token 存在工作區中，重新
@@ -219,6 +228,9 @@ macOS 上 Ctrl 換成 ⌘（切換分頁除外）。尚未傳送任何請求前�
 | 跳到第 1–8 個分頁、最後一個 | `Ctrl+1`…`9` |
 | 側邊欄 | `Ctrl+\` |
 | 左右並排 | `Ctrl+Alt+V` |
+| 放大 / 縮小文字 | `Ctrl+=` / `Ctrl+-` |
+| 預設文字大小 | `Ctrl+0` |
+| 鍵盤快捷鍵 | `Ctrl+/` |
 
 Ctrl+K 可依資料夾與名稱（依序打出其中幾個字母即可）或 URL 的片段找請求、找資料夾（開啟其設定）或環境，也能
 執行按鈕的功能（新增請求、網路設定、Cookie、左右並排…）。
@@ -258,6 +270,9 @@ Markdown」，或執行 `apitool-cli docs`。
 - **集合執行器**：可搭配 CSV 或 JSON 資料。統計涵蓋每一列資料；結果清單保留所有失敗項目與最近
   1000 筆結果。勾選要執行的請求，拖曳調整順序（依資料夾記在這台電腦；↺ 恢復成樹狀清單的順序）。
   「遇到第一個失敗就停止」會在該處結束執行。匯出圖示可把結果存成 JUnit XML。
+  選項同 Postman：保留執行中設定的變數值（關閉時環境與全域變數維持原樣）、從空的 Cookie jar
+  開始、執行後儲存 Cookie、保留每個回應（內容最多 32 KiB）供從結果開啟。「再執行一次」以相同的
+  請求、順序與選項重跑目前顯示的那次執行。
 - **負載測試**窗格：回應內容讀取後即丟棄，因此模擬的使用者再多也不佔記憶體。
 - **模擬伺服器**：以已儲存的範例回應；在資料夾上按右鍵 >「啟動模擬伺服器」，或執行
   `apitool-cli mock`。請求帶上 `x-mock-response-name` 或 `x-mock-response-code` 標頭，可指定
