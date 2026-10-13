@@ -25,6 +25,8 @@ jobs:
       - name: Tools
         run: |
           pipx install httpie
+          # The NTLM snippet names this plugin; HTTPie has no -A ntlm without it.
+          pipx inject httpie httpie-ntlm
           curl -fsSLO https://repo1.maven.org/maven2/com/squareup/okhttp3/okhttp/4.12.0/okhttp-4.12.0.jar
           curl -fsSLO https://repo1.maven.org/maven2/com/squareup/okio/okio-jvm/3.6.0/okio-jvm-3.6.0.jar
           pwsh -Version; php -v; java -version; kotlinc -version; http --version
