@@ -4600,7 +4600,14 @@ impl App {
                     let topics = open.draft.mqtt.topics.iter();
                     let on = topics.filter(|t| t.enabled && !t.filter.is_empty()).count();
                     sub_tab(ui, current, ReqTab::Topics, tab(on, t("Topics")), false);
-                    let properties = count(&open.draft.mqtt.user_properties);
+                    let m = &open.draft.mqtt;
+                    let extras = [
+                        !m.content_type.trim().is_empty(),
+                        !m.response_topic.trim().is_empty(),
+                        m.expiry_secs > 0,
+                    ];
+                    let properties =
+                        count(&m.user_properties) + extras.into_iter().filter(|&set| set).count();
                     sub_tab(
                         ui,
                         current,
@@ -4766,6 +4773,8 @@ impl App {
                     }
                     ReqTab::Properties => {
                         let m = &mut open.draft.mqtt;
+                        publish_properties(ui, m);
+                        ui.add_space(8.0);
                         kv_table(
                             ui,
                             "mqtt-properties",
@@ -4776,7 +4785,7 @@ impl App {
                         ui.add_space(8.0);
                         ui.weak(match m.v5 {
                             true => t("Sent with every message you publish."),
-                            false => t("User properties need MQTT 5.0 (Settings)."),
+                            false => t("Message properties need MQTT 5.0 (Settings)."),
                         });
                     }
                     ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
@@ -9450,9 +9459,57 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
                     .desired_width(240.0),
             );
             ui.end_row();
+
+            ui.label(t("Will content type"));
+            ui.add_enabled_ui(!m.will_topic.trim().is_empty(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut m.will_content_type)
+                            .hint_text("text/plain")
+                            .desired_width(140.0),
+                    );
+                    ui.label(t("Expires after"));
+                    ui.add(egui::DragValue::new(&mut m.will_expiry_secs).suffix(" s"));
+                });
+            });
+            ui.weak(t(
+                "MQTT 5.0. Expiry 0: the broker keeps it until it's delivered",
+            ));
+            ui.end_row();
         });
     ui.add_space(8.0);
     ui.weak(t("Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// use the certificate settings in Network settings, and the connection goes through its proxy."));
+}
+
+/// MQTT 5's own publish properties, above the user properties.
+fn publish_properties(ui: &mut egui::Ui, m: &mut model::Mqtt) {
+    egui::Grid::new("mqtt-publish-properties")
+        .num_columns(3)
+        .spacing([16.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(t("Content type"));
+            ui.add(
+                egui::TextEdit::singleline(&mut m.content_type)
+                    .hint_text("application/json")
+                    .desired_width(240.0),
+            );
+            ui.end_row();
+
+            ui.label(t("Response topic"));
+            ui.add(
+                egui::TextEdit::singleline(&mut m.response_topic)
+                    .hint_text("replies/42")
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(240.0),
+            );
+            ui.weak(t("Where the receiver should answer"));
+            ui.end_row();
+
+            ui.label(t("Expires after"));
+            ui.add(egui::DragValue::new(&mut m.expiry_secs).suffix(" s"));
+            ui.weak(t("0: the broker keeps it until it's delivered"));
+            ui.end_row();
+        });
 }
 
 fn socketio_settings(ui: &mut egui::Ui, s: &mut model::SocketIo) {
@@ -10135,25 +10192,30 @@ impl StreamSession {
                 if topic.contains(['+', '#']) {
                     return Err(t("+ and # are for subscribing; publish to one topic").into());
                 }
+                let r = |s: &str| model::resolve(s, vars, &mut Vec::new());
                 let properties: Vec<_> = (m.user_properties.iter())
                     .filter(|p| p.enabled && !p.key.trim().is_empty())
-                    .map(|p| {
-                        let r = |s: &str| model::resolve(s, vars, &mut Vec::new());
-                        (r(p.key.trim()), r(&p.value))
-                    })
+                    .map(|p| (r(p.key.trim()), r(&p.value)))
                     .collect();
-                // ponytail: goes by the request's version now, not the connection's; they
-                // differ only if it's switched while connected.
-                if !m.v5 && !properties.is_empty() {
-                    return Err(t("User properties need MQTT 5.0 (Settings)").into());
-                }
-                let _ = tx.send(crate::mqtt::Command::Publish(crate::mqtt::Publish {
+                let publish = crate::mqtt::Publish {
                     topic,
                     qos: m.qos,
                     retain: m.retain,
                     payload: self.compose.clone(),
                     properties,
-                }));
+                    content_type: r(m.content_type.trim()),
+                    response_topic: r(m.response_topic.trim()),
+                    expiry_secs: m.expiry_secs,
+                };
+                let extras = !publish.content_type.is_empty()
+                    || !publish.response_topic.is_empty()
+                    || publish.expiry_secs > 0;
+                // ponytail: goes by the request's version now, not the connection's; they
+                // differ only if it's switched while connected.
+                if !m.v5 && (!publish.properties.is_empty() || extras) {
+                    return Err(t("Message properties need MQTT 5.0 (Settings)").into());
+                }
+                let _ = tx.send(crate::mqtt::Command::Publish(publish));
             }
         }
         Ok(())
@@ -11367,8 +11429,8 @@ fn svg_pixels(svg: &str, scale: f32, side: u32) -> Result<(egui::ColorImage, [u3
     Ok((pixels, [w.round() as u32, h.round() as u32]))
 }
 
-/// PNG, JPEG and WebP. Bigger than the GPU takes, the picture is scaled down to fit.
-// ponytail: no GIF; enable that `image` feature if APIs here serve them.
+/// PNG, JPEG, GIF (its first frame) and WebP. Bigger than the GPU takes, the picture is
+/// scaled down to fit.
 fn decode_image(
     ctx: &egui::Context,
     bytes: &[u8],
@@ -15131,14 +15193,13 @@ mod ui_tests {
         h.get_by_label("Send").click();
         h.run_steps(2);
         assert!(h.state().status.contains("MQTT 5"), "{}", h.state().status);
-        h.state_mut()
-            .open
-            .as_mut()
-            .unwrap()
-            .draft
-            .mqtt
-            .user_properties[0]
-            .enabled = false;
+        let m = &mut h.state_mut().open.as_mut().unwrap().draft.mqtt;
+        (m.user_properties[0].enabled, m.expiry_secs) = (false, 60);
+        h.state_mut().status.clear();
+        h.get_by_label("Send").click();
+        h.run_steps(2);
+        assert!(h.state().status.contains("MQTT 5"), "{}", h.state().status);
+        h.state_mut().open.as_mut().unwrap().draft.mqtt.expiry_secs = 0;
         h.get_by_label("Send").click();
         wait_live(&mut h, |app| got(app, "[a/echo] echo cmd ping"));
         shot(&mut h, "33-mqtt");
@@ -15167,7 +15228,7 @@ mod ui_tests {
         assert_eq!(*last, Event::Closed("disconnected".into()), "{events:?}");
     }
 
-    /// MQTT 5 user properties go out with each publish, variables filled in; the broker
+    /// MQTT 5 properties go out with each publish, variables filled in; the broker
     /// echoes them back.
     #[test]
     fn mqtt_5_publishes_user_properties() {
@@ -15177,15 +15238,23 @@ mod ui_tests {
         let mut off = KeyValue::new("off", "x");
         off.enabled = false;
         m.user_properties = vec![KeyValue::new("from", "{{device}}"), off];
+        (m.content_type, m.response_topic) = ("text/plain".into(), "reply/{{device}}".into());
+        m.expiry_secs = 60;
+        // The fake broker checks the will carries these.
+        (m.will_content_type, m.will_expiry_secs) = ("text/plain".into(), 300);
         h.run();
-        h.get_by_label("Properties (1)").click();
+        h.get_by_label("Properties (4)").click();
         h.run();
         h.get_by_label("Connect").click();
         wait_live(&mut h, |app| got(app, "[a/1] hello"));
         h.state_mut().stream.as_mut().unwrap().compose = "ping".into();
         h.get_by_label("Send").click();
         wait_live(&mut h, |app| {
-            got(app, "[a/echo · from=tester] echo cmd ping")
+            let tags = "content-type=text/plain · response-topic=reply/tester · expiry=60s";
+            got(
+                app,
+                &format!("[a/echo · {tags} · from=tester] echo cmd ping"),
+            )
         });
         shot(&mut h, "67-mqtt-properties");
         h.get_by_label("Disconnect").click();
@@ -15919,6 +15988,11 @@ mod ui_tests {
         ))
         .unwrap();
         show(&mut h, webp);
+        h.get_by_label("120 × 80");
+
+        let mut gif = Vec::new();
+        (img.write_to(&mut std::io::Cursor::new(&mut gif), image::ImageFormat::Gif)).unwrap();
+        show(&mut h, gif);
         h.get_by_label("120 × 80");
 
         // Not a picture it reads: its size, and how to keep it.

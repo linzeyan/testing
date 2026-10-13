@@ -18,8 +18,6 @@ TOOLS = set(os.environ.get("SNIP_TOOLS", "").split(",")) - {""}
 PWSH = os.environ.get("SNIP_PWSH", "pwsh")
 BASH = os.environ.get("SNIP_BASH", "bash")
 KOTLIN_CP = os.environ.get("SNIP_KOTLIN_CP", "")
-# What a snippet admits it can't do, in a comment at its top: not a failure.
-ADMITTED = {"multipart.wget.sh", "multipart.java.java"}
 captured = queue.Queue()
 
 
@@ -193,14 +191,14 @@ def main():
             results[name] = "FAIL the cURL reference sent nothing"
             continue
         diff = [k for k in sorted(set(ref) | set(got)) if ref.get(k) != got.get(k)]
-        if case == "digest":  # only curl answers the challenge; the rest leave a comment
+        # Only curl answers the challenge (this server sends none); the rest wait for one.
+        if case in ("digest", "ntlm"):
             diff = [k for k in diff if k != "authorization"]
         if not diff and p.returncode == 0:
             results[name] = "OK"
         else:
-            results[name] = ("admitted " if name in ADMITTED else "") + (
-                f"DIFF exit {p.returncode} " + "; ".join(
-                    f"{k}: {ref.get(k)!r} != {got.get(k)!r}" for k in diff))
+            results[name] = f"DIFF exit {p.returncode} " + "; ".join(
+                f"{k}: {ref.get(k)!r} != {got.get(k)!r}" for k in diff)
     report = "".join(f"{name:28} {results[name]}\n" for name in sorted(results))
     open(f"{SNIP}/report.txt", "w", encoding="utf-8").write(report)
     print(report)

@@ -251,9 +251,10 @@ fn group(c: &Value, at: &str, warnings: &mut Vec<String>) -> Value {
             Err(e) => warnings.push(format!("{path}: {e}")),
         }
     }
+    // Rows, or a map when no row has more than its key and value (as `migrate` writes).
     let vars = [&c["variables"], &c["payload"]["variables"]]
         .into_iter()
-        .find(|v| v.is_array());
+        .find(|v| v.is_array() || v.is_object());
     let at = if at.is_empty() { "collection" } else { at };
     json!({
         "name": name_of(c),
@@ -519,6 +520,11 @@ fn mqtt(req: &mut Request, v: &Value, messages: &[Value], warnings: &mut Vec<Str
     m.will_payload = text(&will["payload"]);
     m.will_qos = qos(&will["qos"]);
     m.will_retain = will["retain"] == true;
+    m.will_content_type = text(&will["properties"]["contentType"]);
+    let expiry = will["properties"]["messageExpiryInterval"]
+        .as_u64()
+        .unwrap_or(0);
+    m.will_expiry_secs = expiry.min(u32::MAX as u64) as u32;
     m.user_properties = (v["properties"]["userProperties"]
         .as_array()
         .into_iter()
@@ -633,6 +639,8 @@ auth:
                     "Users/.resources/definition.yaml",
                     r#"$kind: collection
 description: User folder
+variables:
+  team: red
 scripts:
   - type: http:beforeRequest
     code: console.log('folder');
@@ -780,6 +788,11 @@ order: 3000
             }
         );
         assert_eq!(users.pre_request, "console.log('folder');");
+        assert_eq!(
+            users.vars,
+            [KeyValue::new("team", "red")],
+            "variables as a map"
+        );
         assert_eq!(users.order, ["Get user", "Create user", "Login form"]);
 
         let get = find(&requests, "Users/Get user");
@@ -928,6 +941,9 @@ lastWill:
   payload: gone
   qos: 2
   retain: true
+  properties:
+    messageExpiryInterval: 120
+    contentType: text/plain
 properties:
   userProperties:
     - key: team
@@ -1001,9 +1017,11 @@ messages:
                 m.will_topic.as_str(),
                 m.will_payload.as_str(),
                 m.will_qos,
-                m.will_retain
+                m.will_retain,
+                m.will_content_type.as_str(),
+                m.will_expiry_secs
             ),
-            ("bye", "gone", 2, true)
+            ("bye", "gone", 2, true, "text/plain", 120)
         );
         assert_eq!(m.user_properties, [KeyValue::new("team", "red")]);
         assert_eq!((m.topic.as_str(), m.qos, m.retain), ("scores/1", 1, true));

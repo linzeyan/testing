@@ -51,11 +51,13 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 MQTT:
 
 - Subscribes to the request's topics on Connect and follows changes to them while connected.
-- Publishes from the message panel with QoS and retain. MQTT 5 user properties go out with
-  a message and show on incoming ones.
-- A last will (topic, message, QoS, retain) goes with the connection.
+- Publishes from the message panel with QoS and retain. MQTT 5 properties (content type,
+  response topic, expiry, user properties) go out with a message and show on incoming ones.
+- A last will (topic, message, QoS, retain; in MQTT 5 also content type and expiry) goes
+  with the connection.
 - TLS takes the network settings' CA file, client certificate and "accept any certificate".
-  The connection goes through the proxy https would use, tunnelled with CONNECT.
+  The connection goes through the proxy https would use (http:// or https://), tunnelled
+  with CONNECT.
 
 Every stream's log narrows to received or sent messages (↓ ↑) and to text, which keeps up
 with a busy feed. The bookmark under Send keeps the typed message in the request; the list
@@ -180,7 +182,7 @@ The Tests tab filters All / Passed / Failed, with counts.
   or, on XML, XPath (`//item[@id='b']/name/text()`, prefixes ignored). The last 10 come back
   from Recent; Save… still writes the whole body.
 - Find (Ctrl+F): match case, whole word or regular expression; counts up to 10 000 hits.
-- PNG, JPEG and WebP show as pictures, SVG too (Preview, beside Pretty and Raw), PDF page by
+- PNG, JPEG, GIF (its first frame) and WebP show as pictures, SVG too (Preview, beside Pretty and Raw), PDF page by
   page; other binary bodies show their size. "Open in browser" shows an HTML, PDF or SVG one
   (a PDF in the system's viewer).
 

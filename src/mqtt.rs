@@ -31,8 +31,26 @@ pub struct Publish {
     pub qos: u8,
     pub retain: bool,
     pub payload: String,
-    /// MQTT 5 user properties; the app refuses them for a 3.1.1 connection.
+    /// MQTT 5 user properties; the app refuses these and the three below for a 3.1.1
+    /// connection.
     pub properties: Vec<(String, String)>,
+    pub content_type: String,
+    pub response_topic: String,
+    /// 0: none.
+    pub expiry_secs: u32,
+}
+
+impl Publish {
+    fn v5(&self) -> p5::PublishProperties {
+        let set = |s: &String| (!s.is_empty()).then(|| s.clone());
+        p5::PublishProperties {
+            message_expiry_interval: (self.expiry_secs > 0).then_some(self.expiry_secs),
+            content_type: set(&self.content_type),
+            response_topic: set(&self.response_topic),
+            user_properties: self.properties.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 /// What the app asks of a live session.
@@ -70,7 +88,7 @@ pub async fn session(
         while let Some(command) = commands.recv().await {
             let sent = match command {
                 Command::Publish(p) => {
-                    let shown = shown(&p.topic, &p.properties, p.payload.as_bytes());
+                    let shown = shown(&p.topic, Some(&p.v5()), p.payload.as_bytes());
                     client.publish(p).await.map(|()| emit(Event::Out(shown)))
                 }
                 Command::Topics(want) => update(&client, &acks, &mut have, want).await,
@@ -211,15 +229,8 @@ impl Client {
         match self {
             Client::V3(c) => (c.publish(p.topic, qos3(p.qos), p.retain, p.payload).await)
                 .map_err(|e| e.to_string()),
-            Client::V5(c) if p.properties.is_empty() => {
-                (c.publish(p.topic, qos5(p.qos), p.retain, p.payload).await)
-                    .map_err(|e| e.to_string())
-            }
             Client::V5(c) => {
-                let properties = p5::PublishProperties {
-                    user_properties: p.properties,
-                    ..Default::default()
-                };
+                let properties = p.v5();
                 let (topic, qos, payload) = (p.topic, qos5(p.qos), p.payload);
                 (c.publish_with_properties(topic, qos, p.retain, payload, properties)
                     .await)
@@ -243,7 +254,7 @@ impl Events {
         let got = match self {
             Events::V3(e) => match e.poll().await {
                 Ok(In3(Incoming::ConnAck(_))) => Got::Connected,
-                Ok(In3(Incoming::Publish(p))) => Got::Message(shown(&p.topic, &[], &p.payload)),
+                Ok(In3(Incoming::Publish(p))) => Got::Message(shown(&p.topic, None, &p.payload)),
                 Ok(In3(Incoming::SubAck(ack))) => Got::SubAck(
                     (ack.return_codes.iter())
                         .map(|c| match c {
@@ -262,14 +273,11 @@ impl Events {
             },
             Events::V5(e) => match e.poll().await {
                 Ok(In5(p5::Packet::ConnAck(_))) => Got::Connected,
-                Ok(In5(p5::Packet::Publish(p))) => {
-                    let properties = p.properties.map(|p| p.user_properties);
-                    Got::Message(shown(
-                        &String::from_utf8_lossy(&p.topic),
-                        &properties.unwrap_or_default(),
-                        &p.payload,
-                    ))
-                }
+                Ok(In5(p5::Packet::Publish(p))) => Got::Message(shown(
+                    &String::from_utf8_lossy(&p.topic),
+                    p.properties.as_ref(),
+                    &p.payload,
+                )),
                 Ok(In5(p5::Packet::SubAck(ack))) => Got::SubAck(
                     (ack.return_codes.iter())
                         .map(|c| match c {
@@ -299,11 +307,23 @@ impl Events {
 }
 
 /// User properties go in the brackets, so the one-line list shows them too.
-fn shown(topic: &str, properties: &[(String, String)], payload: &[u8]) -> String {
-    let properties: String = (properties.iter())
-        .map(|(k, v)| format!(" · {k}={v}"))
-        .collect();
-    format!("[{topic}{properties}] {}", String::from_utf8_lossy(payload))
+fn shown(topic: &str, properties: Option<&p5::PublishProperties>, payload: &[u8]) -> String {
+    let mut tags = String::new();
+    if let Some(p) = properties {
+        let expiry = p.message_expiry_interval.map(|s| format!("{s}s"));
+        let named = [
+            ("content-type", p.content_type.clone()),
+            ("response-topic", p.response_topic.clone()),
+            ("expiry", expiry),
+        ];
+        let named = named
+            .into_iter()
+            .filter_map(|(k, v)| Some((k.to_owned(), v?)));
+        for (k, v) in named.chain(p.user_properties.iter().cloned()) {
+            tags += &format!(" · {k}={v}");
+        }
+    }
+    format!("[{topic}{tags}] {}", String::from_utf8_lossy(payload))
 }
 
 fn qos3(n: u8) -> rumqttc::QoS {
@@ -367,7 +387,20 @@ fn target(url: &str) -> Result<(Wire, String, u16), String> {
 
 fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Events), String> {
     let (wire, address, port) = target(&req.url)?;
-    let proxy = proxy(route, &wire, &address, port)?;
+    let insecure = net.insecure || !req.settings.verify_tls;
+    // The proxy's own TLS, if it's an https:// one, is checked as the broker's would be.
+    let tls = |url: &str| {
+        let ring = rustls::crypto::ring::default_provider();
+        let config = tls_config(
+            net,
+            net.cert_for(url),
+            insecure,
+            ring,
+            rustls::DEFAULT_VERSIONS,
+        );
+        config.map(|c| TlsConfiguration::Rustls(Arc::new(c)))
+    };
+    let proxy = proxy(route, &wire, &address, port, &tls)?;
     let m = &req.mqtt;
     let id = match m.client_id.trim() {
         "" => {
@@ -386,23 +419,15 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
     if will.contains(['+', '#']) {
         return Err("+ and # are for subscribing; a last will goes to one topic".into());
     }
-    let insecure = net.insecure || !req.settings.verify_tls;
-    let tls = || {
-        let ring = rustls::crypto::ring::default_provider();
-        let config = tls_config(
-            net,
-            net.cert_for(&req.url),
-            insecure,
-            ring,
-            rustls::DEFAULT_VERSIONS,
-        );
-        config.map(|c| TlsConfiguration::Rustls(Arc::new(c)))
-    };
+    let will_extras = !m.will_content_type.is_empty() || m.will_expiry_secs > 0;
+    if !m.v5 && !will.is_empty() && will_extras {
+        return Err("the will's content type and expiry need MQTT 5.0".into());
+    }
     let transport = match wire {
         Wire::Tcp => Transport::Tcp,
-        Wire::Tls => Transport::tls_with_config(tls()?),
+        Wire::Tls => Transport::tls_with_config(tls(&req.url)?),
         Wire::Ws => Transport::Ws,
-        Wire::Wss => Transport::wss_with_config(tls()?),
+        Wire::Wss => Transport::wss_with_config(tls(&req.url)?),
     };
     let keep_alive = Duration::from_secs(m.keep_alive_secs.into());
     if m.v5 {
@@ -416,7 +441,18 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
         }
         if !will.is_empty() {
             let (payload, qos) = (m.will_payload.clone(), qos5(m.will_qos));
-            o.set_last_will(p5::LastWill::new(will, payload, qos, m.will_retain, None));
+            let properties = will_extras.then(|| p5::LastWillProperties {
+                delay_interval: None,
+                payload_format_indicator: None,
+                message_expiry_interval: (m.will_expiry_secs > 0).then_some(m.will_expiry_secs),
+                content_type: (!m.will_content_type.is_empty())
+                    .then(|| m.will_content_type.clone()),
+                response_topic: None,
+                correlation_data: None,
+                user_properties: Vec::new(),
+            });
+            let will = p5::LastWill::new(will, payload, qos, m.will_retain, properties);
+            o.set_last_will(will);
         }
         // In v5 a session ends with the connection unless it's given a lifetime; "keep
         // the session" means what it does in 3.1.1: until the broker forgets it.
@@ -449,8 +485,14 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
 }
 
 /// The proxy the settings pick for the broker, asked as for an https URL when the broker
-/// speaks TLS, else as for http. Tunnelled with CONNECT.
-fn proxy(route: &Route, wire: &Wire, address: &str, port: u16) -> Result<Option<Proxy>, String> {
+/// speaks TLS, else as for http. Tunnelled with CONNECT, over TLS to an https:// proxy.
+fn proxy(
+    route: &Route,
+    wire: &Wire,
+    address: &str,
+    port: u16,
+    tls: &dyn Fn(&str) -> Result<TlsConfiguration, String>,
+) -> Result<Option<Proxy>, String> {
     let (scheme, host) = match wire {
         Wire::Tcp => ("http", Some(address.to_owned())),
         Wire::Tls => ("https", Some(address.to_owned())),
@@ -464,17 +506,17 @@ fn proxy(route: &Route, wire: &Wire, address: &str, port: u16) -> Result<Option<
     let Some((url, login)) = probe.and_then(|p| route.proxy_for(&p)) else {
         return Ok(None);
     };
-    // ponytail: plain http proxies only (what PAC's "PROXY" means); an https:// one would
-    // need ProxyType::Https with its own TLS settings.
-    let (Some(addr), Some(proxy_port), "http") =
-        (url.host_str(), url.port_or_known_default(), url.scheme())
-    else {
-        return Err(format!(
-            "MQTT can only go through an http:// proxy, not {url}"
-        ));
+    let refused = || format!("MQTT can only go through an http:// or https:// proxy, not {url}");
+    let (Some(addr), Some(proxy_port)) = (url.host_str(), url.port_or_known_default()) else {
+        return Err(refused());
+    };
+    let ty = match url.scheme() {
+        "http" => ProxyType::Http,
+        "https" => ProxyType::Https(tls(url.as_str())?),
+        _ => return Err(refused()),
     };
     Ok(Some(Proxy {
-        ty: ProxyType::Http,
+        ty,
         auth: match login {
             Some((username, password)) => ProxyAuth::Basic { username, password },
             None => ProxyAuth::None,
@@ -699,24 +741,55 @@ pub mod tests {
     fn proxy_to_broker(serve: fn(&mut dyn Pipe)) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || tunnel(listener.accept().unwrap().0, serve));
+        port
+    }
+
+    /// `proxy_to_broker` spoken over TLS, as an https:// proxy is, with a self-signed
+    /// certificate for localhost (returned, for the client's CA file).
+    fn tls_proxy_to_broker(serve: fn(&mut dyn Pipe)) -> (u16, String) {
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = PrivateKeyDer::try_from(own.signing_key.serialize_der()).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![own.cert.der().clone()], key)
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
-            // Byte by byte: what follows the request is MQTT.
-            let mut head = Vec::new();
-            while !head.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                s.read_exact(&mut byte).unwrap();
-                head.push(byte[0]);
+            let mut conn = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            while conn.is_handshaking() {
+                if conn.complete_io(&mut s).is_err() {
+                    return;
+                }
             }
-            let head = String::from_utf8(head).unwrap();
-            let auth = base64::engine::general_purpose::STANDARD.encode("u:p@ss");
-            assert!(head.starts_with("CONNECT broker.test:1883 "), "{head}");
-            assert!(head.contains(&format!("Basic {auth}\r\n")), "{head}");
-            s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                .unwrap();
-            serve(&mut s)
+            tunnel(rustls::StreamOwned::new(conn, s), serve)
         });
-        port
+        (port, own.cert.pem())
+    }
+
+    /// The proxy's side once a client is in: CONNECT (checked), then the broker.
+    fn tunnel<S: Read + Write + Pipe>(mut s: S, serve: fn(&mut dyn Pipe)) {
+        // Byte by byte: what follows the request is MQTT.
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            s.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let auth = base64::engine::general_purpose::STANDARD.encode("u:p@ss");
+        assert!(head.starts_with("CONNECT broker.test:1883 "), "{head}");
+        assert!(head.contains(&format!("Basic {auth}\r\n")), "{head}");
+        s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .unwrap();
+        s.flush().unwrap();
+        serve(&mut s)
     }
 
     /// Just enough MQTT 3.1.1 broker for client "tester" signing in as u/p, with "offline"
@@ -814,7 +887,17 @@ pub mod tests {
             ("u", "p")
         );
         assert_eq!(connect.client_id, "tester");
-        let offline = p5::LastWill::new("status/tester", "offline", qos5(1), true, None);
+        let properties = p5::LastWillProperties {
+            delay_interval: None,
+            payload_format_indicator: None,
+            message_expiry_interval: Some(300),
+            content_type: Some("text/plain".into()),
+            response_topic: None,
+            correlation_data: None,
+            user_properties: Vec::new(),
+        };
+        let offline =
+            p5::LastWill::new("status/tester", "offline", qos5(1), true, Some(properties));
         assert_eq!(will, Some(offline));
         let ack = p5::ConnAck {
             session_present: false,
@@ -888,6 +971,13 @@ pub mod tests {
                 will_payload: "offline".into(),
                 will_qos: 1,
                 will_retain: true,
+                // 3.1.1 has nowhere to put them.
+                will_content_type: if v5 {
+                    "text/plain".into()
+                } else {
+                    String::new()
+                },
+                will_expiry_secs: if v5 { 300 } else { 0 },
                 ..Default::default()
             },
             ..Default::default()
@@ -895,7 +985,7 @@ pub mod tests {
     }
 
     /// Subscribes to a/# and "denied"; answers the hello with a publish (with a user
-    /// property in MQTT 5); once the echo is back, swaps "denied" for b/# while
+    /// property, content type, response topic and expiry in MQTT 5); once the echo is back, swaps "denied" for b/# while
     /// connected; hangs up once b/# is subscribed.
     fn exchange(req: Request, net: Network) -> Vec<Event> {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -906,7 +996,8 @@ pub mod tests {
             .block_on(crate::net::build_client(net.clone()))
             .unwrap()
             .route;
-        let properties = match req.mqtt.v5 {
+        let v5 = req.mqtt.v5;
+        let properties = match v5 {
             true => vec![("unit".to_owned(), "°C".to_owned())],
             false => Vec::new(),
         };
@@ -925,6 +1016,13 @@ pub mod tests {
                     retain: false,
                     payload: "ping".into(),
                     properties: properties.clone(),
+                    content_type: if v5 {
+                        "text/plain".into()
+                    } else {
+                        String::new()
+                    },
+                    response_topic: if v5 { "reply/1".into() } else { String::new() },
+                    expiry_secs: if v5 { 60 } else { 0 },
                 })),
                 Event::In(t) if t.starts_with("[a/echo") => {
                     command(Command::Topics(vec![("a/#".into(), 1), ("b/#".into(), 0)]))
@@ -937,10 +1035,13 @@ pub mod tests {
         events.into_inner().unwrap()
     }
 
-    /// MQTT 5's refusal says why, and its messages carry the user property both ways.
+    /// MQTT 5's refusal says why, and its messages carry their properties both ways.
     fn expected(v5: bool) -> Vec<Event> {
         let (refused, unit) = match v5 {
-            true => ("refused (NotAuthorized)", " · unit=°C"),
+            true => (
+                "refused (NotAuthorized)",
+                " · content-type=text/plain · response-topic=reply/1 · expiry=60s · unit=°C",
+            ),
             false => ("refused", ""),
         };
         vec![
@@ -960,8 +1061,16 @@ pub mod tests {
     fn subscribes_publishes_follows_topic_changes_and_says_goodbye() {
         let url = format!("mqtt://127.0.0.1:{}", broker());
         assert_eq!(
-            exchange(request(url, false), Network::default()),
+            exchange(request(url.clone(), false), Network::default()),
             expected(false)
+        );
+        // Dropped silently, the will would go out without what it was meant to say.
+        let mut req = request(url, false);
+        req.mqtt.will_expiry_secs = 300;
+        let events = exchange(req, Network::default());
+        assert!(
+            matches!(events.as_slice(), [Event::Error(e)] if e.contains("MQTT 5")),
+            "{events:?}"
         );
     }
 
@@ -1100,6 +1209,25 @@ pub mod tests {
         };
         assert_eq!(via(serve_v3, false), expected(false));
         assert_eq!(via(serve_v5, true), expected(true));
+
+        // An https:// proxy is reached over TLS, its certificate checked against the CA file
+        // like any server's, then tunnelled as before.
+        let via_tls = |serve, v5| {
+            let (port, cert) = tls_proxy_to_broker(serve);
+            let ca = std::env::temp_dir().join(format!("apitool-mqtt-proxy-{port}.pem"));
+            std::fs::write(&ca, cert).unwrap();
+            let net = Network {
+                proxy: crate::net::ProxyMode::Manual,
+                proxy_url: format!("https://u:p%40ss@localhost:{port}"),
+                ca_file: ca.display().to_string(),
+                ..Default::default()
+            };
+            let events = exchange(request("mqtt://broker.test:1883".into(), v5), net);
+            std::fs::remove_file(&ca).unwrap();
+            events
+        };
+        assert_eq!(via_tls(serve_v3, false), expected(false));
+        assert_eq!(via_tls(serve_v5, true), expected(true));
     }
 
     #[test]

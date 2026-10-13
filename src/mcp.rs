@@ -452,6 +452,9 @@ impl Server {
                 retain: m.retain,
                 payload,
                 properties,
+                content_type: m.content_type.trim().to_owned(),
+                response_topic: m.response_topic.trim().to_owned(),
+                expiry_secs: m.expiry_secs,
             };
             let _ = mqtt_tx.send(crate::mqtt::Command::Publish(publish));
         }

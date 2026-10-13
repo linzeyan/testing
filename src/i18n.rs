@@ -1326,14 +1326,6 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Update", "更新"),
     ("Updates", "更新"),
     ("Use the files", "使用檔案"),
-    (
-        "User properties need MQTT 5.0 (Settings)",
-        "使用者屬性需要 MQTT 5.0（設定）",
-    ),
-    (
-        "User properties need MQTT 5.0 (Settings).",
-        "使用者屬性需要 MQTT 5.0（設定）。",
-    ),
     ("Username", "使用者名稱"),
     (
         "Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// use the certificate settings in Network settings, and the connection goes through its proxy.",
@@ -1384,6 +1376,28 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Whole word", "全字相符"),
     ("Will message", "遺囑訊息內容"),
+    // MQTT 5 message and will properties.
+    (
+        "0: the broker keeps it until it's delivered",
+        "0：broker 會一直保留到送達為止",
+    ),
+    ("Expires after", "到期時間"),
+    ("Content type", "內容類型"),
+    ("Response topic", "回覆主題"),
+    (
+        "Message properties need MQTT 5.0 (Settings).",
+        "訊息屬性需要 MQTT 5.0（設定）。",
+    ),
+    (
+        "Message properties need MQTT 5.0 (Settings)",
+        "訊息屬性需要 MQTT 5.0（設定）",
+    ),
+    (
+        "MQTT 5.0. Expiry 0: the broker keeps it until it's delivered",
+        "MQTT 5.0。到期時間 0：broker 會一直保留到送達為止",
+    ),
+    ("Where the receiver should answer", "接收端應回覆到哪裡"),
+    ("Will content type", "遺囑內容類型"),
     (
         "Windows has \"Automatically detect settings\" on: the PAC script is looked up via WPAD (DHCP, then DNS) before the first request. If what it finds isn't a usable script, requests go out directly.",
         "Windows 開啟了「自動偵測設定」：第一個請求送出前，會透過 WPAD（先 DHCP 後 DNS）尋找 PAC 指令碼。找到的若不是可用的指令碼，請求就直接連線。",

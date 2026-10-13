@@ -174,6 +174,15 @@ pub struct Mqtt {
     /// MQTT 5 user properties sent with every publish, like headers.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub user_properties: Vec<KeyValue>,
+    /// MQTT 5 publish properties; empty or 0 isn't sent.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub content_type: String,
+    /// Where the receiver should answer.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub response_topic: String,
+    /// How long the broker holds a message nobody has taken yet; 0: until it's taken.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub expiry_secs: u32,
     /// What the broker publishes for this client when it drops without a goodbye. No
     /// topic: no will.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -182,6 +191,11 @@ pub struct Mqtt {
     pub will_payload: String,
     pub will_qos: u8,
     pub will_retain: bool,
+    /// MQTT 5 will properties, as Postman has them.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub will_content_type: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub will_expiry_secs: u32,
 }
 
 impl Default for Mqtt {
@@ -196,10 +210,15 @@ impl Default for Mqtt {
             qos: 0,
             retain: false,
             user_properties: Vec::new(),
+            content_type: String::new(),
+            response_topic: String::new(),
+            expiry_secs: 0,
             will_topic: String::new(),
             will_payload: String::new(),
             will_qos: 0,
             will_retain: false,
+            will_content_type: String::new(),
+            will_expiry_secs: 0,
         }
     }
 }
@@ -377,6 +396,10 @@ fn enabled() -> bool {
 
 fn is_enabled(b: &bool) -> bool {
     *b
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl KeyValue {
@@ -1011,8 +1034,11 @@ impl Request {
                     })
                     .collect(),
                 topic: r(&self.mqtt.topic),
+                content_type: r(self.mqtt.content_type.trim()),
+                response_topic: r(self.mqtt.response_topic.trim()),
                 will_topic: r(self.mqtt.will_topic.trim()),
                 will_payload: r(&self.mqtt.will_payload),
+                will_content_type: r(self.mqtt.will_content_type.trim()),
                 ..self.mqtt.clone()
             },
             socketio: SocketIo {
@@ -1321,6 +1347,30 @@ mod tests {
         assert_eq!(req.resolved(&vars).0.url, "http://x/a?key=s3cr3t");
     }
 
+    /// MCP and the will go out from the resolved request, not the editor's.
+    #[test]
+    fn mqtt_5_properties_fill_in_variables() {
+        let req = Request {
+            method: "MQTT".into(),
+            mqtt: Mqtt {
+                content_type: "{{type}}".into(),
+                response_topic: "reply/{{id}}".into(),
+                will_content_type: "{{type}}".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let vars = HashMap::from([
+            ("type".to_owned(), "text/csv".to_owned()),
+            ("id".to_owned(), "7".to_owned()),
+        ]);
+        let m = req.resolved(&vars).0.mqtt;
+        assert_eq!(
+            [m.content_type, m.response_topic, m.will_content_type],
+            ["text/csv", "reply/7", "text/csv"]
+        );
+    }
+
     #[test]
     fn resolved_drops_disabled_rows() {
         let mut off = KeyValue::new("debug", "1");
@@ -1387,10 +1437,15 @@ mod tests {
                 qos: 1,
                 retain: true,
                 user_properties: vec![KeyValue::new("trace", "{{id}}")],
+                content_type: "application/json".into(),
+                response_topic: "reply/{{device}}".into(),
+                expiry_secs: 60,
                 will_topic: "status/{{device}}".into(),
                 will_payload: "offline".into(),
                 will_qos: 2,
                 will_retain: true,
+                will_content_type: "text/plain".into(),
+                will_expiry_secs: 300,
             },
             socketio: SocketIo {
                 path: "/{{prefix}}/rt".into(),

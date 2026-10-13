@@ -387,8 +387,30 @@ fn curl(w: &Wire) -> String {
 
 fn wget(w: &Wire) -> String {
     let mut out = String::new();
-    if !w.parts.is_empty() {
-        out.push_str("# wget can't send multipart/form-data; use the cURL snippet.\n");
+    let multipart = !w.parts.is_empty();
+    // wget has no multipart option: the body is written to a file first and sent from it.
+    // printf's arguments are taken as they are, so values need no escaping beyond sh().
+    if multipart {
+        out.push_str("boundary=\"Boundary-$RANDOM$RANDOM\"\nbody=$(mktemp)\n{\n");
+        let head = r#"--%s\r\nContent-Disposition: form-data; name="%s""#;
+        for (key, p) in &w.parts {
+            let _ = match p {
+                Part::Text(text) => writeln!(
+                    out,
+                    "  printf -- '{head}\\r\\n\\r\\n%s\\r\\n' \"$boundary\" {} {}",
+                    sh(key),
+                    sh(text)
+                ),
+                Part::File(path) => writeln!(
+                    out,
+                    "  printf -- '{head}; filename=\"%s\"\\r\\n\\r\\n' \"$boundary\" {} {}\n  cat {}\n  printf '\\r\\n'",
+                    sh(key),
+                    sh(Wire::file_name(path)),
+                    sh(path)
+                ),
+            };
+        }
+        out.push_str("  printf -- '--%s--\\r\\n' \"$boundary\"\n} > \"$body\"\n");
     }
     out.push_str("wget --no-verbose --output-document -");
     if w.method != "GET" {
@@ -420,7 +442,15 @@ fn wget(w: &Wire) -> String {
     if let Some(path) = &w.file {
         let _ = write!(out, " \\\n  --body-file {}", sh(path));
     }
+    if multipart {
+        out.push_str(
+            " \\\n  --header \"Content-Type: multipart/form-data; boundary=$boundary\" \\\n  --body-file \"$body\"",
+        );
+    }
     let _ = write!(out, " \\\n  {}", sh(w.url.as_str()));
+    if multipart {
+        out.push_str("\nrm \"$body\"");
+    }
     out
 }
 
@@ -960,18 +990,61 @@ fn java(w: &Wire) -> String {
         "import java.net.URI;\nimport java.net.http.HttpClient;\n\
          import java.net.http.HttpRequest;\nimport java.net.http.HttpResponse;\n",
     );
-    if w.file.is_some() {
+    let multipart = !w.parts.is_empty();
+    if multipart {
+        out.push_str(
+            "import java.io.ByteArrayOutputStream;\nimport java.io.IOException;\n\
+             import java.nio.charset.StandardCharsets;\nimport java.nio.file.Files;\n",
+        );
+    }
+    if w.file.is_some() || multipart {
         out.push_str("import java.nio.file.Path;\n");
+    }
+    if multipart {
+        out.push_str("import java.util.UUID;\n");
     }
     if w.settings.timeout_ms > 0 {
         out.push_str("import java.time.Duration;\n");
     }
-    out.push_str(
-        "\npublic class Main {\n    public static void main(String[] args) throws Exception {\n",
-    );
-    if !w.parts.is_empty() {
+    out.push_str("\npublic class Main {\n");
+    // HttpClient has no multipart builder, so the body is put together by hand.
+    if multipart {
         out.push_str(
-            "        // HttpClient has no multipart builder; see the Kotlin (OkHttp) snippet.\n",
+            "    static void part(ByteArrayOutputStream body, String boundary, String name,\n\
+             \x20           String filename, byte[] content) throws IOException {\n\
+             \x20       String head = \"--\" + boundary + \"\\r\\nContent-Disposition: form-data; name=\\\"\" + name + \"\\\"\";\n\
+             \x20       if (filename != null) head += \"; filename=\\\"\" + filename + \"\\\"\";\n\
+             \x20       body.write((head + \"\\r\\n\\r\\n\").getBytes(StandardCharsets.UTF_8));\n\
+             \x20       body.write(content);\n\
+             \x20       body.write(\"\\r\\n\".getBytes(StandardCharsets.UTF_8));\n\
+             \x20   }\n\n",
+        );
+    }
+    out.push_str("    public static void main(String[] args) throws Exception {\n");
+    if multipart {
+        out.push_str(
+            "        String boundary = \"Boundary-\" + UUID.randomUUID();\n\
+             \x20       ByteArrayOutputStream body = new ByteArrayOutputStream();\n",
+        );
+        for (key, p) in &w.parts {
+            let _ = match p {
+                Part::Text(text) => writeln!(
+                    out,
+                    "        part(body, boundary, {}, null, {}.getBytes(StandardCharsets.UTF_8));",
+                    dq(key),
+                    dq(text)
+                ),
+                Part::File(path) => writeln!(
+                    out,
+                    "        part(body, boundary, {}, {}, Files.readAllBytes(Path.of({})));",
+                    dq(key),
+                    dq(Wire::file_name(path)),
+                    dq(path)
+                ),
+            };
+        }
+        out.push_str(
+            "        body.write((\"--\" + boundary + \"--\\r\\n\").getBytes(StandardCharsets.UTF_8));\n",
         );
     }
     if w.insecure() {
@@ -998,6 +1071,7 @@ fn java(w: &Wire) -> String {
     let publisher = match (&w.body, &w.file) {
         (Some(body), _) => format!("HttpRequest.BodyPublishers.ofString({})", dq(body)),
         (_, Some(path)) => format!("HttpRequest.BodyPublishers.ofFile(Path.of({}))", dq(path)),
+        _ if multipart => "HttpRequest.BodyPublishers.ofByteArray(body.toByteArray())".into(),
         _ => "HttpRequest.BodyPublishers.noBody()".into(),
     };
     let _ = write!(
@@ -1010,6 +1084,11 @@ fn java(w: &Wire) -> String {
     );
     for (k, v) in &w.headers {
         let _ = writeln!(out, "            .header({}, {})", dq(k), dq(v));
+    }
+    if multipart {
+        out.push_str(
+            "            .header(\"Content-Type\", \"multipart/form-data; boundary=\" + boundary)\n",
+        );
     }
     if w.settings.timeout_ms > 0 {
         let _ = writeln!(
@@ -2081,6 +2160,47 @@ fn mqtt_properties(s: &Stream) -> Vec<(&str, &str)> {
         .collect()
 }
 
+/// MQTT 5's other publish properties, by their MQTT names.
+fn mqtt_publish_extras(s: &Stream) -> Vec<(&'static str, String)> {
+    let m = &s.req.mqtt;
+    mqtt_extras(m.v5, &m.content_type, &m.response_topic, m.expiry_secs)
+}
+
+/// The will's MQTT 5 properties; none without a will.
+fn mqtt_will_extras(s: &Stream) -> Vec<(&'static str, String)> {
+    let m = &s.req.mqtt;
+    let v5 = m.v5 && !m.will_topic.trim().is_empty();
+    mqtt_extras(v5, &m.will_content_type, "", m.will_expiry_secs)
+}
+
+fn mqtt_extras(v5: bool, content: &str, reply: &str, expiry: u32) -> Vec<(&'static str, String)> {
+    let expiry = if expiry > 0 {
+        expiry.to_string()
+    } else {
+        String::new()
+    };
+    let all = [
+        ("content-type", content.trim().to_owned()),
+        ("response-topic", reply.trim().to_owned()),
+        ("message-expiry-interval", expiry),
+    ];
+    (all.into_iter())
+        .filter(|(_, v)| v5 && !v.is_empty())
+        .collect()
+}
+
+/// `(name, value)` in a client's own spelling; the expiry is a number, the rest strings.
+fn mqtt_extra(name: &str, value: &str, names: [&'static str; 3]) -> (&'static str, String) {
+    match name {
+        "content-type" => (names[0], dq(value)),
+        "response-topic" => (names[1], dq(value)),
+        _ => (names[2], value.to_owned()),
+    }
+}
+
+const PAHO_NAMES: [&str; 3] = ["ContentType", "ResponseTopic", "MessageExpiryInterval"];
+const MQTT_JS_NAMES: [&str; 3] = ["contentType", "responseTopic", "messageExpiryInterval"];
+
 fn mqtt_mosquitto(s: &Stream) -> String {
     let (b, m) = (Broker::of(&s.req.url), &s.req.mqtt);
     if b.websocket() {
@@ -2121,6 +2241,9 @@ fn mqtt_mosquitto(s: &Stream) -> String {
             if m.will_retain {
                 out.push_str(" --will-retain");
             }
+            for (k, v) in mqtt_will_extras(s) {
+                let _ = write!(out, " -D will {k} {}", sh(&v));
+            }
         }
         // One QoS for every topic: the highest asked for.
         let qos = topics.iter().map(|(_, q)| *q).max().unwrap_or(0);
@@ -2144,6 +2267,9 @@ fn mqtt_mosquitto(s: &Stream) -> String {
         if m.retain {
             out.push_str(" -r");
         }
+        for (k, v) in mqtt_publish_extras(s) {
+            let _ = write!(out, " -D publish {k} {}", sh(&v));
+        }
         for (k, v) in mqtt_properties(s) {
             let _ = write!(out, " -D publish user-property {} {}", sh(k), sh(v));
         }
@@ -2158,18 +2284,35 @@ fn mqtt_mosquitto(s: &Stream) -> String {
 fn mqtt_python(s: &Stream) -> String {
     let (b, m) = (Broker::of(&s.req.url), &s.req.mqtt);
     let user_properties = mqtt_properties(s);
+    let (extras, will_extras) = (mqtt_publish_extras(s), mqtt_will_extras(s));
+    let publishes = !user_properties.is_empty() || !extras.is_empty();
     let mut out = String::from("import paho.mqtt.client as mqtt\n");
-    if !user_properties.is_empty() {
+    if publishes || !will_extras.is_empty() {
         out.push_str(
             "from paho.mqtt.packettypes import PacketTypes\n\
-             from paho.mqtt.properties import Properties\n\n\
-             publish_properties = Properties(PacketTypes.PUBLISH)\n\
-             publish_properties.UserProperty = [\n",
+             from paho.mqtt.properties import Properties\n",
         );
+    }
+    if publishes {
+        out.push_str("\npublish_properties = Properties(PacketTypes.PUBLISH)\n");
+        for (k, v) in &extras {
+            let (k, v) = mqtt_extra(k, v, PAHO_NAMES);
+            let _ = writeln!(out, "publish_properties.{k} = {v}");
+        }
+    }
+    if !user_properties.is_empty() {
+        out.push_str("publish_properties.UserProperty = [\n");
         for (k, v) in &user_properties {
             let _ = writeln!(out, "    ({}, {}),", dq(k), dq(v));
         }
         out.push_str("]\n");
+    }
+    if !will_extras.is_empty() {
+        out.push_str("\nwill_properties = Properties(PacketTypes.WILLMESSAGE)\n");
+        for (k, v) in &will_extras {
+            let (k, v) = mqtt_extra(k, v, PAHO_NAMES);
+            let _ = writeln!(out, "will_properties.{k} = {v}");
+        }
     }
     out.push_str(
         "\n\ndef on_connect(client, userdata, flags, reason_code, properties):\n    \
@@ -2185,9 +2328,9 @@ fn mqtt_python(s: &Stream) -> String {
     }
     if !m.topic.trim().is_empty() {
         let retain = if m.retain { "True" } else { "False" };
-        let properties = match user_properties.is_empty() {
-            true => "",
-            false => ", properties=publish_properties",
+        let properties = match publishes {
+            true => ", properties=publish_properties",
+            false => "",
         };
         let _ = writeln!(
             out,
@@ -2228,9 +2371,13 @@ fn mqtt_python(s: &Stream) -> String {
     }
     if !m.will_topic.trim().is_empty() {
         let retain = if m.will_retain { "True" } else { "False" };
+        let properties = match will_extras.is_empty() {
+            true => "",
+            false => ", properties=will_properties",
+        };
         let _ = writeln!(
             out,
-            "client.will_set({}, {}, qos={}, retain={retain})",
+            "client.will_set({}, {}, qos={}, retain={retain}{properties})",
             dq(m.will_topic.trim()),
             dq(&m.will_payload),
             m.will_qos
@@ -2272,9 +2419,17 @@ fn mqtt_node(s: &Stream) -> String {
         m.clean_session
     );
     if !m.will_topic.trim().is_empty() {
+        let extras: Vec<String> = (mqtt_will_extras(s).iter())
+            .map(|(k, v)| mqtt_extra(k, v, MQTT_JS_NAMES))
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect();
+        let properties = match extras.is_empty() {
+            true => String::new(),
+            false => format!(", properties: {{ {} }}", extras.join(", ")),
+        };
         let _ = writeln!(
             out,
-            "  will: {{ topic: {}, payload: {}, qos: {}, retain: {} }},",
+            "  will: {{ topic: {}, payload: {}, qos: {}, retain: {}{properties} }},",
             dq(m.will_topic.trim()),
             dq(&m.will_payload),
             m.will_qos,
@@ -2291,16 +2446,19 @@ fn mqtt_node(s: &Stream) -> String {
     }
     if !m.topic.trim().is_empty() {
         let mut options = format!("qos: {}, retain: {}", m.qos, m.retain);
-        let properties = mqtt_properties(s);
-        if !properties.is_empty() {
-            let list: Vec<String> = (properties.iter())
+        let mut properties: Vec<String> = (mqtt_publish_extras(s).iter())
+            .map(|(k, v)| mqtt_extra(k, v, MQTT_JS_NAMES))
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect();
+        let user = mqtt_properties(s);
+        if !user.is_empty() {
+            let list: Vec<String> = (user.iter())
                 .map(|(k, v)| format!("{}: {}", dq(k), dq(v)))
                 .collect();
-            let _ = write!(
-                options,
-                ", properties: {{ userProperties: {{ {} }} }}",
-                list.join(", ")
-            );
+            properties.push(format!("userProperties: {{ {} }}", list.join(", ")));
+        }
+        if !properties.is_empty() {
+            let _ = write!(options, ", properties: {{ {} }}", properties.join(", "));
         }
         let _ = writeln!(
             out,
@@ -2325,6 +2483,12 @@ fn mqtt_go(s: &Stream) -> String {
         );
         for (k, v) in mqtt_properties(s) {
             let _ = writeln!(out, "// Left out, as MQTT 5 user property: {k}: {v}");
+        }
+        for (k, v) in mqtt_publish_extras(s) {
+            let _ = writeln!(out, "// Left out, as MQTT 5 publish property: {k}: {v}");
+        }
+        for (k, v) in mqtt_will_extras(s) {
+            let _ = writeln!(out, "// Left out, as MQTT 5 will property: {k}: {v}");
         }
     }
     let _ = write!(
@@ -2789,6 +2953,48 @@ mod tests {
         }
     }
 
+    /// Java and wget have no multipart helper: the body is put together by hand and sent,
+    /// rather than pointing to another snippet (both also run in .github/snippets.py).
+    #[test]
+    fn java_and_wget_build_a_multipart_body_themselves() {
+        let (_, req) = (cases().into_iter())
+            .find(|(case, _)| *case == "multipart")
+            .unwrap();
+        let java = generate("Java (HttpClient)", req.clone()).unwrap();
+        let file = r#"part(body, boundary, "doc", "upload.txt", Files.readAllBytes(Path.of("upload.txt")));"#;
+        let header = r#".header("Content-Type", "multipart/form-data; boundary=" + boundary)"#;
+        assert!(java.contains(file) && java.contains(header), "{java}");
+        assert!(java.contains("ofByteArray(body.toByteArray())"), "{java}");
+
+        let wget = generate("wget", req).unwrap();
+        assert!(wget.contains(r#"--body-file "$body""#), "{wget}");
+        // What it writes before calling wget, run as it is: a body a server can read.
+        #[cfg(unix)]
+        {
+            let dir = std::env::temp_dir().join(format!("apitool-wget-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("upload.txt"), "hello file\n").unwrap();
+            let build = wget.split("\nwget ").next().unwrap();
+            let script = format!("{build}\nprintf %s \"$boundary\"; cat \"$body\"; rm \"$body\"");
+            let out = std::process::Command::new("bash")
+                .args(["-c", &script])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            let out = String::from_utf8(out.stdout).unwrap();
+            let (boundary, body) = out.split_at(out.find("--").unwrap());
+            assert!(boundary.starts_with("Boundary-"), "{out}");
+            let expected = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\n\
+                 it's \"quoted\" $HOME #{{x}} \\ back\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"upload.txt\"\r\n\r\n\
+                 hello file\n\r\n--{boundary}--\r\n"
+            );
+            assert_eq!(body, expected);
+        }
+    }
+
     /// Each kind of stream renders every one of its targets, carrying what Connect would
     /// send: the URL as that client spells it, the handshake's headers, the login.
     #[test]
@@ -2826,7 +3032,12 @@ mod tests {
             qos: 1,
             retain: true,
             user_properties: vec![KeyValue::new("trace", "42")],
+            content_type: "text/csv".into(),
+            response_topic: "replies/7".into(),
+            expiry_secs: 90,
             will_topic: "gone".into(),
+            will_content_type: "text/x-gone".into(),
+            will_expiry_secs: 600,
             ..Default::default()
         };
         #[rustfmt::skip]
@@ -2849,9 +3060,10 @@ mod tests {
             (
                 Request {
                     method: "MQTT".into(), url: "mqtts://broker.test".into(),
-                    auth: Auth::Basic { username: "bob".into(), password: "pw".into() }, mqtt, ..Default::default()
+                    auth: Auth::Basic { username: "bob".into(), password: "pw".into() }, mqtt: mqtt.clone(), ..Default::default()
                 },
-                &["broker.test", "8883", "bob", "pw", "sensors/+", "out", "probe", "gone", "trace", "42"],
+                &["broker.test", "8883", "bob", "pw", "sensors/+", "out", "probe", "gone", "trace", "42",
+                  "text/csv", "replies/7", "90", "text/x-gone", "600"],
             ),
             (
                 Request {
@@ -2883,6 +3095,26 @@ mod tests {
                     let name = format!("{}.{file}.{ext}", req.method.to_lowercase());
                     std::fs::write(dir.join(name), code).unwrap();
                 }
+            }
+        }
+        // paho takes them only as arguments; defined and left unused, nothing would go out.
+        let req = |v5| Request {
+            method: "MQTT".into(),
+            url: "mqtt://broker.test".into(),
+            mqtt: crate::model::Mqtt { v5, ..mqtt.clone() },
+            ..Default::default()
+        };
+        let python = generate("Python (paho-mqtt)", req(true)).unwrap();
+        assert!(
+            python.contains(", properties=publish_properties)"),
+            "{python}"
+        );
+        assert!(python.contains(", properties=will_properties)"), "{python}");
+        // A 3.1.1 broker would refuse a packet carrying MQTT 5 properties.
+        for target in targets("MQTT") {
+            let code = generate(target, req(false)).unwrap();
+            for v5_only in ["trace", "text/csv", "replies/7", "text/x-gone"] {
+                assert!(!code.contains(v5_only), "{target} has {v5_only}:\n{code}");
             }
         }
         // The .proto says Talk streams both ways: every message is written, every answer read.
