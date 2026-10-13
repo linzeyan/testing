@@ -66,6 +66,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("  · server stream", "  · 伺服器串流"),
     (" and 1 environment", "，以及 1 個環境"),
     (" and {} environments", "，以及 {} 個環境"),
+    (" and {} globals", "，以及 {} 個全域變數"),
     ("(not set)", "(未設定)"),
     ("(top level)", "（最上層）"),
     ("*.corp.com or host:8443", "*.corp.com 或 host:8443"),
@@ -110,6 +111,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ("\"{}\" already exists", "「{}」已存在"),
     ("\"{}\" already exists there", "那裡已有「{}」"),
     ("\"{}\" no longer exists", "「{}」已不存在"),
+    (
+        "A Postman v3 collection folder, or a Native Git workspace with its environments and globals",
+        "Postman v3 的集合資料夾，或含環境與全域變數的 Native Git 工作區",
+    ),
     (
         "A broker drops the older of two connections with the same ID",
         "同一個 ID 有兩條連線時，broker 會斷開較舊的那條",
@@ -241,6 +246,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Choose a file", "選擇檔案"),
     ("Choose file…", "選擇檔案…"),
+    ("Choose folder…", "選擇資料夾…"),
     ("Choose where to save", "選擇儲存位置"),
     ("Clean session", "清除工作階段"),
     ("Clear", "清除"),
@@ -662,6 +668,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Import a collection or spec", "匯入集合或規格"),
     ("Imported curl command", "已匯入 curl 指令"),
     ("Imported environment \"{}\"", "已匯入環境「{}」"),
+    ("Imported {} environments", "已匯入 {} 個環境"),
+    ("Imported {} globals", "已匯入 {} 個全域變數"),
     (
         "Imported {} requests into \"{}\"",
         "已匯入 {} 個請求到「{}」",

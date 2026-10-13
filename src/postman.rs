@@ -33,12 +33,25 @@ pub enum Import {
         shared: Vec<KeyValue>,
         secret: Vec<KeyValue>,
     },
+    /// Added to the globals; a key already there keeps its value.
+    Globals {
+        shared: Vec<KeyValue>,
+        secret: Vec<KeyValue>,
+    },
 }
 
 pub fn from_value(v: &Value) -> Result<Import, String> {
     let v = v.clone();
     if let Some(values) = v["values"].as_array() {
-        return Ok(environment(&v, values));
+        let (shared, secret) = variables(values);
+        return Ok(match v["_postman_variable_scope"] == "globals" {
+            true => Import::Globals { shared, secret },
+            false => Import::Environment {
+                name: safe_name(str_of(&v["name"])),
+                shared,
+                secret,
+            },
+        });
     }
     if !v["item"].is_array() {
         return Err("not a Postman collection or environment".into());
@@ -149,6 +162,10 @@ impl Reader {
         req.settings = settings(&item["protocolProfileBehavior"]);
         let examples = item["response"].as_array().into_iter().flatten();
         req.examples = examples.map(example).collect();
+        // A v3 stream request (`postman3`) brings what a v2.1 item can't hold.
+        for warning in crate::postman3::stream(&mut req, &item["_v3"]) {
+            self.warn(key, warning);
+        }
         req.sync_params();
         self.requests.push((key.to_owned(), req));
     }
@@ -454,7 +471,7 @@ fn example(r: &Value) -> Example {
 }
 
 /// Postman's secret type stays on this machine; the rest is shared.
-fn environment(v: &Value, values: &[Value]) -> Import {
+fn variables(values: &[Value]) -> (Vec<KeyValue>, Vec<KeyValue>) {
     let (mut shared, mut secret) = (Vec::new(), Vec::new());
     for row in values {
         let kv = KeyValue {
@@ -468,11 +485,7 @@ fn environment(v: &Value, values: &[Value]) -> Import {
             false => shared.push(kv),
         }
     }
-    Import::Environment {
-        name: safe_name(str_of(&v["name"])),
-        shared,
-        secret,
-    }
+    (shared, secret)
 }
 
 /// The requests under `dir` (the collections root or a folder) as a Postman collection,

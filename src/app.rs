@@ -3971,35 +3971,38 @@ impl App {
         };
     }
 
-    /// `input` is the JSON, or the path to its file (quoted, as Explorer's "Copy as path"
-    /// gives it). What didn't come over as it was comes back to show the user.
+    /// `input` is the JSON, or the path to its file or folder (quoted, as Explorer's "Copy
+    /// as path" gives it). What didn't come over as it was comes back to show the user.
     fn import_text(&mut self, input: &str) -> Result<Vec<String>, String> {
         let input = input.trim();
         // One line that isn't JSON is a path; YAML is never a single line worth importing.
-        let text = match input.starts_with('{') || input.contains('\n') {
-            true => input.to_owned(),
+        let i = match input.starts_with('{') || input.contains('\n') {
+            true => crate::import::into_workspace(&self.ws, input)?,
             false => {
-                let path = input.trim_matches('"');
-                std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?
+                let path = Path::new(input.trim_matches('"'));
+                crate::import::path_into_workspace(&self.ws, path)?
             }
         };
-        let imported = crate::import::into_workspace(&self.ws, &text)?;
-        self.status = match &imported.folder {
-            Some(name) => tf(
-                "Imported {} requests into \"{}\"",
-                &[&imported.requests, name],
-            ),
-            None => tf("Imported environment \"{}\"", &[&imported.environments[0]]),
-        };
-        if imported.folder.is_some() {
-            match imported.environments.len() {
-                0 => {}
-                1 => self.status += t(" and 1 environment"),
-                n => self.status += &tf(" and {} environments", &[&n]),
+        self.status = match (i.folders.as_slice(), i.environments.as_slice()) {
+            ([], []) => tf("Imported {} globals", &[&i.globals]),
+            ([], [env]) => tf("Imported environment \"{}\"", &[env]),
+            ([], envs) => tf("Imported {} environments", &[&envs.len()]),
+            (folders, envs) => {
+                let into = folders.join("\", \"");
+                let mut status = tf("Imported {} requests into \"{}\"", &[&i.requests, &into]);
+                match envs.len() {
+                    0 => {}
+                    1 => status += t(" and 1 environment"),
+                    n => status += &tf(" and {} environments", &[&n]),
+                }
+                status
             }
+        };
+        if i.globals > 0 && !(i.folders.is_empty() && i.environments.is_empty()) {
+            self.status += &tf(" and {} globals", &[&i.globals]);
         }
         self.reload();
-        Ok(imported.warnings)
+        Ok(i.warnings)
     }
 
     fn copy_docs(&mut self, dir: &Path, ctx: &egui::Context) {
@@ -5546,7 +5549,17 @@ impl App {
                                 pick_file("", &[(t("Collection, spec or HAR"), kinds)], false)
                             })
                             .flatten();
-                        let input = dropped.or(chosen).or(import.then(|| text.clone()));
+                        let folder = (ui.button(t("Choose folder…")))
+                            .on_hover_text(t(
+                                "A Postman v3 collection folder, or a Native Git workspace \
+                                 with its environments and globals",
+                            ))
+                            .clicked()
+                            .then(|| rfd::FileDialog::new().pick_folder())
+                            .flatten()
+                            .map(|p| p.display().to_string());
+                        let input = (dropped.or(chosen).or(folder))
+                            .or(import.then(|| text.clone()));
                         if let Some(input) = input {
                             then = Some(Box::new(move |app, _| app.submit_import(&input)));
                         }
@@ -12624,6 +12637,58 @@ mod ui_tests {
             "{}",
             h.state().status
         );
+    }
+
+    /// Postman's Native Git keeps a workspace as folders of YAML; dropping that folder
+    /// brings its collections, environments and globals at once.
+    #[test]
+    fn a_postman_v3_folder_dropped_on_the_dialog_is_imported() {
+        let mut h = with_request("postman-v3");
+        let dir = h.state().ws.root.with_extension("native-git");
+        let files = [
+            (
+                "postman/collections/Orders/List.request.yaml",
+                "$kind: http-request\nmethod: GET\nurl: '{{base}}/orders'\n",
+            ),
+            (
+                "postman/environments/Stage.environment.yaml",
+                "name: Stage\nvalues:\n  - key: base\n    value: https://stage.test\n",
+            ),
+            (
+                "postman/globals/workspace.globals.yaml",
+                "values:\n  - key: team\n    value: red\n",
+            ),
+        ];
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        h.get_all_by_label("More").next().unwrap().click();
+        h.run();
+        button(&h, "Import…").click();
+        h.run();
+        assert!(h.query_by_label("Choose folder…").is_some());
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(dir.clone())));
+        h.run();
+        let app = h.state();
+        assert!(app.dialog.is_none(), "everything came over");
+        let orders = app.ws.collections().join("Orders");
+        assert_eq!(app.ws.load_requests_in(&orders).unwrap().len(), 1);
+        assert!(app.envs.contains(&"Stage".to_owned()), "{:?}", app.envs);
+        let (globals, _) = app.ws.load_env(None).unwrap();
+        assert!(
+            globals
+                .iter()
+                .any(|kv| kv.key == "team" && kv.value == "red")
+        );
+        assert_eq!(
+            app.status,
+            "Imported 1 requests into \"Orders\" and 1 environment and 1 globals"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

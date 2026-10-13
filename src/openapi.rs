@@ -677,7 +677,7 @@ mod tests {
                 warnings,
                 ..
             } => (name, folders, requests, warnings),
-            Import::Environment { .. } => panic!("a collection"),
+            _ => panic!("a collection"),
         }
     }
 

@@ -32,6 +32,7 @@ mod ntlm;
 mod oauth1;
 mod openapi;
 mod postman;
+mod postman3;
 mod runner;
 mod script;
 mod sigv4;

@@ -265,12 +265,13 @@ cookies, side by side…).
 
 ## Import and export
 
-Import from ⋯ > "Import…": paste it, give its path or drop the file.
+Import from ⋯ > "Import…": paste it, give its path or drop the file (or folder).
 
 | Format | What comes in |
 |---|---|
 | curl | Paste it into the URL bar instead |
-| Postman v2.1 | A collection or an environment |
+| Postman v2.1 | A collection, an environment or the globals |
+| Postman v3 (Native Git, the Postman CLI) | A collection's folder of YAML, or a whole workspace folder with its collections, environments and globals ("Choose folder…"); also one v3 document. HTTP, GraphQL, gRPC, WebSocket, Socket.IO and MQTT requests, with folder auth, variables, scripts, examples and saved messages. Globals already set keep their value; MCP and LLM requests, specs, flows and mocks are listed as left out |
 | OpenAPI 3 / Swagger 2, JSON or YAML | A request per operation, a folder per tag, `{{baseUrl}}` from the server, auth from the security schemes, bodies and saved examples from the schemas, so the mock server answers right away |
 | Insomnia v4 JSON / v5 YAML | Folders, auth and scripts; `{{ _.x }}` as `{{x}}`; the base environment as collection variables and each sub-environment as an environment |
 | HAR from browser devtools | A folder per host, each response kept as the request's example |

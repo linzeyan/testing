@@ -243,12 +243,13 @@ Ctrl+K 可依資料夾與名稱（依序打出其中幾個字母即可）或 URL
 
 ## 匯入與匯出
 
-從「⋯ > 匯入…」匯入：貼上內容、輸入路徑，或直接把檔案拖進來。
+從「⋯ > 匯入…」匯入：貼上內容、輸入路徑，或直接把檔案（或資料夾）拖進來。
 
 | 格式 | 匯入內容 |
 |---|---|
 | curl | 改為直接貼到 URL 列 |
-| Postman v2.1 | 集合或環境 |
+| Postman v2.1 | 集合、環境或全域變數 |
+| Postman v3（Native Git、Postman CLI） | 一個集合的 YAML 資料夾，或整個工作區資料夾連同其中的集合、環境與全域變數（「選擇資料夾…」）；也可匯入單一 v3 文件。支援 HTTP、GraphQL、gRPC、WebSocket、Socket.IO 與 MQTT 請求，以及資料夾的驗證、變數、指令碼、範例與存下的訊息。已存在的全域變數保留原值；MCP 與 LLM 請求、spec、flow、mock 會列為未匯入 |
 | OpenAPI 3 / Swagger 2（JSON 或 YAML） | 每個 operation 一個請求、每個 tag 一個資料夾；`{{baseUrl}}` 取自 server，驗證取自 security scheme，內容與已儲存範例取自 schema，因此匯入後模擬伺服器馬上就能回應 |
 | Insomnia v4 JSON / v5 YAML | 資料夾、驗證與指令碼；`{{ _.x }}` 轉為 `{{x}}`；base environment 成為集合變數，每個 sub-environment 成為一個環境 |
 | 瀏覽器開發者工具的 HAR | 每個主機一個資料夾，每筆回應保留為該請求的範例 |

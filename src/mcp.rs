@@ -344,16 +344,20 @@ impl Server {
     }
 
     fn import(&self, args: &Value) -> Result<Value, String> {
-        let text = match (args["text"].as_str(), args["file"].as_str()) {
-            (Some(text), _) if !text.trim().is_empty() => text.to_owned(),
-            (_, Some(file)) => std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?,
+        let i = match (args["text"].as_str(), args["file"].as_str()) {
+            (Some(text), _) if !text.trim().is_empty() => {
+                crate::import::into_workspace(&self.ws, text)?
+            }
+            (_, Some(file)) => {
+                crate::import::path_into_workspace(&self.ws, std::path::Path::new(file))?
+            }
             _ => return Err("pass `text` (the JSON or YAML) or `file` (its path)".into()),
         };
-        let i = crate::import::into_workspace(&self.ws, &text)?;
         Ok(json!({
-            "folder": i.folder,
+            "folders": i.folders,
             "requests": i.requests,
             "environments": i.environments,
+            "globals": i.globals,
             "not_carried_over": i.warnings,
         }))
     }
@@ -1226,12 +1230,12 @@ fn tools(window: bool) -> Value {
         },
         {
             "name": "import",
-            "description": "Import a Postman collection or environment, an Insomnia export, an OpenAPI 3 / Swagger 2 spec or a HAR file, as a new top-level folder (environments as new environments). Nothing existing is replaced.",
+            "description": "Import a Postman collection (v2.1 JSON, or v3: a collection folder, a Native Git workspace folder with its environments and globals, or one v3 document), environment or globals, an Insomnia export, an OpenAPI 3 / Swagger 2 spec or a HAR file, as new top-level folders (environments as new environments, globals added). Nothing existing is replaced.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "The JSON or YAML" },
-                    "file": { "type": "string", "description": "Or the path of its file" },
+                    "file": { "type": "string", "description": "Or the path of its file, or of a Postman v3 folder" },
                 },
             },
         },
@@ -1636,7 +1640,10 @@ mod tests {
         );
         let imported = text(&replies[0]);
         assert_eq!(
-            (imported["folder"].as_str(), imported["requests"].as_u64()),
+            (
+                imported["folders"][0].as_str(),
+                imported["requests"].as_u64()
+            ),
             (Some("Shop"), Some(1))
         );
         assert_eq!(
