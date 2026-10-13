@@ -41,6 +41,13 @@ pub struct Network {
     pub host_certs: Vec<HostCert>,
     pub insecure: bool,
     pub timeout_secs: u64,
+    /// Sent unless a request sets its own. None is `USER_AGENT`, kept unset so it follows
+    /// the version; empty sends none.
+    pub user_agent: Option<String>,
+    /// Empty still sends `*/*`: reqwest adds that to every request and can't be told not to.
+    pub accept: String,
+    /// Off sends no Accept-Encoding and leaves compressed bodies as they come.
+    pub gzip: bool,
 }
 
 impl Default for Network {
@@ -56,6 +63,9 @@ impl Default for Network {
             host_certs: Vec::new(),
             insecure: false,
             timeout_secs: 60,
+            user_agent: None,
+            accept: "*/*".into(),
+            gzip: true,
         }
     }
 }
@@ -73,6 +83,21 @@ pub struct HostCert {
 }
 
 impl Network {
+    /// The User-Agent a request without one gets; None sends none.
+    pub fn user_agent(&self) -> Option<&str> {
+        match &self.user_agent {
+            None => Some(USER_AGENT),
+            Some(agent) => Some(agent.trim()).filter(|a| !a.is_empty()),
+        }
+    }
+
+    pub fn accept(&self) -> &str {
+        match self.accept.trim() {
+            "" => "*/*",
+            accept => accept,
+        }
+    }
+
     /// The certificate path and password for a connection to `url`.
     pub fn cert_for(&self, url: &str) -> (&str, &str) {
         match self.host_cert(url) {
@@ -226,6 +251,11 @@ struct Variants {
 }
 
 impl Clients {
+    /// What these clients were built from: the Timeline lists the headers it made them add.
+    pub fn network(&self) -> &Network {
+        &self.variants.net
+    }
+
     /// The client for a request's settings and host; the shared one unless they differ
     /// from the defaults.
     pub fn for_settings(&self, s: &Settings, url: &str) -> Result<reqwest::Client, String> {
@@ -386,8 +416,11 @@ pub async fn build_client_with_jar(
     let picking = net.clone();
 
     let build = move |v: Variant, jar: &Arc<crate::cookies::Jar>, ntlm: Option<Handshake>| {
+        // Replaces reqwest's own `*/*`; a request's Accept still wins over it.
+        let accept = reqwest::header::HeaderValue::from_str(net.accept())
+            .map_err(|_| format!("Accept {:?}: not a valid header value", net.accept()))?;
         let mut b = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
+            .default_headers([(reqwest::header::ACCEPT, accept)].into_iter().collect())
             .timeout(Duration::from_secs(net.timeout_secs.max(1)))
             .tls_danger_accept_invalid_certs(net.insecure || v.insecure)
             .redirect(match v.redirects {
@@ -403,6 +436,12 @@ pub async fn build_client_with_jar(
                 }),
                 None => reqwest::redirect::Policy::none(),
             });
+        if let Some(agent) = net.user_agent() {
+            b = b.user_agent(agent);
+        }
+        if !net.gzip {
+            b = b.no_gzip();
+        }
         if v.cookies {
             b = b.cookie_provider(jar.clone());
         }

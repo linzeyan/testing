@@ -1519,6 +1519,34 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Set as variable in {}", "設為變數：{}"),
     ("Set {} in {}", "已將 {} 設定於 {}"),
+    // Variables panel
+    (
+        "The nearest scope wins. Enter keeps an edited value, Esc puts it back.",
+        "最近的範圍優先。修改後按 Enter 保存，按 Esc 還原。",
+    ),
+    ("Folders", "資料夾"),
+    ("Set in Folder settings.", "於資料夾設定中修改。"),
+    ("Overridden by {}", "被 {} 覆蓋"),
+    // Default headers
+    ("Change the defaults…", "修改預設值…"),
+    (
+        "User-Agent, Accept and Accept-Encoding for every request, in Network settings. A request's own header still wins.",
+        "所有請求的 User-Agent、Accept 與 Accept-Encoding，在網路設定中修改。請求自己設的標頭仍然優先。",
+    ),
+    ("Default headers", "預設標頭"),
+    (
+        "Sent with every request that doesn't set its own.",
+        "請求沒有自己設定時，一律送出這些標頭。",
+    ),
+    ("Empty sends none", "留空則不送出"),
+    (
+        "Empty still sends */*: the HTTP client always sends an Accept.",
+        "留空仍會送出 */*：HTTP 用戶端一定會帶 Accept。",
+    ),
+    (
+        "Off: no Accept-Encoding, and a compressed body is shown as it came.",
+        "關閉：不送 Accept-Encoding，壓縮過的內容會照原樣顯示。",
+    ),
     // Request settings
     ("Follow original HTTP method", "沿用原本的 HTTP 方法"),
     (

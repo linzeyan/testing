@@ -41,7 +41,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | Protocol | Notes |
 |---|---|
 | HTTP | HTTP version, redirects, TLS check, cookies and timeout per request |
-| GraphQL | Once the schema is fetched, fields complete as you type the query; variables fill in as a form, a row per `$variable` the query declares (enum and Boolean pickers, numbers that may be `{{variables}}`, inputs filled in from the schema), or as JSON; a `subscription` connects over WebSocket (graphql-transport-ws or the older graphql-ws) and streams each result |
+| GraphQL | Once the schema is fetched, fields complete as you type the query; variables fill in as a form, a row per `$variable` the query declares (enum and Boolean pickers, numbers that may be `{{variables}}`, inputs filled in from the schema), or as JSON, under the query with a divider to drag, so a long query doesn't push them off screen; a `subscription` connects over WebSocket (graphql-transport-ws or the older graphql-ws) and streams each result |
 | WebSocket | |
 | SSE | |
 | Socket.IO 2, 3 and 4 | The URL's path is the namespace and a JSON body the auth payload (v2 has none: Params go on the handshake's query); Settings sets the handshake path (`/socket.io/` if empty) and the client version; send `event {"json": "arg"}` or a `["event", …]` array; acks are shown |
@@ -59,7 +59,8 @@ MQTT:
 
 Every stream's log narrows to received or sent messages (↓ ↑) and to text, which keeps up
 with a busy feed. The bookmark under Send keeps the typed message in the request; the list
-beside it puts a kept one back in the box.
+beside it puts a kept one back in the box. Clicking a message shows its payload below, to copy;
+× closes it.
 
 ## Requests
 
@@ -83,12 +84,18 @@ beside it puts a kept one back in the box.
   or the globals); the text itself stays as it is, as in Postman. A new variable is secret
   (kept on this machine) unless its Secret box is unticked.
 - Header names and Content-Type values complete while typing. The Headers tab folds out what
-  Send adds (Host, auth, Content-Type…) and where each comes from.
+  Send adds (Host, auth, Content-Type…) and where each comes from; "Change the defaults…" opens
+  the network settings, where User-Agent, Accept and gzip's Accept-Encoding are set for every
+  request that doesn't set its own. An empty User-Agent sends none; an empty Accept still sends
+  `*/*`, which the HTTP client always adds.
 - All 120 of Postman's dynamic variables (`{{$guid}}`, `{{$timestamp}}`, `{{$randomEmail}}`,
   `{{$randomBankAccountIban}}`…), a fresh value each use; `{{email` completes to
   `$randomEmail`.
 - `{{?name}}` prompt variables are asked for on Send and kept only until apitool closes;
   Insomnia's `{% prompt %}` imports as one.
+- Quick look (the eye by the environment) docks a panel of every variable in scope, grouped as
+  environment, folders and globals, the overridden ones struck through. Environment and global
+  values edit in place: Enter keeps the change, Esc puts it back.
 - An environment can have a colour (prod in red), shown on its selector and as a strip
   across the top.
 - Folder settings (right-click a folder) hold variables, auth and scripts shared by every

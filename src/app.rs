@@ -3373,6 +3373,9 @@ impl eframe::App for App {
                 .default_size(260.0)
                 .show(ui, |ui| self.sidebar(ui));
         }
+        if self.quick_look {
+            self.quick_look_panel(ui);
+        }
         egui::CentralPanel::default().show(ui, |ui| self.main_area(ui));
         if let Some(picked) = varedit::picked(ui.ctx()) {
             match picked {
@@ -3419,7 +3422,6 @@ impl eframe::App for App {
         self.dialog_ui(ui.ctx());
         self.env_editor_ui(ui.ctx());
         self.folder_editor_ui(ui.ctx());
-        self.quick_look_ui(ui.ctx());
         self.cookie_manager_ui(ui.ctx());
         if let Some(id) = self.focus_request.take() {
             ui.memory_mut(|m| m.request_focus(id));
@@ -4244,6 +4246,7 @@ impl App {
             .map(|r| r.every.as_secs());
         let mut define: Option<Vec<String>> = None;
         let mut fetch_schema = false;
+        let mut change_defaults = false;
         let replace_query = self.explorer.replace;
         let mut reflect = false;
         let mut example = None;
@@ -4684,7 +4687,9 @@ impl App {
                     ReqTab::Headers => {
                         kv_table(ui, "headers", &mut open.draft.headers, &all_vars, true);
                         let (wire, _) = open.draft.resolved(&all_vars);
-                        auto_headers_ui(ui, http::auto_headers(wire, &open.draft.headers));
+                        let own = &open.draft.headers;
+                        let auto = http::auto_headers(wire, own, &self.network);
+                        change_defaults |= auto_headers_ui(ui, auto);
                     }
                     ReqTab::Body => {
                         // GRAPHQL requests are always a query; no body type to pick.
@@ -4934,6 +4939,9 @@ impl App {
         }
         if fetch_schema {
             self.fetch_schema(ui.ctx());
+        }
+        if change_defaults {
+            self.network_editor = Some(self.network.clone());
         }
         if self.explorer.replace != replace_query {
             self.save_state();
@@ -5870,71 +5878,198 @@ impl App {
         self.cookie_manager = open;
     }
 
-    /// Every variable `{{name}}` can resolve to right now, and where it comes from.
-    fn quick_look_ui(&mut self, ctx: &egui::Context) {
-        if !self.quick_look {
-            return;
-        }
+    /// Every variable `{{name}}` can resolve to right now, scope by scope, docked at the
+    /// right like Postman's: a value shadowed by a nearer scope is still listed, struck
+    /// through, and environment and global values are edited in place.
+    fn quick_look_panel(&mut self, ui: &mut egui::Ui) {
+        let env = self.active_env.clone();
+        let folder =
+            (self.open.as_ref()).map_or_else(HashMap::new, |o| o.draft.inherited.vars.clone());
+        let env_label = env.clone().unwrap_or_default();
+        let mut set: Option<(Option<String>, String, String)> = None;
         let mut edit = None;
-        let mut open = true;
-        egui::Window::new(t("Variables in scope"))
-            .open(&mut open)
-            .collapsible(false)
+        let mut close = false;
+        egui::Panel::right("quick-look")
             .resizable(true)
-            .default_width(460.0)
-            .default_pos([280.0, 60.0])
-            .show(ctx, |ui| {
-                let env = self.active_env.clone();
-                let mut names: Vec<_> = self.all_vars().into_keys().collect();
-                names.sort_by_key(|n| n.to_lowercase());
-                if names.is_empty() {
-                    ui.weak(t(
-                        "No variables yet. Add some to an environment or to Globals.",
-                    ));
-                }
-                egui::ScrollArea::vertical()
-                    .max_height(360.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("quick-look").striped(true).show(ui, |ui| {
-                            for name in &names {
-                                let folder = self.open.as_ref().map(|o| &o.draft.inherited.vars);
-                                let (value, source) =
-                                    match (self.vars.get(name), folder.and_then(|f| f.get(name))) {
-                                        (Some(v), _) => (v, env.clone().unwrap_or_default()),
-                                        (None, Some(v)) => (v, t("Folder").to_owned()),
-                                        _ => (&self.globals[name], t("Globals").to_owned()),
-                                    };
-                                ui.monospace(name);
-                                ui.label(RichText::new(clip(value, 60)).monospace())
-                                    .on_hover_text(value.as_str());
-                                ui.weak(source);
-                                ui.end_row();
-                            }
-                        });
-                    });
-                ui.separator();
+            .default_size(320.0)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if let Some(name) = &env
-                        && ui.button(tf("Edit {}", &[&name])).clicked()
-                    {
-                        edit = Some(Some(name.clone()));
-                    }
-                    if ui.button(t("Edit Globals")).clicked() {
-                        edit = Some(None);
-                    }
+                    ui.strong(t("Variables in scope"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close = icon_button(ui, icon::X, t("Close"), None)
+                            .on_hover_text(t("Close"))
+                            .clicked();
+                    });
                 });
-                // 120 names don't fit a line: name the common ones, autocomplete has the rest.
-                ui.weak(tf(
-                    "Always available: $guid, $timestamp, $randomInt, $randomEmail… \
-                     ({} in all; type {{$ for the list)",
-                    &[&model::DYNAMIC.len()],
+                ui.weak(t(
+                    "The nearest scope wins. Enter keeps an edited value, Esc puts it back.",
                 ));
+                ui.separator();
+                let sorted = |vars: &HashMap<String, String>| {
+                    let mut vars: Vec<(String, String)> =
+                        vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    vars.sort_by_key(|(k, _)| k.to_lowercase());
+                    vars
+                };
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        let heading = |ui: &mut egui::Ui, title: String, tip: String| {
+                            ui.horizontal(|ui| {
+                                ui.strong(title);
+                                icon_button(ui, icon::PENCIL, t("Edit"), None)
+                                    .on_hover_text(tip)
+                                    .clicked()
+                            })
+                            .inner
+                        };
+                        match &env {
+                            Some(name) => {
+                                if heading(
+                                    ui,
+                                    tf("Environment: {}", &[name]),
+                                    tf("Edit {}", &[name]),
+                                ) {
+                                    edit = Some(Some(name.clone()));
+                                }
+                                egui::Grid::new("qv-env").num_columns(2).striped(true).show(
+                                    ui,
+                                    |ui| {
+                                        for (k, v) in sorted(&self.vars) {
+                                            let id = egui::Id::new(("qv-env", &k));
+                                            if let Some(new) = scope_var(ui, id, &k, &v, None, true)
+                                            {
+                                                set = Some((env.clone(), k, new));
+                                            }
+                                        }
+                                    },
+                                );
+                            }
+                            None => {
+                                ui.strong(t("No environment"));
+                            }
+                        }
+                        if !folder.is_empty() {
+                            ui.add_space(8.0);
+                            ui.strong(t("Folders"));
+                            ui.weak(t("Set in Folder settings."));
+                            egui::Grid::new("qv-folder")
+                                .num_columns(2)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for (k, v) in sorted(&folder) {
+                                        let over = self
+                                            .vars
+                                            .contains_key(&k)
+                                            .then_some(env_label.as_str());
+                                        scope_var(
+                                            ui,
+                                            egui::Id::new(("qv-folder", &k)),
+                                            &k,
+                                            &v,
+                                            over,
+                                            false,
+                                        );
+                                    }
+                                });
+                        }
+                        ui.add_space(8.0);
+                        if heading(ui, t("Globals").to_owned(), t("Edit Globals").to_owned()) {
+                            edit = Some(None);
+                        }
+                        egui::Grid::new("qv-globals")
+                            .num_columns(2)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (k, v) in sorted(&self.globals) {
+                                    let over = if self.vars.contains_key(&k) {
+                                        Some(env_label.as_str())
+                                    } else if folder.contains_key(&k) {
+                                        Some(t("Folders"))
+                                    } else {
+                                        None
+                                    };
+                                    let id = egui::Id::new(("qv-globals", &k));
+                                    if let Some(new) = scope_var(ui, id, &k, &v, over, true) {
+                                        set = Some((None, k, new));
+                                    }
+                                }
+                            });
+                        if self.vars.is_empty() && folder.is_empty() && self.globals.is_empty() {
+                            ui.weak(t(
+                                "No variables yet. Add some to an environment or to Globals.",
+                            ));
+                        }
+                        ui.add_space(8.0);
+                        // 120 names don't fit a line: name the common ones, autocomplete has the rest.
+                        ui.weak(tf(
+                            "Always available: $guid, $timestamp, $randomInt, $randomEmail… \
+                         ({} in all; type {{$ for the list)",
+                            &[&model::DYNAMIC.len()],
+                        ));
+                    });
             });
-        self.quick_look = open;
+        self.quick_look &= !close;
+        if let Some((env, name, value)) = set
+            && let Err(e) = self.set_var(env.as_deref(), &name, &value, true)
+        {
+            self.status = e;
+        }
         if let Some(env) = edit {
             self.open_env_editor(env, &[]);
         }
     }
+}
+
+/// A row of the Variables panel. `over` names the scope whose value wins over this one;
+/// `edit` false is a value kept elsewhere (a folder's settings). Returns the new value once
+/// typed and confirmed: Enter or clicking away keeps it, Esc drops it.
+fn scope_var(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    name: &str,
+    value: &str,
+    over: Option<&str>,
+    edit: bool,
+) -> Option<String> {
+    let label = match over {
+        Some(_) => RichText::new(name).monospace().strikethrough().weak(),
+        None => RichText::new(name).monospace(),
+    };
+    let label = ui.label(label);
+    if let Some(over) = over {
+        label.on_hover_text(tf("Overridden by {}", &[&over]));
+    }
+    let mut out = None;
+    if edit && value.len() <= crate::varedit::MAX_EDIT {
+        // The text being typed lives in egui's memory, so a value reloaded meanwhile
+        // doesn't overwrite it.
+        let typed = id.with("typed");
+        let mut text = ui
+            .data(|d| d.get_temp::<String>(typed))
+            .unwrap_or_else(|| value.to_owned());
+        let field = egui::TextEdit::singleline(&mut text)
+            .id(id)
+            .font(egui::TextStyle::Monospace)
+            .desired_width(ui.available_width().max(80.0));
+        let r = ui.add(field);
+        if r.has_focus() {
+            ui.data_mut(|d| d.insert_temp(typed, text.clone()));
+        }
+        if r.lost_focus() {
+            ui.data_mut(|d| d.remove::<String>(typed));
+            let dropped = ui.input(|i| i.key_pressed(Key::Escape));
+            if !dropped && text != value {
+                out = Some(text);
+            }
+        }
+    } else {
+        ui.label(RichText::new(clip(value, 60)).monospace())
+            .on_hover_text(value);
+    }
+    ui.end_row();
+    out
 }
 
 impl App {
@@ -6884,6 +7019,36 @@ impl App {
                 ui.label(t("Timeout"));
                 ui.add(egui::DragValue::new(&mut net.timeout_secs).range(1..=3600).suffix(" s"));
             });
+
+            ui.add_space(8.0);
+            ui.label(RichText::new(t("Default headers")).strong());
+            ui.weak(t("Sent with every request that doesn't set its own."));
+            egui::Grid::new("default-headers").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                ui.label("User-Agent");
+                ui.horizontal(|ui| {
+                    // Unset follows the version; typing pins a value of its own.
+                    let mut agent = net.user_agent.clone().unwrap_or_else(|| crate::net::USER_AGENT.to_owned());
+                    let reset = net.user_agent.is_some();
+                    let width = if reset { 300.0 } else { 380.0 };
+                    let edit = egui::TextEdit::singleline(&mut agent).hint_text(t("Empty sends none")).desired_width(width);
+                    if ui.add(edit).changed() {
+                        net.user_agent = Some(agent);
+                    }
+                    if reset && ui.small_button(t("Reset")).on_hover_text(crate::net::USER_AGENT).clicked() {
+                        net.user_agent = None;
+                    }
+                });
+                ui.end_row();
+                ui.label("Accept");
+                ui.add(egui::TextEdit::singleline(&mut net.accept).hint_text("*/*").desired_width(380.0))
+                    .on_hover_text(t("Empty still sends */*: the HTTP client always sends an Accept."));
+                ui.end_row();
+                ui.label("Accept-Encoding");
+                ui.checkbox(&mut net.gzip, "gzip").on_hover_text(t(
+                    "Off: no Accept-Encoding, and a compressed body is shown as it came.",
+                ));
+                ui.end_row();
+            });
             ui.separator();
             ui.horizontal(|ui| {
                 apply = ui.add(primary(t("Apply"))).clicked() || enter_pressed(ui);
@@ -7788,13 +7953,15 @@ const CONTENT_TYPES: &[(&str, &str)] = &[
 ];
 
 /// What Send adds to the user's headers, greyed and folded away by default like Postman's
-/// hidden headers: they explain the Timeline without crowding the table.
-fn auto_headers_ui(ui: &mut egui::Ui, auto: Vec<(String, String, &str)>) {
+/// hidden headers: they explain the Timeline without crowding the table. Returns whether
+/// the user asked to change the defaults.
+fn auto_headers_ui(ui: &mut egui::Ui, auto: Vec<(String, String, &str)>) -> bool {
     if auto.is_empty() {
-        return;
+        return false;
     }
     ui.add_space(6.0);
     let title = RichText::new(tf("{} added on Send", &[&auto.len()])).weak();
+    let mut change = false;
     egui::CollapsingHeader::new(title)
         .id_salt("auto-headers")
         .show(ui, |ui| {
@@ -7809,7 +7976,14 @@ fn auto_headers_ui(ui: &mut egui::Ui, auto: Vec<(String, String, &str)>) {
                         ui.end_row();
                     }
                 });
+            change = ui
+                .small_button(t("Change the defaults…"))
+                .on_hover_text(t(
+                    "User-Agent, Accept and Accept-Encoding for every request, in Network settings. A request's own header still wins.",
+                ))
+                .clicked();
         });
+    change
 }
 
 /// Key/value grid with a trailing blank row: typing into it creates a new row, like Postman.
@@ -8299,27 +8473,53 @@ fn graphql_editor(
     let mut insert = None;
     ui.columns(2, |cols| {
         let ui = &mut cols[0];
+        // The query scrolls on its own above a divider to drag, as in Postman: a long one
+        // used to push the variables out of sight. Drawn in reading order, unlike a bottom
+        // panel, so Tab still goes from the query to its variables.
+        let split = egui::Id::new("gql-variables-height");
+        let total = ui.available_height();
+        let row = ui.spacing().interact_size.y;
+        let vars_h: f32 = ui.data(|d| d.get_temp(split)).unwrap_or(total * 0.4);
+        let vars_h = vars_h.clamp(80.0_f32.min(total / 2.0), (total - 4.0 * row).max(80.0));
         ui.label(t("Query"));
         let schema = ex.schema.as_ref().and_then(|s| s.as_ref().ok());
         let fields = |text: &str, at: usize| schema?.complete(text, at);
-        var_edit(
-            ui,
-            egui::Id::new("gql-query"),
-            query,
-            vars,
-            egui::TextStyle::Monospace,
-            true,
-            Some(Lang::GraphQl),
-            Complete::At(&fields),
-            |e| {
-                e.code_editor()
-                    .hint_text(t(
-                        "Fetch the schema and click a field →\nor type a query here: its fields complete as you type.",
-                    ))
-                    .desired_rows(8)
-                    .desired_width(f32::INFINITY)
-            },
-        );
+        egui::ScrollArea::vertical()
+            .id_salt("gql-query-scroll")
+            .auto_shrink(false)
+            .max_height((total - vars_h - 2.0 * row - 8.0).max(row))
+            .show(ui, |ui| {
+                var_edit(
+                    ui,
+                    egui::Id::new("gql-query"),
+                    query,
+                    vars,
+                    egui::TextStyle::Monospace,
+                    true,
+                    Some(Lang::GraphQl),
+                    Complete::At(&fields),
+                    |e| {
+                        e.code_editor()
+                            .hint_text(t(
+                                "Fetch the schema and click a field →\nor type a query here: its fields complete as you type.",
+                            ))
+                            .desired_rows(8)
+                            .desired_width(f32::INFINITY)
+                    },
+                );
+            });
+        let (rect, divider) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::drag());
+        let stroke = match divider.hovered() || divider.dragged() {
+            true => ui.visuals().widgets.hovered.fg_stroke,
+            false => ui.visuals().widgets.noninteractive.bg_stroke,
+        };
+        ui.painter().hline(rect.x_range(), rect.center().y, stroke);
+        let divider = divider.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        if divider.dragged() {
+            let h = vars_h - divider.drag_delta().y;
+            ui.data_mut(|d| d.insert_temp(split, h));
+        }
         ui.horizontal(|ui| {
             ui.label(t("Variables"));
             ui.add_space(4.0);
@@ -8333,27 +8533,32 @@ fn graphql_editor(
                 ui.colored_label(ORANGE, tf("Not valid JSON: {}", &[&e]));
             }
         });
-        if ex.vars_json {
-            var_edit(
-                ui,
-                egui::Id::new("gql-variables"),
-                variables,
-                vars,
-                egui::TextStyle::Monospace,
-                true,
-                Some(Lang::Json),
-                Complete::None,
-                |e| {
-                    e.code_editor()
-                        .hint_text("{ \"id\": \"{{userId}}\" }")
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                },
-            );
-        } else {
-            let schema = ex.schema.as_ref().and_then(|s| s.as_ref().ok());
-            variables_form(ui, query, variables, vars, schema);
-        }
+        egui::ScrollArea::vertical()
+            .id_salt("gql-variables-scroll")
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                if ex.vars_json {
+                    var_edit(
+                        ui,
+                        egui::Id::new("gql-variables"),
+                        variables,
+                        vars,
+                        egui::TextStyle::Monospace,
+                        true,
+                        Some(Lang::Json),
+                        Complete::None,
+                        |e| {
+                            e.code_editor()
+                                .hint_text("{ \"id\": \"{{userId}}\" }")
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY)
+                        },
+                    );
+                } else {
+                    let schema = ex.schema.as_ref().and_then(|s| s.as_ref().ok());
+                    variables_form(ui, query, variables, vars, schema);
+                }
+            });
 
         let ui = &mut cols[1];
         ui.horizontal(|ui| {
@@ -10060,6 +10265,7 @@ fn stream_ui(
     if selected.and_then(at).is_none_or(|i| i >= log.events.len()) {
         s.selected = None;
     }
+    let mut close_detail = false;
     if let Some((_, text)) = &s.selected {
         egui::Panel::bottom("stream-detail")
             .resizable(true)
@@ -10073,6 +10279,11 @@ fn stream_ui(
                         ui.ctx().copy_text(text.clone());
                     }
                     ui.weak(human_size(text.len()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close_detail = icon_button(ui, icon::X, t("Close"), None)
+                            .on_hover_text(t("Close"))
+                            .clicked();
+                    });
                 });
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
@@ -10084,6 +10295,9 @@ fn stream_ui(
                         );
                     });
             });
+    }
+    if close_detail {
+        s.selected = None;
     }
     // One line per event and only the rows in view laid out: 5000 wrapped messages
     // would cost gigabytes of text layout every frame.
@@ -13361,6 +13575,14 @@ mod ui_tests {
             2,
             "sent and echoed"
         );
+        // A message opened whole has its own Close: finding the row again to click it
+        // twice is the only other way.
+        h.get_all_by_label("beta").last().unwrap().click();
+        h.run();
+        assert!(h.state().stream.as_ref().unwrap().selected.is_some());
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(h.state().stream.as_ref().unwrap().selected.is_none());
 
         h.get_by_label("Received only").click();
         h.run();
@@ -14682,11 +14904,59 @@ mod ui_tests {
         h.get_by_label("Quick look").click();
         h.run();
         shot(&mut h, "21-quick-look");
-        assert!(h.query_by_label("k-123").is_some());
+        assert!(var_field(&h, "k-123").is_some());
         assert!(
-            h.query_by_label("127.0.0.1:1").is_some(),
+            var_field(&h, "127.0.0.1:1").is_some(),
             "env vars listed too"
         );
+    }
+
+    /// The Variables panel's field showing `value`.
+    fn var_field<'h>(h: &'h Harness<'_, App>, value: &str) -> Option<egui_kittest::Node<'h>> {
+        (h.get_all_by_role(Role::TextInput))
+            .find(|n| n.accesskit_node().value().as_deref() == Some(value))
+    }
+
+    /// A value edited in the Variables panel is saved where it lives: an environment's
+    /// shared value stays shared (it's what reaches git), a global shadowed by it is still
+    /// listed, and Esc leaves a value as it was.
+    #[test]
+    fn a_variable_is_edited_where_it_lives_in_the_variables_panel() {
+        let mut h = with_request("vars-panel");
+        h.state()
+            .ws
+            .set_var(None, "host", "global-host", false)
+            .unwrap();
+        h.state_mut().reload_vars();
+        h.get_by_label("Quick look").click();
+        h.run();
+        var_field(&h, "127.0.0.1:1").unwrap().click();
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        var_field(&h, "127.0.0.1:1")
+            .unwrap()
+            .type_text("10.0.0.2:80");
+        h.run();
+        h.key_press(Key::Enter);
+        h.run();
+        shot(&mut h, "21b-variables-panel");
+        assert_eq!(h.state().vars["host"], "10.0.0.2:80");
+        let (shared, secret) = h.state().ws.load_env(Some("dev")).unwrap();
+        let host = |kv: &[KeyValue]| kv.iter().any(|v| v.key == "host");
+        assert!(host(&shared) && !host(&secret), "{shared:?} {secret:?}");
+        assert_eq!(
+            h.get_all_by_label("host").count(),
+            2,
+            "the global stays listed under the environment's"
+        );
+        var_field(&h, "global-host").unwrap().click();
+        h.run();
+        var_field(&h, "global-host").unwrap().type_text("-typo");
+        h.run();
+        h.key_press(Key::Escape);
+        h.run();
+        assert_eq!(h.state().globals["host"], "global-host");
+        assert!(var_field(&h, "global-host").is_some(), "shown as it was");
     }
 
     /// The request the test brokers in `mqtt::tests` expect, with its will through a
@@ -15052,6 +15322,35 @@ mod ui_tests {
         h.run();
         assert!(h.state().explorer.vars_json);
         h.get_all_by_role(Role::MultilineTextInput).nth(1).unwrap();
+    }
+
+    /// However long the query, its variables stay in the window: they used to sit under
+    /// it, and a long query took scrolling to the end to reach them.
+    #[test]
+    fn graphql_variables_stay_in_view_under_a_long_query() {
+        let mut h = with_request("gql-long");
+        let picker = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("GET");
+        h.get(picker).click();
+        h.run();
+        h.get_by_label("GraphQL").click();
+        h.run();
+        let fields: Vec<String> = (0..300).map(|i| format!("  field{i}")).collect();
+        if let Body::GraphQL { query, .. } = &mut h.state_mut().open.as_mut().unwrap().draft.body {
+            *query = format!("query {{\n{}\n}}", fields.join("\n"));
+        }
+        h.run();
+        h.get_by_label("JSON").click();
+        h.run();
+        shot(&mut h, "74b-graphql-long-query");
+        let window = h.ctx.content_rect();
+        let variables = h.get_all_by_role(Role::MultilineTextInput).nth(1).unwrap();
+        assert!(
+            window.contains_rect(variables.rect()),
+            "{:?} outside {window:?}",
+            variables.rect()
+        );
     }
 
     #[test]

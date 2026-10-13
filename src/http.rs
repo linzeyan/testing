@@ -89,6 +89,12 @@ pub enum Sink {
     Discard,
 }
 
+tokio::task_local! {
+    /// The network settings of the client a send goes out on, set by `runner::send`: the
+    /// default headers it adds come from them, and a reqwest client can't be asked.
+    pub static NETWORK: crate::net::Network;
+}
+
 /// No-op outside a traced send (WebSocket, SSE, gRPC, the PAC fetch).
 pub fn trace(f: impl FnOnce(&mut Trace)) {
     let _ = TRACE.try_with(|t| f(&mut t.borrow_mut()));
@@ -442,7 +448,9 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
     let (resp, trace) = TRACE.scope(Default::default(), send).await;
     let resp = resp?;
     sent.waited = Some(started.elapsed());
-    sent.added(trace.cookie, body_len);
+    // Outside `runner::send` (tests): the clients built from the defaults.
+    let net = NETWORK.try_with(Clone::clone).unwrap_or_default();
+    sent.added(trace.cookie, body_len, &net);
     sent.hops = trace.hops;
     let info = resp
         .extensions()
@@ -590,7 +598,12 @@ impl Sent {
     /// The headers reqwest and hyper add on the way out, as they add them.
     /// ponytail: mirrors reqwest 0.13's rules (checked by a test against what a server
     /// receives); revisit when upgrading reqwest.
-    fn added(&mut self, cookie: Option<String>, body_len: Option<usize>) {
+    fn added(
+        &mut self,
+        cookie: Option<String>,
+        body_len: Option<usize>,
+        net: &crate::net::Network,
+    ) {
         let has = |h: &[(String, String)], name: &str| h.iter().any(|(k, _)| k == name);
         let mut auto = Vec::new();
         if let Ok(url) = reqwest::Url::parse(&self.url)
@@ -605,13 +618,15 @@ impl Sent {
         auto.append(&mut self.headers);
         self.headers = auto;
         if !has(&self.headers, "accept") {
-            self.headers.push(("accept".into(), "*/*".into()));
+            self.headers.push(("accept".into(), net.accept().into()));
         }
-        if !has(&self.headers, "user-agent") {
-            let agent = crate::net::USER_AGENT.into();
-            self.headers.push(("user-agent".into(), agent));
+        if let Some(agent) = net
+            .user_agent()
+            .filter(|_| !has(&self.headers, "user-agent"))
+        {
+            self.headers.push(("user-agent".into(), agent.into()));
         }
-        if !has(&self.headers, "accept-encoding") && !has(&self.headers, "range") {
+        if net.gzip && !has(&self.headers, "accept-encoding") && !has(&self.headers, "range") {
             self.headers.push(("accept-encoding".into(), "gzip".into()));
         }
         if let Some(cookie) = cookie.filter(|_| !has(&self.headers, "cookie")) {
@@ -625,8 +640,13 @@ impl Sent {
 }
 
 /// What Send will add to the headers the user typed (`own`), with where each comes from, for
-/// the Headers tab. `req` is the resolved request. Empty when it can't be built yet.
-pub fn auto_headers(mut req: Request, own: &[KeyValue]) -> Vec<(String, String, &'static str)> {
+/// the Headers tab. `req` is the resolved request, `net` what the clients are built from.
+/// Empty when it can't be built yet.
+pub fn auto_headers(
+    mut req: Request,
+    own: &[KeyValue],
+    net: &crate::net::Network,
+) -> Vec<(String, String, &'static str)> {
     let mut later = None;
     match &req.auth {
         Auth::OAuth2(o) => {
@@ -661,6 +681,7 @@ pub fn auto_headers(mut req: Request, own: &[KeyValue]) -> Vec<(String, String, 
     sent.added(
         None,
         wire.body().and_then(|b| b.as_bytes()).map(<[u8]>::len),
+        net,
     );
     let own: Vec<String> = (own.iter().filter(|h| h.enabled))
         .map(|h| h.key.trim().to_lowercase())
@@ -1207,7 +1228,7 @@ pub(crate) mod tests {
             auth: Auth::Bearer { token: "t".into() },
             ..Default::default()
         };
-        let auto = auto_headers(req.clone(), &req.headers);
+        let auto = auto_headers(req.clone(), &req.headers, &Default::default());
         let mut predicted: Vec<String> = (auto.iter().map(|(k, ..)| k.clone()))
             .chain(req.headers.iter().map(|h| h.key.to_lowercase()))
             .collect();
@@ -1228,7 +1249,7 @@ pub(crate) mod tests {
             headers: vec![KeyValue::new("User-Agent", "probe")],
             ..Default::default()
         };
-        let auto = auto_headers(own.clone(), &own.headers);
+        let auto = auto_headers(own.clone(), &own.headers, &Default::default());
         assert!(!auto.iter().any(|(k, ..)| k == "user-agent"), "{auto:?}");
         let resp = rt.block_on(execute(client(&rt), own)).unwrap();
         let agents: Vec<_> = (received(&resp).into_iter())
@@ -1239,7 +1260,7 @@ pub(crate) mod tests {
             url: "http://x.test/a".into(),
             ..Default::default()
         };
-        let auto = auto_headers(plain, &[]);
+        let auto = auto_headers(plain, &[], &Default::default());
         assert!(
             auto.contains(&(agent.0, agent.1, "HTTP client")),
             "{auto:?}"
@@ -1256,7 +1277,7 @@ pub(crate) mod tests {
             },
             ..Default::default()
         };
-        let auto = auto_headers(file, &[]);
+        let auto = auto_headers(file, &[], &Default::default());
         std::fs::remove_file(&path).unwrap();
         assert!(
             auto.contains(&("content-type".into(), "image/png".into(), "Body")),
@@ -1281,7 +1302,7 @@ pub(crate) mod tests {
             },
             ..Default::default()
         };
-        let auto = auto_headers(form, &[]);
+        let auto = auto_headers(form, &[], &Default::default());
         let value = |name: &str| auto.iter().find(|(k, ..)| k == name).unwrap().1.clone();
         assert_eq!(value("content-type"), "multipart/form-data; boundary=…");
         assert!(value("authorization").starts_with("Digest"));
@@ -1301,6 +1322,46 @@ pub(crate) mod tests {
     }
 
     /// The header lines an echo server got, as (lowercase name, value), sorted.
+    /// The default headers in Network settings are what arrives, and the Timeline and the
+    /// Headers tab list exactly those: a removed User-Agent or gzip must not show as sent.
+    #[test]
+    fn default_headers_follow_the_network_settings() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            user_agent: Some(String::new()),
+            accept: "application/json".into(),
+            gzip: false,
+            ..Default::default()
+        };
+        let clients = rt.block_on(crate::net::build_client(net.clone())).unwrap();
+        let req = Request {
+            url: echo_server(),
+            ..Default::default()
+        };
+        let resp = rt
+            .block_on(crate::runner::send(&clients, req.clone()))
+            .unwrap();
+        let got = received(&resp);
+        assert!(
+            got.contains(&("accept".into(), "application/json".into())),
+            "{got:?}"
+        );
+        let gone = |k: &str| k == "user-agent" || k == "accept-encoding";
+        assert!(!got.iter().any(|(k, _)| gone(k)), "{got:?}");
+        let mut timeline = resp.sent.headers.clone();
+        timeline.sort();
+        assert_eq!(timeline, got, "the Timeline lists what arrived");
+        let mut predicted: Vec<_> = (auto_headers(req, &[], &net).into_iter())
+            .map(|(k, v, _)| (k, v))
+            .collect();
+        predicted.sort();
+        assert_eq!(predicted, got, "and so does the Headers tab");
+    }
+
     fn received(resp: &Response) -> Vec<(String, String)> {
         let head = resp.body.split("\r\n\r\n").next().unwrap();
         let mut lines: Vec<_> = (head.lines().skip(1))

@@ -39,7 +39,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | 協定 | 說明 |
 |---|---|
 | HTTP | 每個請求可個別設定 HTTP 版本、重新導向、TLS 驗證、Cookie 與逾時 |
-| GraphQL | 取得 schema 後，輸入查詢時會補全欄位；變數以表單填寫，查詢宣告的每個 `$變數` 一列（enum 與 Boolean 用下拉、數字可用 `{{變數}}`、input 可依 schema 填入欄位），也可切成 JSON；`subscription` 透過 WebSocket 連線（graphql-transport-ws 或較舊的 graphql-ws），逐筆串流結果 |
+| GraphQL | 取得 schema 後，輸入查詢時會補全欄位；變數以表單填寫，查詢宣告的每個 `$變數` 一列（enum 與 Boolean 用下拉、數字可用 `{{變數}}`、input 可依 schema 填入欄位），也可切成 JSON；變數區固定在查詢下方，中間的分隔線可拖曳調整高度，查詢再長也不會把變數擠出畫面；`subscription` 透過 WebSocket 連線（graphql-transport-ws 或較舊的 graphql-ws），逐筆串流結果 |
 | WebSocket | |
 | SSE | |
 | Socket.IO 2、3 與 4 | URL 的路徑即 namespace，JSON 內容即 auth payload（v2 沒有 auth payload，「參數」會附在交握的查詢字串上）；「設定」可指定交握路徑（空白即 `/socket.io/`）與用戶端版本；以 `event {"json": "arg"}` 或 `["event", …]` 陣列送出；會顯示 ack |
@@ -56,7 +56,7 @@ MQTT：
   代理伺服器，以 CONNECT 建立通道。
 
 每種串流的紀錄都能只看收到或送出的訊息（↓ ↑），也能依文字篩選，訊息量大時也跟得上。「送出」下方的
-書籤圖示會把輸入的訊息存進請求；旁邊的清單可把存過的訊息放回輸入框。
+書籤圖示會把輸入的訊息存進請求；旁邊的清單可把存過的訊息放回輸入框。點一則訊息會在下方顯示可複製的內容，按 × 關閉。
 
 ## 請求
 
@@ -76,12 +76,16 @@ MQTT：
   存成變數（新增或既有的，存在目前的環境或全域變數中）；和 Postman 一樣，原本的文字維持不變。
   新增的變數預設為機密（只存在這台電腦），取消勾選「機密」則存到共用的一側。
 - 輸入時自動完成標頭名稱與 Content-Type 值。「標頭」分頁可展開查看傳送時自動加上的標頭（Host、
-  驗證、Content-Type…）及各自的來源。
+  驗證、Content-Type…）及各自的來源；「修改預設值…」會開啟網路設定，在那裡設定 User-Agent、
+  Accept 與 gzip 的 Accept-Encoding，套用到所有沒有自行設定的請求。User-Agent 留空則不送出；
+  Accept 留空仍會送出 `*/*`，因為 HTTP 用戶端一定會加上。
 - 支援 Postman 全部 120 個動態變數（`{{$guid}}`、`{{$timestamp}}`、`{{$randomEmail}}`、
   `{{$randomBankAccountIban}}`…），每次使用都產生新值；輸入 `{{email` 會自動完成為
   `$randomEmail`。
 - `{{?name}}` 提示變數：傳送時詢問，只保留到 apitool 關閉；Insomnia 的 `{% prompt %}` 會匯入成
   這種變數。
+- 快速檢視（環境旁的眼睛圖示）會在側邊停駐一個面板，列出所有可用的變數，依環境、資料夾、全域
+  分組，被覆蓋的會加刪除線。環境與全域變數可直接修改：Enter 保留，Esc 還原。
 - 環境可以設定顏色（例如 prod 設紅色），顯示在環境選單上，並在視窗頂端加一條色帶。
 - 資料夾設定（在資料夾上按右鍵）可設定變數、驗證與指令碼，由資料夾內所有請求共用，相當於
   Postman 的集合與資料夾設定。

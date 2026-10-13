@@ -227,9 +227,12 @@ pub async fn send(client: &net::Clients, mut req: Request) -> Result<http::Respo
     } else if let crate::model::Auth::Ntlm(_) = req.auth {
         // `_over` lives until the handshake is done, see `ntlm_for`.
         let (ntlm, _over) = client.ntlm_for(&req.settings, &req.url)?;
-        http::execute(ntlm, req).await
+        let net = client.network().clone();
+        http::NETWORK.scope(net, http::execute(ntlm, req)).await
     } else {
-        http::execute(client.for_settings(&req.settings, &req.url)?, req).await
+        let wire = client.for_settings(&req.settings, &req.url)?;
+        let net = client.network().clone();
+        http::NETWORK.scope(net, http::execute(wire, req)).await
     }
 }
 
