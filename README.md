@@ -41,7 +41,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | Protocol | Notes |
 |---|---|
 | HTTP | HTTP version, redirects, TLS check, cookies and timeout per request |
-| GraphQL | Once the schema is fetched, fields complete as you type the query; variables fill in as a form, a row per `$variable` the query declares (enum and Boolean pickers, numbers that may be `{{variables}}`; an input object lists every field of its type, nested ones under the ticked fields, and only ticked ones are sent, as in Postman), or as JSON. A variable or field added starts with a random value of its type, as gRPC's Fill body does (Fill in values off: empty); under the query with a divider to drag, so a long query doesn't push them off screen; a `subscription` connects over WebSocket (graphql-transport-ws or the older graphql-ws) and streams each result. The schema explorer lists queries, mutations and subscriptions. A query holding several operations shows a picker beside "Query" for the one to run, sent as `operationName` |
+| GraphQL | Once the schema is fetched, fields complete as you type the query; variables fill in as a form, a row per `$variable` the query declares (enum and Boolean pickers, numbers that may be `{{variables}}`; an input object lists every field of its type, nested ones under the ticked fields, and only ticked ones are sent, as in Postman), or as JSON. A variable or field added starts with a random value of its type, as gRPC's Fill body does (Fill in values off: empty); under the query with a divider to drag, so a long query doesn't push them off screen; a `subscription` connects over WebSocket (graphql-transport-ws or the older graphql-ws) and streams each result. The schema explorer lists queries, mutations and subscriptions. A query holding several operations shows a picker beside "Query" for the one to run, sent as `operationName`. Beautify lays a one-line query out one field per line (a query with `#` comments is left as it is) |
 | WebSocket | Text or binary messages: beside Send, Base64 or Hex sends the box decoded, as one binary message; received ones show their size and bytes in hex |
 | SSE | |
 | Socket.IO 2, 3 and 4 | The URL's path is the namespace and a JSON body the auth payload (v2 has none: Params go on the handshake's query); Settings sets the handshake path (`/socket.io/` if empty) and the client version; send `event {"json": "arg"}` or a `["event", …]` array, or name the event in the Event field and type only its argument; Ack asks the server to acknowledge a message, and its answer shows as `ack` with the same number |
@@ -60,7 +60,8 @@ MQTT:
   with CONNECT.
 
 Every stream's log narrows to received or sent messages (↓ ↑) and to text, which keeps up
-with a busy feed. The message box is there before Connect, so a message can be written
+with a busy feed. Each message shows the local time it came or went, to the millisecond;
+hovering shows the seconds since connecting. The message box is there before Connect, so a message can be written
 first; Send waits for the connection. A message that can't go out (JSON that doesn't parse,
 a typo in Base64) says why under the box. The bookmark under Send keeps the typed message in
 the request; the list beside it puts a kept one back in the box. Clicking a message shows its

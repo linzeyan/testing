@@ -365,6 +365,8 @@ fn mcp_setup(client: usize, cli: &Path, root: &Path, window: bool) -> String {
 struct StreamSession {
     path: PathBuf,
     started: Instant,
+    /// `started` on the wall clock: the log shows times of day, to match a server's logs.
+    opened: std::time::SystemTime,
     /// Written by the connection's task, not passed through `Msg`: a queue would grow
     /// without bound while the window is minimized and nothing drains it.
     log: Arc<std::sync::Mutex<Log>>,
@@ -2417,6 +2419,7 @@ impl App {
         self.stream = Some(StreamSession {
             path: open.path.clone(),
             started,
+            opened: std::time::SystemTime::now(),
             log,
             selected: None,
             outgoing,
@@ -9395,13 +9398,23 @@ fn graphql_editor(
                     .response
                     .on_hover_text(t("The operation to run"));
             }
+            let hint = t("One field per line. A query with # comments is left as it is.");
+            if !query.trim().is_empty()
+                && ui.small_button(t("Beautify")).on_hover_text(hint).clicked()
+                && let Some(laid_out) = crate::graphql::pretty(query)
+            {
+                *query = laid_out;
+            }
         });
         let schema = ex.schema.as_ref().and_then(|s| s.as_ref().ok());
         let fields = |text: &str, at: usize| schema?.complete(text, at);
+        let query_h = (total - vars_h - 2.0 * row - 8.0).max(row);
+        // Down to the divider: 8 rows left the rest of its space empty.
+        let rows = (query_h / ui.text_style_height(&egui::TextStyle::Monospace)) as usize;
         egui::ScrollArea::vertical()
             .id_salt("gql-query-scroll")
             .auto_shrink(false)
-            .max_height((total - vars_h - 2.0 * row - 8.0).max(row))
+            .max_height(query_h)
             .show(ui, |ui| {
                 var_edit(
                     ui,
@@ -9417,7 +9430,7 @@ fn graphql_editor(
                             .hint_text(t(
                                 "Fetch the schema and click a field →\nor type a query here: its fields complete as you type.",
                             ))
-                            .desired_rows(8)
+                            .desired_rows(rows.saturating_sub(1).max(4))
                             .desired_width(f32::INFINITY)
                     },
                 );
@@ -11376,11 +11389,16 @@ fn grpc_bar(
     let reflection = source.starts_with(crate::grpc::REFLECTION);
     ui.horizontal(|ui| {
         ui.label(t("Proto"));
-        ui.add(
+        // A path's room grows with the pane, the rest is hover. Empty asks the server, as
+        // the note beside says: the hint only shows what goes here.
+        let field = ui.add(
             egui::TextEdit::singleline(&mut req.proto)
-                .hint_text(t("protos/service.proto, or empty to ask the server"))
-                .desired_width(260.0),
+                .hint_text("protos/service.proto")
+                .desired_width((ui.available_width() * 0.35).max(200.0)),
         );
+        if !req.proto.is_empty() {
+            field.on_hover_text(&req.proto);
+        }
         browse(
             ui,
             &mut req.proto,
@@ -11741,6 +11759,7 @@ fn stream_ui(
     // One line per event and only the rows in view laid out: 5000 wrapped messages
     // would cost gigabytes of text layout every frame.
     let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
+    let opened = s.opened;
     let mut clicked = None;
     egui::ScrollArea::vertical()
         .auto_shrink(false)
@@ -11764,7 +11783,9 @@ fn stream_ui(
                     let n = log.dropped + i as u64;
                     ui.horizontal(|ui| {
                         ui.set_height(row_h);
-                        ui.weak(format!("{:>8.3}", at.as_secs_f32()));
+                        let since = format!("{:.3}", at.as_secs_f32());
+                        ui.weak(clock(opened + *at, *UTC_OFFSET))
+                            .on_hover_text(tf("+{} s after connecting", &[&since]));
                         ui.add_sized(
                             [56.0, row_h],
                             egui::Label::new(
@@ -13351,6 +13372,24 @@ fn ago(unix_secs: u64) -> String {
         s if s < 86400 => tf("{} h ago", &[&(s / 3600)]),
         s => tf("{} d ago", &[&(s / 86400)]),
     }
+}
+
+/// Seconds east of UTC here. The standard library has no time zones; SQLite's localtime
+/// asks the OS, on every platform. ponytail: read once, so a DST change mid-session is an
+/// hour off until restart.
+static UTC_OFFSET: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    let sql = "SELECT strftime('%s', 'now', 'localtime') - strftime('%s', 'now')";
+    (rusqlite::Connection::open_in_memory())
+        .and_then(|db| db.query_row(sql, [], |r| r.get(0)))
+        .unwrap_or(0)
+});
+
+/// `at` as a time of day `offset` seconds east of UTC: "14:03:07.250".
+fn clock(at: std::time::SystemTime, offset: i64) -> String {
+    let ms = (at.duration_since(std::time::UNIX_EPOCH)).map_or(0, |d| d.as_millis() as i64);
+    let day = (ms + offset * 1000).rem_euclid(86_400_000);
+    let (h, m, s) = (day / 3_600_000, day / 60_000 % 60, day / 1000 % 60);
+    format!("{h:02}:{m:02}:{s:02}.{:03}", day % 1000)
 }
 
 fn status_color(status: u16) -> Color32 {
@@ -15911,6 +15950,13 @@ mod ui_tests {
             2,
             "sent and echoed"
         );
+        // Each row at its time of day ("14:03:07.250"), to line up with the server's logs.
+        // A label's text is its accesskit value.
+        let clocks = (h.get_all_by_role(Role::Label))
+            .filter_map(|n| n.value())
+            .filter(|l| l.len() == 12 && l.as_bytes()[2] == b':' && l.as_bytes()[8] == b'.')
+            .count();
+        assert!(clocks >= 5, "open, two out, two in: {clocks}");
         // Hex: the box goes out as the bytes it spells, one binary message; a typo stays
         // in the box with the reason, instead of going out as something else.
         let picker = egui_kittest::kittest::By::new()
@@ -16309,6 +16355,29 @@ mod ui_tests {
         assert_eq!(run(&mut h, "Run"), ["second"]);
         h.run();
         assert_eq!(last(&h).as_deref(), Some("second"), "kept");
+    }
+
+    /// Stream log times are times of day where the user is, as the server's logs have them.
+    #[test]
+    fn log_times_are_times_of_day_where_the_user_is() {
+        let ms = ((14 * 60 + 3) * 60 + 7) * 1000 + 250;
+        let at = std::time::UNIX_EPOCH + Duration::from_millis(ms);
+        assert_eq!(clock(at, 0), "14:03:07.250");
+        assert_eq!(clock(at, 8 * 3600), "22:03:07.250");
+        assert_eq!(clock(at, -15 * 3600), "23:03:07.250", "the day before");
+        // The OS's own zone, through SQLite: what `date` says.
+        #[cfg(unix)]
+        {
+            let out = std::process::Command::new("date")
+                .arg("+%z")
+                .output()
+                .unwrap();
+            let z = String::from_utf8(out.stdout).unwrap();
+            let (sign, hm) = z.trim().split_at(1);
+            let (h, m): (i64, i64) = (hm[..2].parse().unwrap(), hm[2..].parse().unwrap());
+            let secs = (h * 3600 + m * 60) * if sign == "-" { -1 } else { 1 };
+            assert_eq!(*UTC_OFFSET, secs);
+        }
     }
 
     /// A long data-driven run keeps a bounded list, but the counts cover every row and
@@ -18006,6 +18075,44 @@ mod ui_tests {
         assert!(h.query(combo("B")).is_some());
         // An edit like any other, saved with the request.
         assert!(h.state().open.as_ref().unwrap().dirty());
+    }
+
+    /// A one-line query (pasted from devtools) is laid out on a click, and the editor
+    /// reaches down to the variables instead of stopping at 8 rows above empty space.
+    #[test]
+    fn a_graphql_query_is_beautified_and_reaches_the_divider() {
+        let mut h = with_request("gql-beautify");
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        d.method = "GRAPHQL".into();
+        d.body = Body::GraphQL {
+            query: "{ a { b } }".into(),
+            variables: String::new(),
+        };
+        h.state_mut().req_tab = ReqTab::Body;
+        h.run();
+        h.get_by_label("Beautify").click();
+        h.run();
+        let Body::GraphQL { query, .. } = &draft(&h).body else {
+            panic!("not GraphQL")
+        };
+        assert_eq!(query, "{\n  a {\n    b\n  }\n}");
+        let editor = h.get_by_role(Role::MultilineTextInput).rect();
+        let variables = h.get_by_label("Variables").rect();
+        let gap = variables.top() - editor.bottom();
+        assert!(gap < 36.0, "{gap}: {editor:?} {variables:?}");
+    }
+
+    /// A .proto path has room to be read, more in a wider pane; its hint is a path, the
+    /// note beside it says what empty does.
+    #[test]
+    fn the_proto_path_has_room() {
+        let mut h = with_request("proto-room");
+        h.state_mut().open.as_mut().unwrap().draft.method = "GRPC".into();
+        h.run();
+        let field = (h.get_all_by_role(Role::TextInput))
+            .find(|n| n.accesskit_node().placeholder() == Some("protos/service.proto"))
+            .unwrap();
+        assert!(field.rect().width() > 280.0, "{:?}", field.rect());
     }
 
     /// Subscriptions are browsed like queries: a field under their root is written as a

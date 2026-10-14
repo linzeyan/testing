@@ -953,10 +953,6 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Private key", "私密金鑰"),
     ("Properties", "屬性"),
     ("Proto", "Proto"),
-    (
-        "protos/service.proto, or empty to ask the server",
-        "protos/service.proto，留空則向伺服器查詢",
-    ),
     ("Proxy", "代理伺服器"),
     ("Closing Settings applies it too", "關閉設定時也會套用"),
     ("Publish needs a topic", "發布需要指定主題"),
@@ -1763,6 +1759,11 @@ const ZH_TW: &[(&str, &str)] = &[
         "No tests ran. Add checks in the Asserts tab, or pm.test(…) in the Post-response script.",
         "沒有執行任何測試。可在「斷言」分頁加入檢查，或在「回應後」指令碼使用 pm.test(…)。",
     ),
+    (
+        "One field per line. A query with # comments is left as it is.",
+        "每個欄位一行。含 # 註解的查詢不會變更。",
+    ),
+    ("+{} s after connecting", "連線後 +{} 秒"),
     ("Show secret values", "顯示秘密值"),
     (
         "For each request, unless its Settings tab sets its own",

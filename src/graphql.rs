@@ -928,6 +928,81 @@ struct OperationText {
     sel: Selection,
 }
 
+/// The query one field per line, two spaces a level, commas between arguments. None when
+/// it has `#` comments, which the tokens leave out, or when the layout would change a
+/// token: only whitespace and commas, both insignificant in GraphQL, may differ.
+pub fn pretty(query: &str) -> Option<String> {
+    let tokens = |text: &str| -> (Vec<String>, bool) {
+        let p = Parser::new(text);
+        let mut last = 0;
+        let mut comment = false;
+        for &(s, e) in &p.tokens {
+            comment |= text[last..s].contains('#');
+            last = e;
+        }
+        comment |= text[last..].contains('#');
+        let list = p.tokens.iter().map(|&(s, e)| text[s..e].to_owned());
+        (list.collect(), comment)
+    };
+    let (list, comment) = tokens(query);
+    if comment {
+        return None;
+    }
+    let mut out = String::new();
+    // `depth`: selection sets; `nest`: brackets in arguments, objects there included.
+    let (mut depth, mut nest, mut prev) = (0usize, 0usize, "");
+    let line = |out: &mut String, depth: usize| {
+        out.push('\n');
+        out.push_str(&"  ".repeat(depth));
+    };
+    for t in &list {
+        let t = t.as_str();
+        match t {
+            "{" if nest == 0 => {
+                out.push_str(if out.is_empty() { "{" } else { " {" });
+                depth += 1;
+                line(&mut out, depth);
+            }
+            "}" if nest == 0 => {
+                depth = depth.saturating_sub(1);
+                line(&mut out, depth);
+                out.push('}');
+            }
+            _ => {
+                let item = t == "..." || Parser::name(t);
+                if prev == "}" && nest == 0 && depth == 0 {
+                    out.push_str("\n\n");
+                } else if nest == 0
+                    && depth > 0
+                    && (prev == "}" || item)
+                    && !matches!(prev, ":" | "@" | "..." | "on" | "{" | "$")
+                {
+                    line(&mut out, depth);
+                } else if nest > 0
+                    && !matches!(prev, "(" | "[" | "{" | ":" | "$" | "=" | "@")
+                    && !matches!(t, ")" | "]" | "}" | ":" | "!" | "=" | "(")
+                {
+                    out.push_str(", ");
+                } else if !out.is_empty()
+                    && !matches!(prev, "(" | "[" | "{" | "$" | "@")
+                    && !(prev == "..." && t != "on")
+                    && !matches!(t, ")" | "]" | "}" | ":" | "!" | "(")
+                {
+                    out.push(' ');
+                }
+                out.push_str(t);
+                match t {
+                    "(" | "[" | "{" => nest += 1,
+                    ")" | "]" | "}" => nest = nest.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
+        prev = t;
+    }
+    (tokens(&out).0 == list).then_some(out)
+}
+
 /// The names of the document's operations, in order.
 pub fn operation_names(query: &str) -> Vec<String> {
     let p = Parser::new(query);
@@ -1525,6 +1600,31 @@ pub(crate) mod tests {
         // Renamed away: the first, since the server won't guess.
         assert_eq!(operation_name(doc, "Gone").as_deref(), Some("A"));
         assert_eq!(operation_name("query A { a }", "A"), None);
+    }
+
+    /// A query pasted on one line (from devtools, a log) reads as one field per line;
+    /// only whitespace and commas change, so it runs the same.
+    #[test]
+    fn a_one_line_query_is_laid_out_one_field_per_line() {
+        let one_line = "query Q($id: ID!, $n: Int = 2) { user(id: $id) { name ...F \
+            friends(first: $n) @include(if: true) { id } ... on Admin { level } } } \
+            fragment F on User { email }";
+        let laid_out = "query Q($id: ID!, $n: Int = 2) {\n  user(id: $id) {\n    name\n    ...F\n    \
+            friends(first: $n) @include(if: true) {\n      id\n    }\n    ... on Admin {\n      \
+            level\n    }\n  }\n}\n\nfragment F on User {\n  email\n}";
+        assert_eq!(pretty(one_line).as_deref(), Some(laid_out));
+        assert_eq!(pretty(laid_out).as_deref(), Some(laid_out), "and stays so");
+        // Objects and lists in arguments stay on the field's line.
+        let args = r#"{ search(filter: {tags: ["a" "b"] min: -1}) { id } }"#;
+        let expected = "{\n  search(filter: {tags: [\"a\", \"b\"], min: -1}) {\n    id\n  }\n}";
+        assert_eq!(pretty(args).as_deref(), Some(expected));
+        // A comment would be lost: left as it is.
+        assert_eq!(pretty("{ a # why\n b }"), None);
+        assert!(pretty("{ a(s: \"# not a comment\") }").is_some());
+        // A string left open ends at its line: the line break stays, or it would swallow
+        // what follows.
+        let open = "{\n  a(s: \"open\n)\n}";
+        assert_eq!(pretty("{ a(s: \"open\n) }").as_deref(), Some(open));
     }
 
     /// A field clicked at any depth brings only its path along, into the query being
