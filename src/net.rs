@@ -751,7 +751,7 @@ fn detect_wpad() -> Option<String> {
 
 /// Copies a NUL-terminated WinHTTP string and frees it. Null is None.
 #[cfg(windows)]
-unsafe fn take_wide(p: windows_sys::core::PWSTR) -> Option<String> {
+pub(crate) unsafe fn take_wide(p: windows_sys::core::PWSTR) -> Option<String> {
     if p.is_null() {
         return None;
     }

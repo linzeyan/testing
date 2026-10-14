@@ -1863,6 +1863,19 @@ const ZH_TW: &[(&str, &str)] = &[
         "連 HTTPS 也讀取：每個主機改用 apitool CA 簽發的憑證，應用程式必須信任這個 CA",
     ),
     ("Export CA certificate…", "匯出 CA 憑證…"),
+    ("Use as the system proxy", "設為系統代理"),
+    (
+        "Points the system's HTTP and HTTPS proxy here; Stop or quitting puts back what was set",
+        "把系統的 HTTP 與 HTTPS 代理指向這裡；停止擷取或結束 apitool 時會還原原本的設定",
+    ),
+    ("Start capturing first", "請先開始擷取"),
+    ("The system proxy is back as it was", "系統代理已還原"),
+    (
+        "The system proxy couldn't be put back: {}",
+        "無法還原系統代理：{}",
+    ),
+    ("Setting the system proxy: {}", "設定系統代理：{}"),
+    ("The system proxy points at {}", "系統代理已指向 {}"),
     (
         "Add it to the trusted roots of the system (Keychain Access, certmgr) or of the app",
         "把它加到系統（鑰匙圈存取、certmgr）或應用程式的受信任根憑證",

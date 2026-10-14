@@ -687,6 +687,16 @@ impl Workspace {
         self.put("capture-ca", json)
     }
 
+    /// The system's proxy settings from before the capture pointed it at itself; empty
+    /// when it doesn't.
+    pub fn load_system_proxy(&self) -> String {
+        self.get("system-proxy").unwrap_or_default()
+    }
+
+    pub fn save_system_proxy(&self, json: &str) -> Result<(), String> {
+        self.put("system-proxy", json)
+    }
+
     /// Where requests and folders live, as paths (see the module docs).
     pub fn collections(&self) -> PathBuf {
         self.root.join("collections")

@@ -41,6 +41,7 @@ pub mod store;
 mod stream;
 mod sync;
 mod syntax;
+mod sysproxy;
 pub mod update;
 mod varedit;
 mod vault;

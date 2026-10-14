@@ -379,7 +379,10 @@ and a second request to a method and path already taken are left out, and counte
 
 "Capture" in the status bar (or "Capture traffic" from Ctrl+K) opens a pane
 like Proxyman's or Charles's. Start capturing, then set the address shown, `127.0.0.1:9090`
-(another free port when that one is taken), as the HTTP proxy of an app or of the system.
+(another free port when that one is taken), as the HTTP proxy of an app, or tick "Use as the
+system proxy" to point the system's HTTP and HTTPS proxy there (Windows' Internet Options,
+macOS's network services; a proxy script or auto-detection is turned off meanwhile). Stop,
+closing the capture or quitting puts back what was set; after a crash, the next start does.
 What it sends goes on with apitool's own network settings (its proxy, CA and client
 certificates) and shows as a row: time, method, status, duration, size, URL. A row opens
 underneath with both sides' headers and bodies; "Open as request" saves it as a new

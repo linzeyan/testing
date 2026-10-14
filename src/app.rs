@@ -528,6 +528,8 @@ struct CaptureView {
     picked: Option<u64>,
     /// The CA while Decrypt HTTPS is on, shared with the proxy, which reads it per tunnel.
     decrypt: crate::capture::Decrypt,
+    /// The system's proxy points here (what it was is in the workspace).
+    system: bool,
 }
 
 /// Stops the capture proxy when dropped.
@@ -1245,6 +1247,8 @@ impl App {
         if let Some(path) = state.open.filter(|p| app.ws.exists(p)) {
             app.activate(path, true);
         }
+        // Left pointing at a capture that's gone: apitool was killed while capturing.
+        app.restore_system_proxy();
         app
     }
 
@@ -3321,6 +3325,11 @@ impl eframe::App for App {
         eframe::set_value(storage, WINDOW_KEY, &kept);
     }
 
+    /// The system's proxy can't be left pointing at a capture that's gone.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.restore_system_proxy();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         crate::i18n::set(self.appearance.language);
         self.log_frame(frame.info().cpu_usage);
@@ -4307,8 +4316,39 @@ impl App {
         let view = self.capture.as_mut()?;
         if view.server.as_ref().is_some_and(|s| s.abort.is_finished()) {
             view.server = None;
+            self.restore_system_proxy();
         }
-        view.server.as_ref().map(|s| s.addr)
+        self.capture.as_ref()?.server.as_ref().map(|s| s.addr)
+    }
+
+    /// The system's proxy at the capture, what it was kept in the workspace first: killed
+    /// meanwhile, apitool puts it back at its next start.
+    fn point_system_proxy(&mut self, addr: std::net::SocketAddr) -> Result<(), String> {
+        let saved = crate::sysproxy::current()?;
+        let json = serde_json::to_string(&saved).map_err(|e| e.to_string())?;
+        self.ws.save_system_proxy(&json)?;
+        crate::sysproxy::point(&saved, addr).inspect_err(|_| {
+            let _ = self.ws.save_system_proxy("");
+        })
+    }
+
+    /// The system's proxy as it was before the capture pointed it at itself, if it did.
+    fn restore_system_proxy(&mut self) {
+        if let Some(view) = &mut self.capture {
+            view.system = false;
+        }
+        let kept = self.ws.load_system_proxy();
+        let Ok(saved) = serde_json::from_str::<crate::sysproxy::Saved>(&kept) else {
+            return;
+        };
+        match crate::sysproxy::restore(&saved) {
+            Ok(()) => {
+                let _ = self.ws.save_system_proxy("");
+                self.status = t("The system proxy is back as it was").into();
+            }
+            // Kept in the workspace: the next start tries again.
+            Err(e) => self.fail(tf("The system proxy couldn't be put back: {}", &[&e])),
+        }
     }
 
     /// Decrypting's CA: made the first time, then kept in the workspace, its key sealed as
@@ -4331,9 +4371,9 @@ impl App {
     fn capture_ui(&mut self, ui: &mut egui::Ui) {
         let listening = self.capturing();
         let view = self.capture.get_or_insert_with(|| capture_view(ui.ctx()));
-        let decrypting = view.decrypt.lock().unwrap().is_some();
+        let (decrypting, pointing) = (view.decrypt.lock().unwrap().is_some(), view.system);
         let (mut start, mut stop, mut export, mut open_as) = (false, false, false, None);
-        let (mut decrypt, mut export_ca) = (None, false);
+        let (mut decrypt, mut export_ca, mut system) = (None, false, None);
         ui.horizontal(|ui| {
             ui.heading(t("Capture"));
             ui.add_space(8.0);
@@ -4350,6 +4390,19 @@ impl App {
                     stop = ui.button(t("Stop")).clicked();
                 }
                 None => start = ui.add(primary(t("Start capturing"))).clicked(),
+            }
+            let mut on = pointing;
+            let tick = ui.add_enabled_ui(listening.is_some(), |ui| {
+                ui.checkbox(&mut on, t("Use as the system proxy"))
+            });
+            if (tick.inner)
+                .on_hover_text(t(
+                    "Points the system's HTTP and HTTPS proxy here; Stop or quitting puts back what was set",
+                ))
+                .on_disabled_hover_text(t("Start capturing first"))
+                .changed()
+            {
+                system = Some(on);
             }
             ui.separator();
             let mut on = decrypting;
@@ -4431,9 +4484,26 @@ impl App {
                 Err(e) => self.fail(format!("{to}: {e}")),
             }
         }
-        if stop && let Some(view) = &mut self.capture {
-            view.server = None;
+        match (system, listening) {
+            (Some(true), Some(addr)) => match self.point_system_proxy(addr) {
+                Ok(()) => {
+                    if let Some(view) = &mut self.capture {
+                        view.system = true;
+                    }
+                    self.status = tf("The system proxy points at {}", &[&addr]);
+                }
+                Err(e) => self.fail(tf("Setting the system proxy: {}", &[&e])),
+            },
+            (Some(false), _) => self.restore_system_proxy(),
+            _ => {}
+        }
+        if stop {
+            if let Some(view) = &mut self.capture {
+                view.server = None;
+            }
             self.status = t("Capture stopped").into();
+            // After: a failure to put it back is the message that stays.
+            self.restore_system_proxy();
         }
         if export && let Some(to) = pick_file("capture.har", &[("HAR", &["har", "json"])], true) {
             self.export_capture(Path::new(&to));
@@ -4740,6 +4810,7 @@ impl App {
         } else if show_capture {
             (self.capture_shown, self.runner_shown) = (true, false);
         } else if close_capture {
+            self.restore_system_proxy();
             (self.capture, self.capture_shown) = (None, false);
         }
     }
@@ -12005,6 +12076,7 @@ fn capture_view(ctx: &egui::Context) -> CaptureView {
         filter: String::new(),
         picked: None,
         decrypt: Default::default(),
+        system: false,
     }
 }
 
@@ -20904,6 +20976,39 @@ mod ui_tests {
         let kept = h.state().ws.load_capture_ca();
         let sealed = cfg!(any(windows, target_os = "macos"));
         assert_eq!(kept.contains("PRIVATE KEY"), !sealed, "{kept}");
+    }
+
+    /// The system proxy pointed at the capture goes back as it was at the next start after
+    /// a kill, on Stop and on closing the capture: never left at a proxy that's gone. With
+    /// no network service saved nothing is run, so the machine's settings stay untouched;
+    /// the checkbox is never clicked, which would point them here for real.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_system_proxy_goes_back_at_start_on_stop_and_on_close() {
+        let ws = workspace("sysproxy");
+        ws.save_system_proxy("[]").unwrap();
+        let mut h = harness(ws);
+        let kept = |h: &Harness<'_, App>| h.state().ws.load_system_proxy();
+        assert_eq!(kept(&h), "", "left by a kill: put back at start");
+        h.run();
+        h.state_mut().act(Action::Capture);
+        h.run();
+        let pointed = |h: &mut Harness<'_, App>| {
+            h.get_by_label("Start capturing").click();
+            h.run();
+            h.state().ws.save_system_proxy("[]").unwrap();
+            h.state_mut().capture.as_mut().unwrap().system = true;
+            h.run();
+        };
+        pointed(&mut h);
+        h.get_by_label("Stop").click();
+        h.run();
+        assert_eq!(kept(&h), "", "put back on Stop");
+        assert!(!h.state().capture.as_ref().unwrap().system);
+        pointed(&mut h);
+        h.get_by_label("Close the capture").click();
+        h.run();
+        assert_eq!(kept(&h), "", "put back on closing the capture");
     }
 
     fn wait_live(h: &mut Harness<'_, App>, done: impl Fn(&App) -> bool) {
