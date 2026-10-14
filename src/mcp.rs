@@ -183,6 +183,11 @@ impl Server {
             Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or_default(), false),
             Err(e) => (e, true),
         };
+        // The tool, not its arguments: those carry bodies and variable values.
+        match is_error {
+            true => log::debug!("MCP {name} failed: {}", crate::logfile::redact(&text)),
+            false => log::debug!("MCP {name}: {} B back", text.len()),
+        }
         json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
     }
 

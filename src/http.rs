@@ -353,6 +353,7 @@ pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, 
             if resp.status != 401 {
                 return Ok(resp);
             }
+            log::debug!("OAuth 2.0: 401 with the kept token, asking for a new one");
             // The cached token was revoked or expired early: one retry with a new one.
             let mut retry = req;
             with_token(&client, &mut retry, true).await?;
@@ -371,8 +372,13 @@ pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, 
                         .is_some_and(|s| s.eq_ignore_ascii_case("digest"))
             });
             let (401, Some((_, challenge))) = (first.status, challenge) else {
+                log::debug!(
+                    "Digest: {} without a challenge, so that's the answer",
+                    first.status
+                );
                 return Ok(first);
             };
+            log::debug!("Digest: answering the 401's challenge");
             let wire = build(&client, req.clone())?
                 .build()
                 .map_err(|e| error_chain(&e))?;
@@ -410,8 +416,13 @@ pub async fn execute(client: reqwest::Client, req: Request) -> Result<Response, 
                     .then(|| token.trim().to_owned())
             });
             let (401, Some(challenge)) = (first.status, challenge) else {
+                log::debug!(
+                    "NTLM: {} without a challenge, so that's the answer",
+                    first.status
+                );
                 return Ok(first);
             };
+            log::debug!("NTLM: answering the challenge on the same connection");
             let value = crate::ntlm::authenticate(&n, &challenge)?;
             req.headers.push(KeyValue::new("Authorization", value));
             send_once(&client, req).await
@@ -440,13 +451,27 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
         }),
         ..Default::default()
     };
+    log::debug!(
+        "send {} {} {:?}, body {}",
+        sent.method,
+        crate::logfile::redact(&sent.url),
+        wire.version(),
+        match (wire.body(), body_len) {
+            (None, _) => "none".to_owned(),
+            (Some(_), Some(n)) => format!("{n} B"),
+            (Some(_), None) => "streamed".to_owned(),
+        }
+    );
     let started = Instant::now();
     let send = async {
         let resp = follow(client, wire, &settings).await;
         (resp, TRACE.with(|t| t.take()))
     };
     let (resp, trace) = TRACE.scope(Default::default(), send).await;
-    let resp = resp?;
+    let resp = resp.inspect_err(|e| {
+        let ms = started.elapsed().as_millis();
+        log::debug!("failed after {ms} ms: {}", crate::logfile::redact(e));
+    })?;
     sent.waited = Some(started.elapsed());
     // Outside `runner::send` (tests): the clients built from the defaults.
     let net = NETWORK.try_with(Clone::clone).unwrap_or_default();
@@ -460,7 +485,28 @@ async fn send_once(client: &reqwest::Client, req: Request) -> Result<Response, S
     let status = resp.status();
     let version = format!("{:?}", resp.version());
     let headers = header_list(resp.headers());
+    log::debug!(
+        "{status} {version} from {}, headers after {} ms (connect {:?}, DNS {:?}, TLS {:?}), {} redirects",
+        sent.remote.as_deref().unwrap_or("?"),
+        started.elapsed().as_millis(),
+        sent.connect,
+        sent.dns,
+        sent.tls,
+        sent.hops.len()
+    );
+    // Names only: values carry cookies and tokens.
+    log::trace!(
+        "response headers: {}",
+        (headers.iter().map(|h| &h.0[..]))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let (body, bytes, truncated) = read_body(resp).await?;
+    let size = bytes.as_ref().map_or(body.len(), Vec::len);
+    log::trace!(
+        "body {size} B in {} ms, cut: {truncated}",
+        started.elapsed().as_millis()
+    );
     Ok(Response {
         status: status.as_u16(),
         reason: status.canonical_reason().unwrap_or("").to_owned(),
@@ -570,6 +616,10 @@ async fn follow(
         *next.timeout_mut() = deadline.map(|d| d.saturating_duration_since(Instant::now()));
         *next.body_mut() = next_body;
         trace(|t| t.hops.push((status, to.to_string())));
+        log::debug!(
+            "{status}: following to {}",
+            crate::logfile::redact(to.as_str())
+        );
         resp = client.execute(next).await.map_err(failed)?;
         followed += 1;
     }

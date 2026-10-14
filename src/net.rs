@@ -392,6 +392,20 @@ pub async fn build_client_with_jar(
             (Some(pac_proxy(&pac)), Route::Pac(pac))
         }
     };
+    let how = match &route {
+        Route::Direct => "direct",
+        Route::Rules(_) => "proxy rules",
+        Route::Pac(_) => "PAC script",
+    };
+    let host_certs = net.host_certs.len();
+    log::info!(
+        "network: {:?} proxy ({how}), CA file {:?}, client certificate {:?}, {host_certs} host certificates, verify TLS {}, timeout {} s",
+        net.proxy,
+        net.ca_file.trim(),
+        net.client_cert.trim(),
+        !net.insecure,
+        net.timeout_secs
+    );
 
     let ca = net.ca_file.trim();
     let mut certs = Vec::new();
@@ -617,14 +631,17 @@ async fn system_proxy(pac: Option<String>) -> (Option<Arc<Pac>>, Option<String>)
     };
     match load_pac(&url).await {
         Ok(pac) => (Some(pac), None),
-        Err(e) => (
-            None,
-            Some(crate::i18n::tf(
-                "The system's proxy script {} can't be used, so requests go out directly \
-                 (as in a browser).\n{}",
-                &[&url, &e],
-            )),
-        ),
+        Err(e) => {
+            log::warn!("system proxy script {url} skipped, going direct: {e}");
+            (
+                None,
+                Some(crate::i18n::tf(
+                    "The system's proxy script {} can't be used, so requests go out directly \
+                     (as in a browser).\n{}",
+                    &[&url, &e],
+                )),
+            )
+        }
     }
 }
 
@@ -735,11 +752,17 @@ fn detect_wpad() -> Option<String> {
 
 /// The PAC script System mode uses: the configured one, else WPAD discovery if it's on.
 async fn system_pac_url() -> Result<Option<String>, String> {
-    match system_auto_config() {
+    let (pac, wpad) = system_auto_config();
+    log::debug!("system proxy: PAC script {pac:?}, automatically detect {wpad}");
+    match (pac, wpad) {
         (Some(url), _) => Ok(Some(url)),
-        (None, true) => tokio::task::spawn_blocking(detect_wpad)
-            .await
-            .map_err(|e| format!("WPAD: {e}")),
+        (None, true) => {
+            let found = tokio::task::spawn_blocking(detect_wpad)
+                .await
+                .map_err(|e| format!("WPAD: {e}"))?;
+            log::info!("WPAD found {found:?}");
+            Ok(found)
+        }
         (None, false) => Ok(None),
     }
 }
@@ -768,7 +791,9 @@ async fn fetch_pac(location: &str) -> Result<String, String> {
             .await
             .and_then(|r| r.error_for_status())
             .map_err(|e| err(&e))?;
-        return resp.text().await.map_err(|e| err(&e));
+        let text = resp.text().await.map_err(|e| err(&e))?;
+        log::debug!("PAC script from {location}: {} B", text.len());
+        return Ok(text);
     }
     let path = match reqwest::Url::parse(location) {
         Ok(url) if url.scheme() == "file" => url
@@ -864,10 +889,17 @@ impl Pac {
         if let Some(hit) = self.cache.lock().expect("PAC cache").get(&key) {
             return hit.clone();
         }
-        let proxy = self
-            .find(url.as_str(), host)
-            .ok()
-            .and_then(|r| first_proxy(&r));
+        // An error is DIRECT, as in a browser, but said here: nothing else shows it.
+        let proxy = match self.find(url.as_str(), host) {
+            Ok(r) => {
+                log::debug!("PAC for {key}: {r}");
+                first_proxy(&r)
+            }
+            Err(e) => {
+                log::warn!("PAC for {key}, going direct: {e}");
+                None
+            }
+        };
         self.cache
             .lock()
             .expect("PAC cache")

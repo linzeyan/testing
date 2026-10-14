@@ -87,7 +87,7 @@ beside it puts a kept one back in the box. Clicking a message shows its payload 
   (kept on this machine) unless its Secret box is unticked.
 - Header names and Content-Type values complete while typing. The Headers tab folds out what
   Send adds (Host, auth, Content-Type…) and where each comes from; "Change the defaults…" opens
-  the network settings, where User-Agent, Accept and gzip's Accept-Encoding are set for every
+  Settings > Network, where User-Agent, Accept and gzip's Accept-Encoding are set for every
   request that doesn't set its own. An empty User-Agent sends none; an empty Accept still sends
   `*/*`, which the HTTP client always adds.
 - All 120 of Postman's dynamic variables (`{{$guid}}`, `{{$timestamp}}`, `{{$randomEmail}}`,
@@ -103,7 +103,7 @@ beside it puts a kept one back in the box. Clicking a message shows its payload 
 - Folder settings (right-click a folder) hold variables, auth and scripts shared by every
   request inside, like Postman's collection and folder settings.
 
-**Network**
+**Network** (Settings > Network; the status bar shows the proxy in use and opens it)
 
 - Proxies: http, https and SOCKS (`socks5h://host:1080`), PAC (`SOCKS`/`SOCKS5` entries
   included) and WPAD.
@@ -226,8 +226,10 @@ right or all, which leaves tabs with unsaved edits open.
 
 **Layout**: the response sits beside the request; a window too narrow for two columns stacks
 them until it's wider. "Side by side" in the status bar turns that off and "Sidebar" folds
-the tree away; both are kept across restarts, as are the window's size, place and
-maximized. A screen too small for the default window gets it maximized.
+the tree away. Stacked, the request gets most of the height. The response's ⌄ (or
+"Response" in the status bar, `Ctrl+J`) folds it to a bar under the request that still
+shows the last status, time and size. All three are kept across restarts, as are the
+window's size, place and maximized. A screen too small for the default window gets it maximized.
 
 ## Keyboard shortcuts
 
@@ -257,6 +259,7 @@ lists these too.
 | Go to tab 1–8, the last | `Ctrl+1`…`9` |
 | Sidebar | `Ctrl+\` |
 | Side by side | `Ctrl+Alt+V` |
+| Show or hide the response | `Ctrl+J` |
 | Larger / smaller text | `Ctrl+=` / `Ctrl+-` |
 | Default text size | `Ctrl+0` |
 | Keyboard shortcuts | `Ctrl+/` |
@@ -367,6 +370,13 @@ requests, presses Send and switches environments, and its changes show at once.
 |---|---|---|
 | Workspace | `$APITOOL_WORKSPACE`, else `$XDG_DATA_HOME/apitool` (`~/.local/share/apitool`) | `$APITOOL_WORKSPACE`, else `workspace/` next to the executable |
 | Log, `apitool.log`; the window, `.window.ron` | `$XDG_STATE_HOME/apitool` (`~/.local/state/apitool`) | The workspace |
+
+The log keeps 1 MB and the one before it (`apitool.log.1`). Each line says which source line
+wrote it (`src/http.rs:478`). Settings > General sets how much goes in: Info by default;
+Debug adds each step of a request or stream (the proxy or PAC answer used, the connection,
+TLS, redirects, status and timings) and the network libraries' own steps; Trace also each
+message's size and a response's header names. Headers' values, bodies and tokens are never
+written, and every URL loses its query. The folder icon beside it opens the log's folder.
 
 The workspace keeps everything in one SQLite file, `apitool.db`. The collections,
 environments and globals are also written beside it as TOML for git (`collections/`,

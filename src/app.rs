@@ -49,7 +49,7 @@ const NEXT_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::T
 const PREV_TAB: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab);
 /// What Ctrl+K also offers, by key.
-const KEYED_ACTIONS: [(KeyboardShortcut, Action); 5] = [
+const KEYED_ACTIONS: [(KeyboardShortcut, Action); 6] = [
     (
         KeyboardShortcut::new(SHIFT_COMMAND, Key::N),
         Action::NewFolder,
@@ -69,6 +69,11 @@ const KEYED_ACTIONS: [(KeyboardShortcut, Action); 5] = [
     (
         KeyboardShortcut::new(Modifiers::COMMAND, Key::Slash),
         Action::Shortcuts,
+    ),
+    // VS Code's key for its bottom panel.
+    (
+        KeyboardShortcut::new(Modifiers::COMMAND, Key::J),
+        Action::Response,
     ),
 ];
 #[cfg(test)]
@@ -162,6 +167,7 @@ enum ReqTab {
 #[derive(PartialEq, Clone, Copy)]
 enum SettingsTab {
     General,
+    Network,
     Updates,
     Mcp,
     Sync,
@@ -937,10 +943,12 @@ pub struct App {
     /// Set each frame: the workbench is too narrow for side by side.
     narrow: bool,
     hide_sidebar: bool,
+    hide_response: bool,
     env_colors: HashMap<String, [u8; 3]>,
     recent_filters: Vec<String>,
     raw_types: Vec<String>,
     appearance: Appearance,
+    log_level: crate::logfile::Level,
     /// What `appearance` was when last applied; differs on the first frame and after a
     /// change in Settings.
     applied: Option<Appearance>,
@@ -1022,6 +1030,7 @@ impl App {
     pub fn new(ws: Workspace, renderer: String) -> Self {
         let (tx, rx) = mpsc::channel();
         let state = ws.load_state();
+        crate::logfile::set_level(state.log_level);
         crate::auth::import(&ws.load_tokens());
         let mut app = Self {
             tree: ws.tree(),
@@ -1058,10 +1067,12 @@ impl App {
             side_by_side: !state.stacked,
             narrow: false,
             hide_sidebar: state.hide_sidebar,
+            hide_response: state.hide_response,
             env_colors: state.env_colors.clone(),
             recent_filters: state.recent_filters.clone(),
             raw_types: state.raw_types.clone(),
             appearance: state.appearance.clone(),
+            log_level: state.log_level,
             applied: None,
             title_bar: None,
             fitted: false,
@@ -1343,6 +1354,7 @@ impl App {
             wrap_response: self.wrap_response,
             stacked: !self.side_by_side,
             hide_sidebar: self.hide_sidebar,
+            hide_response: self.hide_response,
             env_colors: self.env_colors.clone(),
             recent_filters: self.recent_filters.clone(),
             raw_types: self.raw_types.clone(),
@@ -1350,6 +1362,7 @@ impl App {
             run_orders: self.run_orders.clone(),
             run_options: self.run_options.clone(),
             appearance: self.appearance.clone(),
+            log_level: self.log_level,
             updates: self.updates.clone(),
             mcp_window: self.mcp_window,
             mcp_bind_host: self.mcp_bind_host.clone(),
@@ -1885,6 +1898,7 @@ impl App {
     /// Shows `path` in its tab, opening one if needed. A clean preview tab is reused, so
     /// clicking through the tree doesn't pile up tabs; `pin` makes the tab a normal one.
     fn activate(&mut self, path: PathBuf, pin: bool) {
+        log::debug!("open {}", self.ws.key(&path));
         // The tree is at the request now, not at the folder clicked before.
         self.tree_folder = None;
         let current = self.open.as_ref().map(|o| o.path.clone());
@@ -3426,7 +3440,6 @@ impl eframe::App for App {
         if let Some(id) = self.focus_request.take() {
             ui.memory_mut(|m| m.request_focus(id));
         }
-        self.network_editor_ui(ui.ctx());
         self.settings_ui(ui.ctx());
     }
 }
@@ -3486,7 +3499,7 @@ impl App {
                     .on_hover_text(note.unwrap_or(t("Network settings")))
                     .clicked()
                 {
-                    self.network_editor = Some(self.network.clone());
+                    (self.settings, self.settings_tab) = (true, SettingsTab::Network);
                 }
                 ui.separator();
                 let shown = !self.hide_sidebar;
@@ -3511,6 +3524,15 @@ impl App {
                     .clicked()
                 {
                     self.side_by_side = !on;
+                    self.save_state();
+                }
+                let shown = !self.hide_response;
+                let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[5].0);
+                if icon_button(ui, icon::PANEL_BOTTOM, t("Response"), Some(shown))
+                    .on_hover_text(format!("{} ({key})", t("Show or hide the response")))
+                    .clicked()
+                {
+                    self.hide_response = shown;
                     self.save_state();
                 }
                 ui.separator();
@@ -4355,11 +4377,26 @@ impl App {
         // like yaak and insomnia; widening the window puts it back.
         self.narrow = ui.available_width() < NARROW;
         // Separate ids, so each layout keeps its own dragged size.
-        let panel = match self.side_by_side && !self.narrow {
-            true => egui::Panel::left("request-side").default_size(ui.available_width() / 2.0),
-            false => egui::Panel::top("request").default_size(320.0),
+        let panel = if self.hide_response {
+            // Folded to its bar under the request, in either layout: the request gets the
+            // rest. The bar is a button tall in the central panel's margins.
+            let bar = button_height(ui) + 2.0 * 8.0 + 1.0;
+            let rest = (ui.available_height() - bar).max(0.0);
+            egui::Panel::top("request-full")
+                .exact_size(rest)
+                .resizable(false)
+        } else if self.side_by_side && !self.narrow {
+            egui::Panel::left("request-side")
+                .default_size(ui.available_width() / 2.0)
+                .resizable(true)
+        } else {
+            // Most of the height to the request: a response under 320 px of request took
+            // the rest, more than a status and a few lines of body need to be read.
+            egui::Panel::top("request")
+                .default_size(ui.available_height() * 0.6)
+                .resizable(true)
         };
-        panel.resizable(true).show(ui, |ui| {
+        panel.show(ui, |ui| {
             ui.add_space(4.0);
             // Buttons first, from the right; the name gets what is left and truncates,
             // instead of running under them.
@@ -4801,7 +4838,37 @@ impl App {
             delete: None,
             clear: false,
         };
+        let mut fold = None;
         egui::CentralPanel::default().show(ui, |ui| {
+            let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[5].0);
+            if self.hide_response {
+                ui.horizontal(|ui| {
+                    if icon_button(ui, icon::CHEVRON_UP, t("Show the response"), None)
+                        .on_hover_text(format!("{} ({key})", t("Show the response")))
+                        .clicked()
+                    {
+                        fold = Some(false);
+                    }
+                    // What came back, so a Send needn't unfold it to be seen.
+                    match (&pending, &self.response) {
+                        (Some(_), _) => {
+                            ui.weak(t("Sending…"));
+                        }
+                        (None, Some(shown)) if !streaming && self.load.is_none() => {
+                            match &shown.result {
+                                Ok(view) => status_line(ui, view),
+                                Err(_) => {
+                                    ui.colored_label(RED, t("Request failed"));
+                                }
+                            }
+                        }
+                        _ => {
+                            ui.weak(t("Response"));
+                        }
+                    }
+                });
+                return;
+            }
             if let Some(p) = pending {
                 // No spinner: it draws every frame, and on a software renderer (WARP on
                 // the VDI) each frame is CPU. A count of seconds needs one a second.
@@ -4841,6 +4908,11 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.weak(tf("Press Send or {} to see the response.", &[&ui.ctx().format_shortcut(&SEND)]));
                         past_menu(ui, &mut past, None);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if fold_button(ui, &key) {
+                                fold = Some(true);
+                            }
+                        });
                     });
                     shortcut_list(ui);
                 }
@@ -4849,7 +4921,11 @@ impl App {
                     let wrap = &mut self.wrap_response;
                     let tab = &mut self.resp_tab;
                     let recent = &mut self.recent_filters;
-                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_external, &mut past, recent);
+                    let hide = &mut false;
+                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_external, &mut past, recent, hide);
+                    if *hide {
+                        fold = Some(true);
+                    }
                     if let Ok(view) = &shown.result
                         && pretty_before != Some(view.pretty)
                     {
@@ -4863,6 +4939,10 @@ impl App {
                 }
             }
         });
+        if let Some(hide) = fold {
+            self.hide_response = hide;
+            self.save_state();
+        }
         let path = self.open.as_ref().map(|o| o.path.clone());
         if past.clear
             && let Some(path) = &path
@@ -4953,7 +5033,7 @@ impl App {
             self.fetch_schema(ui.ctx());
         }
         if change_defaults {
-            self.network_editor = Some(self.network.clone());
+            (self.settings, self.settings_tab) = (true, SettingsTab::Network);
         }
         if self.explorer.replace != replace_query {
             self.save_state();
@@ -6504,14 +6584,23 @@ impl App {
     fn settings_ui(&mut self, ctx: &egui::Context) {
         use crate::appearance::{DEFAULT_SIZE, SIZES, Theme};
         if !self.settings {
+            // Closed some other way than its own close: what was typed under Network is dropped.
+            self.network_editor = None;
             return;
         }
+        // Why the system's script was skipped: what Windows is configured with says nothing
+        // about whether it worked.
+        let skipped = (self.client.get()).and_then(|c| c.as_ref().ok()?.note.clone());
         // A restart that waited on the unsaved-edits question could come on a later close.
         let unsaved = !self.unsaved().is_empty();
+        let (net_draft, net_now) = (&mut self.network_editor, &self.network);
+        let mut apply_net = false;
         let families = self
             .font_families
             .get_or_insert_with(crate::appearance::families);
         let a = &mut self.appearance;
+        let log_level = &mut self.log_level;
+        let mut open_logs = false;
         let (updates, update) = (&mut self.updates, &self.update);
         let (mcp_window, mcp_client) = (&mut self.mcp_window, &mut self.mcp_client);
         let (bind_host, bind_port) = (&mut self.mcp_bind_host, &mut self.mcp_bind_port);
@@ -6534,16 +6623,18 @@ impl App {
         let remote_passphrase = &mut self.remote_passphrase;
         let passphrase_saved = self.remote_passphrase_saved;
         let mut sync_now = false;
-        let (mut close, mut network) = (false, false);
+        let mut close = false;
         let (mut check, mut install, mut restart) = (false, None, false);
         let tab = &mut self.settings_tab;
         let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
-            ui.set_width(460.0);
+            // As wide as Network needs, on every tab: a width per tab moved the tabs.
+            ui.set_width(560.0);
             ui.heading(t("Settings"));
             ui.add_space(6.0);
             // A tab each: in one long grid, the sections ran together and got misread.
             ui.horizontal(|ui| {
                 sub_tab(ui, tab, SettingsTab::General, t("General"), false);
+                sub_tab(ui, tab, SettingsTab::Network, t("Network"), false);
                 sub_tab(ui, tab, SettingsTab::Updates, t("Updates"), false);
                 sub_tab(ui, tab, SettingsTab::Mcp, "MCP", false).on_hover_text(t(
                     "Model Context Protocol: lets an LLM client such as Claude or Cursor use apitool",
@@ -6597,10 +6688,55 @@ impl App {
                                 }
                             });
                             ui.end_row();
-                            ui.label(t("Network"));
-                            network = ui.button(t("Proxy and certificates…")).clicked();
+                            ui.label(t("Log"));
+                            ui.horizontal(|ui| {
+                                use crate::logfile::Level;
+                                let name = |l| match l {
+                                    Level::Error => t("Errors"),
+                                    Level::Warn => t("Warnings"),
+                                    Level::Info => t("Info"),
+                                    Level::Debug => t("Debug"),
+                                    Level::Trace => t("Trace"),
+                                };
+                                let before = *log_level;
+                                egui::ComboBox::from_id_salt("log-level")
+                                    .selected_text(name(*log_level))
+                                    .show_ui(ui, |ui| {
+                                        for l in Level::ALL {
+                                            ui.selectable_value(log_level, l, name(l));
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(t(
+                                        "How much goes into apitool.log. Debug adds each step of a request or stream: proxy picked, connection, TLS, redirects, status. Trace also each message's size. Headers, bodies and tokens are never written, nor a URL's query.",
+                                    ));
+                                if *log_level != before {
+                                    crate::logfile::set_level(*log_level);
+                                }
+                                if let Some(path) = crate::logfile::path() {
+                                    open_logs = icon_button(ui, icon::FOLDER_OPEN, t("Open the log's folder"), None)
+                                        .on_hover_text(path.display().to_string())
+                                        .clicked();
+                                }
+                            });
                             ui.end_row();
                         });
+                }
+                SettingsTab::Network => {
+                    // A copy until Apply or Close: a proxy URL half typed would be used.
+                    let net = net_draft.get_or_insert_with(|| net_now.clone());
+                    network_settings(ui, net, skipped.as_deref());
+                    ui.add_space(6.0);
+                    let changed = net != net_now;
+                    // Blue only when it would do something.
+                    let button = match changed {
+                        true => primary(t("Apply")),
+                        false => egui::Button::new(t("Apply")),
+                    };
+                    apply_net = (ui.add_enabled(changed, button))
+                        .on_hover_text(t("Closing Settings applies it too"))
+                        .clicked()
+                        || (changed && enter_pressed(ui));
                 }
                 SettingsTab::Updates => {
                     ui.vertical(|ui| {
@@ -6884,11 +7020,17 @@ impl App {
         if let Some(copied) = copied {
             self.status = copied;
         }
+        if open_logs
+            && let Some(dir) = crate::logfile::path().and_then(|p| p.parent())
+            && let Err(e) = crate::auth::open_browser(&dir.display().to_string())
+        {
+            self.status = e;
+        }
         // Not per keystroke: half a port number would bind somewhere else first.
         if rebind || close || modal.should_close() {
             self.mcp_rebind = true;
         }
-        if sync_now || close || network || modal.should_close() {
+        if sync_now || close || modal.should_close() {
             let typed = [
                 (
                     crate::store::SYNC_TOKEN,
@@ -6912,12 +7054,21 @@ impl App {
             self.save_state();
             self.start_sync(ctx, None);
         }
-        if close || network || modal.should_close() {
+        if close || modal.should_close() {
             self.settings = false;
+            apply_net = true;
+        }
+        if apply_net
+            && let Some(net) = &self.network_editor
+            && *net != self.network
+        {
+            // Saves the state too.
+            self.apply_network(net.clone(), ctx);
+        } else if close || modal.should_close() {
             self.save_state();
         }
-        if network {
-            self.network_editor = Some(self.network.clone());
+        if !self.settings {
+            self.network_editor = None;
         }
         if check {
             self.check_updates(ctx);
@@ -6931,159 +7082,215 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
+}
 
-    fn network_editor_ui(&mut self, ctx: &egui::Context) {
-        // Why the system's script was skipped: what Windows is configured with says nothing
-        // about whether it worked.
-        let skipped = (self.client.get()).and_then(|c| c.as_ref().ok()?.note.clone());
-        let Some(net) = &mut self.network_editor else {
-            return;
-        };
-        let (mut apply, mut cancel) = (false, false);
-        egui::Modal::new(egui::Id::new("network")).show(ctx, |ui| {
-            ui.set_width(560.0);
-            ui.heading(t("Network"));
-            ui.weak(t("Stored on this machine only (in apitool.db), never exported."));
-            ui.add_space(6.0);
-            let field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
-                ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(f32::INFINITY));
-            };
-            // In a row: right to left on its own, it took all the height left.
-            let file_field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        browse(ui, text, &[], false);
-                        field(ui, text, hint);
-                    });
-                });
-            };
-
-            ui.label(RichText::new(t("Proxy")).strong());
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut net.proxy, ProxyMode::System, t("System"));
-                ui.radio_value(&mut net.proxy, ProxyMode::None, t("None"));
-                ui.radio_value(&mut net.proxy, ProxyMode::Manual, t("Manual"));
-                ui.radio_value(&mut net.proxy, ProxyMode::Pac, t("PAC script"));
-            });
-            match net.proxy {
-                ProxyMode::System => match net::system_auto_config() {
-                    _ if let Some(skipped) = &skipped => {
-                        ui.colored_label(ORANGE, skipped.as_str());
-                    }
-                    (Some(url), _) => {
-                        ui.weak(tf("Windows is configured with a PAC script, which will be used:\n{}", &[&url]));
-                    }
-                    (None, true) => {
-                        ui.weak(
-                            t("Windows has \"Automatically detect settings\" on: the PAC script is \
-                             looked up via WPAD (DHCP, then DNS) before the first request. If \
-                             what it finds isn't a usable script, requests go out directly."),
-                        );
-                    }
-                    (None, false) => {
-                        ui.weak(t("Uses the OS proxy settings and HTTP(S)_PROXY / NO_PROXY variables."));
-                    }
-                },
-                ProxyMode::None => {
-                    ui.weak(t("Connect directly, ignoring OS settings."));
-                }
-                ProxyMode::Manual => {
-                    field(ui, &mut net.proxy_url, t("http://user:pass@proxy.corp:8080 or socks5h://host:1080"));
-                    field(ui, &mut net.no_proxy, t("Bypass: localhost,127.0.0.1,.corp.local"));
-                }
-                ProxyMode::Pac => {
-                    field(ui, &mut net.pac_url, t("http://wpad/proxy.pac  or  C:\\path\\proxy.pac"));
-                }
-            }
-
-            ui.add_space(8.0);
-            ui.label(RichText::new(t("Certificates")).strong());
-            ui.weak(t("The OS certificate store is always trusted; these are added on top."));
-            file_field(ui, &mut net.ca_file, t("Extra CA bundle (PEM file path)"));
-            let pfx = |path: &str| path.to_lowercase().ends_with(".pfx") || path.to_lowercase().ends_with(".p12");
-            file_field(ui, &mut net.client_cert, t("Client certificate (.pem with key, or .pfx / .p12)"));
-            if pfx(&net.client_cert) {
-                ui.add(
-                    egui::TextEdit::singleline(&mut net.client_cert_password)
-                        .password(true)
-                        .hint_text(t("PFX password"))
-                        .desired_width(f32::INFINITY),
-                );
-            }
-            let mut removed = None;
-            for (i, c) in net.host_certs.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut c.host).hint_text(t("*.corp.com or host:8443")).desired_width(150.0));
-                    let width = if pfx(&c.cert) { 220.0 } else { 330.0 };
-                    ui.add(egui::TextEdit::singleline(&mut c.cert).hint_text(t("Certificate; empty sends none")).desired_width(width));
-                    browse(ui, &mut c.cert, &[], false);
-                    if pfx(&c.cert) {
-                        ui.add(egui::TextEdit::singleline(&mut c.password).password(true).hint_text(t("PFX password")).desired_width(100.0));
-                    }
-                    if icon_button(ui, icon::TRASH, t("Remove"), None).on_hover_text(t("Remove")).clicked() {
-                        removed = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = removed {
-                net.host_certs.remove(i);
-            }
-            if ui.add(icon_text(ui, icon::PLUS, t("Certificate for a host"))).on_hover_text(t("Checked in order before the one above")).clicked() {
-                net.host_certs.push(Default::default());
-            }
-            ui.checkbox(&mut net.insecure, t("Skip TLS certificate verification"));
-            if net.insecure {
-                ui.colored_label(RED, t("Any server certificate is accepted. Use only to diagnose CA problems."));
-            }
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(t("Timeout"));
-                ui.add(egui::DragValue::new(&mut net.timeout_secs).range(1..=3600).suffix(" s"));
-            });
-
-            ui.add_space(8.0);
-            ui.label(RichText::new(t("Default headers")).strong());
-            ui.weak(t("Sent with every request that doesn't set its own."));
-            egui::Grid::new("default-headers").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                ui.label("User-Agent");
-                ui.horizontal(|ui| {
-                    // Unset follows the version; typing pins a value of its own.
-                    let mut agent = net.user_agent.clone().unwrap_or_else(|| crate::net::USER_AGENT.to_owned());
-                    let reset = net.user_agent.is_some();
-                    let width = if reset { 300.0 } else { 380.0 };
-                    let edit = egui::TextEdit::singleline(&mut agent).hint_text(t("Empty sends none")).desired_width(width);
-                    if ui.add(edit).changed() {
-                        net.user_agent = Some(agent);
-                    }
-                    if reset && ui.small_button(t("Reset")).on_hover_text(crate::net::USER_AGENT).clicked() {
-                        net.user_agent = None;
-                    }
-                });
-                ui.end_row();
-                ui.label("Accept");
-                ui.add(egui::TextEdit::singleline(&mut net.accept).hint_text("*/*").desired_width(380.0))
-                    .on_hover_text(t("Empty still sends */*: the HTTP client always sends an Accept."));
-                ui.end_row();
-                ui.label("Accept-Encoding");
-                ui.checkbox(&mut net.gzip, "gzip").on_hover_text(t(
-                    "Off: no Accept-Encoding, and a compressed body is shown as it came.",
-                ));
-                ui.end_row();
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                apply = ui.add(primary(t("Apply"))).clicked() || enter_pressed(ui);
-                cancel = ui.button(t("Cancel")).clicked() || escape_pressed(ui);
+/// Settings' Network tab: proxy, certificates, timeout and default headers. `skipped` says
+/// why the system's PAC script wasn't used.
+fn network_settings(ui: &mut egui::Ui, net: &mut Network, skipped: Option<&str>) {
+    ui.weak(t(
+        "Stored on this machine only (in apitool.db), never exported.",
+    ));
+    ui.add_space(6.0);
+    let field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
+        ui.add(
+            egui::TextEdit::singleline(text)
+                .hint_text(hint)
+                .desired_width(f32::INFINITY),
+        );
+    };
+    // In a row: right to left on its own, it took all the height left.
+    let file_field = |ui: &mut egui::Ui, text: &mut String, hint: &str| {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                browse(ui, text, &[], false);
+                field(ui, text, hint);
             });
         });
-        if apply {
-            let net = self.network_editor.take().expect("editor open");
-            self.apply_network(net, ctx);
-        } else if cancel {
-            self.network_editor = None;
+    };
+
+    ui.label(RichText::new(t("Proxy")).strong());
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut net.proxy, ProxyMode::System, t("System"));
+        ui.radio_value(&mut net.proxy, ProxyMode::None, t("None"));
+        ui.radio_value(&mut net.proxy, ProxyMode::Manual, t("Manual"));
+        ui.radio_value(&mut net.proxy, ProxyMode::Pac, t("PAC script"));
+    });
+    match net.proxy {
+        ProxyMode::System => match net::system_auto_config() {
+            _ if let Some(skipped) = skipped => {
+                ui.colored_label(ORANGE, skipped);
+            }
+            (Some(url), _) => {
+                ui.weak(tf(
+                    "Windows is configured with a PAC script, which will be used:\n{}",
+                    &[&url],
+                ));
+            }
+            (None, true) => {
+                ui.weak(t(
+                    "Windows has \"Automatically detect settings\" on: the PAC script is \
+                     looked up via WPAD (DHCP, then DNS) before the first request. If \
+                     what it finds isn't a usable script, requests go out directly.",
+                ));
+            }
+            (None, false) => {
+                ui.weak(t(
+                    "Uses the OS proxy settings and HTTP(S)_PROXY / NO_PROXY variables.",
+                ));
+            }
+        },
+        ProxyMode::None => {
+            ui.weak(t("Connect directly, ignoring OS settings."));
+        }
+        ProxyMode::Manual => {
+            field(
+                ui,
+                &mut net.proxy_url,
+                t("http://user:pass@proxy.corp:8080 or socks5h://host:1080"),
+            );
+            field(
+                ui,
+                &mut net.no_proxy,
+                t("Bypass: localhost,127.0.0.1,.corp.local"),
+            );
+        }
+        ProxyMode::Pac => {
+            field(
+                ui,
+                &mut net.pac_url,
+                t("http://wpad/proxy.pac  or  C:\\path\\proxy.pac"),
+            );
         }
     }
+
+    ui.add_space(8.0);
+    ui.label(RichText::new(t("Certificates")).strong());
+    ui.weak(t(
+        "The OS certificate store is always trusted; these are added on top.",
+    ));
+    file_field(ui, &mut net.ca_file, t("Extra CA bundle (PEM file path)"));
+    let pfx =
+        |path: &str| path.to_lowercase().ends_with(".pfx") || path.to_lowercase().ends_with(".p12");
+    file_field(
+        ui,
+        &mut net.client_cert,
+        t("Client certificate (.pem with key, or .pfx / .p12)"),
+    );
+    if pfx(&net.client_cert) {
+        ui.add(
+            egui::TextEdit::singleline(&mut net.client_cert_password)
+                .password(true)
+                .hint_text(t("PFX password"))
+                .desired_width(f32::INFINITY),
+        );
+    }
+    let mut removed = None;
+    for (i, c) in net.host_certs.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut c.host)
+                    .hint_text(t("*.corp.com or host:8443"))
+                    .desired_width(150.0),
+            );
+            let width = if pfx(&c.cert) { 220.0 } else { 330.0 };
+            ui.add(
+                egui::TextEdit::singleline(&mut c.cert)
+                    .hint_text(t("Certificate; empty sends none"))
+                    .desired_width(width),
+            );
+            browse(ui, &mut c.cert, &[], false);
+            if pfx(&c.cert) {
+                ui.add(
+                    egui::TextEdit::singleline(&mut c.password)
+                        .password(true)
+                        .hint_text(t("PFX password"))
+                        .desired_width(100.0),
+                );
+            }
+            if icon_button(ui, icon::TRASH, t("Remove"), None)
+                .on_hover_text(t("Remove"))
+                .clicked()
+            {
+                removed = Some(i);
+            }
+        });
+    }
+    if let Some(i) = removed {
+        net.host_certs.remove(i);
+    }
+    if ui
+        .add(icon_text(ui, icon::PLUS, t("Certificate for a host")))
+        .on_hover_text(t("Checked in order before the one above"))
+        .clicked()
+    {
+        net.host_certs.push(Default::default());
+    }
+    ui.checkbox(&mut net.insecure, t("Skip TLS certificate verification"));
+    if net.insecure {
+        ui.colored_label(
+            RED,
+            t("Any server certificate is accepted. Use only to diagnose CA problems."),
+        );
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(t("Timeout"));
+        ui.add(
+            egui::DragValue::new(&mut net.timeout_secs)
+                .range(1..=3600)
+                .suffix(" s"),
+        );
+    });
+
+    ui.add_space(8.0);
+    ui.label(RichText::new(t("Default headers")).strong());
+    ui.weak(t("Sent with every request that doesn't set its own."));
+    egui::Grid::new("default-headers")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("User-Agent");
+            ui.horizontal(|ui| {
+                // Unset follows the version; typing pins a value of its own.
+                let mut agent = net
+                    .user_agent
+                    .clone()
+                    .unwrap_or_else(|| crate::net::USER_AGENT.to_owned());
+                let reset = net.user_agent.is_some();
+                let width = if reset { 300.0 } else { 380.0 };
+                let edit = egui::TextEdit::singleline(&mut agent)
+                    .hint_text(t("Empty sends none"))
+                    .desired_width(width);
+                if ui.add(edit).changed() {
+                    net.user_agent = Some(agent);
+                }
+                if reset
+                    && ui
+                        .small_button(t("Reset"))
+                        .on_hover_text(crate::net::USER_AGENT)
+                        .clicked()
+                {
+                    net.user_agent = None;
+                }
+            });
+            ui.end_row();
+            ui.label("Accept");
+            ui.add(
+                egui::TextEdit::singleline(&mut net.accept)
+                    .hint_text("*/*")
+                    .desired_width(380.0),
+            )
+            .on_hover_text(t(
+                "Empty still sends */*: the HTTP client always sends an Accept.",
+            ));
+            ui.end_row();
+            ui.label("Accept-Encoding");
+            ui.checkbox(&mut net.gzip, "gzip").on_hover_text(t(
+                "Off: no Accept-Encoding, and a compressed body is shown as it came.",
+            ));
+            ui.end_row();
+        });
 }
 
 /// The requests under `scope` with their methods, in tree order.
@@ -7294,7 +7501,7 @@ enum Go {
 }
 
 /// What a button somewhere already does, for whoever's hands are on the keyboard.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Action {
     NewRequest,
     NewFolder,
@@ -7306,11 +7513,12 @@ enum Action {
     Cookies,
     Sidebar,
     SideBySide,
+    Response,
     Settings,
     Shortcuts,
 }
 
-const ACTIONS: [(&str, Action); 12] = [
+const ACTIONS: [(&str, Action); 13] = [
     (n_("New request"), Action::NewRequest),
     (n_("New collection"), Action::NewFolder),
     (n_("New environment"), Action::NewEnv),
@@ -7324,6 +7532,7 @@ const ACTIONS: [(&str, Action); 12] = [
     (n_("Cookies"), Action::Cookies),
     (n_("Show or hide the sidebar"), Action::Sidebar),
     (n_("Side by side or stacked"), Action::SideBySide),
+    (n_("Show or hide the response"), Action::Response),
     (n_("Settings (theme, fonts, text size)"), Action::Settings),
     (n_("Keyboard shortcuts"), Action::Shortcuts),
 ];
@@ -7352,6 +7561,7 @@ impl App {
     }
 
     fn act(&mut self, action: Action) {
+        log::debug!("action {action:?}");
         let root = self.ws.collections();
         match action {
             Action::NewRequest => self.new_request(),
@@ -7365,7 +7575,7 @@ impl App {
                     note: String::new(),
                 });
             }
-            Action::Network => self.network_editor = Some(self.network.clone()),
+            Action::Network => (self.settings, self.settings_tab) = (true, SettingsTab::Network),
             Action::Cookies => self.cookie_manager = true,
             Action::Sidebar => {
                 self.hide_sidebar = !self.hide_sidebar;
@@ -7373,6 +7583,10 @@ impl App {
             }
             Action::SideBySide => {
                 self.side_by_side = !self.side_by_side;
+                self.save_state();
+            }
+            Action::Response => {
+                self.hide_response = !self.hide_response;
                 self.save_state();
             }
             Action::Settings => self.settings = true,
@@ -9747,6 +9961,7 @@ fn shortcut_list(ui: &mut egui::Ui) {
         (t("Import…"), key(&KEYED_ACTIONS[1].0)),
         (t("Sidebar"), key(&KEYED_ACTIONS[2].0)),
         (t("Side by side"), key(&KEYED_ACTIONS[3].0)),
+        (t("Response"), key(&KEYED_ACTIONS[5].0)),
         (t("Larger text"), key(&ZOOM_IN)),
         (t("Smaller text"), key(&ZOOM_OUT)),
         (t("Default text size"), key(&ZOOM_RESET)),
@@ -10631,6 +10846,15 @@ fn status_line(ui: &mut egui::Ui, view: &ResponseView) {
 // Each is a separate App field borrowed for the pane; a struct for this one call would
 // only rename them.
 #[allow(clippy::too_many_arguments)]
+/// Folds the response to a bar under the request; `key` is the shortcut that does too.
+fn fold_button(ui: &mut egui::Ui, key: &str) -> bool {
+    let hint = format!("{} ({key})", t("Hide the response"));
+    icon_button(ui, icon::CHEVRON_DOWN, t("Hide the response"), None)
+        .on_hover_text(hint)
+        .clicked()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn response_ui(
     ui: &mut egui::Ui,
     shown: &mut Shown,
@@ -10640,6 +10864,7 @@ fn response_ui(
     open_external: &mut bool,
     past: &mut Past,
     recent: &mut Vec<String>,
+    hide: &mut bool,
 ) -> Option<Example> {
     let mut example = None;
     let passed = shown.tests.iter().filter(|t| t.passed).count();
@@ -10654,6 +10879,7 @@ fn response_ui(
         }
         let actions = egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true);
         ui.with_layout(actions, |ui| {
+            *hide = fold_button(ui, &ui.ctx().format_shortcut(&KEYED_ACTIONS[5].0));
             if let Ok(view) = &mut shown.result {
                 let timeline = *tab == RespTab::Timeline;
                 let binary = view.head.bytes.is_some();
@@ -12170,7 +12396,7 @@ mod ui_tests {
         clients.note = Some(why.into());
         let client = tokio::sync::OnceCell::new_with(Some(Ok(clients)));
         h.state_mut().client = std::sync::Arc::new(client);
-        h.state_mut().network_editor = Some(h.state().network.clone());
+        (h.state_mut().settings, h.state_mut().settings_tab) = (true, SettingsTab::Network);
         h.run();
         assert!(h.query_by_label(why).is_some());
         // Another mode picked in the dialog: its own hint, as the note is about System.
@@ -12180,6 +12406,38 @@ mod ui_tests {
         assert!(
             h.query_by_label("Connect directly, ignoring OS settings.")
                 .is_some()
+        );
+    }
+
+    /// The status bar's proxy opens Settings at Network. What's picked there goes out only
+    /// on Apply or when Settings closes, so a proxy URL half typed is never used.
+    #[test]
+    fn network_is_a_settings_tab_applied_on_apply_or_close() {
+        let mut h = harness(workspace("network-tab"));
+        h.run();
+        h.get_by_label("System proxy").click();
+        h.run();
+        assert!(h.state().settings && h.state().settings_tab == SettingsTab::Network);
+        shot(&mut h, "settings-network");
+        h.get_by_label("None").click();
+        h.run();
+        assert_eq!(
+            h.state().network.proxy,
+            ProxyMode::System,
+            "not before Apply"
+        );
+        h.get_by_label("Apply").click();
+        h.run();
+        assert_eq!(h.state().network.proxy, ProxyMode::None);
+        h.get_by_label("Manual").click();
+        h.run();
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(!h.state().settings);
+        assert_eq!(
+            h.state().network.proxy,
+            ProxyMode::Manual,
+            "Close applies it too"
         );
     }
 
@@ -14192,8 +14450,8 @@ mod ui_tests {
         assert_eq!(h.state().active_env.as_deref(), Some("prod"));
         // Actions do what their buttons do, saved state included.
         switch(&mut h, "network", 0);
-        assert!(h.state().network_editor.is_some());
-        h.state_mut().network_editor = None;
+        assert!(h.state().settings && h.state().settings_tab == SettingsTab::Network);
+        h.state_mut().settings = false;
         switch(&mut h, "side by", 0);
         assert!(!h.state().side_by_side && h.state().ws.load_state().stacked);
         switch(&mut h, "new req", 0);
@@ -14494,6 +14752,42 @@ mod ui_tests {
         assert!(h.query_by_label("Auth URL").is_some());
         assert!(h.query_by_label("Redirect URI").is_some());
         assert!(h.query_by_label_contains("opens your browser").is_some());
+    }
+
+    /// Stacked, the request gets most of the height; the response folds to a bar that still
+    /// says how the last Send went, stays folded after a restart, and ⌘J unfolds it.
+    #[test]
+    fn the_response_folds_to_a_bar_that_keeps_the_status() {
+        let mut h = with_request("fold-response");
+        h.state_mut().side_by_side = false;
+        h.state_mut().open.as_mut().unwrap().draft.url = crate::http::tests::echo_server();
+        h.run();
+        h.get_by_label("Send").click();
+        wait_live(&mut h, |app| {
+            app.pending.is_empty() && app.response.is_some()
+        });
+        h.run();
+        let tabs = h.get_by_label("Timeline").rect();
+        assert!(
+            tabs.top() > 800.0 * 0.55,
+            "the response starts at {}",
+            tabs.top()
+        );
+        shot(&mut h, "response-stacked");
+        button(&h, "Hide the response").click();
+        h.run();
+        shot(&mut h, "response-folded");
+        assert!(h.query_by_label("Timeline").is_none(), "folded away");
+        assert!(
+            h.query_by_label_contains("200 OK").is_some(),
+            "the status still shows"
+        );
+        assert!(h.state().ws.load_state().hide_response, "and stays folded");
+        let key = KEYED_ACTIONS[5].0;
+        h.key_press_modifiers(key.modifiers, key.logical_key);
+        h.run();
+        assert!(!h.state().hide_response);
+        assert!(h.query_by_label("Timeline").is_some());
     }
 
     #[test]
@@ -14868,6 +15162,9 @@ mod ui_tests {
     #[test]
     fn a_folded_json_block_hides_its_lines_until_find_needs_them() {
         let mut h = with_request("fold");
+        // Taller: stacked, the request keeps most of the window, and every line of this
+        // body has to be on screen to be found.
+        h.set_size(egui::vec2(1200.0, 1200.0));
         let long = "z".repeat(400);
         let body =
             format!(r#"{{"a":{{"x":"NEEDLE","y":2}},"w":"{long}","list":[1,2],"b":"tail"}}"#);
@@ -17289,7 +17586,7 @@ mod ui_tests {
     #[test]
     fn a_file_field_takes_one_row() {
         let mut h = harness(workspace("file-field"));
-        h.state_mut().network_editor = Some(Network::default());
+        (h.state_mut().settings, h.state_mut().settings_tab) = (true, SettingsTab::Network);
         h.run();
         let field = |h: &Harness<'_, App>, hint: &str| {
             let mut fields = h.get_all_by_role(Role::TextInput);
@@ -17318,6 +17615,15 @@ mod ui_tests {
         let theme = |h: &Harness<'_, App>| h.ctx.options(|o| o.theme_preference);
         assert_eq!(theme(&h), egui::ThemePreference::Light);
         shot(&mut h, "80-settings");
+        // The log's level too, from a menu that names what the default is.
+        let level = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("Info");
+        h.get(level).click();
+        h.run();
+        h.get_by_label("Debug").click();
+        h.run();
+        assert_eq!(h.state().log_level, crate::logfile::Level::Debug);
         h.get_by_label("Close").click();
         h.run();
         assert!(!h.state().settings);
@@ -17326,6 +17632,7 @@ mod ui_tests {
         let mut h = harness(ws);
         h.run();
         assert_eq!(theme(&h), egui::ThemePreference::Light);
+        assert_eq!(h.state().log_level, crate::logfile::Level::Debug);
     }
 
     /// Choosing 繁體中文 translates what's on screen at once, not after a restart, and the

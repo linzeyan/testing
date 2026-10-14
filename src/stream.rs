@@ -38,6 +38,22 @@ pub async fn connect(
     mqtt: mpsc::UnboundedReceiver<crate::mqtt::Command>,
     emit: impl Fn(Event),
 ) {
+    // Sizes only: what a message says is the user's. The app logs opening, closing and
+    // errors itself.
+    let emit = |e: Event| {
+        match &e {
+            Event::In(m) => log::trace!("received {} B", m.len()),
+            Event::Out(m) => log::trace!("sent {} B", m.len()),
+            Event::Info(m) => log::debug!("{}", crate::logfile::redact(m)),
+            Event::Open(_) | Event::Closed(_) | Event::Error(_) => {}
+        }
+        emit(e)
+    };
+    log::debug!(
+        "{} stream to {}",
+        req.method,
+        crate::logfile::redact(&req.url)
+    );
     match req.method.as_str() {
         // MQTT isn't HTTP, but it takes the client's proxy choice (maybe from PAC).
         "MQTT" => crate::mqtt::session(req, net, clients.route.clone(), mqtt, emit).await,

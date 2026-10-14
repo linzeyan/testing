@@ -154,6 +154,8 @@ pub struct State {
     /// and yaak: wide screens have the room, and long JSON reads better tall.
     pub stacked: bool,
     pub hide_sidebar: bool,
+    /// The response folded to a bar, for room to edit the request.
+    pub hide_response: bool,
     /// By environment name. ponytail: a renamed or deleted environment leaves its entry
     /// behind; harmless, prune it if the list ever matters.
     pub env_colors: HashMap<String, [u8; 3]>,
@@ -169,6 +171,8 @@ pub struct State {
     /// Its options by scope, like `run_orders`: only scopes that differ from the defaults.
     pub run_options: HashMap<String, crate::runner::RunOptions>,
     pub appearance: crate::appearance::Appearance,
+    /// How much goes into apitool.log (Settings).
+    pub log_level: crate::logfile::Level,
     pub updates: crate::update::Updates,
     /// MCP clients may operate the window (Settings).
     pub mcp_window: bool,
