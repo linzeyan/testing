@@ -547,6 +547,14 @@ pub fn label_menu(ui: &mut egui::Ui) {
         Some(text) => ui.label(RichText::new(clip(text, 60)).monospace().weak()),
         None => ui.weak(t("Select text to set it as a variable")),
     };
+    // First, as in Postman's and every text menu: right-click replaced the copy menu the
+    // selection would otherwise have had.
+    if let Some(text) = &text
+        && ui.button(t("Copy")).clicked()
+    {
+        ui.ctx().copy_text(text.clone());
+        ui.close();
+    }
     set_as_variable(ui, text.as_deref());
 }
 

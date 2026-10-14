@@ -1723,6 +1723,13 @@ const ZH_TW: &[(&str, &str)] = &[
         "連線不是按「中斷連線」而結束時，連續嘗試的次數",
     ),
     ("Reconnection interval", "重新連線間隔"),
+    ("Session", "工作階段"),
+    ("Click again to clear all", "再點一次即全部清除"),
+    ("Click again to clear history", "再點一次即清除歷史紀錄"),
+    ("Clear response history", "清除回應歷史紀錄"),
+    ("Create", "建立"),
+    ("Close the load test", "關閉負載測試"),
+    ("Request failed: {}", "請求失敗：{}"),
     (
         "Show the fields proto3 leaves out at 0, \"\" or false",
         "顯示 proto3 因值為 0、\"\" 或 false 而省略的欄位",

@@ -238,7 +238,8 @@ middle click closes one. Right-click a tab to duplicate it, or to close others, 
 right or all, which leaves tabs with unsaved edits open.
 
 **Layout**: the response sits beside the request; a window too narrow for two columns stacks
-them until it's wider. "Side by side" in the status bar turns that off and "Sidebar" folds
+them until it's wider (the "Side by side" toggle greys out meanwhile). "Side by side" in the
+status bar turns that off and "Sidebar" folds
 the tree away. Stacked, the request gets most of the height. The response's ⌄ (or
 "Response" in the status bar, `Ctrl+J`) folds it to a bar under the request that still
 shows the last status, time and size. All three are kept across restarts, as are the
@@ -247,7 +248,7 @@ window's size, place and maximized. A screen too small for the default window ge
 ## Keyboard shortcuts
 
 Ctrl is ⌘ on macOS, except for switching tabs. Until something is sent, the response pane
-lists these too.
+lists the everyday ones and `Ctrl+/` for the rest.
 
 | Action | Keys |
 |---|---|

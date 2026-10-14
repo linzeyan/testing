@@ -72,6 +72,15 @@ pub fn apply(ctx: &egui::Context, a: &Appearance) -> Result<(), String> {
         for v in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
             v.corner_radius = egui::CornerRadius::same(RADIUS);
         }
+        // egui's 200 px cut the 13 auth types off after the ninth, the rest only a scroll
+        // away that nothing hints at. Scaled, so a larger text size gets as many rows.
+        style.spacing.combo_height = 420.0 * scale;
+    });
+    // egui's light fields are white on a near-white panel with no edge: a URL bar or a
+    // Key cell couldn't be told from the background. Postman and Hoppscotch outline them.
+    ctx.style_mut_of(egui::Theme::Light, |style| {
+        style.visuals.widgets.inactive.bg_stroke =
+            egui::Stroke::new(1.0, egui::Color32::from_gray(205));
     });
     let mut fonts = egui::FontDefinitions::default();
     let mut missing = Vec::new();
@@ -266,7 +275,15 @@ mod tests {
             for v in [w.inactive, w.hovered, w.active, w.open] {
                 assert_eq!(v.corner_radius, egui::CornerRadius::same(RADIUS));
             }
+            // Every auth type in view at once (13 rows of about 20 px).
+            assert!(style.spacing.combo_height >= 13.0 * 24.0);
         }
+        // Light fields have an edge; dark ones stand out by their fill already.
+        let edge = |theme| ctx.style_of(theme).visuals.widgets.inactive.bg_stroke.width;
+        assert_eq!(
+            (edge(egui::Theme::Light), edge(egui::Theme::Dark)),
+            (1.0, 0.0)
+        );
     }
 
     /// A chosen font comes first in its family, ahead of the built-in one.

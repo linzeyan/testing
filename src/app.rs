@@ -2553,11 +2553,11 @@ impl App {
             };
             // Kept only while the request has a tab: bodies can be MBs and RAM is the constraint.
             if self.open.as_ref().is_some_and(|o| o.path == path) {
-                self.resp_tab = if to_tests {
-                    RespTab::Tests
-                } else {
-                    RespTab::Body
-                };
+                // The tab being read stays, as in Postman: resending to watch a header is
+                // common. One this response lacks falls back to the body in `response_ui`.
+                if to_tests {
+                    self.resp_tab = RespTab::Tests;
+                }
                 self.response = Some(shown());
             } else if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path)
                 && let Some(p) = &mut t.parked
@@ -3526,8 +3526,13 @@ impl App {
                 };
                 let on = self.side_by_side;
                 let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[3].0);
-                if icon_button(ui, icon::COLUMNS, t("Side by side"), Some(on))
+                // Greyed while too narrow: lit, it looked on yet changed nothing.
+                let button = ui.add_enabled_ui(!self.narrow, |ui| {
+                    icon_button(ui, icon::COLUMNS, t("Side by side"), Some(on))
+                });
+                if (button.inner)
                     .on_hover_text(format!("{hint} ({key})"))
+                    .on_disabled_hover_text(hint)
                     .clicked()
                 {
                     self.side_by_side = !on;
@@ -4133,19 +4138,29 @@ impl App {
 
     fn history_ui(&mut self, ui: &mut egui::Ui) {
         let mut restore = None;
-        ui.horizontal(|ui| {
-            ui.weak(t("Click to load what was sent."));
-            if !self.history.is_empty()
-                && icon_button(ui, icon::TRASH, t("Clear"), None)
-                    .on_hover_text(t("Clear history"))
-                    .clicked()
-            {
-                match self.ws.clear_history() {
-                    Ok(()) => self.history.clear(),
-                    Err(e) => self.status = e,
+        if !self.history.is_empty() {
+            ui.horizontal(|ui| {
+                ui.weak(t("Click to load what was sent."));
+                // Up to 200 requests with no undo: a second click, as for environments.
+                let armed = egui::Id::new("clear-history");
+                let confirm = ui.data(|d| d.get_temp(armed)).unwrap_or(false);
+                let clicked = match confirm {
+                    true => ui.button(RichText::new(t("Click again to clear history")).color(RED)),
+                    false => icon_button(ui, icon::TRASH, t("Clear"), None)
+                        .on_hover_text(t("Clear history")),
                 }
-            }
-        });
+                .clicked();
+                if clicked {
+                    ui.data_mut(|d| d.insert_temp(armed, !confirm));
+                }
+                if clicked && confirm {
+                    match self.ws.clear_history() {
+                        Ok(()) => self.history.clear(),
+                        Err(e) => self.status = e,
+                    }
+                }
+            });
+        }
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -4927,7 +4942,7 @@ impl App {
                 return;
             }
             if let Some(view) = self.load.as_mut() {
-                start_load = load_ui(ui, view);
+                (start_load, toggle_load) = load_ui(ui, view);
                 return;
             }
             if streaming {
@@ -4961,7 +4976,7 @@ impl App {
                             }
                         });
                     });
-                    shortcut_list(ui);
+                    shortcut_list(ui, false);
                 }
                 Some(shown) => {
                     let pretty_before = shown.result.as_ref().ok().map(|v| v.pretty);
@@ -5249,11 +5264,13 @@ impl App {
             }
             _ => Vec::new(),
         };
-        let mut modal = egui::Modal::new(egui::Id::new("dialog"));
+        // One id per kind of dialog: shared, the next dialog inherited the last one's
+        // remembered sizes (the shortcut list opened 160 px tall after Import).
+        let id = egui::Id::new(("dialog", std::mem::discriminant(dialog)));
+        let mut modal = egui::Modal::new(id);
         if let Dialog::Switch { .. } = dialog {
             // Pinned to the top: centred, it would jump as the list grows and shrinks.
-            let area = egui::Modal::default_area(egui::Id::new("dialog"))
-                .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0]);
+            let area = egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, [0.0, 80.0]);
             modal = modal.area(area);
         }
         // Room for the list's two columns side by side, as on the pane.
@@ -5312,8 +5329,15 @@ impl App {
                     if !error.is_empty() {
                         ui.colored_label(RED, error.as_str());
                     }
+                    // The verb, as Postman and Hoppscotch label it: "OK" said nothing of
+                    // what happens, and wasn't translated.
+                    let verb = match kind {
+                        NameKind::Rename(_) => t("Rename"),
+                        NameKind::SaveAs { .. } | NameKind::DuplicateEnv(_) => t("Save"),
+                        _ => t("Create"),
+                    };
                     ui.horizontal(|ui| {
-                        if ui.add(primary("OK")).clicked() || enter {
+                        if ui.add(primary(verb)).clicked() || enter {
                             then = Some(Box::new(|app, _| app.submit_name()));
                         }
                         cancel = ui.button(t("Cancel")).clicked();
@@ -5704,7 +5728,7 @@ impl App {
                 }
                 Dialog::Shortcuts => {
                     ui.heading(t("Keyboard shortcuts"));
-                    shortcut_list(ui);
+                    shortcut_list(ui, true);
                     cancel = ui.button(t("Close")).clicked();
                 }
             }
@@ -5979,15 +6003,15 @@ impl App {
             return;
         }
         let rows = self.cookies.rows();
-        let (mut open, mut remove, mut clear) = (true, None, false);
-        egui::Window::new(t("Cookies"))
-            .open(&mut open)
-            .default_width(560.0)
-            .show(ctx, |ui| {
-                if rows.is_empty() {
-                    ui.weak(t("No cookies yet. Set-Cookie responses fill the jar."));
-                    return;
-                }
+        let (mut close, mut remove, mut clear) = (false, None, false);
+        // A centred modal like every other dialog: as a free window it opened over the
+        // environment picker, far from the cookie icon at the right.
+        let modal = egui::Modal::new(egui::Id::new("cookies")).show(ctx, |ui| {
+            ui.set_width(560.0);
+            ui.heading(t("Cookies"));
+            if rows.is_empty() {
+                ui.weak(t("No cookies yet. Set-Cookie responses fill the jar."));
+            } else {
                 ui.weak(t(
                     "Sent back to matching URLs, unless a request sets its own Cookie header.",
                 ));
@@ -6008,13 +6032,30 @@ impl App {
                                     remove = Some(i);
                                 }
                                 ui.monospace(format!("{}={}", r.name, clip(&r.value, 60)));
-                                let expires = r.expires.as_deref().unwrap_or("session");
+                                let expires = r.expires.as_deref().unwrap_or(t("Session"));
                                 ui.weak(format!("{} · {expires}", r.path));
                             });
                         }
                     });
-                clear = ui.button(t("Clear all")).clicked();
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                close = ui.button(t("Close")).clicked();
+                if !rows.is_empty() {
+                    // Every login at once, with no undo: a second click, as for environments.
+                    let armed = egui::Id::new("clear-cookies");
+                    let confirm = ui.data(|d| d.get_temp(armed)).unwrap_or(false);
+                    let label = match confirm {
+                        true => t("Click again to clear all"),
+                        false => t("Clear all"),
+                    };
+                    if ui.button(RichText::new(label).color(RED)).clicked() {
+                        clear = confirm;
+                        ui.data_mut(|d| d.insert_temp(armed, !confirm));
+                    }
+                }
             });
+        });
         if let Some(i) = remove {
             self.cookies.remove(&rows[i]);
         }
@@ -6024,7 +6065,10 @@ impl App {
         if remove.is_some() || clear {
             self.save_cookies();
         }
-        self.cookie_manager = open;
+        if close || modal.should_close() {
+            ctx.data_mut(|d| d.remove::<bool>(egui::Id::new("clear-cookies")));
+            self.cookie_manager = false;
+        }
     }
 
     /// Every variable `{{name}}` can resolve to right now, scope by scope, docked at the
@@ -10337,8 +10381,10 @@ fn cipher_picker(ui: &mut egui::Ui, ciphers: &mut Vec<String>) {
 }
 
 /// The empty response pane is where every reference app teaches its keys: it is the
-/// biggest blank area, and it is in view exactly when nothing has been sent yet.
-fn shortcut_list(ui: &mut egui::Ui) {
+/// biggest blank area, and it is in view exactly when nothing has been sent yet. There it
+/// shows the everyday few and the key for the rest (`all` false), as Hoppscotch does: all
+/// of them in two columns ran off a narrow pane.
+fn shortcut_list(ui: &mut egui::Ui, all: bool) {
     ui.add_space(12.0);
     let key = |k: &KeyboardShortcut| ui.ctx().format_shortcut(k);
     let first = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
@@ -10370,11 +10416,16 @@ fn shortcut_list(ui: &mut egui::Ui) {
         (t("Default text size"), key(&ZOOM_RESET)),
         (t("Keyboard shortcuts"), key(&KEYED_ACTIONS[4].0)),
     ];
+    let few: Vec<_> = rows[..7].iter().chain(rows.last()).cloned().collect();
+    let (rows, per) = match all {
+        true => (&rows[..], rows.len().div_ceil(2)),
+        false => (&few[..], few.len()),
+    };
     // Two lists side by side when there's room, one under the other when there isn't.
     egui::ScrollArea::vertical().show(ui, |ui| {
         let layout = egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true);
         ui.with_layout(layout, |ui| {
-            for (i, half) in rows.chunks(rows.len().div_ceil(2)).enumerate() {
+            for (i, half) in rows.chunks(per).enumerate() {
                 egui::Grid::new(("shortcuts", i))
                     .num_columns(2)
                     .spacing([16.0, 4.0])
@@ -10687,13 +10738,13 @@ fn grpc_bar(
     (error, ask)
 }
 
-/// Returns true when Start was pressed.
-fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
+/// Whether Start, and whether Close, was pressed.
+fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> (bool, bool) {
     let running = view
         .stats
         .as_ref()
         .is_some_and(|s| s.lock().unwrap().finished.is_none());
-    let mut start = false;
+    let (mut start, mut close) = (false, false);
     ui.horizontal(|ui| {
         ui.strong(t("Load test"));
         ui.separator();
@@ -10716,13 +10767,20 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
         } else {
             start = ui.add(icon_text(ui, icon::PLAY, t("Start"))).clicked();
         }
+        // Its own ×, as the Code panel has: the gauge icon that opened it was the only
+        // way back to the response.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            close = icon_button(ui, icon::X, t("Close"), None)
+                .on_hover_text(t("Close the load test"))
+                .clicked();
+        });
     });
     ui.weak(t(
         "Sends the current draft (variables resolved once). Scripts are skipped.",
     ));
     ui.separator();
     let Some(stats) = &view.stats else {
-        return start;
+        return (start, close);
     };
     let s = stats.lock().unwrap();
     let elapsed = s.elapsed().as_secs_f64();
@@ -10780,7 +10838,7 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> bool {
             });
         }
     }
-    start
+    (start, close)
 }
 
 impl StreamSession {
@@ -11167,7 +11225,8 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
             });
         }
         ui.separator();
-        if ui.button(t("Clear history")).clicked() {
+        // Not the sidebar's "Clear history", which drops the sent requests.
+        if ui.button(t("Clear response history")).clicked() {
             past.clear = true;
         }
     });
@@ -11288,14 +11347,44 @@ fn response_ui(
     hide: &mut bool,
 ) -> Option<Example> {
     let mut example = None;
+    // A tab from the previous run may not exist in this one; fall back to the body before
+    // drawing, so the tab strip and the body's tools agree with what is shown.
+    *tab = match *tab {
+        RespTab::Tests if shown.tests.is_empty() => RespTab::Body,
+        RespTab::Console if shown.logs.is_empty() => RespTab::Body,
+        RespTab::Headers if shown.result.is_err() => RespTab::Body,
+        RespTab::Cookies
+            if (shown.result.as_ref())
+                .is_ok_and(|v| crate::cookies::from_response(&v.head.headers).is_empty())
+                || shown.result.is_err() =>
+        {
+            RespTab::Body
+        }
+        RespTab::Timeline
+            if (shown.result.as_ref()).is_ok_and(|v| v.head.sent.method.is_empty())
+                || shown.result.is_err() =>
+        {
+            RespTab::Body
+        }
+        t => t,
+    };
     let passed = shown.tests.iter().filter(|t| t.passed).count();
     // Two rows, so a narrow pane wraps them instead of drawing one control over another.
     // The status comes first: it matters more than the actions, which wrap at the right.
     ui.horizontal(|ui| {
         match &shown.result {
             Ok(view) => status_line(ui, view),
-            Err(_) => {
-                ui.colored_label(RED, t("Request failed"));
+            // The reason in the bar too, as Postman's "Could not send request" does: the
+            // chain below can start with a line that says little.
+            Err(e) => {
+                // The innermost cause (`http::error_chain`) is the one that says what to fix.
+                let why = e.lines().last().unwrap_or_default().trim();
+                let why = why.strip_prefix("caused by: ").unwrap_or(why);
+                ui.add(
+                    egui::Label::new(RichText::new(tf("Request failed: {}", &[&why])).color(RED))
+                        .truncate(),
+                )
+                .on_hover_text(e.as_str());
             }
         }
         let actions = egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true);
@@ -11471,27 +11560,8 @@ fn response_ui(
         ui.horizontal(|ui| find_bar(ui, view));
     }
     ui.separator();
-    // A tab from the previous run may not exist in this one; fall back to the body.
-    let current = match *tab {
-        RespTab::Tests if shown.tests.is_empty() => RespTab::Body,
-        RespTab::Console if shown.logs.is_empty() => RespTab::Body,
-        RespTab::Headers if shown.result.is_err() => RespTab::Body,
-        RespTab::Cookies
-            if (shown.result.as_ref())
-                .is_ok_and(|v| crate::cookies::from_response(&v.head.headers).is_empty())
-                || shown.result.is_err() =>
-        {
-            RespTab::Body
-        }
-        RespTab::Timeline
-            if (shown.result.as_ref()).is_ok_and(|v| v.head.sent.method.is_empty())
-                || shown.result.is_err() =>
-        {
-            RespTab::Body
-        }
-        t => t,
-    };
-    match (current, &mut shown.result) {
+    // A tab clicked above shows in this frame.
+    match (*tab, &mut shown.result) {
         (RespTab::Tests, _) => {
             // None: all; else only passed (true) or failed (false) ones.
             let id = egui::Id::new("tests-filter");
@@ -11538,7 +11608,14 @@ fn response_ui(
                 });
         }
         (_, Err(e)) => {
-            ui.add(egui::Label::new(RichText::new(e.as_str()).monospace()).selectable(true));
+            // A long `caused by:` chain ran past the bottom.
+            egui::ScrollArea::vertical()
+                .id_salt("response-error")
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    let text = RichText::new(e.as_str()).monospace();
+                    ui.add(egui::Label::new(text).selectable(true));
+                });
         }
         (RespTab::Headers, Ok(view)) => {
             egui::ScrollArea::vertical()
@@ -11553,7 +11630,9 @@ fn response_ui(
                                 ui.add(
                                     egui::Label::new(RichText::new(k).strong()).selectable(true),
                                 );
-                                ui.add(egui::Label::new(v.as_str()).selectable(true));
+                                // A Grid doesn't wrap, and this pane doesn't scroll sideways:
+                                // a long CSP or Link value would run off the edge.
+                                ui.add(egui::Label::new(v.as_str()).wrap().selectable(true));
                                 ui.end_row();
                             }
                         });
@@ -11575,7 +11654,7 @@ fn response_ui(
                             }
                             ui.end_row();
                             for c in crate::cookies::from_response(&view.head.headers) {
-                                let expires = c.expires.as_deref().unwrap_or("session");
+                                let expires = c.expires.as_deref().unwrap_or(t("Session"));
                                 for cell in [&c.name, &c.value, &c.domain, &c.path] {
                                     ui.add(egui::Label::new(cell.as_str()).selectable(true));
                                 }
@@ -12758,7 +12837,7 @@ mod ui_tests {
         h.get_by_label("New environment").click();
         h.run();
         type_into(&mut h, 0, "dev");
-        h.get_by_label("OK").click();
+        h.get_by_label("Create").click();
         h.run();
         // No click needed: the editor opens with the key field focused. One char per
         // frame, as a physical keyboard delivers them.
@@ -13165,11 +13244,15 @@ mod ui_tests {
         let (p, r) = rects(&h);
         assert!(h.state().side_by_side);
         assert!(r.top() > p.bottom(), "narrow: stacked {p:?} {r:?}");
+        let greyed =
+            |h: &Harness<'_, App>| button(h, "Side by side").accesskit_node().is_disabled();
+        assert!(greyed(&h), "lit but doing nothing looked broken");
         h.set_size(egui::vec2(1600.0, 900.0));
         h.run();
         h.run();
         let (p, r) = rects(&h);
         assert!(r.left() > p.right(), "wide again: side by side {p:?} {r:?}");
+        assert!(!greyed(&h));
     }
 
     /// A workspace with one request `r` (and env `dev` with `host`), opened in the app.
@@ -13603,6 +13686,103 @@ mod ui_tests {
         h.get_by_label("Discard").click(); // the unsaved "/later" edit
         h.run();
         assert_eq!(draft(&h).url, sent);
+
+        // Clearing every sent request can't be undone: the first click only asks.
+        h.get_by_label("Clear").click();
+        h.run();
+        assert_eq!(h.state().history.len(), 1, "one click clears nothing");
+        h.get_by_label("Click again to clear history").click();
+        h.run();
+        assert!(h.state().history.is_empty() && h.state().ws.load_history().is_empty());
+        assert!(
+            h.query_by_label("Click to load what was sent.").is_none(),
+            "no rows to click"
+        );
+    }
+
+    /// Resending to watch a header is common: the tab being read stays. One the next
+    /// response lacks falls back to the body with the body's tools, not to a blank strip.
+    #[test]
+    fn the_response_tab_is_kept_across_sends_and_falls_back_whole() {
+        let long = "k".repeat(400);
+        let head = format!("200 OK\r\nset-cookie: a=1\r\nx-token: {long}");
+        let addr = crate::http::tests::serve(move |_| (head.clone(), "{}".into()));
+        let mut h = with_request("resp-tab");
+        // The empty pane teaches the everyday keys and where the rest are, not all 26.
+        assert!(h.query_by_label("Keyboard shortcuts").is_some());
+        assert!(h.query_by_label("Next tab").is_none());
+        let send = |h: &mut Harness<'_, App>| {
+            h.state_mut().response = None;
+            h.get_by_label("Send").click();
+            wait(h, |app| app.response.is_some());
+        };
+        h.state_mut().open.as_mut().unwrap().draft.url = format!("http://{addr}/");
+        send(&mut h);
+        h.get_by_label_contains("Headers (").click();
+        h.run();
+        // Wrapped inside the pane: there is no sideways scroll to reach the rest.
+        let right = h.get_by_label(&long).rect().right();
+        assert!(right <= 1200.0, "the header value runs off to {right}");
+        send(&mut h);
+        assert!(
+            h.state().resp_tab == RespTab::Headers,
+            "still reading the headers"
+        );
+
+        h.get_by_label("Cookies (1)").click();
+        h.run();
+        show_response(&mut h, "application/json", "{}".into());
+        assert!(h.state().resp_tab == RespTab::Body);
+        // The response's Body comes after the request's.
+        let body = h.get_all_by_label("Body").last().unwrap();
+        let lit = body.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True);
+        assert!(lit, "the tab shown is the one lit");
+        button(&h, "Find");
+    }
+
+    /// A failure says why in the bar, as Postman's does: the chain's last cause is the
+    /// one to act on. And the load test has its own way back to the response.
+    #[test]
+    fn a_failure_says_why_and_the_load_test_closes_from_its_bar() {
+        let mut h = with_request("fail-why");
+        let chain = "error sending request for url (http://127.0.0.1:1/)\n  caused by: \
+                     client error (Connect)\n  caused by: Connection refused (os error 61)";
+        h.state_mut().response = Some(Shown {
+            result: Err(chain.into()),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            past: None,
+        });
+        h.run();
+        let bar = "Request failed: Connection refused (os error 61)";
+        assert!(h.query_by_label(bar).is_some());
+
+        button(&h, "Load test").click();
+        h.run();
+        assert!(h.state().load.is_some());
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(h.state().load.is_none(), "back to the response");
+    }
+
+    /// Each kind of dialog keeps its own size: the shortcut list once opened as short as
+    /// the Import box before it, cut mid-row.
+    #[test]
+    fn a_dialog_opens_at_its_own_size_whatever_came_before() {
+        let mut h = with_request("dialog-size");
+        h.state_mut().act(Action::ImportAny);
+        h.run();
+        h.get_by_label("Close").click();
+        h.run();
+        h.state_mut().act(Action::Shortcuts);
+        h.run();
+        h.run();
+        let last = h.get_by_label("Default text size").rect();
+        let close = h.get_by_label("Close").rect();
+        assert!(
+            last.bottom() <= close.top(),
+            "cut off: {last:?} above {close:?}"
+        );
     }
 
     #[test]
@@ -13644,6 +13824,24 @@ mod ui_tests {
         h.run();
         assert!(h.state().cookies.rows().is_empty());
         assert!(!h.state().ws.load_cookies().contains("sid"));
+
+        // A dialog like the others: Esc closes it.
+        h.key_press(Key::Escape);
+        h.run();
+        assert!(!h.state().cookie_manager);
+        send(&mut h, "/login");
+        h.get_by_label("Cookies").click();
+        h.run();
+        // Every login at once, with no undo: the first click only asks.
+        h.get_by_label("Clear all").click();
+        h.run();
+        assert_eq!(h.state().cookies.rows().len(), 1);
+        h.get_by_label("Click again to clear all").click();
+        h.run();
+        assert!(h.state().cookies.rows().is_empty());
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(!h.state().cookie_manager);
     }
 
     /// As if the open request had just been sent and answered 200 with this body.
@@ -15579,7 +15777,7 @@ mod ui_tests {
         // Now plain "History", after the sidebar tab of that name.
         h.get_all_by_label("History").last().unwrap().click();
         h.run();
-        h.get_by_label("Clear history").click();
+        h.get_by_label("Clear response history").click();
         h.run();
         assert!(h.state().ws.responses(&path).is_empty());
         assert!(h.query_by_label_contains("History: ").is_none());
@@ -16777,18 +16975,48 @@ mod ui_tests {
             });
             h.run();
         };
-        h.hover_at(x(12.0));
-        press(&mut h, x(12.0), true);
-        h.hover_at(x(15.0));
-        h.run();
-        h.hover_at(x(18.0));
-        h.run();
-        press(&mut h, x(18.0), false);
-        h.run();
+        let select = |h: &mut Harness<'_, App>| {
+            h.hover_at(x(12.0));
+            press(h, x(12.0), true);
+            h.hover_at(x(15.0));
+            h.run();
+            h.hover_at(x(18.0));
+            h.run();
+            press(h, x(18.0), false);
+            h.run();
+        };
+        select(&mut h);
         assert_eq!(copies(&h), 0, "the selection's text isn't copied");
         click(&mut h, at, egui::PointerButton::Secondary);
         shot(&mut h, "94-response-selection-menu");
         assert_eq!(menu_text(&h).as_deref(), Some("abc123"));
+        // Copy, as any text menu has. The menu's, not the response bar's icon of the same name.
+        let copy = h
+            .get_all(by.clone().role(Role::Button).label("Copy"))
+            .last();
+        let copy = copy.unwrap().rect().center();
+        h.hover_at(copy);
+        let mut copied = Vec::new();
+        for pressed in [true, false] {
+            let (button, modifiers) = (egui::PointerButton::Primary, Modifiers::NONE);
+            h.event(egui::Event::PointerButton {
+                pos: copy,
+                button,
+                pressed,
+                modifiers,
+            });
+            h.step();
+            copied.extend(
+                (h.output().platform_output.commands.iter()).filter_map(|c| match c {
+                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                    _ => None,
+                }),
+            );
+        }
+        h.run();
+        assert_eq!(copied, ["abc123"]);
+        select(&mut h);
+        click(&mut h, at, egui::PointerButton::Secondary);
         for label in ["Set as variable in Globals", "New variable…"] {
             let at = h
                 .get(by.clone().role(Role::Button).label_contains(label))
@@ -18873,5 +19101,253 @@ mod ui_tests {
             }
             all_ok(results);
         }
+    }
+
+    /// Not a check: every tab of every kind of request, each auth and body type, every
+    /// dialog and settings page, as pictures for a UX review against Postman and Hoppscotch.
+    /// `APITOOL_SHOTS=1 cargo test ux_tour -- --ignored`, into /tmp/apitool-shots/t-*.png.
+    #[test]
+    #[ignore = "screenshots for a UX review"]
+    fn ux_tour() {
+        use egui_kittest::kittest::By;
+        let mut h = with_request("tour");
+        let kinds = [
+            ("GET", "https://{{host}}/users/{id}?page=1"),
+            ("POST", "https://{{host}}/users"),
+            ("GRAPHQL", "https://{{host}}/graphql"),
+            ("WS", "wss://{{host}}/socket"),
+            ("SSE", "https://{{host}}/events"),
+            ("SOCKETIO", "http://{{host}}"),
+            ("MQTT", "mqtt://{{host}}"),
+            ("GRPC", "{{host}}"),
+        ];
+        let tabs = [
+            (ReqTab::Params, "params"),
+            (ReqTab::Headers, "headers"),
+            (ReqTab::Body, "body"),
+            (ReqTab::Topics, "topics"),
+            (ReqTab::Properties, "properties"),
+            (ReqTab::Auth, "auth"),
+            (ReqTab::Scripts, "scripts"),
+            (ReqTab::Vars, "vars"),
+            (ReqTab::Asserts, "asserts"),
+            (ReqTab::Settings, "settings"),
+            (ReqTab::Docs, "docs"),
+        ];
+        for (kind, url) in kinds {
+            let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+            (d.method, d.url) = (kind.into(), url.into());
+            // As typing the URL does.
+            d.params_from_url();
+            d.path_vars_from_url();
+            if kind == "POST" {
+                d.body = Body::Json {
+                    text: r#"{"name": "Ada", "admin": false}"#.into(),
+                };
+            }
+            h.run();
+            for (tab, name) in tabs {
+                h.state_mut().req_tab = tab;
+                h.run();
+                // A tab the kind doesn't have falls back to its first: the same picture.
+                if h.state().req_tab == tab {
+                    shot(&mut h, &format!("t-{}-{name}", kind.to_lowercase()));
+                }
+            }
+        }
+
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        (d.method, d.url) = ("POST".into(), "https://{{host}}/upload".into());
+        h.state_mut().req_tab = ReqTab::Body;
+        let bodies = [
+            ("none", Body::None),
+            (
+                "text",
+                Body::Text {
+                    text: "plain words".into(),
+                },
+            ),
+            (
+                "form",
+                Body::Form {
+                    fields: vec![KeyValue::new("q", "rust")],
+                },
+            ),
+            (
+                "multipart",
+                Body::Multipart {
+                    parts: vec![KeyValue::new("file", "@/tmp/a.png")],
+                },
+            ),
+            (
+                "file",
+                Body::File {
+                    path: "/tmp/a.png".into(),
+                },
+            ),
+            (
+                "base64",
+                Body::Base64 {
+                    text: "3q2+7w==".into(),
+                },
+            ),
+            (
+                "hex",
+                Body::Hex {
+                    text: "de ad be ef".into(),
+                },
+            ),
+        ];
+        for (name, body) in bodies {
+            h.state_mut().open.as_mut().unwrap().draft.body = body;
+            h.run();
+            shot(&mut h, &format!("t-body-{name}"));
+        }
+
+        h.state_mut().open.as_mut().unwrap().draft.method = "GET".into();
+        h.state_mut().req_tab = ReqTab::Auth;
+        h.run();
+        h.get(By::new().role(Role::ComboBox).value("Inherit from parent"))
+            .click();
+        h.run();
+        shot(&mut h, "t-auth-list");
+        h.key_press(Key::Escape);
+        let auths = [
+            (
+                "bearer",
+                Auth::Bearer {
+                    token: "{{token}}".into(),
+                },
+            ),
+            (
+                "basic",
+                Auth::Basic {
+                    username: "ada".into(),
+                    password: String::new(),
+                },
+            ),
+            (
+                "digest",
+                Auth::Digest {
+                    username: "ada".into(),
+                    password: String::new(),
+                },
+            ),
+            ("oauth2", Auth::OAuth2(model::OAuth2::default())),
+            (
+                "apikey",
+                Auth::ApiKey {
+                    key: "X-Key".into(),
+                    value: String::new(),
+                    in_query: false,
+                },
+            ),
+            ("aws", Auth::AwsV4(model::AwsV4::default())),
+            ("oauth1", Auth::OAuth1(model::OAuth1::default())),
+            ("jwt", Auth::Jwt(model::Jwt::default())),
+            ("hawk", Auth::Hawk(model::Hawk::default())),
+            ("edgegrid", Auth::EdgeGrid(model::EdgeGrid::default())),
+            ("ntlm", Auth::Ntlm(model::Ntlm::default())),
+            ("none", Auth::None),
+        ];
+        for (name, auth) in auths {
+            h.state_mut().open.as_mut().unwrap().draft.auth = auth;
+            h.run();
+            shot(&mut h, &format!("t-auth-{name}"));
+        }
+
+        h.state_mut().req_tab = ReqTab::Params;
+        let json = r#"{"id":42,"name":"Ada","tags":["a","b"]}"#;
+        show_response(&mut h, "application/json", json.into());
+        for (tab, name) in [
+            (RespTab::Body, "body"),
+            (RespTab::Headers, "headers"),
+            (RespTab::Cookies, "cookies"),
+            (RespTab::Timeline, "timeline"),
+            (RespTab::Tests, "tests"),
+            (RespTab::Console, "console"),
+        ] {
+            h.state_mut().resp_tab = tab;
+            h.run();
+            shot(&mut h, &format!("t-resp-{name}"));
+        }
+        h.state_mut().resp_tab = RespTab::Body;
+
+        let close = |h: &mut Harness<'_, App>| {
+            let app = h.state_mut();
+            (app.dialog, app.env_editor, app.folder_editor, app.runner) = (None, None, None, None);
+            (app.settings, app.cookie_manager, app.code, app.show_history) =
+                (false, false, false, false);
+            app.load = None;
+            h.run();
+        };
+        for (name, action) in [
+            ("new-request", Action::NewRequest),
+            ("new-folder", Action::NewFolder),
+            ("new-env", Action::NewEnv),
+            ("globals", Action::Globals),
+            ("run", Action::RunCollection),
+            ("import", Action::ImportAny),
+            ("cookies", Action::Cookies),
+            ("shortcuts", Action::Shortcuts),
+            ("side-by-side", Action::SideBySide),
+            ("no-response", Action::Response),
+        ] {
+            h.state_mut().act(action);
+            h.run();
+            shot(&mut h, &format!("t-do-{name}"));
+            if matches!(action, Action::SideBySide | Action::Response) {
+                h.state_mut().act(action);
+            }
+            close(&mut h);
+        }
+        for (tab, name) in [
+            (SettingsTab::General, "general"),
+            (SettingsTab::Network, "network"),
+            (SettingsTab::Updates, "updates"),
+            (SettingsTab::Mcp, "mcp"),
+            (SettingsTab::Sync, "sync"),
+        ] {
+            (h.state_mut().settings, h.state_mut().settings_tab) = (true, tab);
+            h.run();
+            shot(&mut h, &format!("t-settings-{name}"));
+        }
+        close(&mut h);
+
+        let top = h.state().ws.collections();
+        let dir = h.state().ws.create_folder(&top, "api").unwrap();
+        h.state_mut().open_folder_editor(dir);
+        for (tab, name) in [
+            (FolderTab::Vars, "vars"),
+            (FolderTab::Auth, "auth"),
+            (FolderTab::Scripts, "scripts"),
+            (FolderTab::Docs, "docs"),
+        ] {
+            h.state_mut().folder_editor.as_mut().unwrap().tab = tab;
+            h.run();
+            shot(&mut h, &format!("t-folder-{name}"));
+        }
+        close(&mut h);
+
+        h.state_mut().code = true;
+        h.run();
+        shot(&mut h, "t-code");
+        close(&mut h);
+        h.state_mut().show_history = true;
+        h.run();
+        shot(&mut h, "t-history");
+        close(&mut h);
+        h.state_mut().load = Some(LoadView {
+            vus: 10,
+            secs: 30,
+            stats: None,
+            abort: None,
+        });
+        h.run();
+        shot(&mut h, "t-load");
+        close(&mut h);
+        h.key_press_modifiers(Modifiers::COMMAND, Key::K);
+        h.run();
+        shot(&mut h, "t-switcher");
     }
 }
