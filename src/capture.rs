@@ -1,7 +1,9 @@
 //! The capture proxy, as Proxyman and Charles have: what apps send through it is forwarded
 //! with the app's own network settings and kept as flows. HTTPS passes as a tunnel, seen
-//! only as its host and byte counts.
+//! only as its host and byte counts, unless decrypting: then its TLS ends here, with a
+//! certificate for its host from apitool's CA, and its requests are flows as any other.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +19,8 @@ use hyper::body::{Body as _, Frame, Incoming};
 use hyper::header::{HeaderMap, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -175,7 +179,7 @@ fn text(status: StatusCode, message: &str) -> Response<Body> {
 
 /// Serves until dropped, its tunnels with it. `clients` forwards: its proxy, CA file and
 /// client certificates.
-pub async fn serve(listener: TcpListener, clients: Clients, flows: Flows) {
+pub async fn serve(listener: TcpListener, clients: Clients, flows: Flows, decrypt: Decrypt) {
     let own = listener.local_addr().ok();
     // Tunnels watch it: the sender goes when this does.
     let (_running, stopped) = tokio::sync::watch::channel(());
@@ -191,11 +195,21 @@ pub async fn serve(listener: TcpListener, clients: Clients, flows: Flows) {
                 continue;
             }
         };
-        let (clients, flows, stopped) = (clients.clone(), flows.clone(), stopped.clone());
+        let (clients, flows) = (clients.clone(), flows.clone());
+        let (stopped, decrypt) = (stopped.clone(), decrypt.clone());
         connections.spawn(async move {
             let service = hyper::service::service_fn(move |req| {
-                let (clients, flows, stopped) = (clients.clone(), flows.clone(), stopped.clone());
-                async move { Ok::<_, Infallible>(handle(req, &clients, &flows, own, stopped).await) }
+                let (clients, flows) = (clients.clone(), flows.clone());
+                let (stopped, ca) = (stopped.clone(), decrypt.lock().unwrap().clone());
+                async move {
+                    let res = match ca {
+                        Some(ca) if req.method() == Method::CONNECT => {
+                            intercept(req, ca, &clients, &flows, stopped)
+                        }
+                        _ => handle(req, &clients, &flows, own, stopped).await,
+                    };
+                    Ok::<_, Infallible>(res)
+                }
             });
             let conn = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -217,16 +231,21 @@ async fn handle(
     if req.method() == Method::CONNECT {
         return tunnel(req, &clients.route, flows, own, stopped).await;
     }
+    if req.uri().scheme().is_none() {
+        let hint = "This is apitool's capture proxy: set it as the HTTP proxy, not as the server.";
+        return text(StatusCode::BAD_REQUEST, hint);
+    }
+    exchange(req, clients, flows).await
+}
+
+/// A request with its absolute URL: forwarded, unless it came back around.
+async fn exchange(req: Request<Incoming>, clients: &Clients, flows: &Flows) -> Response<Body> {
     let vias = req.headers().get_all(hyper::header::VIA);
     if vias
         .iter()
         .any(|v| v.as_bytes().ends_with(b"apitool-capture"))
     {
         return text(StatusCode::LOOP_DETECTED, LOOP);
-    }
-    if req.uri().scheme().is_none() {
-        let hint = "This is apitool's capture proxy: set it as the HTTP proxy, not as the server.";
-        return text(StatusCode::BAD_REQUEST, hint);
     }
     forward(req, clients, flows).await
 }
@@ -446,6 +465,175 @@ async fn connect(
     }
 }
 
+/// Decrypting's CA while it's on; tunnels pass untouched while it's None.
+pub type Decrypt = Arc<Mutex<Option<Arc<Ca>>>>;
+
+/// The CA that signs a certificate for each host an app opens HTTPS to. The app must trust
+/// it, so it is made once and kept (see `generate` and `load`).
+pub struct Ca {
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+    cert: CertificateDer<'static>,
+    pem: String,
+    /// One certificate per host, made on its first tunnel.
+    hosts: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
+}
+
+impl Ca {
+    /// A new CA, its certificate and key as PEM, for `load`.
+    pub fn generate() -> Result<(String, String), String> {
+        let key = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
+        let mut params = ca_params();
+        // Ten years: re-trusting a new CA in every app is the chore this saves.
+        valid_for(&mut params, 10 * 365);
+        let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
+        Ok((cert.pem(), key.serialize_pem()))
+    }
+
+    pub fn load(cert: &str, key: &str) -> Result<Self, String> {
+        let bad = |e: &dyn std::fmt::Display| format!("apitool's capture CA: {e}");
+        let key = rcgen::KeyPair::from_pem(key).map_err(|e| bad(&e))?;
+        let der = CertificateDer::from_pem_slice(cert.as_bytes()).map_err(|e| bad(&e))?;
+        Ok(Self {
+            // Its name, key usages and key are all a signature needs of it: the same
+            // params as `generate` made it with.
+            issuer: rcgen::Issuer::new(ca_params(), key),
+            cert: der,
+            pem: cert.to_owned(),
+            hosts: Mutex::default(),
+        })
+    }
+
+    /// The certificate to export, for apps to trust.
+    pub fn pem(&self) -> &str {
+        &self.pem
+    }
+
+    fn config_for(&self, host: &str) -> Result<Arc<rustls::ServerConfig>, String> {
+        let mut hosts = self.hosts.lock().unwrap();
+        if let Some(config) = hosts.get(host) {
+            return Ok(config.clone());
+        }
+        let fail = |e: &dyn std::fmt::Display| format!("a certificate for {host}: {e}");
+        let key = rcgen::KeyPair::generate().map_err(|e| fail(&e))?;
+        let mut params =
+            rcgen::CertificateParams::new(vec![host.to_owned()]).map_err(|e| fail(&e))?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, host);
+        // What Apple's and Chrome's checks ask of a server certificate: a SAN, server auth,
+        // at most 825 days.
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.use_authority_key_identifier_extension = true;
+        valid_for(&mut params, 365);
+        let cert = params.signed_by(&key, &self.issuer).map_err(|e| fail(&e))?;
+        let chain = vec![cert.der().clone(), self.cert.clone()];
+        let key = PrivateKeyDer::try_from(key.serialize_der()).map_err(|e| fail(&e))?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        // No ALPN: an app offering h2 hears nothing of it and speaks HTTP/1.1, all this
+        // serves.
+        let config = (rustls::ServerConfig::builder_with_provider(provider))
+            .with_safe_default_protocol_versions()
+            .and_then(|b| b.with_no_client_auth().with_single_cert(chain, key))
+            .map_err(|e| fail(&e))?;
+        let config = Arc::new(config);
+        hosts.insert(host.to_owned(), config.clone());
+        Ok(config)
+    }
+}
+
+fn ca_params() -> rcgen::CertificateParams {
+    let mut params = rcgen::CertificateParams::default();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    (params.distinguished_name).push(rcgen::DnType::CommonName, "apitool capture CA");
+    (params.distinguished_name).push(rcgen::DnType::OrganizationName, "apitool");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    params
+}
+
+/// From a day ago, for a clock a little behind, for `days`.
+fn valid_for(params: &mut rcgen::CertificateParams, days: u64) {
+    let since = (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)).unwrap_or_default();
+    let now = rcgen::date_time_ymd(1970, 1, 1) + since;
+    params.not_before = now - Duration::from_secs(86_400);
+    params.not_after = now + Duration::from_secs(days * 86_400);
+}
+
+/// CONNECT while decrypting: the app's TLS ends here and each request inside goes on as
+/// any other, its URL https://. A handshake the app broke off is a flow with why.
+fn intercept(
+    req: Request<Incoming>,
+    ca: Arc<Ca>,
+    clients: &Clients,
+    flows: &Flows,
+    mut stopped: tokio::sync::watch::Receiver<()>,
+) -> Response<Body> {
+    let Some(authority) = req.uri().authority().cloned() else {
+        return text(StatusCode::BAD_REQUEST, "CONNECT takes host:port");
+    };
+    let (clients, flows) = (clients.clone(), flows.clone());
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let host = authority.host().trim_matches(['[', ']']);
+        let accepted = async {
+            let config = ca.config_for(host)?;
+            let upgraded = (hyper::upgrade::on(req).await).map_err(|e| e.to_string())?;
+            let acceptor = tokio_rustls::TlsAcceptor::from(config);
+            (acceptor.accept(TokioIo::new(upgraded)).await)
+                .map_err(|e| format!("{e} (does the app trust apitool's CA?)"))
+        };
+        let tls = match accepted.await {
+            Ok(tls) => tls,
+            Err(e) => {
+                let id = flows.start("CONNECT", authority.as_str(), &HeaderMap::new());
+                flows.update(id, |f| {
+                    (f.error, f.elapsed) = (Some(e), Some(started.elapsed()));
+                });
+                return;
+            }
+        };
+        let origin = match authority.port_u16() {
+            Some(443) | None => format!("https://{}", authority.host()),
+            Some(_) => format!("https://{authority}"),
+        };
+        let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+            let (clients, flows) = (clients.clone(), flows.clone());
+            // Inside the tunnel a request names only its path.
+            let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
+            let uri = format!("{origin}{path}").parse::<hyper::Uri>();
+            async move {
+                let res = match uri {
+                    Ok(uri) => {
+                        *req.uri_mut() = uri;
+                        exchange(req, &clients, &flows).await
+                    }
+                    Err(e) => text(StatusCode::BAD_REQUEST, &e.to_string()),
+                };
+                Ok::<_, Infallible>(res)
+            }
+        });
+        let conn =
+            hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tls), service);
+        tokio::select! {
+            served = conn => if let Err(e) = served {
+                log::debug!("capture: {e}");
+            },
+            _ = stopped.changed() => {}
+        }
+    });
+    Response::new(
+        http_body_util::Empty::new()
+            .map_err(|e| match e {})
+            .boxed_unsync(),
+    )
+}
+
 /// HAR 1.2, as browsers' devtools save it, of the flows that were HTTP exchanges.
 pub fn har(flows: &[&Flow]) -> Value {
     let headers = |h: &[(String, String)]| -> Vec<Value> {
@@ -535,7 +723,7 @@ mod tests {
         let clients = rt.block_on(crate::net::build_client(net)).unwrap();
         let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let (addr, flows) = (listener.local_addr().unwrap(), Flows::new(|| {}));
-        rt.spawn(serve(listener, clients, flows.clone()));
+        rt.spawn(serve(listener, clients, flows.clone(), Decrypt::default()));
         (addr, flows)
     }
 
@@ -709,7 +897,12 @@ mod tests {
         let own = listener.local_addr().unwrap();
         let clients = rt.block_on(crate::net::build_client(behind(format!("http://{own}"))));
         let flows = Flows::new(|| {});
-        rt.spawn(serve(listener, clients.unwrap(), flows.clone()));
+        rt.spawn(serve(
+            listener,
+            clients.unwrap(),
+            flows.clone(),
+            Decrypt::default(),
+        ));
         let refused = ping_through(own, &target);
         assert!(refused.starts_with("HTTP/1.1 502"), "{refused}");
         let f = flow_when(&flows, |f| f.error.is_some());
@@ -717,6 +910,85 @@ mod tests {
             f.error.as_deref().unwrap().contains("its own upstream"),
             "{f:?}"
         );
+    }
+
+    /// An HTTPS server with a certificate of its own, answering with the request line.
+    fn tls_server() -> SocketAddr {
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = PrivateKeyDer::try_from(own.signing_key.serialize_der()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = (rustls::ServerConfig::builder_with_provider(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![own.cert.der().clone()], key)
+            .unwrap();
+        let config = Arc::new(config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let config = config.clone();
+                std::thread::spawn(move || {
+                    let mut conn = rustls::ServerConnection::new(config).unwrap();
+                    let mut tls = rustls::Stream::new(&mut conn, &mut s);
+                    let req = crate::http::tests::read_request(&mut tls);
+                    let line = req.lines().next().unwrap_or_default();
+                    let head = "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length";
+                    let _ = write!(tls, "{head}: {}\r\n\r\n{line}", line.len());
+                });
+            }
+        });
+        addr
+    }
+
+    /// Decrypting, an app that trusts the CA reads its HTTPS answer through the proxy, and
+    /// the exchange is a flow as any other, its URL https://. The CA is the one kept: loaded
+    /// again, it signs for the same certificate apps were given. An app that doesn't trust
+    /// it can't go on, and its tunnel says why.
+    #[test]
+    fn https_is_read_when_the_app_trusts_the_ca() {
+        let rt = runtime();
+        let (cert, key) = Ca::generate().unwrap();
+        let ca = Arc::new(Ca::load(&cert, &key).unwrap());
+        // The server's own certificate is self-signed: only apitool's side checks it.
+        let net = Network {
+            insecure: true,
+            ..direct()
+        };
+        let clients = rt.block_on(crate::net::build_client(net)).unwrap();
+        let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let (addr, flows) = (listener.local_addr().unwrap(), Flows::new(|| {}));
+        let decrypt = Arc::new(Mutex::new(Some(ca)));
+        rt.spawn(serve(listener, clients, flows.clone(), decrypt));
+        let server = tls_server();
+        let app = |trusted: bool| {
+            let mut b = reqwest::Client::builder()
+                .proxy(reqwest::Proxy::https(format!("http://{addr}")).unwrap());
+            if trusted {
+                b = b
+                    .add_root_certificate(reqwest::Certificate::from_pem(cert.as_bytes()).unwrap());
+            }
+            b.build().unwrap()
+        };
+        let url = format!("https://localhost:{}/items?x=1", server.port());
+        let res = rt.block_on(async {
+            let res = app(true).get(&url).send().await.unwrap();
+            res.text().await.unwrap()
+        });
+        assert_eq!(res, "GET /items?x=1 HTTP/1.1");
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!(
+            (f.method.as_str(), f.url.as_str(), f.status),
+            ("GET", &*url, Some(200))
+        );
+        assert_eq!(f.response.body, res.as_bytes());
+
+        let refused = rt.block_on(app(false).get(&url).send());
+        assert!(refused.is_err(), "{refused:?}");
+        let f = flow_when(&flows, |f| f.tunnel() && f.error.is_some());
+        assert_eq!(f.url, format!("localhost:{}", server.port()));
+        assert!(f.error.unwrap().contains("trust apitool's CA"));
     }
 
     /// Past the cap the oldest flows go, the newest stay: a busy app left capturing

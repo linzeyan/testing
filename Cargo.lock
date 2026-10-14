@@ -292,6 +292,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tower-layer",
  "tower-service",

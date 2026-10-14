@@ -678,6 +678,15 @@ impl Workspace {
         self.put("oauth-tokens", json)
     }
 
+    /// The capture's CA as the app keeps it; empty before its first use.
+    pub fn load_capture_ca(&self) -> String {
+        self.get("capture-ca").unwrap_or_default()
+    }
+
+    pub fn save_capture_ca(&self, json: &str) -> Result<(), String> {
+        self.put("capture-ca", json)
+    }
+
     /// Where requests and folders live, as paths (see the module docs).
     pub fn collections(&self) -> PathBuf {
         self.root.join("collections")

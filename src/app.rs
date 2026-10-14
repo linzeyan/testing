@@ -526,6 +526,8 @@ struct CaptureView {
     filter: String,
     /// The flow shown under the list.
     picked: Option<u64>,
+    /// The CA while Decrypt HTTPS is on, shared with the proxy, which reads it per tunnel.
+    decrypt: crate::capture::Decrypt,
 }
 
 /// Stops the capture proxy when dropped.
@@ -4269,28 +4271,24 @@ impl App {
             Ok(l) => l,
             Err(e) => return self.fail(tf("Capture: {}", &[&e])),
         };
-        let repaint = ctx.clone();
-        let view = self.capture.get_or_insert_with(|| CaptureView {
-            // Flows come in bursts: one frame for a burst.
-            flows: crate::capture::Flows::new(move || repaint.request_repaint_after(BATCHED)),
-            server: None,
-            filter: String::new(),
-            picked: None,
-        });
+        let view = self.capture.get_or_insert_with(|| capture_view(ctx));
         let (cell, net, tx, ctx) = (
             self.client.clone(),
             (self.network.clone(), self.cookies.clone()),
             self.tx.clone(),
             ctx.clone(),
         );
-        let (flows, failed) = (view.flows.clone(), t("Capture: {}"));
+        let (flows, decrypt) = (view.flows.clone(), view.decrypt.clone());
+        let failed = t("Capture: {}");
         let task = self.rt.spawn(async move {
             // Through the proxy chosen for requests: a VDI may have no other way out.
             match cell
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
                 .await
             {
-                Ok(clients) => crate::capture::serve(listener, clients.clone(), flows).await,
+                Ok(clients) => {
+                    crate::capture::serve(listener, clients.clone(), flows, decrypt).await;
+                }
                 // The pane sees the task ended and offers Start again.
                 Err(e) => {
                     let _ = tx.send(Msg::Status(fill(failed, &[e])));
@@ -4313,9 +4311,29 @@ impl App {
         view.server.as_ref().map(|s| s.addr)
     }
 
+    /// Decrypting's CA: made the first time, then kept in the workspace, its key sealed as
+    /// secrets are, so an app that trusts it once goes on doing so.
+    fn capture_ca(&self) -> Result<Arc<crate::capture::Ca>, String> {
+        let kept = serde_json::from_str::<(String, String)>(&self.ws.load_capture_ca());
+        let (cert, key) = match kept {
+            Ok((cert, sealed)) => (cert, crate::vault::open(&sealed)?),
+            Err(_) => {
+                let (cert, key) = crate::capture::Ca::generate()?;
+                let sealed = crate::vault::seal(&key)?;
+                let json = serde_json::to_string(&(&cert, sealed)).map_err(|e| e.to_string())?;
+                self.ws.save_capture_ca(&json)?;
+                (cert, key)
+            }
+        };
+        crate::capture::Ca::load(&cert, &key).map(Arc::new)
+    }
+
     fn capture_ui(&mut self, ui: &mut egui::Ui) {
         let listening = self.capturing();
+        let view = self.capture.get_or_insert_with(|| capture_view(ui.ctx()));
+        let decrypting = view.decrypt.lock().unwrap().is_some();
         let (mut start, mut stop, mut export, mut open_as) = (false, false, false, None);
+        let (mut decrypt, mut export_ca) = (None, false);
         ui.horizontal(|ui| {
             ui.heading(t("Capture"));
             ui.add_space(8.0);
@@ -4333,12 +4351,34 @@ impl App {
                 }
                 None => start = ui.add(primary(t("Start capturing"))).clicked(),
             }
+            ui.separator();
+            let mut on = decrypting;
+            if ui
+                .checkbox(&mut on, t("Decrypt HTTPS"))
+                .on_hover_text(t(
+                    "Reads HTTPS too: each host gets a certificate from apitool's CA, which apps must trust",
+                ))
+                .changed()
+            {
+                decrypt = Some(on);
+            }
+            export_ca = ui
+                .button(t("Export CA certificate…"))
+                .on_hover_text(t(
+                    "Add it to the trusted roots of the system (Keychain Access, certmgr) or of the app",
+                ))
+                .clicked();
         });
         let addr = listening.map_or("127.0.0.1:9090".to_owned(), |a| a.to_string());
-        ui.weak(tf(
-            "Set {} as the HTTP proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS shows as tunnels, their host and size only.",
-            &[&addr],
-        ));
+        let hint = match decrypting {
+            false => t(
+                "Set {} as the HTTP proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS shows as tunnels, their host and size only.",
+            ),
+            true => t(
+                "Set {} as the HTTP proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS is decrypted: an app that doesn't trust apitool's CA fails to connect.",
+            ),
+        };
+        ui.weak(fill(hint, &[&addr]));
         if let Some(CaptureView {
             flows,
             filter,
@@ -4370,6 +4410,26 @@ impl App {
         }
         if start {
             self.start_capture(&ui.ctx().clone());
+        }
+        let ca = match (decrypt, export_ca) {
+            (Some(true), _) | (_, true) => match self.capture_ca() {
+                Ok(ca) => Some(ca),
+                Err(e) => return self.fail(e),
+            },
+            _ => None,
+        };
+        // Ticked, `ca` is the CA; unticked, None.
+        if let (Some(_), Some(view)) = (decrypt, &self.capture) {
+            *view.decrypt.lock().unwrap() = ca.clone();
+        }
+        if export_ca
+            && let Some(ca) = ca
+            && let Some(to) = pick_file("apitool-capture-ca.pem", &[("PEM", &["pem", "crt"])], true)
+        {
+            match std::fs::write(&to, ca.pem()) {
+                Ok(()) => self.status = tf("Saved {}", &[&to]),
+                Err(e) => self.fail(format!("{to}: {e}")),
+            }
         }
         if stop && let Some(view) = &mut self.capture {
             view.server = None;
@@ -11931,6 +11991,20 @@ impl StreamSession {
             let want = req.mqtt.topics.into_iter().map(|t| (t.filter, t.qos));
             let _ = tx.send(crate::mqtt::Command::Topics(want.collect()));
         }
+    }
+}
+
+/// The capture pane's state, from when it first shows: Decrypt HTTPS can be set before
+/// the first Start.
+fn capture_view(ctx: &egui::Context) -> CaptureView {
+    let repaint = ctx.clone();
+    CaptureView {
+        // Flows come in bursts: one frame for a burst.
+        flows: crate::capture::Flows::new(move || repaint.request_repaint_after(BATCHED)),
+        server: None,
+        filter: String::new(),
+        picked: None,
+        decrypt: Default::default(),
     }
 }
 
@@ -20798,6 +20872,38 @@ mod ui_tests {
         let har: serde_json::Value = serde_json::from_slice(&std::fs::read(&to).unwrap()).unwrap();
         let _ = std::fs::remove_file(&to);
         assert_eq!(har["log"]["entries"][0]["request"]["url"], *url);
+    }
+
+    /// Decrypt HTTPS hands the proxy a CA made once and kept in the workspace, its key
+    /// sealed where the OS can: ticked again after the pane was closed, it's the same CA,
+    /// so apps that trust it go on doing so.
+    #[test]
+    fn decrypting_keeps_one_ca_in_the_workspace() {
+        let mut h = harness(workspace("capture-ca"));
+        h.run();
+        h.state_mut().act(Action::Capture);
+        h.run();
+        let ca = |h: &Harness<'_, App>| {
+            let view = h.state().capture.as_ref().unwrap();
+            let ca = view.decrypt.lock().unwrap().clone();
+            ca.map(|ca| ca.pem().to_owned())
+        };
+        let tick = |h: &mut Harness<'_, App>| {
+            h.get_by_label("Decrypt HTTPS").click();
+            h.run();
+        };
+        tick(&mut h);
+        let first = ca(&h).expect("decrypting");
+        assert!(first.starts_with("-----BEGIN CERTIFICATE-----"));
+        tick(&mut h);
+        assert_eq!(ca(&h), None, "unticked, tunnels pass untouched");
+        h.state_mut().capture = None;
+        h.run();
+        tick(&mut h);
+        assert_eq!(ca(&h), Some(first));
+        let kept = h.state().ws.load_capture_ca();
+        let sealed = cfg!(any(windows, target_os = "macos"));
+        assert_eq!(kept.contains("PRIVATE KEY"), !sealed, "{kept}");
     }
 
     fn wait_live(h: &mut Harness<'_, App>, done: impl Fn(&App) -> bool) {

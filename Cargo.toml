@@ -81,6 +81,10 @@ h2 = "0.4.19"
 # Already in the tree via reqwest, as a client: the capture proxy serves with it too, its
 # upgrades carrying CONNECT tunnels.
 hyper = { version = "1", features = ["server", "http1"] }
+# Decrypting HTTPS: the CA and a certificate per host, made with ring (aws-lc doesn't
+# cross-build for Windows); tokio-rustls, already in the tree via reqwest, ends the app's TLS.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 bytes = "1"
 # Already in the tree via reqwest-websocket, whose handshake takes its config: the
 # largest message a WebSocket takes in.
@@ -100,4 +104,3 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
 # Already in the tree via eframe: its WindowSettings checks the copy in app.rs.
 egui-winit = { version = "0.36.2", default-features = false, features = ["serde"] }
-rcgen = "0.14"

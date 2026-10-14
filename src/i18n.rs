@@ -1857,6 +1857,20 @@ const ZH_TW: &[(&str, &str)] = &[
     ("({} of binary data)", "（{} 二進位資料）"),
     ("(the first {} of {})", "（只保留前 {}，共 {}）"),
     ("{} sent, {} received", "送出 {}，收到 {}"),
+    ("Decrypt HTTPS", "解密 HTTPS"),
+    (
+        "Reads HTTPS too: each host gets a certificate from apitool's CA, which apps must trust",
+        "連 HTTPS 也讀取：每個主機改用 apitool CA 簽發的憑證，應用程式必須信任這個 CA",
+    ),
+    ("Export CA certificate…", "匯出 CA 憑證…"),
+    (
+        "Add it to the trusted roots of the system (Keychain Access, certmgr) or of the app",
+        "把它加到系統（鑰匙圈存取、certmgr）或應用程式的受信任根憑證",
+    ),
+    (
+        "Set {} as the HTTP proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS is decrypted: an app that doesn't trust apitool's CA fails to connect.",
+        "把 {} 設為應用程式或系統的 HTTP 代理：送出的請求會顯示在這裡，並以 apitool 的網路設定轉送。HTTPS 會被解密：不信任 apitool CA 的應用程式將無法連線。",
+    ),
 ];
 
 #[cfg(test)]

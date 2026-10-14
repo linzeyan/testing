@@ -384,8 +384,14 @@ What it sends goes on with apitool's own network settings (its proxy, CA and cli
 certificates) and shows as a row: time, method, status, duration, size, URL. A row opens
 underneath with both sides' headers and bodies; "Open as request" saves it as a new
 request, its answer as an example. The export icon writes every flow as HAR. HTTPS passes
-through as a tunnel, shown with its host and the bytes each way. The latest 1000 flows are
-kept, each body's first 256 KiB. WebSocket upgrades through the proxy aren't relayed.
+through as a tunnel, shown with its host and the bytes each way, unless "Decrypt HTTPS" is
+on: then each host gets a certificate from apitool's own CA, made once and kept in the
+workspace (its key sealed as secrets are), and its requests show as any other. "Export CA
+certificate…" saves the CA for the system's trusted roots (Keychain Access, certmgr) or an
+app's; an app that doesn't trust it fails to connect, and its tunnel says so. Decrypted
+connections speak HTTP/1.1, so an app that only speaks HTTP/2 (gRPC) can't go through. The
+latest 1000 flows are kept, each body's first 256 KiB. WebSocket upgrades through the proxy
+aren't relayed.
 
 ## Command line
 
