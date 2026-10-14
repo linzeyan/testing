@@ -593,8 +593,8 @@ const ZH_TW: &[(&str, &str)] = &[
         "取得 schema 後點選欄位 →\n或在這裡輸入查詢：輸入時會補全欄位。",
     ),
     (
-        "Fetch the schema to browse its queries and mutations.",
-        "取得 schema 後即可瀏覽它的查詢與變更。",
+        "Fetch the schema to browse its queries, mutations and subscriptions.",
+        "取得 schema 後即可瀏覽它的查詢、變更與訂閱。",
     ),
     ("File not found: {}", "找不到檔案：{}"),
     ("File path", "檔案路徑"),
@@ -1738,6 +1738,20 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Close the runner", "關閉執行器"),
     ("Filter by name or URL", "依名稱或 URL 篩選"),
     ("Flags", "旗標"),
+    ("Subscription", "訂閱"),
+    ("Event", "事件"),
+    (
+        "chat; empty: the message names it",
+        "chat；留空則由訊息指定",
+    ),
+    ("Ack", "要求確認"),
+    (
+        "Ask the server to acknowledge it: its answer shows as \"ack\" with the same number",
+        "要求伺服器回覆確認：回覆會顯示為「ack」加上同一個編號",
+    ),
+    ("Its argument: JSON, or text", "事件的參數：JSON 或文字"),
+    ("Connect first", "請先連線"),
+    ("The operation to run", "要執行的操作"),
     ("Show secret values", "顯示秘密值"),
     (
         "For each request, unless its Settings tab sets its own",

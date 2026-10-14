@@ -378,15 +378,25 @@ struct StreamSession {
     grpc: Option<(String, String)>,
     /// Socket.IO, whose messages are checked before they are sent too.
     socketio: bool,
-    /// What the compose box takes, shown while it's empty.
-    hint: &'static str,
     live: bool,
-    compose: String,
-    /// WebSocket: the compose box sent as text (0), or as the bytes it spells in Base64 (1)
-    /// or hex (2). None where messages are text only.
-    encoding: Option<usize>,
     filter: LogFilter,
     abort: tokio::task::AbortHandle,
+}
+
+/// The stream composer's box. Not the session's: it's there before Connect, and what's
+/// typed stays across connections.
+#[derive(Default)]
+struct Compose {
+    text: String,
+    /// WebSocket: the box sent as text (0), or as the bytes it spells in Base64 (1) or
+    /// hex (2).
+    encoding: usize,
+    /// Socket.IO: the event `text` is the one argument of; empty, `text` names it itself.
+    event: String,
+    /// Socket.IO: the server is asked to acknowledge it.
+    ack: bool,
+    /// Why the last Send didn't go: under the box, not in the status bar far away.
+    error: String,
 }
 
 /// What the stream log shows when filtered. The log only grows at the end and loses its
@@ -1036,6 +1046,7 @@ pub struct App {
     prompted: HashMap<String, String>,
     answers: Option<HashMap<String, String>>,
     stream: Option<StreamSession>,
+    compose: Compose,
     /// Methods of the last `.proto` the gRPC picker looked at; recompiled only on change.
     grpc_methods: Rpcs,
     explorer: Explorer,
@@ -1152,6 +1163,7 @@ impl App {
             prompted: HashMap::new(),
             answers: None,
             stream: None,
+            compose: Compose::default(),
             grpc_methods: None,
             explorer: Explorer {
                 replace: state.gql_replace,
@@ -1638,11 +1650,12 @@ impl App {
                     if s.outgoing.is_none() {
                         return Err("this connection only listens".into());
                     }
-                    // What the user is typing stays in the box.
-                    let typed = std::mem::replace(&mut s.compose, message.to_owned());
-                    let sent = s.send_compose(Some(&open.draft.mqtt), &vars);
-                    s.compose = typed;
-                    sent?;
+                    // Not through the box: what the user is typing stays there.
+                    let message = Compose {
+                        text: message.to_owned(),
+                        ..Default::default()
+                    };
+                    s.send_compose(&message, Some(&open.draft.mqtt), &vars)?;
                     return Ok(json!({ "stream": true }));
                 }
                 if live.is_some() {
@@ -1973,6 +1986,8 @@ impl App {
         self.tree_folder = None;
         self.runner_shown = false;
         let current = self.open.as_ref().map(|o| o.path.clone());
+        let kinds = |app: &Self| (app.open.as_ref()).map(|o| ReqTab::of(&o.draft.method));
+        let before = kinds(self);
         if current.as_ref() != Some(&path) {
             let from = current.as_ref().and_then(|p| self.tab_index(p));
             let parked = self.open.take().map(|open| {
@@ -2028,6 +2043,11 @@ impl App {
                         return;
                     }
                 }
+            }
+            // Another kind lands on its main tab (a gRPC call on Message, MQTT on Topics):
+            // the tab read last, Headers say, was the other kind's. HTTP to HTTP keeps it.
+            if let Some(now) = kinds(self).filter(|now| before != Some(*now)) {
+                self.req_tab = now[0];
             }
         }
         if pin && let Some(i) = self.tab_index(&path) {
@@ -2352,14 +2372,11 @@ impl App {
         let (method, url) = (&open.draft.method, redact(&open.draft.url));
         log::info!("connect {method} {url}");
         let (req, _) = open.draft.resolved(&self.all_vars());
-        let is_ws = req.method.eq_ignore_ascii_case("WS");
         let socketio = req.method == "SOCKETIO";
         let is_mqtt = req.method == "MQTT";
         let grpc = (req.method == "GRPC")
             .then(|| (crate::grpc::source(&req.proto, &req.url), req.rpc.clone()));
-        let sends = is_ws
-            || socketio
-            || rpc_of(&open.draft, &self.grpc_methods).is_some_and(|r| r.client_streaming);
+        let sends = composes(&open.draft, &self.grpc_methods);
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
         let (pub_tx, pub_rx) = tokio::sync::mpsc::unbounded_channel();
         let outgoing = match (is_mqtt, sends) {
@@ -2396,23 +2413,16 @@ impl App {
                 Err(e) => emit(Event::Error(fill(failed, &[&e]))),
             }
         });
-        let old = self.stream.take();
+        self.compose.error.clear();
         self.stream = Some(StreamSession {
             path: open.path.clone(),
             started,
             log,
             selected: None,
             outgoing,
-            hint: match (&grpc, socketio) {
-                (Some(_), _) => t("Message (JSON)"),
-                (None, true) => t("An event and its argument: chat {\"text\": \"hi\"}"),
-                (None, false) => t("Message"),
-            },
             grpc,
             socketio,
             live: true,
-            compose: old.as_ref().map(|s| s.compose.clone()).unwrap_or_default(),
-            encoding: is_ws.then(|| old.and_then(|s| s.encoding).unwrap_or(0)),
             filter: LogFilter::default(),
             abort: task.abort_handle(),
         });
@@ -3350,9 +3360,8 @@ impl eframe::App for App {
             let mqtt = self.open.as_ref().map(|o| &o.draft.mqtt);
             match self.stream.as_mut().filter(|s| s.live) {
                 Some(s) => {
-                    if let Err(e) = s.send_compose(mqtt, &vars) {
-                        self.fail(e);
-                    }
+                    let sent = s.send_compose(&self.compose, mqtt, &vars);
+                    self.compose.error = sent.err().unwrap_or_default();
                 }
                 None => self.send(ui.ctx(), None),
             }
@@ -4951,8 +4960,14 @@ impl App {
                         if open.draft.method == "GRAPHQL"
                             && let Body::GraphQL { query, variables } = &mut open.draft.body
                         {
-                            fetch_schema |=
-                                graphql_editor(ui, query, variables, &all_vars, &mut self.explorer);
+                            fetch_schema |= graphql_editor(
+                                ui,
+                                query,
+                                variables,
+                                &mut open.draft.operation,
+                                &all_vars,
+                                &mut self.explorer,
+                            );
                             return;
                         }
                         if let "GRPC" | "SOCKETIO" = open.draft.method.as_str() {
@@ -4969,6 +4984,7 @@ impl App {
                         fetch_schema |= body_editor(
                             ui,
                             &mut open.draft.body,
+                            &mut open.draft.operation,
                             &mut open.draft.headers,
                             &all_vars,
                             &mut self.explorer,
@@ -5118,27 +5134,22 @@ impl App {
                 return;
             }
             if streaming {
+                let sends = composes(&open.draft, &self.grpc_methods);
+                let compose = &mut self.compose;
                 match session {
-                    Some(s) => {
-                        let draft = &mut open.draft;
-                        if let Err(e) = stream_ui(ui, s, draft, &all_vars) {
-                            (self.status, self.failed) = (e.clone(), e);
-                        }
-                    }
-                    None if open.draft.method == "MQTT" => {
-                        ui.weak(t("Press Connect to reach the broker; it subscribes to the topics in the Topics tab. Scripts don't run for MQTT."));
-                    }
-                    None if open.draft.method == "GRPC" => {
-                        ui.weak(t("Press Connect to start the call. The body is the first message (for a client stream, an array is several, empty is none). Scripts don't run for streams."));
-                    }
-                    None if open.draft.method == "SOCKETIO" => {
-                        ui.weak(t("Press Connect to join the namespace, then send events: a name, then its argument. Scripts don't run for Socket.IO."));
-                    }
-                    None if open.draft.method == "GRAPHQL" => {
-                        ui.weak(t("A subscription: press Connect to start it; each event shows here. Scripts don't run for subscriptions."));
-                    }
+                    Some(s) => stream_ui(ui, s, compose, sends, &mut open.draft, &all_vars),
                     None => {
-                        ui.weak(t("Press Connect to open the stream. Scripts don't run for WebSocket/SSE."));
+                        ui.weak(match open.draft.method.as_str() {
+                            "MQTT" => t("Press Connect to reach the broker; it subscribes to the topics in the Topics tab. Scripts don't run for MQTT."),
+                            "GRPC" => t("Press Connect to start the call. The body is the first message (for a client stream, an array is several, empty is none). Scripts don't run for streams."),
+                            "SOCKETIO" => t("Press Connect to join the namespace, then send events: a name, then its argument. Scripts don't run for Socket.IO."),
+                            "GRAPHQL" => t("A subscription: press Connect to start it; each event shows here. Scripts don't run for subscriptions."),
+                            _ => t("Press Connect to open the stream. Scripts don't run for WebSocket/SSE."),
+                        });
+                        // Ready to type into before connecting, Send greyed until then.
+                        if sends {
+                            composer(ui, compose, &mut open.draft, false);
+                        }
                     }
                 }
                 return;
@@ -8929,6 +8940,7 @@ fn json_body_editor(ui: &mut egui::Ui, body: &mut Body, vars: &HashMap<String, S
 fn body_editor(
     ui: &mut egui::Ui,
     body: &mut Body,
+    operation: &mut String,
     headers: &mut Vec<KeyValue>,
     vars: &HashMap<String, String>,
     explorer: &mut Explorer,
@@ -9070,7 +9082,7 @@ fn body_editor(
             binary_editor(ui, binary, vars);
         }
         Body::GraphQL { query, variables } => {
-            return graphql_editor(ui, query, variables, vars, explorer);
+            return graphql_editor(ui, query, variables, operation, vars, explorer);
         }
     }
     false
@@ -9286,6 +9298,7 @@ fn graphql_editor(
     ui: &mut egui::Ui,
     query: &mut String,
     variables: &mut String,
+    operation: &mut String,
     vars: &HashMap<String, String>,
     ex: &mut Explorer,
 ) -> bool {
@@ -9301,7 +9314,22 @@ fn graphql_editor(
         let row = ui.spacing().interact_size.y;
         let vars_h: f32 = ui.data(|d| d.get_temp(split)).unwrap_or(total * 0.4);
         let vars_h = vars_h.clamp(80.0_f32.min(total / 2.0), (total - 4.0 * row).max(80.0));
-        ui.label(t("Query"));
+        ui.horizontal(|ui| {
+            ui.label(t("Query"));
+            // A document of several operations runs only the named one, as in Insomnia.
+            let names = crate::graphql::operation_names(query);
+            if let Some(shown) = crate::graphql::operation_name(query, operation) {
+                egui::ComboBox::from_id_salt("gql-operation")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        for n in names {
+                            ui.selectable_value(operation, n.clone(), n);
+                        }
+                    })
+                    .response
+                    .on_hover_text(t("The operation to run"));
+            }
+        });
         let schema = ex.schema.as_ref().and_then(|s| s.as_ref().ok());
         let fields = |text: &str, at: usize| schema?.complete(text, at);
         egui::ScrollArea::vertical()
@@ -9410,7 +9438,7 @@ fn graphql_editor(
         });
         match &ex.schema {
             None => {
-                ui.weak(t("Fetch the schema to browse its queries and mutations."));
+                ui.weak(t("Fetch the schema to browse its queries, mutations and subscriptions."));
             }
             Some(Err(e)) => {
                 ui.colored_label(RED, e.as_str());
@@ -9429,6 +9457,8 @@ fn graphql_editor(
                         for (title, op, fields) in [
                             (t("Query"), Operation::Query, &schema.query),
                             (t("Mutation"), Operation::Mutation, &schema.mutation),
+                            // Sent over a WebSocket once it's the query: `is_subscription`.
+                            (t("Subscription"), Operation::Subscription, &schema.subscription),
                         ] {
                             if fields.is_empty() {
                                 continue;
@@ -9441,7 +9471,7 @@ fn graphql_editor(
                                         .filter(|f| f.name.to_lowercase().contains(&filter))
                                     {
                                         let id =
-                                            egui::Id::new(("gql", op == Operation::Query, &f.name));
+                                            egui::Id::new(("gql", op, &f.name));
                                         let click = match ex.replace {
                                             true => t("Click to replace the query with this field."),
                                             false => t("Click to add this field to the query."),
@@ -11200,6 +11230,13 @@ fn rpc_of<'a>(req: &Request, rpcs: &'a Rpcs) -> Option<&'a crate::grpc::Rpc> {
     }
 }
 
+/// Kinds whose messages are typed in the composer: WebSocket, Socket.IO, MQTT and a gRPC
+/// client stream.
+fn composes(req: &Request, rpcs: &Rpcs) -> bool {
+    matches!(req.method.as_str(), "WS" | "SOCKETIO" | "MQTT")
+        || rpc_of(req, rpcs).is_some_and(|r| r.client_streaming)
+}
+
 /// WebSocket, SSE and streaming gRPC methods connect instead of sending.
 fn streams(req: &Request, rpcs: &Rpcs) -> bool {
     model::is_streaming(&req.method)
@@ -11392,25 +11429,36 @@ impl StreamSession {
     /// Err when a gRPC message doesn't fit the method: refused here, so a typo doesn't
     /// end the call. MQTT publishes to the open request's topic, as it is now.
     fn send_compose(
-        &mut self,
+        &self,
+        c: &Compose,
         mqtt: Option<&model::Mqtt>,
         vars: &HashMap<String, String>,
     ) -> Result<(), String> {
+        let event = c.event.trim();
         match &self.outgoing {
             None => {}
-            Some(Outgoing::Text(_)) if self.compose.is_empty() => {}
+            Some(Outgoing::Text(_))
+                if c.text.is_empty() && !(self.socketio && !event.is_empty()) => {}
             Some(Outgoing::Text(tx)) => {
                 if let Some((proto, rpc)) = &self.grpc {
-                    crate::grpc::check(proto, rpc, &self.compose)?;
+                    crate::grpc::check(proto, rpc, &c.text)?;
                 }
-                // Here, beside the box, rather than lost in the log as the task's own.
-                if self.socketio {
-                    stream::event_args(&self.compose)?;
-                }
-                let frame = match self.encoding {
-                    Some(1) => stream::Frame::Binary(model::decode_base64(&self.compose)?),
-                    Some(2) => stream::Frame::Binary(model::decode_hex(&self.compose)?),
-                    _ => stream::Frame::Text(self.compose.clone()),
+                let frame = match (self.socketio, self.grpc.is_some(), c.encoding) {
+                    (true, ..) => {
+                        // Checked here, beside the box, rather than lost in the log.
+                        let args = match event {
+                            "" => stream::event_args(&c.text)?,
+                            name => stream::event_with(name, &c.text),
+                        };
+                        match c.ack {
+                            true => stream::Frame::Ack(args),
+                            false => stream::Frame::Text(args),
+                        }
+                    }
+                    // Bytes are WebSocket's only: the encoding is kept across kinds.
+                    (false, false, 1) => stream::Frame::Binary(model::decode_base64(&c.text)?),
+                    (false, false, 2) => stream::Frame::Binary(model::decode_hex(&c.text)?),
+                    _ => stream::Frame::Text(c.text.clone()),
                 };
                 let _ = tx.send(frame);
             }
@@ -11433,7 +11481,7 @@ impl StreamSession {
                     topic,
                     qos: m.qos,
                     retain: m.retain,
-                    payload: self.compose.clone(),
+                    payload: c.text.clone(),
                     properties,
                     content_type: r(m.content_type.trim()),
                     response_topic: r(m.response_topic.trim()),
@@ -11471,11 +11519,11 @@ impl StreamSession {
 fn stream_ui(
     ui: &mut egui::Ui,
     s: &mut StreamSession,
+    c: &mut Compose,
+    composes: bool,
     draft: &mut Request,
     vars: &HashMap<String, String>,
-) -> Result<(), String> {
-    let (mqtt, saved) = (&mut draft.mqtt, &mut draft.messages);
-    let mut sent = Ok(());
+) {
     let (total, shown) = {
         let log = s.log.lock().unwrap();
         s.filter.update(&log);
@@ -11520,59 +11568,9 @@ fn stream_ui(
             }
         });
     });
-    if matches!(s.outgoing, Some(Outgoing::Mqtt(_))) {
-        // Part of the request, as in Postman, so it's there next time.
-        ui.horizontal(|ui| {
-            ui.label(t("Publish to"));
-            ui.add(
-                egui::TextEdit::singleline(&mut mqtt.topic)
-                    .hint_text("devices/42/cmd")
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(240.0),
-            );
-            qos_box(ui, "publish-qos", &mut mqtt.qos);
-            ui.checkbox(&mut mqtt.retain, t("Retain"))
-                .on_hover_text(t("The broker keeps it for whoever subscribes later"));
-        });
-    }
-    if s.outgoing.is_some() {
-        ui.horizontal(|ui| {
-            let send_w = 70.0;
-            let id = egui::Id::new("compose");
-            if crate::varedit::too_big(ui, id, &mut s.compose).is_none() {
-                ui.add(
-                    egui::TextEdit::multiline(&mut s.compose)
-                        .id(id)
-                        .desired_rows(2)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text(match s.encoding {
-                            Some(1) => "SGVsbG8sIHdvcmxk",
-                            Some(2) => "48 65 6c 6c 6f",
-                            _ => s.hint,
-                        })
-                        .desired_width(ui.available_width() - send_w - 8.0),
-                );
-            }
-            ui.vertical(|ui| {
-                if ui
-                    .add_sized([send_w, 22.0], egui::Button::new(t("Send")))
-                    .on_hover_text(ui.ctx().format_shortcut(&SEND))
-                    .clicked()
-                {
-                    sent = s.send_compose(Some(mqtt), vars);
-                }
-                if let Some(encoding) = &mut s.encoding {
-                    let names = [t("Text"), "Base64", "Hex"];
-                    egui::ComboBox::from_id_salt("ws-encoding")
-                        .width(send_w - 8.0)
-                        .show_index(ui, encoding, names.len(), |i| names[i])
-                        .on_hover_text(t(
-                            "Base64 and hex are decoded and sent as a binary message",
-                        ));
-                }
-                ui.horizontal(|ui| saved_messages(ui, &mut s.compose, saved));
-            });
-        });
+    if composes && composer(ui, c, draft, s.outgoing.is_some()) {
+        let sent = s.send_compose(c, Some(&draft.mqtt), vars);
+        c.error = sent.err().unwrap_or_default();
     }
     ui.separator();
     let log = s.log.lock().unwrap();
@@ -11678,11 +11676,123 @@ fn stream_ui(
     if let Some((n, text)) = clicked {
         s.selected = match selected == Some(n) {
             true => None,
-            // Pretty when it's JSON; already capped at MAX_EVENT_TEXT.
-            false => Some((n, http::pretty_json(text).unwrap_or_else(|| text.clone()))),
+            // Already capped at MAX_EVENT_TEXT.
+            false => Some((n, pretty_event(text))),
         };
     }
-    sent
+}
+
+/// The box a stream's messages are typed in, under its bar: there before Connect and after
+/// the connection ends too, Send greyed, so a message can be ready. Returns whether Send
+/// was pressed.
+fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: bool) -> bool {
+    let method = draft.method.as_str();
+    let (mqtt, saved) = (&mut draft.mqtt, &mut draft.messages);
+    if method == "MQTT" {
+        // Part of the request, as in Postman, so it's there next time.
+        ui.horizontal(|ui| {
+            ui.label(t("Publish to"));
+            ui.add(
+                egui::TextEdit::singleline(&mut mqtt.topic)
+                    .hint_text("devices/42/cmd")
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(240.0),
+            );
+            qos_box(ui, "publish-qos", &mut mqtt.qos);
+            ui.checkbox(&mut mqtt.retain, t("Retain"))
+                .on_hover_text(t("The broker keeps it for whoever subscribes later"));
+        });
+    }
+    let socketio = method == "SOCKETIO";
+    if socketio {
+        // Its own field, as in Postman and Hoppscotch: typed into the message, the name
+        // was easy to miss.
+        ui.horizontal(|ui| {
+            ui.label(t("Event"));
+            ui.add(
+                egui::TextEdit::singleline(&mut c.event)
+                    .hint_text(t("chat; empty: the message names it"))
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(220.0),
+            );
+            ui.checkbox(&mut c.ack, t("Ack")).on_hover_text(t(
+                "Ask the server to acknowledge it: its answer shows as \"ack\" with the same number",
+            ));
+        });
+    }
+    let named = socketio && !c.event.trim().is_empty();
+    let mut send = false;
+    ui.horizontal(|ui| {
+        let send_w = 70.0;
+        let id = egui::Id::new("compose");
+        let hint = match (method, c.encoding) {
+            ("GRPC", _) => t("Message (JSON)"),
+            ("SOCKETIO", _) if named => t("Its argument: JSON, or text"),
+            ("SOCKETIO", _) => t("An event and its argument: chat {\"text\": \"hi\"}"),
+            ("WS", 1) => "SGVsbG8sIHdvcmxk",
+            ("WS", 2) => "48 65 6c 6c 6f",
+            _ => t("Message"),
+        };
+        if crate::varedit::too_big(ui, id, &mut c.text).is_none() {
+            let edit = ui.add(
+                egui::TextEdit::multiline(&mut c.text)
+                    .id(id)
+                    .desired_rows(4)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text(hint)
+                    .desired_width(ui.available_width() - send_w - 8.0),
+            );
+            if edit.changed() {
+                c.error.clear();
+            }
+        }
+        ui.vertical(|ui| {
+            let button = (ui.add_enabled_ui(can_send, |ui| {
+                ui.add_sized([send_w, 22.0], egui::Button::new(t("Send")))
+            }))
+            .inner;
+            send = button
+                .on_hover_text(ui.ctx().format_shortcut(&SEND))
+                .on_disabled_hover_text(t("Connect first"))
+                .clicked();
+            if method == "WS" {
+                let names = [t("Text"), "Base64", "Hex"];
+                egui::ComboBox::from_id_salt("ws-encoding")
+                    .width(send_w - 8.0)
+                    .show_index(ui, &mut c.encoding, names.len(), |i| names[i])
+                    .on_hover_text(t("Base64 and hex are decoded and sent as a binary message"));
+            }
+            ui.horizontal(|ui| match named {
+                // Kept whole, name and argument; one picked from the list names itself.
+                true => {
+                    let whole = stream::event_with(c.event.trim(), &c.text);
+                    let mut picked = whole.clone();
+                    saved_messages(ui, &mut picked, saved);
+                    if picked != whole {
+                        (c.text, c.event) = (picked, String::new());
+                    }
+                }
+                false => saved_messages(ui, &mut c.text, saved),
+            });
+        });
+    });
+    if !c.error.is_empty() {
+        ui.colored_label(RED, c.error.as_str());
+    }
+    send
+}
+
+/// A stream event shown whole: pretty when it's JSON, also after the `[topic]` or event
+/// name it starts with, which kept MQTT's and Socket.IO's as one long line.
+fn pretty_event(text: &str) -> String {
+    if let Some(pretty) = http::pretty_json(text) {
+        return pretty;
+    }
+    // An object or array: `chat 5` stays on its line.
+    let split = (text.split_once(' ')).filter(|(_, rest)| rest.starts_with(['{', '[']));
+    let pretty =
+        split.and_then(|(head, rest)| Some(format!("{head}\n{}", http::pretty_json(rest)?)));
+    pretty.unwrap_or_else(|| text.to_owned())
 }
 
 /// Under Send: keep the typed message in the request, and the list of those kept, to put
@@ -15521,7 +15631,7 @@ mod ui_tests {
             }
         };
         let say = |h: &mut Harness<'_, App>, text: &str, n: usize| {
-            h.state_mut().stream.as_mut().unwrap().compose = text.into();
+            h.state_mut().compose.text = text.into();
             h.run();
             button(h, "Send").click();
             wait_live(h, received(n));
@@ -15551,10 +15661,14 @@ mod ui_tests {
         say(&mut h, "de ad", 3);
         let bytes = "<binary, 2 bytes> de ad";
         assert_eq!(h.get_all_by_label(bytes).count(), 2, "sent and echoed");
-        h.state_mut().stream.as_mut().unwrap().compose = "de a".into();
+        h.state_mut().compose.text = "de a".into();
         button(&h, "Send").click();
         h.run_steps(2);
-        assert!(h.state().status.contains("Not hex"), "{}", h.state().status);
+        assert!(
+            h.state().compose.error.contains("Not hex"),
+            "{}",
+            h.state().compose.error
+        );
         // A message opened whole has its own Close: finding the row again to click it
         // twice is the only other way.
         h.get_all_by_label("beta").last().unwrap().click();
@@ -15582,14 +15696,14 @@ mod ui_tests {
         assert_eq!(h.get_all_by_label("hello alpha").count(), 1);
         assert_eq!(h.query_all_by_label("beta").count(), 0);
 
-        h.state_mut().stream.as_mut().unwrap().compose.clear();
+        h.state_mut().compose.text.clear();
         h.get_by_label("Saved messages (1)").click();
         h.run();
         shot(&mut h, "94-saved-messages");
         let by = egui_kittest::kittest::By::new().role(Role::Button);
         h.get(by.label("hello alpha")).click();
         h.run();
-        assert_eq!(h.state().stream.as_ref().unwrap().compose, "hello alpha");
+        assert_eq!(h.state().compose.text, "hello alpha");
     }
 
     /// A row in the Vars tab, sent as the user would, lands in the selected environment.
@@ -15981,6 +16095,40 @@ mod ui_tests {
             "the first failure, from row 0, is still there"
         );
         assert_eq!(run.items.back().unwrap().iteration, 3 * MAX_RUN_ROWS - 1);
+    }
+
+    /// Another kind of request opens on its main tab, not on the tab read in the last one
+    /// (a gRPC call on Message, not Metadata); between HTTP requests the tab stays.
+    #[test]
+    fn another_kind_of_request_opens_on_its_main_tab() {
+        let ws = workspace("kind-tab");
+        let top = ws.collections();
+        let [a, b, call] = ["a", "b", "call"].map(|n| ws.create_request(&top, n).unwrap());
+        let grpc = Request {
+            method: "GRPC".into(),
+            ..Default::default()
+        };
+        ws.save_request(&call, &grpc).unwrap();
+        let mut h = harness(ws);
+        h.state_mut().activate(a, true);
+        h.state_mut().req_tab = ReqTab::Headers;
+        h.state_mut().activate(b.clone(), true);
+        assert!(h.state().req_tab == ReqTab::Headers, "HTTP to HTTP");
+        h.state_mut().activate(call, true);
+        assert!(h.state().req_tab == ReqTab::Body, "gRPC's Message");
+        h.state_mut().activate(b, true);
+        assert!(h.state().req_tab == ReqTab::Params);
+    }
+
+    /// MQTT's `[topic]` and Socket.IO's event name kept their JSON on one long line.
+    #[test]
+    fn a_stream_event_is_pretty_after_its_topic_or_name() {
+        assert_eq!(pretty_event(r#"[a/1] {"x":1}"#), "[a/1]\n{\n  \"x\": 1\n}");
+        assert_eq!(pretty_event("chat [1,2]"), "chat\n[\n  1,\n  2\n]");
+        assert_eq!(pretty_event(r#"{"x":1}"#), "{\n  \"x\": 1\n}");
+        for plain in ["chat 5", "echo hello", "[a/1] {not json"] {
+            assert_eq!(pretty_event(plain), plain);
+        }
     }
 
     /// The folder editor keeps one size across its tabs: centred, a shorter tab moved the
@@ -17138,23 +17286,49 @@ mod ui_tests {
         h.get_by_label("Auth payload").click();
         h.run();
         assert!(h.query_by_label_contains("no auth payload").is_some());
+        // The box is there before Connect, so a message can be ready; Send waits.
+        assert!(h.get_by_label("Send").accesskit_node().is_disabled());
         h.get_by_label("Connect").click();
         wait_live(&mut h, |app| got(app, r#"welcome {"n":1}"#));
         // Not an event: refused beside the box, and the connection goes on.
-        h.state_mut().stream.as_mut().unwrap().compose = "[1, 2]".into();
+        h.state_mut().compose.text = "[1, 2]".into();
         h.get_by_label("Send").click();
         h.run_steps(2);
         assert!(
-            h.state().status.contains("event name"),
+            h.state().compose.error.contains("event name"),
             "{}",
-            h.state().status
+            h.state().compose.error
         );
+        // Under the box, where the eye is: the status bar is far away.
+        assert!(h.query_by_label_contains("event name").is_some());
+        assert!(!h.state().status.contains("event name"));
         assert!(h.state().stream.as_ref().unwrap().live);
+        // The event named in its own field, its argument in the box; Ack asks for an answer.
+        let hint = Some("chat; empty: the message names it");
+        for step in 0..2 {
+            let field = (h.get_all_by_role(Role::TextInput))
+                .find(|n| n.accesskit_node().placeholder() == hint)
+                .unwrap();
+            match step {
+                0 => field.click(),
+                _ => field.type_text("say"),
+            }
+            h.run();
+        }
+        h.get_by_label("Ack").click();
+        h.state_mut().compose.text = r#"{"text": "hi"}"#.into();
+        h.run();
+        h.get_by_label("Send").click();
+        wait_live(&mut h, |app| {
+            let events = app.stream.as_ref().unwrap().events();
+            (events.iter()).any(|(_, e)| matches!(e, Event::Out(_)))
+        });
         h.get_by_label("Disconnect").click();
         h.run();
         let (pings, sent) = server.join().unwrap();
         assert!(pings >= 2, "{pings} pings");
-        assert_eq!(sent, ["40/chat,", "41/chat,", ""]);
+        let say = r#"42/chat,1["say",{"text":"hi"}]"#;
+        assert_eq!(sent, ["40/chat,", say, "41/chat,", ""]);
     }
 
     /// Every kind of request has a Settings tab with what its client uses: WebSocket, SSE
@@ -17285,25 +17459,37 @@ mod ui_tests {
         let delay = h.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
         assert!(delay >= Duration::from_millis(500), "{delay:?}");
 
-        h.state_mut().stream.as_mut().unwrap().compose = "ping".into();
+        h.state_mut().compose.text = "ping".into();
         for (topic, why) in [("", "needs a topic"), ("cmd/#", "subscribing")] {
             h.state_mut().open.as_mut().unwrap().draft.mqtt.topic = topic.into();
             h.get_by_label("Send").click();
             h.run_steps(2);
-            assert!(h.state().status.contains(why), "{}", h.state().status);
+            assert!(
+                h.state().compose.error.contains(why),
+                "{}",
+                h.state().compose.error
+            );
         }
         // 3.1.1 has nowhere to put them; dropping them silently would mislead.
         let m = &mut h.state_mut().open.as_mut().unwrap().draft.mqtt;
         (m.topic, m.user_properties) = ("cmd".into(), vec![KeyValue::new("unit", "C")]);
         h.get_by_label("Send").click();
         h.run_steps(2);
-        assert!(h.state().status.contains("MQTT 5"), "{}", h.state().status);
+        assert!(
+            h.state().compose.error.contains("MQTT 5"),
+            "{}",
+            h.state().compose.error
+        );
         let m = &mut h.state_mut().open.as_mut().unwrap().draft.mqtt;
         (m.user_properties[0].enabled, m.expiry_secs) = (false, 60);
-        h.state_mut().status.clear();
+        h.state_mut().compose.error.clear();
         h.get_by_label("Send").click();
         h.run_steps(2);
-        assert!(h.state().status.contains("MQTT 5"), "{}", h.state().status);
+        assert!(
+            h.state().compose.error.contains("MQTT 5"),
+            "{}",
+            h.state().compose.error
+        );
         h.state_mut().open.as_mut().unwrap().draft.mqtt.expiry_secs = 0;
         h.get_by_label("Send").click();
         wait_live(&mut h, |app| got(app, "[a/echo] echo cmd ping"));
@@ -17352,7 +17538,7 @@ mod ui_tests {
         h.run();
         h.get_by_label("Connect").click();
         wait_live(&mut h, |app| got(app, "[a/1] hello"));
-        h.state_mut().stream.as_mut().unwrap().compose = "ping".into();
+        h.state_mut().compose.text = "ping".into();
         h.get_by_label("Send").click();
         wait_live(&mut h, |app| {
             let tags = "content-type=text/plain · response-topic=reply/tester · expiry=60s";
@@ -17394,11 +17580,15 @@ mod ui_tests {
         wait_live(&mut h, |app| replies(app) == 1);
 
         // A typo is refused before it reaches the wire; the call goes on.
-        h.state_mut().stream.as_mut().unwrap().compose = r#"{"nmae": "bob"}"#.into();
+        h.state_mut().compose.text = r#"{"nmae": "bob"}"#.into();
         h.get_by_label("Send").click();
         h.run_steps(2);
-        assert!(h.state().status.contains("nmae"), "{}", h.state().status);
-        h.state_mut().stream.as_mut().unwrap().compose = r#"{"name": "bob"}"#.into();
+        assert!(
+            h.state().compose.error.contains("nmae"),
+            "{}",
+            h.state().compose.error
+        );
+        h.state_mut().compose.text = r#"{"name": "bob"}"#.into();
         h.get_by_label("Send").click();
         wait_live(&mut h, |app| replies(app) == 2);
         shot(&mut h, "32-grpc-stream");
@@ -17468,6 +17658,81 @@ mod ui_tests {
         h.key_press(Key::Enter);
         h.run();
         assert_eq!(query(&h), "{ users { name\n");
+    }
+
+    /// A document of several operations runs only the named one: the picker shows which,
+    /// and only then, since a lone operation needs no name.
+    #[test]
+    fn the_operation_to_run_is_picked_when_the_query_holds_several() {
+        let mut h = with_request("gql-operation");
+        let combo = |v: &'static str| {
+            egui_kittest::kittest::By::new()
+                .role(Role::ComboBox)
+                .value(v)
+        };
+        h.get(combo("GET")).click();
+        h.run();
+        h.get_by_label("GraphQL").click();
+        h.run();
+        fn set(h: &mut Harness<'_, App>, text: &str) {
+            if let Body::GraphQL { query, .. } =
+                &mut h.state_mut().open.as_mut().unwrap().draft.body
+            {
+                *query = text.into();
+            }
+            h.run();
+        }
+        set(&mut h, "query A { a }");
+        assert!(
+            h.query(combo("A")).is_none(),
+            "one operation needs no picker"
+        );
+        set(&mut h, "query A { a }\nmutation B { b }");
+        let o = h.state_mut().open.as_mut().unwrap();
+        o.saved = o.draft.clone();
+        h.get(combo("A")).click();
+        h.run();
+        h.get_by_label("B").click();
+        h.run();
+        assert_eq!(draft(&h).operation, "B");
+        assert!(h.query(combo("B")).is_some());
+        // An edit like any other, saved with the request.
+        assert!(h.state().open.as_ref().unwrap().dirty());
+    }
+
+    /// Subscriptions are browsed like queries: a field under their root is written as a
+    /// subscription, which then connects instead of posting.
+    #[test]
+    fn the_explorer_writes_a_subscription_from_its_own_root() {
+        let mut h = with_request("gql-subscription");
+        let picker = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("GET");
+        h.get(picker).click();
+        h.run();
+        h.get_by_label("GraphQL").click();
+        h.run();
+        let scalar = |name| serde_json::json!({ "kind": "SCALAR", "name": name, "ofType": null });
+        let json = serde_json::json!({ "data": { "__schema": {
+            "queryType": { "name": "Query" },
+            "subscriptionType": { "name": "Subscription" },
+            "types": [
+                { "kind": "OBJECT", "name": "Query", "fields": [
+                    { "name": "version", "args": [], "type": scalar("String") }
+                ]},
+                { "kind": "OBJECT", "name": "Subscription", "fields": [
+                    { "name": "ticks", "args": [], "type": scalar("Int") }
+                ]}
+            ]
+        }}});
+        h.state_mut().explorer.schema = Some(crate::graphql::parse(&json.to_string()));
+        h.run();
+        h.get_by_label("ticks: Int").click_accesskit();
+        h.run();
+        let Body::GraphQL { query, .. } = &draft(&h).body else {
+            panic!("body changed type")
+        };
+        assert!(query.starts_with("subscription Ticks {"), "{query}");
     }
 
     /// Postman and Bruno take argument values in fields, not as hand-written JSON: each
@@ -20219,7 +20484,7 @@ mod ui_tests {
 
         /// Sends `text` and waits for an incoming message holding it.
         fn echo(h: &mut Harness<'_, App>, what: &str, text: &str) -> Result<(), String> {
-            h.state_mut().stream.as_mut().unwrap().compose = text.into();
+            h.state_mut().compose.text = text.into();
             h.step();
             h.get_by_label("Send").click();
             wait_for(h, what, |app| heard(app, text) || ended(app));

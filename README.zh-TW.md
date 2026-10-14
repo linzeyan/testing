@@ -39,10 +39,10 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | 協定 | 說明 |
 |---|---|
 | HTTP | 每個請求可個別設定 HTTP 版本、重新導向、TLS 驗證、Cookie 與逾時 |
-| GraphQL | 取得 schema 後，輸入查詢時會補全欄位；變數以表單填寫，查詢宣告的每個 `$變數` 一列（enum 與 Boolean 用下拉、數字可用 `{{變數}}`；input object 會列出該型別的所有欄位，勾選的欄位下再列出其巢狀欄位，只有勾選的才會送出，同 Postman），也可切成 JSON。新加入的變數或欄位預設填入該型別的隨機值，如同 gRPC 的 Fill body（關閉「填入值」則從空值開始）；變數區固定在查詢下方，中間的分隔線可拖曳調整高度，查詢再長也不會把變數擠出畫面；`subscription` 透過 WebSocket 連線（graphql-transport-ws 或較舊的 graphql-ws），逐筆串流結果 |
+| GraphQL | 取得 schema 後，輸入查詢時會補全欄位；變數以表單填寫，查詢宣告的每個 `$變數` 一列（enum 與 Boolean 用下拉、數字可用 `{{變數}}`；input object 會列出該型別的所有欄位，勾選的欄位下再列出其巢狀欄位，只有勾選的才會送出，同 Postman），也可切成 JSON。新加入的變數或欄位預設填入該型別的隨機值，如同 gRPC 的 Fill body（關閉「填入值」則從空值開始）；變數區固定在查詢下方，中間的分隔線可拖曳調整高度，查詢再長也不會把變數擠出畫面；`subscription` 透過 WebSocket 連線（graphql-transport-ws 或較舊的 graphql-ws），逐筆串流結果。Schema 瀏覽器會列出查詢、變更與訂閱。查詢裡有多個操作時，「查詢」旁會出現選單，選擇要執行哪一個，以 `operationName` 送出 |
 | WebSocket | 文字或二進位訊息：Send 旁選 Base64 或 Hex，輸入框內容解碼後以一則二進位訊息送出；收到的二進位訊息顯示大小與 hex |
 | SSE | |
-| Socket.IO 2、3 與 4 | URL 的路徑即 namespace，JSON 內容即 auth payload（v2 沒有 auth payload，「參數」會附在交握的查詢字串上）；「設定」可指定交握路徑（空白即 `/socket.io/`）與用戶端版本；以 `event {"json": "arg"}` 或 `["event", …]` 陣列送出；會顯示 ack |
+| Socket.IO 2、3 與 4 | URL 的路徑即 namespace，JSON 內容即 auth payload（v2 沒有 auth payload，「參數」會附在交握的查詢字串上）；「設定」可指定交握路徑（空白即 `/socket.io/`）與用戶端版本；以 `event {"json": "arg"}` 或 `["event", …]` 陣列送出，也可以在「事件」欄填事件名稱、輸入框只放參數；勾選「要求確認」會請伺服器確認收到，回覆會顯示為 `ack` 加上同一個編號 |
 | MQTT 3.1.1 與 5 | 透過 TCP、TLS 或 WebSocket（`mqtt://`、`mqtts://`、`ws://`、`wss://`），詳見下方 |
 | gRPC | 方法來自執行時載入的 `.proto`；未指定時改用伺服器反射（v1 或 v1alpha，按 ↻ 或第一次傳送時查詢）。串流方法像 WebSocket 一樣連線；JSON 陣列內容會送出多則訊息 |
 
@@ -55,8 +55,10 @@ MQTT：
 - TLS 沿用網路設定中的 CA 檔、用戶端憑證與「接受任何憑證」選項；連線走 https 所用的同一個
   代理伺服器（http:// 或 https://），以 CONNECT 建立通道。
 
-每種串流的紀錄都能只看收到或送出的訊息（↓ ↑），也能依文字篩選，訊息量大時也跟得上。「送出」下方的
-書籤圖示會把輸入的訊息存進請求；旁邊的清單可把存過的訊息放回輸入框。點一則訊息會在下方顯示可複製的內容，按 × 關閉。
+每種串流的紀錄都能只看收到或送出的訊息（↓ ↑），也能依文字篩選，訊息量大時也跟得上。訊息輸入框在連線前
+就會出現，可以先寫好訊息，「送出」會等到連線後才能按。送不出去的訊息（JSON 解析失敗、Base64 打錯）會在
+輸入框下方說明原因。「送出」下方的書籤圖示會把輸入的訊息存進請求；旁邊的清單可把存過的訊息放回輸入框。
+點一則訊息會在下方顯示可複製的內容，即使前面帶有主題或事件名稱（`chat {…}`）也會以縮排後的 JSON 呈現；按 × 關閉。
 
 ## 請求
 
@@ -120,7 +122,8 @@ MQTT：
   Socket.IO、gRPC、MQTT 可接收的訊息大小上限。WebSocket、Socket.IO、SSE、MQTT 的連線若不是按
   「中斷連線」而結束，可依設定的次數與間隔連續重新連線：SSE 會以 `Last-Event-ID` 送出最後的事件
   ID，MQTT 會重新訂閱主題。
-- 每種請求只顯示用得到的分頁。GraphQL 一開就是查詢（Query）；WebSocket 與 SSE 沒有 Body
+- 每種請求只顯示用得到的分頁；開啟另一種請求時，會從它的第一個分頁開始，而不是停在上一個請求所在的分頁。
+  GraphQL 一開就是查詢（Query）；WebSocket 與 SSE 沒有 Body
   （交握只是一般的 GET），且與 Socket.IO、MQTT 一樣沒有腳本、Vars、Asserts（串流不會執行它們）；
   gRPC 有 JSON 的 Message 與 Metadata，但沒有 Params（URL 就是伺服器）。Socket.IO 的 JSON body
   即驗證酬載（Auth payload）。驗證方式只列出該種請求送得出的（MQTT 只有 Basic）。請求從 GraphQL

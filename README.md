@@ -41,10 +41,10 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | Protocol | Notes |
 |---|---|
 | HTTP | HTTP version, redirects, TLS check, cookies and timeout per request |
-| GraphQL | Once the schema is fetched, fields complete as you type the query; variables fill in as a form, a row per `$variable` the query declares (enum and Boolean pickers, numbers that may be `{{variables}}`; an input object lists every field of its type, nested ones under the ticked fields, and only ticked ones are sent, as in Postman), or as JSON. A variable or field added starts with a random value of its type, as gRPC's Fill body does (Fill in values off: empty); under the query with a divider to drag, so a long query doesn't push them off screen; a `subscription` connects over WebSocket (graphql-transport-ws or the older graphql-ws) and streams each result |
+| GraphQL | Once the schema is fetched, fields complete as you type the query; variables fill in as a form, a row per `$variable` the query declares (enum and Boolean pickers, numbers that may be `{{variables}}`; an input object lists every field of its type, nested ones under the ticked fields, and only ticked ones are sent, as in Postman), or as JSON. A variable or field added starts with a random value of its type, as gRPC's Fill body does (Fill in values off: empty); under the query with a divider to drag, so a long query doesn't push them off screen; a `subscription` connects over WebSocket (graphql-transport-ws or the older graphql-ws) and streams each result. The schema explorer lists queries, mutations and subscriptions. A query holding several operations shows a picker beside "Query" for the one to run, sent as `operationName` |
 | WebSocket | Text or binary messages: beside Send, Base64 or Hex sends the box decoded, as one binary message; received ones show their size and bytes in hex |
 | SSE | |
-| Socket.IO 2, 3 and 4 | The URL's path is the namespace and a JSON body the auth payload (v2 has none: Params go on the handshake's query); Settings sets the handshake path (`/socket.io/` if empty) and the client version; send `event {"json": "arg"}` or a `["event", …]` array; acks are shown |
+| Socket.IO 2, 3 and 4 | The URL's path is the namespace and a JSON body the auth payload (v2 has none: Params go on the handshake's query); Settings sets the handshake path (`/socket.io/` if empty) and the client version; send `event {"json": "arg"}` or a `["event", …]` array, or name the event in the Event field and type only its argument; Ack asks the server to acknowledge a message, and its answer shows as `ack` with the same number |
 | MQTT 3.1.1 and 5 | Over TCP, TLS or WebSocket (`mqtt://`, `mqtts://`, `ws://`, `wss://`), see below |
 | gRPC | Methods from a `.proto` loaded at run time or, with none set, from server reflection (v1 or v1alpha, asked on ↻ or the first send). Streaming methods connect like a WebSocket; a JSON array body sends several messages |
 
@@ -60,9 +60,12 @@ MQTT:
   with CONNECT.
 
 Every stream's log narrows to received or sent messages (↓ ↑) and to text, which keeps up
-with a busy feed. The bookmark under Send keeps the typed message in the request; the list
-beside it puts a kept one back in the box. Clicking a message shows its payload below, to copy;
-× closes it.
+with a busy feed. The message box is there before Connect, so a message can be written
+first; Send waits for the connection. A message that can't go out (JSON that doesn't parse,
+a typo in Base64) says why under the box. The bookmark under Send keeps the typed message in
+the request; the list beside it puts a kept one back in the box. Clicking a message shows its
+payload below, to copy, as indented JSON even after a topic or event name (`chat {…}`); ×
+closes it.
 
 ## Requests
 
@@ -139,12 +142,13 @@ beside it puts a kept one back in the box. Clicking a message shows its payload 
   connection takes in. A WebSocket, Socket.IO, SSE or MQTT connection that ends without
   Disconnect can open again, up to a set number of times in a row at a set interval: SSE
   sends the last event ID as `Last-Event-ID`, and MQTT subscribes to its topics again.
-- Each kind shows only the tabs it uses. GraphQL opens on its Query; WebSocket and SSE have
-  no Body (the handshake is a plain GET) and, like Socket.IO and MQTT, no Scripts, Vars or
-  Asserts, which don't run on streams; gRPC has a JSON Message and Metadata but no Params
-  (the URL is the server). Socket.IO's JSON body is its Auth payload. The Auth types offered
-  are the ones the kind can send (MQTT: Basic only). A query left behind when a request
-  turns from GraphQL into a stream or gRPC is dropped rather than sent.
+- Each kind shows only the tabs it uses, and opening a request of another kind starts on its
+  first tab instead of the one the last request was on. GraphQL opens on its Query;
+  WebSocket and SSE have no Body (the handshake is a plain GET) and, like Socket.IO and
+  MQTT, no Scripts, Vars or Asserts, which don't run on streams; gRPC has a JSON Message and
+  Metadata but no Params (the URL is the server). Socket.IO's JSON body is its Auth payload.
+  The Auth types offered are the ones the kind can send (MQTT: Basic only). A query left
+  behind when a request turns from GraphQL into a stream or gRPC is dropped rather than sent.
 
 ## Authentication
 

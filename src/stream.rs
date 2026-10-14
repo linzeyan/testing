@@ -25,12 +25,14 @@ pub enum Event {
 pub enum Frame {
     Text(String),
     Binary(Vec<u8>),
+    /// A Socket.IO event the server is asked to acknowledge; text elsewhere.
+    Ack(String),
 }
 
 impl Frame {
     pub fn into_text(self) -> String {
         match self {
-            Frame::Text(t) => t,
+            Frame::Text(t) | Frame::Ack(t) => t,
             Frame::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
         }
     }
@@ -267,7 +269,7 @@ pub async fn websocket(
             out = outgoing.recv() => match out {
                 Some(frame) => {
                     let (message, shown) = match frame {
-                        Frame::Text(t) => (Message::Text(t.clone()), t),
+                        Frame::Text(t) | Frame::Ack(t) => (Message::Text(t.clone()), t),
                         Frame::Binary(b) => (Message::Binary(b.clone().into()), binary(&b)),
                     };
                     if let Err(e) = sink.send(message).await {
@@ -335,7 +337,10 @@ pub async fn graphql(client: reqwest::Client, req: Request, emit: impl Fn(Event)
             Err(e) => return emit(Event::Error(format!("Variables aren't JSON: {e}"))),
         },
     };
-    let payload = json!({ "query": query, "variables": variables });
+    let mut payload = json!({ "query": query, "variables": variables });
+    if let Some(name) = crate::graphql::operation_name(query, &req.operation) {
+        payload["operationName"] = name.into();
+    }
     // The handshake is a GET carrying the request's headers and auth, not its body.
     let mut upgrade = Request {
         method: "WS".into(),
@@ -482,6 +487,8 @@ pub async fn socketio(
     // its messages before the connection is up: hold them until the CONNECT comes back.
     let mut joined = false;
     let mut pending = Vec::new();
+    // The last acknowledgement id asked for: the server's ack packet carries it back.
+    let mut acks = 0u64;
     loop {
         tokio::select! {
             _ = async { pings.as_mut().unwrap().tick().await }, if pings.is_some() => {
@@ -490,7 +497,7 @@ pub async fn socketio(
                 }
             },
             out = outgoing.recv() => match out {
-                Some(frame) => pending.push(frame.into_text()),
+                Some(frame) => pending.push(frame),
                 None => {
                     let _ = sink.send(Message::Text(format!("41{prefix}"))).await;
                     hang_up(&mut sink, &mut stream).await;
@@ -550,19 +557,34 @@ pub async fn socketio(
         if !joined {
             continue;
         }
-        for text in pending.drain(..) {
+        for frame in pending.drain(..) {
+            let ack = matches!(frame, Frame::Ack(_));
             // Not an Error: that ends the session, and this connection is still fine.
-            let args = match event_args(&text) {
+            let args = match event_args(&frame.into_text()) {
                 Ok(a) => a,
                 Err(e) => {
                     emit(Event::Info(format!("not sent: {e}")));
                     continue;
                 }
             };
-            if let Err(e) = sink.send(Message::Text(format!("42{prefix}{args}"))).await {
+            let id = match ack {
+                true => {
+                    acks += 1;
+                    acks.to_string()
+                }
+                false => String::new(),
+            };
+            if let Err(e) = sink
+                .send(Message::Text(format!("42{prefix}{id}{args}")))
+                .await
+            {
                 return emit(Event::Error(error_chain(&e)));
             }
-            emit(Event::Out(args));
+            // Its id, to match the `ack` that comes back.
+            emit(Event::Out(match ack {
+                true => format!("{args} · ack {id}"),
+                false => args,
+            }));
         }
     }
 }
@@ -618,13 +640,19 @@ pub fn event_args(text: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("type an event name, then its argument: chat {\"text\": \"hi\"}".into());
     }
+    Ok(event_with(name, arg))
+}
+
+/// The event `name` with `arg` as its one argument (none when empty), as the JSON array an
+/// event packet carries.
+pub fn event_with(name: &str, arg: &str) -> String {
     let mut args = vec![serde_json::Value::String(name.to_owned())];
     let arg = arg.trim();
     if !arg.is_empty() {
         // Text that isn't JSON goes as a string, as `socket.emit("chat", "hi")` would.
         args.push(serde_json::from_str(arg).unwrap_or_else(|_| arg.into()));
     }
-    Ok(serde_json::to_string(&args).unwrap_or_default())
+    serde_json::to_string(&args).unwrap_or_default()
 }
 
 /// Incremental `text/event-stream` parser. Works on bytes so multi-byte characters
@@ -1277,6 +1305,7 @@ pub mod tests {
                 let sub = read(&mut ws);
                 assert_eq!(sub["type"], subscribe);
                 assert_eq!(sub["payload"]["variables"]["room"], "a");
+                assert_eq!(sub["payload"]["operationName"], "Room");
                 let id = sub["id"].clone();
                 send(
                     &mut ws,
@@ -1306,8 +1335,11 @@ pub mod tests {
             let req = Request {
                 method: "GRAPHQL".into(),
                 url: format!("http://{addr}/graphql"),
+                operation: "Room".into(),
                 body: Body::GraphQL {
-                    query: "subscription ($room: String) { messages(room: $room) { n } }".into(),
+                    query: "subscription Ping { ping }\n\
+                        subscription Room($room: String) { messages(room: $room) { n } }"
+                        .into(),
                     variables: r#"{"room": "a"}"#.into(),
                 },
                 ..Default::default()
@@ -1386,7 +1418,7 @@ pub mod tests {
                         send(&mut ws, "2");
                     }
                     "3" => send(&mut ws, r#"42/chat,["welcome",{"n":1},"x"]"#),
-                    t if t.starts_with("42/chat,") => send(&mut ws, r#"43/chat,7["ok"]"#),
+                    t if t.starts_with("42/chat,1[") => send(&mut ws, r#"43/chat,1["ok"]"#),
                     _ => {}
                 }
             }
@@ -1413,11 +1445,12 @@ pub mod tests {
         let events = std::sync::Mutex::new(Vec::new());
         rt.block_on(socketio(client, req, &mut rx, |e| {
             match &e {
+                // Asking for an acknowledgement: the server answers with the same id.
                 Event::In(t) if t.starts_with("welcome") => {
                     let tx = tx.lock().unwrap();
                     tx.as_ref()
                         .unwrap()
-                        .send(Frame::Text(r#"say {"text": "hi"}"#.into()))
+                        .send(Frame::Ack(r#"say {"text": "hi"}"#.into()))
                         .unwrap();
                 }
                 Event::In(t) if t.starts_with("ack") => drop(tx.lock().unwrap().take()),
@@ -1431,7 +1464,7 @@ pub mod tests {
             [
                 r#"40/chat,{"token": "t"}"#,
                 "3",
-                r#"42/chat,["say",{"text":"hi"}]"#,
+                r#"42/chat,1["say",{"text":"hi"}]"#,
                 "41/chat,",
                 ""
             ]
@@ -1441,14 +1474,18 @@ pub mod tests {
             [
                 Event::Open("connected to /chat".into()),
                 Event::In(r#"welcome {"n":1} "x""#.into()),
-                Event::Out(r#"["say",{"text":"hi"}]"#.into()),
-                Event::In(r#"ack 7 ["ok"]"#.into()),
+                Event::Out(r#"["say",{"text":"hi"}] · ack 1"#.into()),
+                Event::In(r#"ack 1 ["ok"]"#.into()),
                 Event::Closed("disconnected".into()),
             ]
         );
         assert_eq!(event_args("ping").unwrap(), r#"["ping"]"#);
         assert_eq!(event_args("say hi there").unwrap(), r#"["say","hi there"]"#);
         assert!(event_args("[1, 2]").is_err() && event_args("  ").is_err());
+        // The composer's Event field: a name with spaces, and no argument.
+        let joined = event_with("user joined", r#"{"n": 1}"#);
+        assert_eq!(joined, r#"["user joined",{"n":1}]"#);
+        assert_eq!(event_with("ping", " "), r#"["ping"]"#);
     }
 
     /// MCP's stream_request queues its messages before the socket is even open; a server

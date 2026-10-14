@@ -27,6 +27,9 @@ pub struct Request {
     pub proto: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub rpc: String,
+    /// GraphQL: the operation to run when the query holds several.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub operation: String,
     /// Markdown, for the generated API docs.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub description: String,
@@ -411,6 +414,7 @@ impl Default for Request {
             url: String::new(),
             proto: String::new(),
             rpc: String::new(),
+            operation: String::new(),
             description: String::new(),
             params: Vec::new(),
             path_vars: Vec::new(),
@@ -1082,6 +1086,7 @@ impl Request {
             url: r(&url),
             proto: r(&self.proto),
             rpc: r(&self.rpc),
+            operation: self.operation.clone(),
             description: String::new(),
             params: kv(&self.params, &mut r),
             path_vars: Vec::new(),
@@ -1250,6 +1255,7 @@ impl Request {
             url,
             proto,
             rpc,
+            operation,
             description,
             params,
             path_vars,
@@ -1268,6 +1274,7 @@ impl Request {
             inherited: _,
         } = self;
         (method, url, proto, rpc) == (&other.method, &other.url, &other.proto, &other.rpc)
+            && operation == &other.operation
             && (description, params, path_vars)
                 == (&other.description, &other.params, &other.path_vars)
             && (headers, pre_request, tests) == (&other.headers, &other.pre_request, &other.tests)
@@ -1604,6 +1611,7 @@ mod tests {
             url: "https://{{host}}/users/:id".into(),
             proto: "protos/users.proto".into(),
             rpc: "users.v1.Users/Get".into(),
+            operation: "GetUser".into(),
             description: "Fetches **one** user.\n".into(),
             params: vec![KeyValue {
                 description: "1-based".into(),

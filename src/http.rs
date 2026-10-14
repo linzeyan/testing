@@ -297,7 +297,10 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
                 serde_json::from_str(&variables)
                     .map_err(|e| format!("GraphQL variables are not valid JSON: {e}"))?
             };
-            let payload = serde_json::json!({ "query": query, "variables": variables });
+            let mut payload = serde_json::json!({ "query": query, "variables": variables });
+            if let Some(name) = crate::graphql::operation_name(&query, &req.operation) {
+                payload["operationName"] = name.into();
+            }
             typed(b, "application/json").body(payload.to_string())
         }
     };
@@ -1244,6 +1247,35 @@ pub(crate) mod tests {
         let h = wire.headers()["authorization"].to_str().unwrap();
         assert!(h.starts_with(r#"OAuth oauth_consumer_key="ck""#), "{h}");
         assert!(h.contains(r#"oauth_signature_method="HMAC-SHA1""#), "{h}");
+    }
+
+    /// A server refuses a document of several operations without `operationName`: the
+    /// picked one goes out, and a lone operation goes out as it always did.
+    #[test]
+    fn several_operations_send_the_picked_name() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sent = |query: &str, operation: &str| {
+            let req = Request {
+                method: "GRAPHQL".into(),
+                url: "http://x.test/graphql".into(),
+                operation: operation.into(),
+                body: Body::GraphQL {
+                    query: query.into(),
+                    variables: String::new(),
+                },
+                ..Default::default()
+            };
+            let wire = build(&client(&rt), req).unwrap().build().unwrap();
+            let body = wire.body().and_then(|b| b.as_bytes()).unwrap();
+            serde_json::from_slice::<serde_json::Value>(body).unwrap()
+        };
+        let two = "query A { a } query B { b }";
+        assert_eq!(sent(two, "B")["operationName"], "B");
+        assert_eq!(sent(two, "")["operationName"], "A");
+        assert!(sent("query A { a }", "A").get("operationName").is_none());
     }
 
     #[test]

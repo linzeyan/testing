@@ -10,6 +10,7 @@ pub const INTROSPECTION: &str = "query IntrospectionQuery {
   __schema {
     queryType { name }
     mutationType { name }
+    subscriptionType { name }
     types {
       kind
       name
@@ -67,9 +68,10 @@ pub struct Type {
 pub struct Schema {
     pub query: Vec<Field>,
     pub mutation: Vec<Field>,
+    pub subscription: Vec<Field>,
     /// Every named type that has fields or values, by name.
     types: BTreeMap<String, Type>,
-    /// The query and mutation types: their fields are `query` and `mutation`.
+    /// The root types: their fields are `query`, `mutation` and `subscription`.
     roots: Vec<String>,
 }
 
@@ -77,10 +79,11 @@ pub struct Schema {
 /// (`edges { node { … } }`); past that, a big schema's query runs to thousands of lines.
 const SELECT_DEPTH: usize = 4;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Operation {
     Query,
     Mutation,
+    Subscription,
 }
 
 /// Parses an introspection response body (`{"data": {"__schema": …}}`).
@@ -106,7 +109,7 @@ pub fn parse(body: &str) -> Result<Schema, String> {
         let kind = t["kind"].as_str().unwrap_or_default().to_owned();
         types.insert(name.to_owned(), Type { kind, fields });
     }
-    let roots: Vec<String> = (["queryType", "mutationType"].iter())
+    let roots: Vec<String> = (["queryType", "mutationType", "subscriptionType"].iter())
         .filter_map(|key| schema[*key]["name"].as_str().map(str::to_owned))
         .collect();
     let root = |key: &str| {
@@ -116,6 +119,7 @@ pub fn parse(body: &str) -> Result<Schema, String> {
     Ok(Schema {
         query: root("queryType"),
         mutation: root("mutationType"),
+        subscription: root("subscriptionType"),
         types,
         roots,
     })
@@ -327,6 +331,7 @@ impl Schema {
         let mut fields = match op {
             Operation::Query => &self.query[..],
             Operation::Mutation => &self.mutation[..],
+            Operation::Subscription => &self.subscription[..],
         };
         let mut out = Vec::new();
         for name in path {
@@ -471,6 +476,7 @@ impl Operation {
         match self {
             Operation::Query => "query",
             Operation::Mutation => "mutation",
+            Operation::Subscription => "subscription",
         }
     }
 }
@@ -920,6 +926,36 @@ struct OperationText {
     /// Its `{`.
     open: usize,
     sel: Selection,
+}
+
+/// The names of the document's operations, in order.
+pub fn operation_names(query: &str) -> Vec<String> {
+    let p = Parser::new(query);
+    let tokens: Vec<&str> = p.tokens.iter().map(|&(s, e)| &query[s..e]).collect();
+    let (mut depth, mut names) = (0, Vec::new());
+    for (i, t) in tokens.iter().enumerate() {
+        match *t {
+            "{" => depth += 1,
+            "}" => depth -= 1,
+            // Inside braces `query` is a field; outside, the keyword of an operation.
+            "query" | "mutation" | "subscription" if depth == 0 => {
+                if let Some(n) = tokens.get(i + 1).filter(|n| Parser::name(n)) {
+                    names.push(n.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// What goes out as `operationName`: nothing for a single operation, which the server runs
+/// anyway; otherwise the picked one, or the first while none (or a renamed one) is picked,
+/// since the server refuses to guess.
+pub fn operation_name(query: &str, picked: &str) -> Option<String> {
+    let names = operation_names(query);
+    let name = names.iter().find(|n| *n == picked).or(names.first());
+    name.filter(|_| names.len() > 1).cloned()
 }
 
 /// Just enough of a GraphQL parser to find where a path's fields are in a query: tokens
@@ -1445,6 +1481,50 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(text, "query Version {\n  version\n}\n");
         assert_eq!(vars, "");
+    }
+
+    /// Subscriptions are a root of their own: one clicked is written as a `subscription`,
+    /// which the request then streams. They weren't asked for, so never listed.
+    #[test]
+    fn subscription_fields_are_a_root_of_their_own() {
+        assert!(INTROSPECTION.contains("subscriptionType { name }"));
+        let json = serde_json::json!({ "data": { "__schema": {
+            "queryType": { "name": "Query" },
+            "subscriptionType": { "name": "Subscription" },
+            "types": [
+                { "kind": "OBJECT", "name": "Query", "fields": [
+                    { "name": "version", "args": [], "type": named("SCALAR", "String") }
+                ]},
+                { "kind": "OBJECT", "name": "Subscription", "fields": [
+                    { "name": "ticks", "args": [], "type": named("SCALAR", "Int") }
+                ]}
+            ]
+        }}});
+        let schema = parse(&json.to_string()).unwrap();
+        let names: Vec<_> = schema.subscription.iter().map(|f| &f.name).collect();
+        assert_eq!(names, ["ticks"]);
+        let (text, _) = schema
+            .operation(Operation::Subscription, &path(&["ticks"]))
+            .unwrap();
+        assert_eq!(text, "subscription Ticks {\n  ticks\n}\n");
+        assert!(is_subscription(&text));
+        // A root, not one of the types listed below them.
+        assert!(schema.listed().all(|(name, _)| name != "Subscription"));
+    }
+
+    /// Only the keywords at the top are operations: a field or argument called `query`, a
+    /// comment, a string and an anonymous operation aren't names to pick.
+    #[test]
+    fn operation_names_are_the_named_operations_at_the_top() {
+        // `query name` inside braces: two fields, the first one called `query`.
+        let doc = "# query Comment { x }\nfragment F on Query { query name }\n\
+            query A($q: String = \"query Z\") { search(query: $q) { query } }\n\
+            mutation B { b }\nsubscription C { c }\n{ anonymous }";
+        assert_eq!(operation_names(doc), ["A", "B", "C"]);
+        assert_eq!(operation_name(doc, "C").as_deref(), Some("C"));
+        // Renamed away: the first, since the server won't guess.
+        assert_eq!(operation_name(doc, "Gone").as_deref(), Some("A"));
+        assert_eq!(operation_name("query A { a }", "A"), None);
     }
 
     /// A field clicked at any depth brings only its path along, into the query being
