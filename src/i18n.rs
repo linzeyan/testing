@@ -252,6 +252,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Certificates", "憑證"),
     ("Check every day", "每天檢查"),
     ("Check every week", "每週檢查"),
+    ("Check for updates", "檢查更新"),
     ("Check now", "立即檢查"),
     ("Check when apitool starts", "每次啟動 apitool 時檢查"),
     (
@@ -285,6 +286,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "Client certificate (.pem with key, or .pfx / .p12)",
         "用戶端憑證（含金鑰的 .pem，或 .pfx / .p12）",
     ),
+    ("Client", "用戶端"),
     ("Client credentials", "用戶端憑證"),
     (
         "Client error: the request is wrong or can't be fulfilled.",
@@ -894,6 +896,7 @@ const ZH_TW: &[(&str, &str)] = &[
         "開啟：點的欄位會加進查詢，一個查詢可同時查多個。關閉：點根欄位會取代整個查詢。",
     ),
     ("Open in browser", "在瀏覽器開啟"),
+    ("Open in new tab", "在新分頁開啟"),
     ("optional", "選填"),
     (
         "Optional CSV (with header row) or JSON array; one iteration per row",
@@ -1468,6 +1471,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("{} d ago", "{} 天前"),
     ("{} failed requests", "{} 個請求失敗"),
+    ("1 failed request", "1 個請求失敗"),
     ("{} h ago", "{} 小時前"),
     ("{} is available", "有新版本 {}"),
     (

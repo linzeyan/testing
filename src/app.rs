@@ -817,6 +817,8 @@ struct FolderEditor {
 enum TreeAction {
     /// `true` (a double-click) opens a normal tab instead of a preview.
     Open(PathBuf, bool),
+    /// The menu's "Open in new tab": a normal tab, the one shown kept even as a preview.
+    OpenNew(PathBuf),
     Dialog(Dialog),
     Duplicate(PathBuf),
     Run(PathBuf),
@@ -3564,7 +3566,7 @@ impl App {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                let shortcut = ui.ctx().format_shortcut(&SETTINGS);
+                let shortcut = shortcut_label(ui.ctx(), &SETTINGS);
                 if icon_button(ui, icon::SETTINGS, t("App settings"), None)
                     .on_hover_text(tf("Settings ({})", &[&shortcut]))
                     .clicked()
@@ -3620,7 +3622,7 @@ impl App {
                 ui.separator();
                 let shown = !self.hide_sidebar;
                 let hint = t("Show or hide collections and history, for more room");
-                let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[2].0);
+                let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[2].0);
                 if icon_button(ui, icon::SIDEBAR, t("Sidebar"), Some(shown))
                     .on_hover_text(format!("{hint} ({key})"))
                     .clicked()
@@ -3634,7 +3636,7 @@ impl App {
                     false => t("The response beside the request instead of under it"),
                 };
                 let on = self.side_by_side;
-                let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[3].0);
+                let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[3].0);
                 // Greyed while too narrow: lit, it looked on yet changed nothing.
                 let button = ui.add_enabled_ui(!self.narrow, |ui| {
                     icon_button(ui, icon::COLUMNS, t("Side by side"), Some(on))
@@ -3648,7 +3650,7 @@ impl App {
                     self.save_state();
                 }
                 let shown = !self.hide_response;
-                let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[5].0);
+                let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[5].0);
                 if icon_button(ui, icon::PANEL_BOTTOM, t("Response"), Some(shown))
                     .on_hover_text(format!("{} ({key})", t("Show or hide the response")))
                     .clicked()
@@ -3763,7 +3765,7 @@ impl App {
                     .on_hover_text(format!(
                         "{} ({})",
                         t("Edit this environment's variables"),
-                        ui.ctx().format_shortcut(&EDIT_ENV)
+                        shortcut_label(ui.ctx(), &EDIT_ENV)
                     ))
                     .clicked()
             {
@@ -3796,7 +3798,7 @@ impl App {
         }
         ui.horizontal(|ui| {
             let root = self.ws.collections();
-            let shortcut = ui.ctx().format_shortcut(&NEW_REQUEST);
+            let shortcut = shortcut_label(ui.ctx(), &NEW_REQUEST);
             if icon_button(ui, icon::FILE_PLUS, t("New request"), None)
                 .on_hover_text(tf("New request ({})", &[&shortcut]))
                 .clicked()
@@ -3814,7 +3816,7 @@ impl App {
                 self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
             }
             // Out in the open: in the ⋯ menu only, a first-time user never found it.
-            let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[1].0);
+            let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[1].0);
             if icon_button(ui, icon::DOWNLOAD, t("Import…"), None)
                 .on_hover_text(tf("Import: Postman, OpenAPI, Insomnia, HAR ({})", &[&key]))
                 .clicked()
@@ -3846,7 +3848,7 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
-                let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[1].0);
+                let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[1].0);
                 if (ui.add(egui::Button::new(t("Import…")).shortcut_text(key)))
                     .on_hover_text(t(
                         "A Postman collection or environment, or an OpenAPI/Swagger spec",
@@ -3881,7 +3883,7 @@ impl App {
                             .hint_text(t("Filter by name"))
                             .desired_width(f32::INFINITY),
                     );
-                    let switch = ui.ctx().format_shortcut(&SWITCH);
+                    let switch = shortcut_label(ui.ctx(), &SWITCH);
                     let filter = filter
                         .on_hover_text(tf("{} jumps to any request or environment", &[&switch]));
                     // Escape leaves the box, and clears it like a search field.
@@ -3972,6 +3974,16 @@ impl App {
                 TreeAction::Open(path, pin) => {
                     self.tree_picked.clear();
                     self.activate(path, pin);
+                }
+                TreeAction::OpenNew(path) => {
+                    // Its tab first, as reopen_tab does: activate would reuse a preview tab.
+                    if self.tab_index(&path).is_none() {
+                        let shown = (self.open.as_ref()).and_then(|o| self.tab_index(&o.path));
+                        let at = shown.map_or(self.tabs.len(), |i| i + 1);
+                        self.tabs.insert(at, Tab::new(path.clone(), false));
+                    }
+                    self.tree_picked.clear();
+                    self.activate(path, true);
                 }
                 TreeAction::Folder(path) => self.tree_folder = Some(path),
                 TreeAction::Pick(path) => {
@@ -4391,7 +4403,7 @@ impl App {
                     }
                     label.context_menu(|ui| {
                         let ctx = ui.ctx().clone();
-                        let shortcut = |s| ctx.format_shortcut(s);
+                        let shortcut = |s| shortcut_label(&ctx, s);
                         let item = egui::Button::new(t("Duplicate request"))
                             .shortcut_text(shortcut(&DUPLICATE));
                         if ui.add(item).clicked() {
@@ -4419,7 +4431,7 @@ impl App {
                             menu = Some((i, Menu::Reopen));
                         }
                     });
-                    let key = ui.ctx().format_shortcut(&CLOSE_TAB);
+                    let key = shortcut_label(ui.ctx(), &CLOSE_TAB);
                     let x = icon_button(ui, icon::X, t("Close tab"), None)
                         .on_hover_text(tf("Close ({})", &[&key]));
                     if x.clicked() || label.middle_clicked() {
@@ -4482,7 +4494,7 @@ impl App {
         let all_vars = self.all_vars();
         let Some(open) = &mut self.open else {
             ui.centered_and_justified(|ui| {
-                let key = ui.ctx().format_shortcut(&NEW_REQUEST);
+                let key = shortcut_label(ui.ctx(), &NEW_REQUEST);
                 ui.weak(tf(
                     "Select a request on the left, or press {} for a new one.",
                     &[&key],
@@ -4643,7 +4655,7 @@ impl App {
                     egui::Popup::menu(&more)
                         .id(egui::Id::new("save-more"))
                         .show(|ui| {
-                            let key = ui.ctx().format_shortcut(&SAVE_AS);
+                            let key = shortcut_label(ui.ctx(), &SAVE_AS);
                             save_as = (ui.add(egui::Button::new(t("Save as…")).shortcut_text(key)))
                                 .on_hover_text(t(
                                     "Save these edits as a new request; this one stays as saved",
@@ -4652,7 +4664,7 @@ impl App {
                         });
                     save = ui
                         .add_enabled(open.dirty(), egui::Button::new(t("Save")))
-                        .on_hover_text(ui.ctx().format_shortcut(&SAVE))
+                        .on_hover_text(shortcut_label(ui.ctx(), &SAVE))
                         .clicked();
                     if !streaming {
                         let on = self.load.is_some();
@@ -4669,7 +4681,7 @@ impl App {
                     }
                     let on = self.code;
                     let hint = t("This request as curl, Python, Go, … to copy");
-                    let key = ui.ctx().format_shortcut(&CODE);
+                    let key = shortcut_label(ui.ctx(), &CODE);
                     if icon_button(ui, icon::CODE, t("Code"), Some(on))
                         .on_hover_text(format!("{hint} ({key})"))
                         .clicked()
@@ -4802,7 +4814,7 @@ impl App {
                     // A call needs its method: Send only failed with `Method "" should look
                     // like package.Service/Method`.
                     let ready = open.draft.method != "GRPC" || !open.draft.rpc.trim().is_empty();
-                    let key = ui.ctx().format_shortcut(&SEND);
+                    let key = shortcut_label(ui.ctx(), &SEND);
                     send |= (ui.add_enabled_ui(ready, |ui| {
                         let fill = Color32::from_rgb(40, 110, 200);
                         ui.add_sized(button, egui::Button::new(label).fill(fill))
@@ -4823,7 +4835,7 @@ impl App {
                     egui::Popup::menu(&button)
                         .id(egui::Id::new("send-more"))
                         .show(|ui| {
-                            let key = ui.ctx().format_shortcut(&SEND_DOWNLOAD);
+                            let key = shortcut_label(ui.ctx(), &SEND_DOWNLOAD);
                             let button = egui::Button::new(t("Send and download…"));
                             download = (ui.add(button.shortcut_text(key)))
                                 .on_hover_text(t(
@@ -5109,7 +5121,7 @@ impl App {
         };
         let mut fold = None;
         egui::CentralPanel::default().show(ui, |ui| {
-            let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[5].0);
+            let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[5].0);
             if self.hide_response {
                 ui.horizontal(|ui| {
                     if icon_button(ui, icon::CHEVRON_UP, t("Show the response"), None)
@@ -5176,7 +5188,7 @@ impl App {
             match &mut self.response {
                 None => {
                     ui.horizontal(|ui| {
-                        ui.weak(tf("Press Send or {} to see the response.", &[&ui.ctx().format_shortcut(&SEND)]));
+                        ui.weak(tf("Press Send or {} to see the response.", &[&shortcut_label(ui.ctx(), &SEND)]));
                         past_menu(ui, &mut past, None);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if fold_button(ui, &key) {
@@ -6020,15 +6032,9 @@ impl App {
             ui.horizontal(|ui| {
                 save = ui
                     .add(primary(t("Save")))
-                    .on_hover_text(ui.ctx().format_shortcut(&SAVE))
+                    .on_hover_text(shortcut_label(ui.ctx(), &SAVE))
                     .clicked()
                     || enter_pressed(ui);
-                let close_label = if ed.confirm_discard {
-                    RichText::new(t("Discard changes")).color(RED)
-                } else {
-                    RichText::new(t("Close"))
-                };
-                close = ui.button(close_label).clicked() || escape_pressed(ui);
                 if ed.env.is_some() {
                     duplicate = ui
                         .button(t("Duplicate…"))
@@ -6041,6 +6047,15 @@ impl App {
                         ui.ctx().copy_text(json);
                         self.status = tf("Copied {} as a Postman environment", &[&name]);
                     }
+                }
+                // After the actions, as in every dialog; deleting stays apart at the right.
+                let close_label = if ed.confirm_discard {
+                    RichText::new(t("Discard changes")).color(RED)
+                } else {
+                    RichText::new(t("Close"))
+                };
+                close = ui.button(close_label).clicked() || escape_pressed(ui);
+                if ed.env.is_some() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let label = if ed.confirm_delete {
                             t("Click again to delete")
@@ -6210,7 +6225,7 @@ impl App {
             ui.horizontal(|ui| {
                 save = ui
                     .add(primary(t("Save")))
-                    .on_hover_text(ui.ctx().format_shortcut(&SAVE))
+                    .on_hover_text(shortcut_label(ui.ctx(), &SAVE))
                     .clicked()
                     || enter_pressed(ui);
                 let close_label = if ed.confirm_discard {
@@ -6294,18 +6309,22 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| {
                 close = ui.button(t("Close")).clicked();
+                // At the right, apart from Close, as Delete environment is.
+                let right = egui::Layout::right_to_left(egui::Align::Center);
                 if !rows.is_empty() {
-                    // Every login at once, with no undo: a second click, as for environments.
-                    let armed = egui::Id::new("clear-cookies");
-                    let confirm = ui.data(|d| d.get_temp(armed)).unwrap_or(false);
-                    let label = match confirm {
-                        true => t("Click again to clear all"),
-                        false => t("Clear all"),
-                    };
-                    if ui.button(RichText::new(label).color(RED)).clicked() {
-                        clear = confirm;
-                        ui.data_mut(|d| d.insert_temp(armed, !confirm));
-                    }
+                    ui.with_layout(right, |ui| {
+                        // Every login at once, with no undo: a second click, as for environments.
+                        let armed = egui::Id::new("clear-cookies");
+                        let confirm = ui.data(|d| d.get_temp(armed)).unwrap_or(false);
+                        let label = match confirm {
+                            true => t("Click again to clear all"),
+                            false => t("Clear all"),
+                        };
+                        if ui.button(RichText::new(label).color(RED)).clicked() {
+                            clear = confirm;
+                            ui.data_mut(|d| d.insert_temp(armed, !confirm));
+                        }
+                    });
                 }
             });
         });
@@ -6913,7 +6932,10 @@ impl App {
                 ui.separator();
                 ui.colored_label(
                     if failed == 0 { GREEN } else { RED },
-                    tf("{} failed requests", &[&failed]),
+                    match failed {
+                        1 => t("1 failed request").to_owned(),
+                        n => tf("{} failed requests", &[&n]),
+                    },
                 );
                 ui.separator();
                 let color = if tests_passed == tests_total {
@@ -7155,6 +7177,7 @@ impl App {
                             Check::Weekly => t("Check every week"),
                         };
                         ui.horizontal(|ui| {
+                            ui.label(t("Check for updates"));
                             egui::ComboBox::from_id_salt("update-check")
                                 .selected_text(label(updates.check))
                                 .show_ui(ui, |ui| {
@@ -7219,6 +7242,7 @@ impl App {
                 SettingsTab::Mcp => {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
+                            ui.label(t("Client"));
                             egui::ComboBox::from_id_salt("mcp-client")
                                 .selected_text(MCP_CLIENTS[*mcp_client])
                                 .show_ui(ui, |ui| {
@@ -7445,11 +7469,11 @@ impl App {
                 *most = most.max(used);
                 *most
             });
-            ui.add_space(most - used + 6.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                close = ui.button(t("Close")).clicked();
-                // By Close, as a dialog's buttons go: under the default headers it read
-                // as theirs.
+            ui.add_space(most - used);
+            ui.separator();
+            // As every dialog's footer: the action, then Close, from the left. By Close:
+            // under the default headers it read as theirs.
+            ui.horizontal(|ui| {
                 if *tab == SettingsTab::Network {
                     let changed = net_draft.as_ref().is_some_and(|n| n != net_now);
                     // Blue only when it would do something.
@@ -7462,6 +7486,7 @@ impl App {
                         .clicked()
                         || (changed && enter_pressed(ui));
                 }
+                close = ui.button(t("Close")).clicked();
             });
         });
         if let Some(copied) = copied {
@@ -7953,7 +7978,7 @@ enum Go {
 }
 
 /// What a button somewhere already does, for whoever's hands are on the keyboard.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Action {
     NewRequest,
     NewFolder,
@@ -8383,8 +8408,21 @@ fn row_menu(
 /// none. Either works everywhere.
 fn delete_key(ctx: &egui::Context) -> String {
     match ctx.os() == egui::os::OperatingSystem::Mac {
-        true => ctx.format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Backspace)),
-        false => ctx.format_shortcut(&KeyboardShortcut::new(Modifiers::NONE, Key::Delete)),
+        true => shortcut_label(
+            ctx,
+            &KeyboardShortcut::new(Modifiers::COMMAND, Key::Backspace),
+        ),
+        false => shortcut_label(ctx, &KeyboardShortcut::new(Modifiers::NONE, Key::Delete)),
+    }
+}
+
+/// `format_shortcut`, the key as its symbol on every system: without a Mac's ⌘ glyphs egui
+/// spells it out, "Ctrl+Backslash", "Ctrl+Comma", where apps write Ctrl+\ and Ctrl+,.
+fn shortcut_label(ctx: &egui::Context, k: &KeyboardShortcut) -> String {
+    let text = ctx.format_shortcut(k);
+    match text.strip_suffix(k.logical_key.name()) {
+        Some(mods) => format!("{mods}{}", k.logical_key.symbol_or_name()),
+        None => text,
     }
 }
 
@@ -8495,7 +8533,7 @@ fn folder_menu(
     collection: bool,
     actions: &mut Vec<TreeAction>,
 ) {
-    let (rename_key, delete_key) = (ui.ctx().format_shortcut(&RENAME), delete_key(ui.ctx()));
+    let (rename_key, delete_key) = (shortcut_label(ui.ctx(), &RENAME), delete_key(ui.ctx()));
     let mut keyed = |ui: &mut egui::Ui, label: &str, keys: Option<String>, a: TreeAction| {
         let button = egui::Button::new(label);
         let button = match keys {
@@ -8509,6 +8547,14 @@ fn folder_menu(
     };
     let dialog = |kind| TreeAction::Dialog(Dialog::name(kind, ""));
     let path = path.to_path_buf();
+    // At the top, as in Postman's menu: what a collection is mostly opened for. Last, it
+    // sat under a dozen other items.
+    let run = match collection {
+        true => t("Run collection"),
+        false => t("Run folder"),
+    };
+    keyed(ui, run, None, TreeAction::Run(path.clone()));
+    ui.separator();
     let new_request = dialog(NameKind::NewRequest(path.clone()));
     keyed(ui, t("New request"), None, new_request);
     let new_folder = dialog(NameKind::NewFolder(path.clone()));
@@ -8543,23 +8589,23 @@ fn folder_menu(
         t("Copy as Postman collection"),
         TreeAction::CopyPostman(path.clone()),
     );
-    item(ui, t("Start mock server"), TreeAction::Mock(path.clone()));
-    let run = match collection {
-        true => t("Run collection"),
-        false => t("Run folder"),
-    };
-    item(ui, run, TreeAction::Run(path));
+    item(ui, t("Start mock server"), TreeAction::Mock(path));
 }
 
 fn request_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<TreeAction>) {
-    let rename = egui::Button::new(t("Rename")).shortcut_text(ui.ctx().format_shortcut(&RENAME));
+    if ui.button(t("Open in new tab")).clicked() {
+        actions.push(TreeAction::OpenNew(path.to_path_buf()));
+        ui.close();
+    }
+    ui.separator();
+    let rename = egui::Button::new(t("Rename")).shortcut_text(shortcut_label(ui.ctx(), &RENAME));
     if ui.add(rename).clicked() {
         let rename = Dialog::name(NameKind::Rename(path.to_path_buf()), name);
         actions.push(TreeAction::Dialog(rename));
         ui.close();
     }
     let duplicate =
-        egui::Button::new(t("Duplicate")).shortcut_text(ui.ctx().format_shortcut(&DUPLICATE));
+        egui::Button::new(t("Duplicate")).shortcut_text(shortcut_label(ui.ctx(), &DUPLICATE));
     if ui.add(duplicate).clicked() {
         actions.push(TreeAction::Duplicate(path.to_path_buf()));
         ui.close();
@@ -11094,7 +11140,17 @@ fn cipher_picker(ui: &mut egui::Ui, ciphers: &mut Vec<String>) {
 /// of them in two columns ran off a narrow pane.
 fn shortcut_list(ui: &mut egui::Ui, all: bool) {
     ui.add_space(12.0);
-    let key = |k: &KeyboardShortcut| ui.ctx().format_shortcut(k);
+    let key = |k: &KeyboardShortcut| shortcut_label(ui.ctx(), k);
+    // Named as Ctrl+K names them: "Sidebar" here and "Show or hide the sidebar" there
+    // read as two things.
+    let keyed = |i: usize| {
+        let (keys, action) = KEYED_ACTIONS[i];
+        let label = ACTIONS
+            .iter()
+            .find(|(_, a)| *a == action)
+            .map_or("", |(l, _)| t(l));
+        (label, key(&keys))
+    };
     let first = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
     let rows = [
         (t("Send request"), key(&SEND)),
@@ -11114,15 +11170,15 @@ fn shortcut_list(ui: &mut egui::Ui, all: bool) {
         (t("Rename"), key(&RENAME)),
         (t("Code"), key(&CODE)),
         (t("Edit environment"), key(&EDIT_ENV)),
-        (t("New collection"), key(&KEYED_ACTIONS[0].0)),
-        (t("Import…"), key(&KEYED_ACTIONS[1].0)),
-        (t("Sidebar"), key(&KEYED_ACTIONS[2].0)),
-        (t("Side by side"), key(&KEYED_ACTIONS[3].0)),
-        (t("Response"), key(&KEYED_ACTIONS[5].0)),
+        keyed(0),
+        keyed(1),
+        keyed(2),
+        keyed(3),
+        keyed(5),
         (t("Larger text"), key(&ZOOM_IN)),
         (t("Smaller text"), key(&ZOOM_OUT)),
         (t("Default text size"), key(&ZOOM_RESET)),
-        (t("Keyboard shortcuts"), key(&KEYED_ACTIONS[4].0)),
+        keyed(4),
     ];
     let few: Vec<_> = rows[..7].iter().chain(rows.last()).cloned().collect();
     let (rows, per) = match all {
@@ -11894,7 +11950,7 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
             }))
             .inner;
             send = button
-                .on_hover_text(ui.ctx().format_shortcut(&SEND))
+                .on_hover_text(shortcut_label(ui.ctx(), &SEND))
                 .on_disabled_hover_text(t("Connect first"))
                 .clicked();
             if method == "WS" {
@@ -12181,7 +12237,7 @@ fn response_ui(
         }
         let actions = egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true);
         ui.with_layout(actions, |ui| {
-            *hide = fold_button(ui, &ui.ctx().format_shortcut(&KEYED_ACTIONS[5].0));
+            *hide = fold_button(ui, &shortcut_label(ui.ctx(), &KEYED_ACTIONS[5].0));
             if let Ok(view) = &mut shown.result {
                 // What the tab shows, said in the status bar: it copied the body from any
                 // tab, without a word. Cookies, Tests and Console copy row by row.
@@ -12287,7 +12343,7 @@ fn response_ui(
                     view.preview = true;
                     view.find.close();
                 }
-                let shortcut = ui.ctx().format_shortcut(&FIND);
+                let shortcut = shortcut_label(ui.ctx(), &FIND);
                 if !view.preview
                     && icon_button(ui, icon::SEARCH, t("Find"), Some(view.find.open))
                         .on_hover_text(tf("Find ({})", &[&shortcut]))
@@ -13864,6 +13920,61 @@ mod ui_tests {
         );
     }
 
+    /// A Settings combo says what it sets beside it: its choices alone ("Check every day",
+    /// "Claude Code") left the question to guess.
+    #[test]
+    fn settings_combos_say_what_they_set() {
+        let mut h = harness(workspace("settings-labels"));
+        h.state_mut().settings = true;
+        for (tab, label) in [
+            (SettingsTab::Updates, "Check for updates"),
+            (SettingsTab::Mcp, "Client"),
+        ] {
+            h.state_mut().settings_tab = tab;
+            h.run();
+            // The environment picker behind the dialog is a combo too.
+            let label = h.get_by_label(label).rect();
+            let beside = (h.get_all_by_role(Role::ComboBox))
+                .map(|c| c.rect())
+                .any(|c| {
+                    (c.center().y - label.center().y).abs() < 4.0
+                        && (0.0..24.0).contains(&(c.left() - label.right()))
+                });
+            assert!(beside, "{label:?}");
+        }
+    }
+
+    /// Every dialog's footer reads the same way: its actions, then Close, from the left;
+    /// what deletes for good stands apart at the right. Settings had Close at the right
+    /// end, the cookie jar's Clear all sat against Close.
+    #[test]
+    fn dialog_footers_read_the_same_way() {
+        let ws = workspace("footers");
+        ws.save_env(Some("dev"), &[KeyValue::new("host", "h")], &[])
+            .unwrap();
+        let mut h = harness(ws);
+        let rect = |h: &Harness<'_, App>, l: &str| h.get_by_label(l).rect();
+        (h.state_mut().settings, h.state_mut().settings_tab) = (true, SettingsTab::Network);
+        h.run();
+        let (apply, close, first_tab) = (rect(&h, "Apply"), rect(&h, "Close"), rect(&h, "General"));
+        assert!((apply.left() - first_tab.left()).abs() < 2.0 && apply.right() < close.left());
+        h.state_mut().settings = false;
+
+        h.state_mut().open_env_editor(Some("dev".into()), &[]);
+        h.run();
+        let order = ["Save", "Duplicate…", "Copy as Postman environment", "Close"];
+        let lefts: Vec<_> = order.iter().map(|l| rect(&h, l).left()).collect();
+        assert!(lefts.is_sorted(), "{lefts:?}");
+        assert!(rect(&h, "Delete environment").left() > rect(&h, "Close").right() + 40.0);
+        h.state_mut().env_editor = None;
+
+        let url = reqwest::Url::parse("http://a.test/").unwrap();
+        h.state().cookies.set(&url, "sid", "1").unwrap();
+        h.state_mut().cookie_manager = true;
+        h.run();
+        assert!(rect(&h, "Clear all").left() > rect(&h, "Close").right() + 40.0);
+    }
+
     #[test]
     fn an_environment_copies_for_postman_as_the_editor_shows_it() {
         let ws = workspace("env-postman");
@@ -15373,6 +15484,41 @@ mod ui_tests {
         ));
     }
 
+    /// A row's menu starts with what the row is mostly for: a folder's with Run, a
+    /// request's with Open in new tab, which keeps the tab shown beside the new one, even
+    /// a preview the next click would have reused.
+    #[test]
+    fn a_row_menu_starts_with_what_the_row_is_for() {
+        let ws = workspace("row-menus");
+        let top = ws.collections();
+        ws.create_folder(&top, "api").unwrap();
+        let (a, b) = (top.join("a.toml"), top.join("b.toml"));
+        ws.create_request(&top, "a").unwrap();
+        ws.create_request(&top, "b").unwrap();
+        let mut h = harness(ws);
+        h.run();
+        let top_of = |h: &Harness<'_, App>, l: &str| button(h, l).rect().top();
+        h.get_all_by_label("api").next().unwrap().click_secondary();
+        h.run();
+        // At the top level a folder is a collection.
+        assert!(top_of(&h, "Run collection") < top_of(&h, "Rename"));
+        h.key_press(Key::Escape);
+        h.run();
+
+        h.get_all_by_label("a").next().unwrap().click();
+        h.run();
+        h.get_all_by_label("b").next().unwrap().click_secondary();
+        h.run();
+        assert!(top_of(&h, "Open in new tab") < top_of(&h, "Rename"));
+        button(&h, "Open in new tab").click();
+        h.run();
+        let tabs: Vec<_> = (h.state().tabs.iter())
+            .map(|t| (t.path.clone(), t.preview))
+            .collect();
+        assert_eq!(tabs, [(a, true), (b.clone(), false)]);
+        assert_eq!(h.state().open.as_ref().map(|o| &o.path), Some(&b));
+    }
+
     #[test]
     fn header_names_and_content_types_complete_while_typing() {
         let mut h = with_request("hdr-complete");
@@ -16228,6 +16374,11 @@ mod ui_tests {
             panic!("the run didn't finish");
         };
         assert_eq!(run(&mut h), ["c", "a"], "c fails to connect, a still runs");
+        h.run();
+        assert!(
+            h.query_by_label("1 failed request").is_some(),
+            "not 1 failed requests"
+        );
         h.get_by_label("Stop at the first failure").click();
         h.run();
         assert_eq!(run(&mut h), ["c"]);
@@ -19642,6 +19793,17 @@ mod ui_tests {
         assert_eq!((h.state().appearance.size, body(&h)), (13.0, 13.0));
     }
 
+    /// Off a Mac, keys read as they're printed on the keyboard, as other apps write them:
+    /// egui spells out "Ctrl+Backslash".
+    #[test]
+    fn shortcut_keys_read_as_their_symbols() {
+        let ctx = egui::Context::default();
+        ctx.set_os(egui::os::OperatingSystem::Windows);
+        let key = |k| shortcut_label(&ctx, &KeyboardShortcut::new(Modifiers::COMMAND, k));
+        let keys = [key(Key::Backslash), key(Key::Comma), key(Key::K)];
+        assert_eq!(keys, ["Ctrl+\\", "Ctrl+,", "Ctrl+K"]);
+    }
+
     /// Ctrl+/ shows the empty response pane's list, for when a response covers it; Ctrl+K
     /// finds it too.
     #[test]
@@ -19658,12 +19820,14 @@ mod ui_tests {
         h.run();
         shot(&mut h, "97-keyboard-shortcuts");
         assert!(h.query_by_label(known).is_some());
-        let key = |k: &KeyboardShortcut| h.ctx.format_shortcut(k);
+        let key = |k: &KeyboardShortcut| shortcut_label(&h.ctx, k);
         assert!(h.query_by_label(&key(&SWITCH)).is_some(), "with its key");
         assert!(
             h.query_by_label(&key(&help)).is_some(),
             "its own key listed too"
         );
+        // Called what Ctrl+K calls it: "Sidebar" there read as another thing.
+        assert!(h.query_by_label("Show or hide the sidebar").is_some());
         h.key_press(Key::Escape);
         h.run();
         assert!(h.state().dialog.is_none());

@@ -258,7 +258,8 @@ past 16 MiB keep only their start, to spare RAM. Send and download keeps a whole
 - Drag a request or folder onto a folder (or the empty space under the tree) to move it,
   open tabs following, or onto a row's top or bottom edge to put it before or after that
   row. The order is kept in `.folder.toml`; Postman and Insomnia imports keep theirs.
-- The ⋯ on a hovered row opens the same menu as right-click.
+- The ⋯ on a hovered row opens the same menu as right-click. A folder's starts with "Run
+  collection" or "Run folder", a request's with "Open in new tab", which keeps the tab shown, a preview too.
 - A new request goes into the folder last clicked in the tree, else beside the open request;
   its dialog can pick another folder.
 - Save ⏷ "Save as…" saves the edits as a new request (`folder/name`); the original stays as
