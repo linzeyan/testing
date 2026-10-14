@@ -257,6 +257,8 @@ the tree away. Stacked, the request gets most of the height. The response's ⌄ 
 "Response" in the status bar, `Ctrl+J`) folds it to a bar under the request that still
 shows the last status, time and size. All three are kept across restarts, as are the
 window's size, place and maximized. A screen too small for the default window gets it maximized.
+With the sidebar folded, the environment picker moves to the right end of the tab strip.
+Messages in the status bar fade after a few seconds; an error stays, in red, until its × dismisses it.
 
 ## Keyboard shortcuts
 
@@ -297,7 +299,8 @@ cookies, side by side…).
 
 ## Import and export
 
-Import from ⋯ > "Import…": paste it, give its path or drop the file (or folder).
+Import from the import icon above the tree (also ⋯ > "Import…", `Ctrl+O`, or "Import…" in an
+empty tree): paste it, give its path or drop the file (or folder).
 
 | Format | What comes in |
 |---|---|
@@ -335,7 +338,9 @@ and a second request to a method and path already taken are left out, and counte
 
 ## Runner, load test and mock server
 
-- **Collection runner** with CSV or JSON data. Counts cover every row; the list keeps
+- **Collection runner** with CSV or JSON data. It opens as a "Run:" chip at the end of the
+  tab strip; opening a request keeps the run going there, and the chip's × stops it and
+  closes the results. Counts cover every row; the list keeps
   failures and the latest 1000 results. Tick the requests to run and drag them into the
   order wanted (kept per folder on this machine; ↺ goes back to the tree's). "Stop at the
   first failure" ends the run there. The export icon writes the results as JUnit XML.

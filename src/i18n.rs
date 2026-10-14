@@ -125,8 +125,8 @@ const ZH_TW: &[(&str, &str)] = &[
         "資料夾名稱不能以 .toml 結尾",
     ),
     (
-        "A Postman collection (v2.1) or environment, or an OpenAPI 3 / Swagger 2 spec (JSON or YAML): choose the file, paste it or its path, or drop the file here. Nothing already here is replaced.",
-        "Postman 集合（v2.1）或環境，或 OpenAPI 3 / Swagger 2 規格（JSON 或 YAML）：選擇檔案、貼上內容或路徑，或把檔案拖曳到這裡。現有的內容都不會被取代。",
+        "A Postman collection, environment or globals (v2.1, or a v3 folder), an OpenAPI 3 / Swagger 2 spec, an Insomnia v4/v5 export or a HAR from the browser's devtools: choose the file or folder, paste it or its path, or drop it here. Nothing already here is replaced. A curl command goes into the URL bar instead.",
+        "Postman 集合、環境或全域變數（v2.1，或 v3 資料夾）、OpenAPI 3 / Swagger 2 規格、Insomnia v4/v5 匯出檔，或瀏覽器開發者工具的 HAR：選擇檔案或資料夾、貼上內容或路徑，或拖放到這裡。不會取代既有的任何項目。curl 指令請直接貼到網址列。",
     ),
     (
         "A Postman collection or environment, or an OpenAPI/Swagger spec",
@@ -297,11 +297,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Close", "關閉"),
     ("Close (Esc)", "關閉 (Esc)"),
     ("Close ({})", "關閉 ({})"),
-    ("Close All Tabs", "關閉所有分頁"),
-    ("Close Other Tabs", "關閉其他分頁"),
-    ("Close Tab", "關閉分頁"),
+    ("Close all tabs", "關閉所有分頁"),
+    ("Close other tabs", "關閉其他分頁"),
     ("Close tab", "關閉分頁"),
-    ("Close Tabs to the Right", "關閉右側分頁"),
+    ("Close tabs to the right", "關閉右側分頁"),
     ("Code", "程式碼"),
     ("Code font", "程式碼字型"),
     ("Collection settings", "集合設定"),
@@ -412,7 +411,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Duplicate", "複製一份"),
     ("Duplicate environment", "複製環境"),
-    ("Duplicate Tab", "複製分頁"),
+    ("Duplicate request", "複製請求"),
     ("Duplicated as \"{}\"", "已複製為「{}」"),
     ("Duplicate…", "複製一份…"),
     ("Duration (s)", "時長 (秒)"),
@@ -1000,7 +999,6 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Remove", "移除"),
     ("Rename", "重新命名"),
-    ("Reopen Closed Tab", "重新開啟已關閉的分頁"),
     ("Reopen closed tab", "重新開啟關閉的分頁"),
     ("Repeat every", "每隔一段時間重送"),
     (
@@ -1259,10 +1257,6 @@ const ZH_TW: &[(&str, &str)] = &[
     (
         "The collection runner is already running.",
         "集合執行器已在執行中。",
-    ),
-    (
-        "The collection runner is still running; cancel it first.",
-        "集合執行器仍在執行，請先取消。",
     ),
     (
         "The file's bytes are the body, as they are. Content-Type comes from the extension unless set under Headers. Or drop a file here.",
@@ -1741,6 +1735,28 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Double-click to rename", "按兩下可重新命名"),
     ("Variable", "變數"),
+    ("Close the runner", "關閉執行器"),
+    ("Copy the headers", "複製標頭"),
+    ("Copied the timeline", "已複製時間軸"),
+    ("Copied the headers", "已複製標頭"),
+    ("Copied the body", "已複製內容"),
+    ("Dismiss", "關閉訊息"),
+    ("Repository", "儲存庫"),
+    ("Passphrase", "密語"),
+    ("Syncing…", "同步中…"),
+    (
+        "Fill in the repository and branch first",
+        "請先填入儲存庫與分支",
+    ),
+    ("Paste a token first", "請先貼上權杖"),
+    (
+        "Set a passphrase first: what's ticked goes encrypted",
+        "請先設定密語：勾選的項目會加密後才送出",
+    ),
+    (
+        "Import: Postman, OpenAPI, Insomnia, HAR ({})",
+        "匯入：Postman、OpenAPI、Insomnia、HAR（{}）",
+    ),
     (
         "Sent without credentials, whatever the folders above set.",
         "不帶任何憑證送出，不論上層資料夾怎麼設定。",

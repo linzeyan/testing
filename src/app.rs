@@ -1043,6 +1043,14 @@ pub struct App {
     env_editor: Option<EnvEditor>,
     folder_editor: Option<FolderEditor>,
     runner: Option<RunnerView>,
+    /// `status` as it was set by `fail`: red, and kept until dismissed or replaced, while
+    /// other messages fade.
+    failed: String,
+    /// The status shown and since when, for the fade.
+    status_since: (String, Instant),
+    /// The runner's chip is the active tab. Opening a request only hides it: its results,
+    /// or a run still going, wait behind the chip instead of being dropped.
+    runner_shown: bool,
     /// `State::run_orders`.
     run_orders: HashMap<String, Vec<(String, bool)>>,
     /// `State::run_options`.
@@ -1150,6 +1158,9 @@ impl App {
             env_editor: None,
             folder_editor: None,
             runner: None,
+            failed: String::new(),
+            status_since: (String::new(), Instant::now()),
+            runner_shown: false,
             run_orders: state.run_orders.clone(),
             run_options: state.run_options.clone(),
             next_run_id: 0,
@@ -1291,12 +1302,18 @@ impl App {
             return;
         }
         let (last, len) = (self.tabs.len() - 1, self.tabs.len());
-        let at = (self.open.as_ref()).and_then(|o| self.tab_index(&o.path));
+        // The runner's chip comes first: from it, next is the first tab.
+        let runner = self.runner.is_some() && self.runner_shown;
+        let at = (self.open.as_ref())
+            .and_then(|o| self.tab_index(&o.path))
+            .filter(|_| !runner);
         let to = match (numbered, at) {
             (Some((8, _)), _) => Some(last),
             (Some((n, _)), _) => Some(n.min(last)),
             (None, Some(at)) if next => Some((at + 1) % len),
             (None, Some(at)) if prev => Some((at + len - 1) % len),
+            (None, None) if next => Some(0),
+            (None, None) if prev => Some(last),
             _ => None,
         };
         if let Some(to) = to.filter(|&to| Some(to) != at) {
@@ -1373,7 +1390,7 @@ impl App {
             .map_err(|e| e.to_string())
             .and_then(|()| crate::auth::open_browser(&path.display().to_string()));
         if let Err(e) = opened {
-            self.status = e;
+            self.fail(e);
         }
     }
 
@@ -1421,7 +1438,7 @@ impl App {
                 return;
             }
             Err(e) => {
-                self.status = tf("Sync: {}", &[&e]);
+                self.fail(tf("Sync: {}", &[&e]));
                 return;
             }
         };
@@ -1432,7 +1449,7 @@ impl App {
         let passphrase = match passphrase {
             Ok(p) => p.flatten().unwrap_or_default(),
             Err(e) => {
-                self.status = tf("Sync: {}", &[&e]);
+                self.fail(tf("Sync: {}", &[&e]));
                 return;
             }
         };
@@ -1748,7 +1765,8 @@ impl App {
     fn reload_vars(&mut self) {
         let mut load = |env: Option<&str>| {
             self.ws.env_vars(env).unwrap_or_else(|e| {
-                self.status = tf("Variables not loaded: {}", &[&e]);
+                let e = tf("Variables not loaded: {}", &[&e]);
+                (self.status, self.failed) = (e.clone(), e);
                 HashMap::new()
             })
         };
@@ -1785,7 +1803,7 @@ impl App {
                     confirm_discard: false,
                 });
             }
-            Err(e) => self.status = e,
+            Err(e) => self.fail(e),
         }
     }
 
@@ -1867,7 +1885,7 @@ impl App {
             // Never over another dialog; the next look asks again.
             Ok(Synced::Conflict) if self.dialog.is_none() => self.dialog = Some(Dialog::Sync),
             Ok(_) => {}
-            Err(e) => self.status = tf("Workspace files not in step: {}", &[&e]),
+            Err(e) => self.fail(tf("Workspace files not in step: {}", &[&e])),
         }
     }
 
@@ -1908,7 +1926,7 @@ impl App {
             Err(_) if !self.ws.exists(&open.path) => {
                 self.status = tf("{} was deleted on disk; Save recreates it", &[&open.name()])
             }
-            Err(e) => self.status = e,
+            Err(e) => self.fail(e),
         }
     }
 
@@ -1921,7 +1939,7 @@ impl App {
                 open.saved.inherited = inherited.clone();
                 open.draft.inherited = inherited;
             }
-            Err(e) => self.status = e,
+            Err(e) => self.fail(e),
         }
     }
 
@@ -1935,6 +1953,7 @@ impl App {
         log::debug!("open {}", self.ws.key(&path));
         // The tree is at the request now, not at the folder clicked before.
         self.tree_folder = None;
+        self.runner_shown = false;
         let current = self.open.as_ref().map(|o| o.path.clone());
         if current.as_ref() != Some(&path) {
             let from = current.as_ref().and_then(|p| self.tab_index(p));
@@ -2090,7 +2109,7 @@ impl App {
         for p in self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()) {
             if p.open.dirty() {
                 if let Err(e) = self.ws.save_request(&p.open.path, &p.open.draft) {
-                    self.status = e;
+                    self.fail(e);
                     return false;
                 }
                 p.open.saved = p.open.draft.clone();
@@ -2100,15 +2119,6 @@ impl App {
     }
 
     /// The runner pane can't be left mid-run; says so in the status bar.
-    fn runner_busy(&mut self) -> bool {
-        let runner = self.runner.as_ref().and_then(|r| r.run.as_ref());
-        let busy = runner.is_some_and(RunState::running);
-        if busy {
-            self.status = t("The collection runner is still running; cancel it first.").into();
-        }
-        busy
-    }
-
     /// Puts a request from history in its tab, asking first if that has unsaved edits.
     fn restore(&mut self, path: PathBuf, draft: Box<Request>) {
         self.activate(path.clone(), true);
@@ -2131,10 +2141,17 @@ impl App {
         }
     }
 
+    /// An error for the status bar. Where all of `self` is borrowed, the two fields are set
+    /// as here instead.
+    fn fail(&mut self, e: impl Into<String>) {
+        self.status = e.into();
+        self.failed = self.status.clone();
+    }
+
     fn save_cookies(&mut self) {
         let saved = self.cookies.to_json();
         if let Err(e) = saved.and_then(|json| self.ws.save_cookies(&json)) {
-            self.status = e;
+            self.fail(e);
         }
     }
 
@@ -2145,7 +2162,7 @@ impl App {
         }
         self.saved_grants = grants;
         if let Err(e) = self.ws.save_tokens(&crate::auth::export()) {
-            self.status = e;
+            self.fail(e);
         }
     }
 
@@ -2158,7 +2175,7 @@ impl App {
         let path = self.ws.key(&sent.path);
         let entry = HistoryEntry::new(path, status, elapsed.as_millis() as u64, sent.request);
         if let Err(e) = self.ws.append_history(&entry) {
-            self.status = e;
+            self.fail(e);
         }
         self.history.push(entry);
         if self.history.len() > store::MAX_HISTORY {
@@ -2179,7 +2196,7 @@ impl App {
                 self.load = None;
                 self.save_state();
             }
-            Err(e) => self.status = e,
+            Err(e) => self.fail(e),
         }
     }
 
@@ -2196,7 +2213,7 @@ impl App {
                 open.draft.examples.push(example);
                 self.req_tab = ReqTab::Examples;
             }
-            Err(e) => self.status = e,
+            Err(e) => self.fail(e),
         }
     }
 
@@ -2213,7 +2230,7 @@ impl App {
                 true
             }
             Err(e) => {
-                self.status = e;
+                self.fail(e);
                 false
             }
         }
@@ -2534,7 +2551,7 @@ impl App {
                         Ok(Outcome::Conflicts(paths)) => {
                             self.dialog = Some(Dialog::RemoteConflict(paths));
                         }
-                        Err(e) => self.status = tf("Sync: {}", &[&e]),
+                        Err(e) => self.fail(tf("Sync: {}", &[&e])),
                     }
                     continue;
                 }
@@ -2566,7 +2583,7 @@ impl App {
                 Ok(r) => {
                     self.statuses.insert(path.clone(), r.status);
                     (self.ws.add_response(&path, r))
-                        .inspect_err(|e| self.status = tf("Keeping the response: {}", &[&e]))
+                        .inspect_err(|e| self.fail(tf("Keeping the response: {}", &[&e])))
                         .ok()
                 }
                 Err(_) => None,
@@ -2602,7 +2619,7 @@ impl App {
             match self.active_env.clone() {
                 Some(name) => {
                     if let Err(e) = self.ws.apply_changes(Some(&name), &env) {
-                        self.status = tf("Saving environment: {}", &[&e]);
+                        self.fail(tf("Saving environment: {}", &[&e]));
                         failed = true;
                     }
                 }
@@ -2615,7 +2632,7 @@ impl App {
             }
         }
         if let Err(e) = self.ws.apply_changes(None, &globals) {
-            self.status = tf("Saving globals: {}", &[&e]);
+            self.fail(tf("Saving globals: {}", &[&e]));
             failed = true;
         }
         if !failed {
@@ -2699,7 +2716,7 @@ impl App {
             self.reveal = Some(new);
         }
         if !errors.is_empty() {
-            self.status = errors.join("; ");
+            self.fail(errors.join("; "));
         }
     }
 
@@ -3205,7 +3222,7 @@ impl eframe::App for App {
         self.log_frame(frame.info().cpu_usage);
         if self.applied.as_ref() != Some(&self.appearance) {
             if let Err(e) = crate::appearance::apply(ui.ctx(), &self.appearance) {
-                self.status = e;
+                self.fail(e);
             }
             self.applied = Some(self.appearance.clone());
         }
@@ -3282,7 +3299,7 @@ impl eframe::App for App {
             match self.stream.as_mut().filter(|s| s.live) {
                 Some(s) => {
                     if let Err(e) = s.send_compose(mqtt, &vars) {
-                        self.status = e;
+                        self.fail(e);
                     }
                 }
                 None => self.send(ui.ctx(), None),
@@ -3435,7 +3452,7 @@ impl eframe::App for App {
                 } => {
                     // Picked from the names there, so it stays on its side.
                     if let Err(e) = self.set_var(env.as_deref(), &name, &value, true) {
-                        self.status = e;
+                        self.fail(e);
                     }
                 }
                 Picked::Set {
@@ -3598,6 +3615,29 @@ impl App {
                     self.mock = None;
                     self.status = t("Mock server stopped").into();
                 }
+                // Before the path, which pushed it out of sight. A message fades; an error
+                // stays, red, until dismissed or replaced.
+                if self.status_since.0 != self.status {
+                    self.status_since = (self.status.clone(), Instant::now());
+                }
+                let failed = !self.status.is_empty() && self.status == self.failed;
+                let left = STATUS_FADE.saturating_sub(self.status_since.1.elapsed());
+                if !failed && left.is_zero() {
+                    self.status.clear();
+                }
+                if !self.status.is_empty() {
+                    let text = RichText::new(&self.status);
+                    if failed {
+                        ui.label(text.color(RED));
+                        if icon_button(ui, icon::X, t("Dismiss"), None).clicked() {
+                            self.status.clear();
+                        }
+                    } else {
+                        ui.label(text);
+                        ui.ctx().request_repaint_after(left);
+                    }
+                    ui.separator();
+                }
                 if let Some(m) = memory_stats::memory_stats() {
                     ui.weak(format!("RAM {:.0} MB", mb(m.physical_mem)))
                         .on_hover_text(format!(
@@ -3608,10 +3648,6 @@ impl App {
                     ui.separator();
                 }
                 ui.weak(self.ws.root.display().to_string());
-                if !self.status.is_empty() {
-                    ui.separator();
-                    ui.label(&self.status);
-                }
             });
         });
     }
@@ -3637,37 +3673,7 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            let mut label = RichText::new(
-                self.active_env
-                    .clone()
-                    .unwrap_or_else(|| t("No environment").into()),
-            );
-            if let Some(color) = self.env_color() {
-                label = label.color(color).strong();
-            }
-            let mut chosen = None;
-            egui::ComboBox::from_id_salt("env")
-                .selected_text(label)
-                .width(150.0)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(self.active_env.is_none(), t("No environment"))
-                        .clicked()
-                    {
-                        chosen = Some(None);
-                    }
-                    for name in &self.envs {
-                        if ui
-                            .selectable_label(self.active_env.as_ref() == Some(name), name)
-                            .clicked()
-                        {
-                            chosen = Some(Some(name.clone()));
-                        }
-                    }
-                });
-            if let Some(env) = chosen {
-                self.set_env(env);
-            }
+            self.env_combo(ui);
             if let Some(name) = self.active_env.clone() {
                 let colour = square_button(ui, t("Environment colour"), None)
                     .on_hover_text(t("Colour this environment, e.g. prod in red"));
@@ -3748,6 +3754,14 @@ impl App {
                 .clicked()
             {
                 self.dialog = Some(Dialog::name(NameKind::NewFolder(root.clone()), ""));
+            }
+            // Out in the open: in the ⋯ menu only, a first-time user never found it.
+            let key = ui.ctx().format_shortcut(&KEYED_ACTIONS[1].0);
+            if icon_button(ui, icon::DOWNLOAD, t("Import…"), None)
+                .on_hover_text(tf("Import: Postman, OpenAPI, Insomnia, HAR ({})", &[&key]))
+                .clicked()
+            {
+                self.act(Action::ImportAny);
             }
             let more =
                 icon_button(ui, icon::MORE, t("More"), None).on_hover_text(t("All collections"));
@@ -3833,7 +3847,7 @@ impl App {
         let reveal = self.reveal.take();
         let expand =
             |p: &Path| !query.is_empty() || reveal.as_ref().is_some_and(|r| r.starts_with(p));
-        let mut create = false;
+        let (mut create, mut import) = (false, false);
         let tree = egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -3842,6 +3856,7 @@ impl App {
                     create = ui
                         .add(icon_text(ui, icon::FILE_PLUS, t("New request")))
                         .clicked();
+                    import = (ui.add(icon_text(ui, icon::DOWNLOAD, t("Import…")))).clicked();
                 } else if nodes.is_empty() {
                     ui.weak(t("Nothing matches."));
                 }
@@ -3860,6 +3875,9 @@ impl App {
                 let rest = ui.allocate_response(size, egui::Sense::hover());
                 tree_drop(ui, &rows, rest.rect, &self.ws.collections(), &mut actions);
             });
+        if import {
+            self.act(Action::ImportAny);
+        }
         if create {
             self.new_request();
         }
@@ -3894,11 +3912,7 @@ impl App {
         for action in actions {
             match action {
                 TreeAction::Open(path, pin) => {
-                    if self.runner_busy() {
-                        continue;
-                    }
                     self.tree_picked.clear();
-                    self.runner = None;
                     self.activate(path, pin);
                 }
                 TreeAction::Folder(path) => self.tree_folder = Some(path),
@@ -3985,12 +3999,11 @@ impl App {
             Ok(new) => {
                 self.reload();
                 self.status = tf("Duplicated as \"{}\"", &[&self.ws.display_name(&new)]);
-                if crate::store::is_request(&new) && !self.runner_busy() {
-                    self.runner = None;
+                if crate::store::is_request(&new) {
                     self.activate(new, true);
                 }
             }
-            Err(e) => self.status = e,
+            Err(e) => self.fail(e),
         }
     }
 
@@ -4083,7 +4096,7 @@ impl App {
                 ctx.copy_text(md);
                 self.status = t("Copied the docs as Markdown").into();
             }
-            Err(e) => self.status = e,
+            Err(e) => self.fail(e),
         }
     }
 
@@ -4138,7 +4151,7 @@ impl App {
         });
         let listener = match bound.and_then(|l| Ok((l.local_addr()?, l))) {
             Ok(l) => l,
-            Err(e) => return self.status = tf("Mock server: {}", &[&e]),
+            Err(e) => return self.fail(tf("Mock server: {}", &[&e])),
         };
         let (addr, listener) = listener;
         let folder = if dir == self.ws.collections() {
@@ -4184,7 +4197,7 @@ impl App {
                 if clicked && confirm {
                     match self.ws.clear_history() {
                         Ok(()) => self.history.clear(),
-                        Err(e) => self.status = e,
+                        Err(e) => self.fail(e),
                     }
                 }
             });
@@ -4230,7 +4243,6 @@ impl App {
             match self.ws.request_path(&e.path) {
                 Ok(path) if self.ws.exists(&path) => {
                     let draft = Box::new(e.request.clone());
-                    self.runner = None;
                     self.restore(path, draft);
                 }
                 _ => {
@@ -4249,10 +4261,28 @@ impl App {
             All,
             Reopen,
         }
-        let active = self.open.as_ref().map(|o| o.path.clone());
+        // No request tab is lit while the runner's chip is.
+        let runner = self.runner.as_ref().filter(|_| self.runner_shown).is_some();
+        let active = self
+            .open
+            .as_ref()
+            .map(|o| o.path.clone())
+            .filter(|_| !runner);
         let (mut show, mut close, mut menu) = (None, None, None);
+        let (mut show_runner, mut close_runner) = (false, false);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
+                if let Some(view) = &self.runner {
+                    if view.run.as_ref().is_some_and(RunState::running) {
+                        ui.spinner();
+                    }
+                    let text = tf("Run: {}", &[&view.title]);
+                    show_runner = tab_label(ui, runner, text, None).clicked();
+                    close_runner = icon_button(ui, icon::X, t("Close the runner"), None)
+                        .on_hover_text(t("Close the runner"))
+                        .clicked();
+                    ui.separator();
+                }
                 for (i, tab) in self.tabs.iter().enumerate() {
                     let is_active = active.as_ref() == Some(&tab.path);
                     let open = match &tab.parked {
@@ -4260,9 +4290,13 @@ impl App {
                         Some(p) => Some(&p.open),
                         None => None,
                     };
+                    // The whole tab lit, method and × too: the name alone read as one more
+                    // button in the strip. Painted under it once its size is known.
+                    let under = ui.painter().add(egui::Shape::Noop);
+                    let mut whole = egui::Rect::NOTHING;
                     if let Some(o) = open {
                         let m = &o.draft.method;
-                        method_badge(ui, m, 0);
+                        whole = method_badge(ui, m, 0).rect;
                     }
                     let mut text = RichText::new(leaf_name(&tab.path));
                     if tab.preview {
@@ -4277,28 +4311,28 @@ impl App {
                     label.context_menu(|ui| {
                         let ctx = ui.ctx().clone();
                         let shortcut = |s| ctx.format_shortcut(s);
-                        let item = egui::Button::new(t("Duplicate Tab"))
+                        let item = egui::Button::new(t("Duplicate request"))
                             .shortcut_text(shortcut(&DUPLICATE));
                         if ui.add(item).clicked() {
                             menu = Some((i, Menu::Duplicate));
                         }
                         ui.separator();
                         let item =
-                            egui::Button::new(t("Close Tab")).shortcut_text(shortcut(&CLOSE_TAB));
+                            egui::Button::new(t("Close tab")).shortcut_text(shortcut(&CLOSE_TAB));
                         if ui.add(item).clicked() {
                             close = Some(tab.path.clone());
                         }
                         for (label, action) in [
-                            (t("Close Other Tabs"), Menu::Others),
-                            (t("Close Tabs to the Right"), Menu::Right),
-                            (t("Close All Tabs"), Menu::All),
+                            (t("Close other tabs"), Menu::Others),
+                            (t("Close tabs to the right"), Menu::Right),
+                            (t("Close all tabs"), Menu::All),
                         ] {
                             if ui.button(label).clicked() {
                                 menu = Some((i, action));
                             }
                         }
                         ui.separator();
-                        let item = egui::Button::new(t("Reopen Closed Tab"))
+                        let item = egui::Button::new(t("Reopen closed tab"))
                             .shortcut_text(shortcut(&REOPEN_TAB));
                         if ui.add_enabled(!self.closed.is_empty(), item).clicked() {
                             menu = Some((i, Menu::Reopen));
@@ -4309,6 +4343,12 @@ impl App {
                         .on_hover_text(tf("Close ({})", &[&key]));
                     if x.clicked() || label.middle_clicked() {
                         close = Some(tab.path.clone());
+                    }
+                    if is_active {
+                        let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.35);
+                        let rect = whole.union(label.rect).union(x.rect).expand(2.0);
+                        let shape = egui::Shape::rect_filled(rect, 4.0, fill);
+                        ui.painter().set(under, shape);
                     }
                     ui.separator();
                 }
@@ -4330,19 +4370,31 @@ impl App {
             self.close_tabs(paths);
         } else if let Some(path) = close {
             self.close_tab(&path);
-        } else if let Some(path) = show
-            && !self.runner_busy()
-        {
-            self.runner = None;
+        } else if let Some(path) = show {
             self.activate(path, false);
+        } else if show_runner {
+            self.runner_shown = true;
+        } else if close_runner {
+            self.close_runner();
         }
     }
 
     fn main_area(&mut self, ui: &mut egui::Ui) {
-        if !self.tabs.is_empty() {
-            egui::Panel::top("tabs").show(ui, |ui| self.tab_bar(ui));
+        if !self.tabs.is_empty() || self.runner.is_some() || self.hide_sidebar {
+            egui::Panel::top("tabs").show(ui, |ui| {
+                if !self.hide_sidebar {
+                    return self.tab_bar(ui);
+                }
+                // With the sidebar hidden, the environment would be out of sight and reach.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.env_combo(ui);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        self.tab_bar(ui)
+                    });
+                });
+            });
         }
-        if self.runner.is_some() {
+        if self.runner.is_some() && self.runner_shown {
             self.runner_ui(ui);
             return;
         }
@@ -4629,7 +4681,10 @@ impl App {
                             d.settings = r.settings;
                             self.status = t("Imported curl command").into();
                         }
-                        Err(e) => self.status = tf("curl import: {}", &[&e]),
+                        Err(e) => {
+                            let e = tf("curl import: {}", &[&e]);
+                            (self.status, self.failed) = (e.clone(), e);
+                        }
                     }
                 } else if url.changed() {
                     open.draft.params_from_url();
@@ -4702,7 +4757,7 @@ impl App {
             if let Some(source) = &grpc_source {
                 let (error, ask) = grpc_bar(ui, &mut open.draft, source, &mut self.grpc_methods);
                 if let Some(e) = error {
-                    self.status = e;
+                    (self.status, self.failed) = (e.clone(), e);
                 }
                 reflect |= ask;
             }
@@ -4998,7 +5053,7 @@ impl App {
                     Some(s) => {
                         let draft = &mut open.draft;
                         if let Err(e) = stream_ui(ui, s, draft, &all_vars) {
-                            self.status = e;
+                            (self.status, self.failed) = (e.clone(), e);
                         }
                     }
                     None if open.draft.method == "MQTT" => {
@@ -5038,7 +5093,8 @@ impl App {
                     let tab = &mut self.resp_tab;
                     let recent = &mut self.recent_filters;
                     let hide = &mut false;
-                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_external, &mut past, recent, hide);
+                    let status = &mut self.status;
+                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_external, &mut past, recent, hide, status);
                     if *hide {
                         fold = Some(true);
                     }
@@ -5068,7 +5124,7 @@ impl App {
                     self.statuses.remove(path);
                     self.status = t("Cleared this request's response history").into();
                 }
-                Err(e) => self.status = e,
+                Err(e) => self.fail(e),
             }
         }
         if let Some(id) = past.delete {
@@ -5079,7 +5135,7 @@ impl App {
                         shown.past = None;
                     }
                 }
-                Err(e) => self.status = e,
+                Err(e) => self.fail(e),
             }
         }
         if let Some(id) = past.pick {
@@ -5093,7 +5149,7 @@ impl App {
                         past: Some(id),
                     })
                 }
-                Err(e) => self.status = tf("Reading that response: {}", &[&e]),
+                Err(e) => self.fail(tf("Reading that response: {}", &[&e])),
             }
         }
         if let Some(example) = example {
@@ -5337,6 +5393,8 @@ impl App {
         // Room for the list's two columns side by side, as on the pane.
         let width = match dialog {
             Dialog::Shortcuts => 720.0,
+            // A pasted spec is long lines: the box was 360 px.
+            Dialog::Paste { .. } => 560.0,
             _ => 360.0,
         };
         let modal = modal.show(ctx, |ui| {
@@ -5360,26 +5418,33 @@ impl App {
                      Overrides shared values; values set by scripts land here.",
                         ));
                     }
-                    if let NameKind::SaveAs { folder, .. } | NameKind::NewRequest(folder) = kind {
-                        let shown = (folders.iter())
-                            .find(|(_, p)| p == folder)
-                            .map_or("", |(label, _)| label.as_str());
-                        egui::ComboBox::from_label(t("Folder"))
-                            .selected_text(shown)
-                            .width(280.0)
-                            .show_ui(ui, |ui| {
-                                for (label, path) in &folders {
-                                    ui.selectable_value(folder, path.clone(), label);
-                                }
-                            });
-                    }
+                    // Labels before their fields: the folder's came after its combo, and the
+                    // name had only a hint, gone once typed in.
                     let id = egui::Id::new("name-edit");
-                    ui.add(
-                        egui::TextEdit::singleline(name)
-                            .id(id)
-                            .hint_text(t("Name"))
-                            .desired_width(f32::INFINITY),
-                    );
+                    egui::Grid::new("name-fields").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        if let NameKind::SaveAs { folder, .. } | NameKind::NewRequest(folder) = kind {
+                            let shown = (folders.iter())
+                                .find(|(_, p)| p == folder)
+                                .map_or("", |(label, _)| label.as_str());
+                            ui.label(t("Folder"));
+                            egui::ComboBox::from_id_salt("name-folder")
+                                .selected_text(shown)
+                                .width(280.0)
+                                .show_ui(ui, |ui| {
+                                    for (label, path) in &folders {
+                                        ui.selectable_value(folder, path.clone(), label);
+                                    }
+                                });
+                            ui.end_row();
+                        }
+                        ui.label(t("Name"));
+                        ui.add(
+                            egui::TextEdit::singleline(name)
+                                .id(id)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+                    });
                     // Before refocusing: Enter is what made the field let go of focus.
                     let enter = enter_pressed(ui);
                     if !enter && ui.memory(|m| m.focused().is_none()) {
@@ -5448,7 +5513,7 @@ impl App {
                                 for path in paths {
                                     match app.ws.delete(&path) {
                                         Ok(()) => deleted.push(path),
-                                        Err(e) => app.status = e,
+                                        Err(e) => app.fail(e),
                                     }
                                 }
                                 // The delete was confirmed; its tabs close without asking.
@@ -5680,8 +5745,7 @@ impl App {
                                     match app.ws.resolve(use_files) {
                                         Ok(()) => app.refresh_from_disk(),
                                         Err(e) => {
-                                            app.status =
-                                                tf("Workspace files not in step: {}", &[&e])
+                                            app.fail(tf("Workspace files not in step: {}", &[&e]))
                                         }
                                     }
                                 }));
@@ -5724,9 +5788,11 @@ impl App {
                 Dialog::Paste { text, note } => {
                     ui.heading(t("Import a collection or spec"));
                     ui.label(t(
-                        "A Postman collection (v2.1) or environment, or an OpenAPI 3 / Swagger 2 \
-                         spec (JSON or YAML): choose the file, paste it or its path, or drop \
-                         the file here. Nothing already here is replaced.",
+                        "A Postman collection, environment or globals (v2.1, or a v3 folder), \
+                         an OpenAPI 3 / Swagger 2 spec, an Insomnia v4/v5 export or a HAR from \
+                         the browser's devtools: choose the file or folder, paste it or its \
+                         path, or drop it here. Nothing already here is replaced. A curl \
+                         command goes into the URL bar instead.",
                     ));
                     // An exported collection is often past MAX_EDIT once pasted.
                     let id = egui::Id::new("postman-text");
@@ -5938,7 +6004,7 @@ impl App {
                     confirm_discard: false,
                 })
             }
-            Err(e) => self.status = e,
+            Err(e) => self.fail(e),
         }
     }
 
@@ -6268,7 +6334,7 @@ impl App {
         if let Some((env, name, value)) = set
             && let Err(e) = self.set_var(env.as_deref(), &name, &value, true)
         {
-            self.status = e;
+            self.fail(e);
         }
         if let Some(env) = edit {
             self.open_env_editor(env, &[]);
@@ -6327,6 +6393,41 @@ fn scope_var(
 }
 
 impl App {
+    /// The active environment, picked from a list.
+    fn env_combo(&mut self, ui: &mut egui::Ui) {
+        let mut label = RichText::new(
+            self.active_env
+                .clone()
+                .unwrap_or_else(|| t("No environment").into()),
+        );
+        if let Some(color) = self.env_color() {
+            label = label.color(color).strong();
+        }
+        let mut chosen = None;
+        egui::ComboBox::from_id_salt("env")
+            .selected_text(label)
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(self.active_env.is_none(), t("No environment"))
+                    .clicked()
+                {
+                    chosen = Some(None);
+                }
+                for name in &self.envs {
+                    if ui
+                        .selectable_label(self.active_env.as_ref() == Some(name), name)
+                        .clicked()
+                    {
+                        chosen = Some(Some(name.clone()));
+                    }
+                }
+            });
+        if let Some(env) = chosen {
+            self.set_env(env);
+        }
+    }
+
     fn open_runner(&mut self, scope: PathBuf) {
         if self
             .runner
@@ -6335,6 +6436,7 @@ impl App {
             .is_some_and(RunState::running)
         {
             self.status = t("The collection runner is already running.").into();
+            self.runner_shown = true;
             return;
         }
         let title = if scope == self.ws.collections() {
@@ -6367,6 +6469,7 @@ impl App {
             error: String::new(),
             run: None,
         });
+        self.runner_shown = true;
     }
 
     /// "Folder/Request" relative to the collections root, without the extension.
@@ -6480,6 +6583,17 @@ impl App {
             open: None,
             abort: task.abort_handle(),
         });
+    }
+
+    /// Stops a run still going: closed, nothing would show its results.
+    fn close_runner(&mut self) {
+        if let Some(run) = (self.runner.as_ref())
+            .and_then(|r| r.run.as_ref())
+            .filter(|r| r.running())
+        {
+            run.abort.abort();
+        }
+        self.runner = None;
     }
 
     fn runner_ui(&mut self, ui: &mut egui::Ui) {
@@ -6693,15 +6807,7 @@ impl App {
         }
 
         if close {
-            if let Some(run) = self
-                .runner
-                .as_ref()
-                .and_then(|r| r.run.as_ref())
-                .filter(|r| r.running())
-            {
-                run.abort.abort();
-            }
-            self.runner = None;
+            self.close_runner();
         } else if start || again {
             let view = self.runner.as_ref().expect("runner open");
             let setup = match (again, &view.run) {
@@ -7072,25 +7178,32 @@ impl App {
                     });
                 }
                 SettingsTab::Sync => {
-                    ui.vertical(|ui| {
-                        use crate::sync::Provider;
+                    use crate::sync::Provider;
+                    // Labelled rows: hint text alone was gone once a field was filled in.
+                    egui::Grid::new("sync-fields").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label(t("Service"));
+                        egui::ComboBox::from_id_salt("remote-provider")
+                            .selected_text(remote.provider.name())
+                            .show_ui(ui, |ui| {
+                                for p in [Provider::GitHub, Provider::GitLab] {
+                                    ui.selectable_value(&mut remote.provider, p, p.name());
+                                }
+                            });
+                        ui.end_row();
+                        ui.label(t("Repository"));
                         ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("remote-provider")
-                                .selected_text(remote.provider.name())
-                                .show_ui(ui, |ui| {
-                                    for p in [Provider::GitHub, Provider::GitLab] {
-                                        ui.selectable_value(&mut remote.provider, p, p.name());
-                                    }
-                                });
                             let repo = egui::TextEdit::singleline(&mut remote.repo)
                                 .hint_text(t("owner/repository"))
-                                .desired_width(170.0);
+                                .desired_width(230.0);
                             ui.add(repo);
+                            ui.label(t("Branch"));
                             let branch = egui::TextEdit::singleline(&mut remote.branch)
                                 .hint_text("main")
                                 .desired_width(70.0);
-                            ui.add(branch).on_hover_text(t("Branch"));
+                            ui.add(branch);
                         });
+                        ui.end_row();
+                        ui.label(t("Token"));
                         ui.horizontal(|ui| {
                             let hint = match token_saved {
                                 true => t("Token kept; type to replace"),
@@ -7110,38 +7223,35 @@ impl App {
                                     "Sign in to {} and make one with what sync needs filled in",
                                     &[&remote.provider.name()],
                                 ));
-                            let ready = remote.is_set()
-                                && (token_saved || !remote_token.is_empty())
-                                && (!remote.share.any() || passphrase_saved || !remote_passphrase.is_empty());
-                            sync_now = (ui.add_enabled(!syncing && ready, egui::Button::new(t("Sync now"))))
-                                .clicked();
                         });
+                        ui.end_row();
+                        ui.label(t("Sync automatically"));
+                        let every = |m: u32| match m {
+                            0 => t("Off").to_owned(),
+                            60 => t("Every hour").to_owned(),
+                            m => tf("Every {} minutes", &[&m]),
+                        };
+                        egui::ComboBox::from_id_salt("remote-every")
+                            .selected_text(every(remote.every))
+                            .show_ui(ui, |ui| {
+                                for m in crate::sync::EVERY {
+                                    ui.selectable_value(&mut remote.every, m, every(m));
+                                }
+                            })
+                            .response
+                            .on_hover_text(t("When apitool starts, then this often"));
+                        ui.end_row();
+                        ui.label(t("Also sync"));
                         ui.horizontal(|ui| {
-                            ui.label(t("Sync automatically"));
-                            let every = |m: u32| match m {
-                                0 => t("Off").to_owned(),
-                                60 => t("Every hour").to_owned(),
-                                m => tf("Every {} minutes", &[&m]),
-                            };
-                            egui::ComboBox::from_id_salt("remote-every")
-                                .selected_text(every(remote.every))
-                                .show_ui(ui, |ui| {
-                                    for m in crate::sync::EVERY {
-                                        ui.selectable_value(&mut remote.every, m, every(m));
-                                    }
-                                })
-                                .response
-                                .on_hover_text(t("When apitool starts, then this often"));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(t("Also sync"));
                             let share = &mut remote.share;
                             ui.checkbox(&mut share.secrets, t("Secret values"));
                             ui.checkbox(&mut share.history, t("History"));
                             ui.checkbox(&mut share.cookies, t("Cookies"));
                             ui.checkbox(&mut share.tokens, t("OAuth tokens"));
                         });
+                        ui.end_row();
                         if remote.share.any() {
+                            ui.label(t("Passphrase"));
                             let hint = match passphrase_saved {
                                 true => t("Passphrase kept; type to replace"),
                                 false => t("Passphrase, the same on every machine"),
@@ -7151,9 +7261,31 @@ impl App {
                                 .hint_text(hint)
                                 .desired_width(230.0);
                             ui.add(field).on_hover_text(t("What's ticked is encrypted with it before it leaves; another machine opens it with the same one."));
+                            ui.end_row();
                         }
-                        ui.weak(t("To a private repository. What isn't ticked stays on this machine."));
+                        // Greyed with what's missing beside it: greyed alone left a guess.
+                        let why = if syncing {
+                            Some(t("Syncing…"))
+                        } else if !remote.is_set() {
+                            Some(t("Fill in the repository and branch first"))
+                        } else if !token_saved && remote_token.is_empty() {
+                            Some(t("Paste a token first"))
+                        } else if remote.share.any() && !passphrase_saved && remote_passphrase.is_empty() {
+                            Some(t("Set a passphrase first: what's ticked goes encrypted"))
+                        } else {
+                            None
+                        };
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            sync_now = (ui.add_enabled(why.is_none(), egui::Button::new(t("Sync now"))))
+                                .clicked();
+                            if let Some(why) = why {
+                                ui.weak(why);
+                            }
+                        });
+                        ui.end_row();
                     });
+                    ui.weak(t("To a private repository. What isn't ticked stays on this machine."));
                 }
             }
             // As tall as the tallest tab shown yet: a shorter one would re-centre the window
@@ -7176,7 +7308,7 @@ impl App {
             && let Some(dir) = crate::logfile::path().and_then(|p| p.parent())
             && let Err(e) = crate::auth::open_browser(&dir.display().to_string())
         {
-            self.status = e;
+            self.fail(e);
         }
         // Not per keystroke: half a port number would bind somewhere else first.
         if rebind || close || modal.should_close() {
@@ -7198,7 +7330,10 @@ impl App {
             for (name, value, saved) in typed.into_iter().filter(|(_, v, _)| !v.is_empty()) {
                 match self.ws.set_sync_secret(name, std::mem::take(value).trim()) {
                     Ok(()) => *saved = true,
-                    Err(e) => self.status = tf("Sync: {}", &[&e]),
+                    Err(e) => {
+                        let e = tf("Sync: {}", &[&e]);
+                        (self.status, self.failed) = (e.clone(), e);
+                    }
                 }
             }
         }
@@ -10867,6 +11002,9 @@ fn schema_snippet(body: &str) -> String {
 
 const GREEN: Color32 = Color32::from_rgb(40, 150, 70);
 
+/// How long a status message stays: long enough to read twice.
+const STATUS_FADE: Duration = Duration::from_secs(8);
+
 /// Enter meant for a dialog's OK: pressed in a single-line field (which lets go of focus on
 /// Enter) or with nothing focused. A multi-line editor or a focused button keeps it. Call
 /// after the dialog's fields are drawn. Consumed, so a dialog opened by this one (New
@@ -11598,6 +11736,7 @@ fn response_ui(
     past: &mut Past,
     recent: &mut Vec<String>,
     hide: &mut bool,
+    status: &mut String,
 ) -> Option<Example> {
     let mut example = None;
     // A tab from the previous run may not exist in this one; fall back to the body before
@@ -11644,23 +11783,31 @@ fn response_ui(
         ui.with_layout(actions, |ui| {
             *hide = fold_button(ui, &ui.ctx().format_shortcut(&KEYED_ACTIONS[5].0));
             if let Ok(view) = &mut shown.result {
-                let timeline = *tab == RespTab::Timeline;
+                // What the tab shows, said in the status bar: it copied the body from any
+                // tab, without a word. Cookies, Tests and Console copy row by row.
                 let binary = view.head.bytes.is_some();
-                let what = if timeline {
-                    t("Copy the timeline")
-                } else {
-                    t("Copy body")
+                let what = match *tab {
+                    RespTab::Timeline => Some(t("Copy the timeline")),
+                    RespTab::Headers => Some(t("Copy the headers")),
+                    RespTab::Body if !binary => Some(t("Copy body")),
+                    _ => None,
                 };
-                if (timeline || !binary)
+                if let Some(what) = what
                     && icon_button(ui, icon::COPY, t("Copy"), None)
                         .on_hover_text(what)
                         .clicked()
                 {
-                    let text = match timeline {
-                        true => view.head.timeline(),
-                        false => view.text.clone(),
+                    let (text, done) = match *tab {
+                        RespTab::Timeline => (view.head.timeline(), t("Copied the timeline")),
+                        RespTab::Headers => {
+                            let lines =
+                                view.head.headers.iter().map(|(k, v)| format!("{k}: {v}\n"));
+                            (lines.collect(), t("Copied the headers"))
+                        }
+                        _ => (view.text.clone(), t("Copied the body")),
                     };
                     ui.ctx().copy_text(text);
+                    *status = done.into();
                 }
                 if icon_button(ui, icon::DOWNLOAD, t("Save…"), None)
                     .on_hover_text(t("Save the body to a file, as received"))
@@ -11879,6 +12026,10 @@ fn response_ui(
                         .num_columns(2)
                         .striped(true)
                         .show(ui, |ui| {
+                            // Titled, as the request's tables are.
+                            ui.weak(t("Name"));
+                            ui.weak(t("Value"));
+                            ui.end_row();
                             for (k, v) in &view.head.headers {
                                 ui.add(
                                     egui::Label::new(RichText::new(k).strong()).selectable(true),
@@ -13405,16 +13556,16 @@ mod ui_tests {
                 .click();
             h.run();
         };
-        menu(&mut h, "c", "Close Tabs to the Right");
+        menu(&mut h, "c", "Close tabs to the right");
         assert_eq!(tabs(&h), ["a", "b", "c"]);
         // Bulk closing never asks, so the edited tab stays and the status bar says why.
-        menu(&mut h, "c", "Close Other Tabs");
+        menu(&mut h, "c", "Close other tabs");
         assert_eq!(tabs(&h), ["b", "c"]);
         assert!(h.state().dialog.is_none());
         assert_eq!(h.state().status, "1 tab with unsaved edits left open");
-        menu(&mut h, "c", "Duplicate Tab");
+        menu(&mut h, "c", "Duplicate request");
         assert!(tabs(&h).contains(&"c copy".to_owned()), "{:?}", tabs(&h));
-        menu(&mut h, "c copy", "Close All Tabs");
+        menu(&mut h, "c copy", "Close all tabs");
         assert_eq!(tabs(&h), ["b"]);
         assert_eq!(draft(&h).url, "http://edited");
 
@@ -13425,7 +13576,7 @@ mod ui_tests {
         };
         reopen(&mut h);
         assert_eq!(tabs(&h), ["b", "c"]);
-        menu(&mut h, "c", "Reopen Closed Tab");
+        menu(&mut h, "c", "Reopen closed tab");
         assert_eq!(tabs(&h), ["b", "c copy", "c"]);
         reopen(&mut h);
         assert_eq!(tabs(&h), ["a", "b", "c copy", "c"]);
@@ -13663,9 +13814,8 @@ mod ui_tests {
             { "name": "signed", "request": { "method": "GET", "url": "{{base}}/s",
                                              "auth": { "type": "asap", "asap": [] } } } ] }"#;
         std::fs::write(&file, shop).unwrap();
-        h.get_all_by_label("More").next().unwrap().click();
-        h.run();
-        button(&h, "Import…").click();
+        // The toolbar's, drawn before the empty tree's.
+        h.get_all_by_label("Import…").next().unwrap().click();
         h.run();
         h.input_mut()
             .dropped_files
@@ -13745,9 +13895,8 @@ mod ui_tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
-        h.get_all_by_label("More").next().unwrap().click();
-        h.run();
-        button(&h, "Import…").click();
+        // The toolbar's, drawn before the empty tree's.
+        h.get_all_by_label("Import…").next().unwrap().click();
         h.run();
         assert!(h.query_by_label("Choose folder…").is_some());
         h.input_mut()
@@ -18145,8 +18294,13 @@ mod ui_tests {
         h.get_by_label("Sync").click();
         h.run();
         assert!(button(&h, "Sync now").accesskit_node().is_disabled());
+        // Greyed with the reason beside it, the next thing to fill in.
+        let why = |h: &Harness<'_, App>, text: &str| h.query_by_label(text).is_some();
+        assert!(why(&h, "Fill in the repository and branch first"));
 
         h.state_mut().remote.repo = "https://github.com/o/r".into();
+        h.run();
+        assert!(why(&h, "Paste a token first"));
         h.state_mut().remote_token = "ghp_s3cret".into();
         h.run();
         assert!(!button(&h, "Sync now").accesskit_node().is_disabled());
@@ -18156,6 +18310,10 @@ mod ui_tests {
             button(&h, "Sync now").accesskit_node().is_disabled(),
             "cookies go encrypted: no passphrase, no sync"
         );
+        assert!(why(
+            &h,
+            "Set a passphrase first: what's ticked goes encrypted"
+        ));
         h.state_mut().remote_passphrase = "pa55phrase".into();
         h.run();
         assert!(!button(&h, "Sync now").accesskit_node().is_disabled());
@@ -19250,6 +19408,146 @@ mod ui_tests {
         let shown = response.result.as_ref().unwrap();
         let got = (shown.head.status, shown.text.as_str());
         assert_eq!(got, (200, "CORP\\User"));
+    }
+
+    /// The runner is a chip in the tab strip, lit while it covers the workbench. Opening a
+    /// request hides it with its results kept (they used to be dropped without a word),
+    /// the chip brings it back, Ctrl+Tab goes from it to the first tab, and × closes it.
+    #[test]
+    fn the_runner_waits_behind_its_chip_while_a_request_is_open() {
+        let mut h = with_request("runner-chip");
+        let root = h.state().ws.collections();
+        h.state_mut().open_runner(root);
+        h.run();
+        let chip = "Run: All collections";
+        // The tab: topmost, above the tree row and the runner's heading of the same name.
+        fn top<'h>(h: &'h Harness<'_, App>, label: &'h str) -> egui_kittest::Node<'h> {
+            (h.get_all_by_label(label))
+                .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+                .unwrap()
+        }
+        let tab = |h: &Harness<'_, App>, label: &str| {
+            top(h, label).accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
+        };
+        let pane = |h: &Harness<'_, App>| h.get_all_by_label(chip).count() == 2;
+        assert!(tab(&h, chip) && !tab(&h, "r") && pane(&h));
+
+        let click_tab = |h: &mut Harness<'_, App>, label: &str| {
+            top(h, label).click();
+            h.run();
+        };
+        click_tab(&mut h, "r");
+        assert!(!tab(&h, chip) && tab(&h, "r") && !pane(&h));
+        assert!(h.state().runner.is_some(), "kept behind the chip");
+        click_tab(&mut h, chip);
+        assert!(tab(&h, chip) && !tab(&h, "r") && pane(&h));
+        h.key_press_modifiers(Modifiers::CTRL, Key::Tab);
+        h.run();
+        assert!(!tab(&h, chip) && tab(&h, "r"));
+
+        h.get_by_label("Close the runner").click();
+        h.run();
+        assert!(h.state().runner.is_none() && h.query_by_label(chip).is_none());
+    }
+
+    /// A status message fades and an error stays until dismissed: they never cleared, so
+    /// an old "Saved" read as news. Both sit before the workspace path, which a long path
+    /// pushed them past.
+    #[test]
+    fn a_message_fades_and_an_error_stays_until_dismissed() {
+        let mut h = with_request("status");
+        let path = h.state().ws.root.display().to_string();
+        h.state_mut().status = "Saved r".into();
+        h.run();
+        let at = h.get_by_label("Saved r").rect();
+        assert!(at.right() <= h.get_by_label(&path).rect().left());
+        let age = |h: &mut Harness<'_, App>| {
+            let since = &mut h.state_mut().status_since.1;
+            *since = since.checked_sub(STATUS_FADE).unwrap();
+            h.run();
+        };
+        age(&mut h);
+        assert!(h.query_by_label("Saved r").is_none());
+
+        h.state_mut().fail("Saving r: disk full");
+        h.run();
+        age(&mut h);
+        assert!(h.query_by_label("Saving r: disk full").is_some());
+        h.get_by_label("Dismiss").click();
+        h.run();
+        assert!(h.state().status.is_empty());
+    }
+
+    /// The response's Copy takes what the tab shows and says so: it copied the body from
+    /// every tab, without a word. Tabs of rows (Cookies, Tests, Console) have none.
+    #[test]
+    fn response_copy_takes_what_the_tab_shows_and_says_so() {
+        let mut h = with_request("copy-tab");
+        show_response(&mut h, "application/json", r#"{"a":1}"#.into());
+        let copy = |h: &mut Harness<'_, App>| {
+            button(h, "Copy").click();
+            (0..4).find_map(|_| {
+                h.step();
+                (h.output().platform_output.commands.iter()).find_map(|c| match c {
+                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                    _ => None,
+                })
+            })
+        };
+        h.state_mut().resp_tab = RespTab::Headers;
+        h.run();
+        assert_eq!(
+            copy(&mut h).as_deref(),
+            Some("content-type: application/json\n")
+        );
+        assert_eq!(h.state().status, "Copied the headers");
+        h.state_mut().resp_tab = RespTab::Body;
+        h.run();
+        assert!(copy(&mut h).is_some_and(|t| t.contains("\"a\"")));
+        assert_eq!(h.state().status, "Copied the body");
+        h.state_mut().response.as_mut().unwrap().logs = vec!["hi".into()];
+        h.state_mut().resp_tab = RespTab::Console;
+        h.run();
+        let by = egui_kittest::kittest::By::new()
+            .role(Role::Button)
+            .label("Copy");
+        assert!(h.query(by).is_none());
+    }
+
+    /// Import is where a first-time user looks: on the sidebar's toolbar and in the empty
+    /// tree, not only in the ⋯ menu.
+    #[test]
+    fn import_is_offered_on_the_toolbar_and_in_the_empty_tree() {
+        let mut h = harness(workspace("import-offer"));
+        h.run();
+        let imports: Vec<_> = h.get_all_by_label("Import…").map(|n| n.rect()).collect();
+        assert_eq!(imports.len(), 2, "toolbar and empty tree");
+        for at in imports {
+            h.state_mut().dialog = None;
+            h.run();
+            let node = (h.get_all_by_label("Import…")).find(|n| n.rect() == at);
+            node.unwrap().click();
+            h.run();
+            assert!(matches!(h.state().dialog, Some(Dialog::Paste { .. })));
+        }
+    }
+
+    /// With the sidebar hidden, the environment shows and switches at the end of the tab
+    /// strip: it was out of sight and out of reach.
+    #[test]
+    fn the_environment_stays_in_reach_with_the_sidebar_hidden() {
+        use egui_kittest::kittest::By;
+        let mut h = with_request("env-hidden");
+        h.get_by_label("Sidebar").click();
+        h.run();
+        let url_row = h.get(By::new().role(Role::ComboBox).value("GET")).rect();
+        let env = h.get(By::new().role(Role::ComboBox).value("dev"));
+        assert!(env.rect().bottom() <= url_row.top(), "in the tab strip");
+        env.click();
+        h.run();
+        h.get_by_label("No environment").click();
+        h.run();
+        assert!(h.state().active_env.is_none());
     }
 
     /// Body, script and docs editors reach the bottom of the pane: twelve rows stopped
