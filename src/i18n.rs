@@ -1427,8 +1427,13 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Content type", "內容類型"),
     ("Response topic", "回覆主題"),
     (
-        "Message properties need MQTT 5.0 (Settings).",
-        "訊息屬性需要 MQTT 5.0（設定）。",
+        "Message properties need MQTT 5.0.",
+        "訊息屬性需要 MQTT 5.0。",
+    ),
+    ("Use MQTT 5.0", "改用 MQTT 5.0"),
+    (
+        "What the payload is, for the receiver",
+        "告訴接收端酬載的格式",
     ),
     (
         "Message properties need MQTT 5.0 (Settings)",
@@ -1730,6 +1735,20 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Create", "建立"),
     ("Close the load test", "關閉負載測試"),
     ("Request failed: {}", "請求失敗：{}"),
+    ("Metadata", "中繼資料"),
+    (
+        "Pick a method first (↻ asks the server for them)",
+        "請先選擇方法（↻ 會向伺服器查詢）",
+    ),
+    ("Auth payload", "驗證酬載"),
+    (
+        "Press Connect to join the namespace, then send events: a name, then its argument. Scripts don't run for Socket.IO.",
+        "按「連線」加入命名空間，再傳送事件：先寫名稱，再寫參數。Socket.IO 不執行腳本。",
+    ),
+    (
+        "A subscription: press Connect to start it; each event shows here. Scripts don't run for subscriptions.",
+        "這是訂閱：按「連線」開始，每個事件都會顯示在這裡。訂閱不執行腳本。",
+    ),
     (
         "Show the fields proto3 leaves out at 0, \"\" or false",
         "顯示 proto3 因值為 0、\"\" 或 false 而省略的欄位",

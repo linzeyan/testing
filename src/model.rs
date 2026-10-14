@@ -263,6 +263,22 @@ impl Mqtt {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
+
+    /// A copy with the Settings tab's fields (how it connects) as a new request has them;
+    /// the topics and what it publishes are kept.
+    pub fn with_default_connection(&self) -> Mqtt {
+        Mqtt {
+            topics: self.topics.clone(),
+            topic: self.topic.clone(),
+            qos: self.qos,
+            retain: self.retain,
+            user_properties: self.user_properties.clone(),
+            content_type: self.content_type.clone(),
+            response_topic: self.response_topic.clone(),
+            expiry_secs: self.expiry_secs,
+            ..Default::default()
+        }
+    }
 }
 
 /// Socket.IO only: where the server mounts it and which client it expects, as in

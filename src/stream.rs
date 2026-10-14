@@ -174,6 +174,9 @@ pub async fn sse(
     last_id: &mut String,
     emit: impl Fn(Event),
 ) {
+    // A GET with no body, whatever one a request switched from another kind kept: the
+    // tab to see it is gone. Before signing, so a signature covers what goes out.
+    req.body = Body::None;
     if let Err(e) = http::with_token(&client, &mut req, false).await {
         return emit(Event::Error(e));
     }
@@ -239,6 +242,8 @@ pub async fn websocket(
     outgoing: &mut mpsc::UnboundedReceiver<Frame>,
     emit: impl Fn(Event),
 ) {
+    // As `sse`: the handshake is a GET with no body.
+    req.body = Body::None;
     if let Err(e) = http::with_token(&client, &mut req, false).await {
         return emit(Event::Error(e));
     }
@@ -437,7 +442,9 @@ pub async fn socketio(
         .append_pair("transport", "websocket");
     // Socket.IO 2's CONNECT has no payload; its servers read the handshake's query.
     let auth = match &req.body {
-        Body::Json { text } if !v2 && !text.trim().is_empty() => text.trim().to_owned(),
+        Body::Json { text } | Body::Text { text } if !v2 && !text.trim().is_empty() => {
+            text.trim().to_owned()
+        }
         _ => String::new(),
     };
     let mut upgrade = Request {
@@ -544,10 +551,11 @@ pub async fn socketio(
             continue;
         }
         for text in pending.drain(..) {
+            // Not an Error: that ends the session, and this connection is still fine.
             let args = match event_args(&text) {
                 Ok(a) => a,
                 Err(e) => {
-                    emit(Event::Error(e));
+                    emit(Event::Info(format!("not sent: {e}")));
                     continue;
                 }
             };
@@ -596,7 +604,7 @@ fn socketio_packet(p: &str) -> Packet {
 }
 
 /// What the compose box holds, as the JSON array an event packet carries.
-fn event_args(text: &str) -> Result<String, String> {
+pub fn event_args(text: &str) -> Result<String, String> {
     let text = text.trim();
     if text.starts_with('[') {
         let v: Vec<serde_json::Value> =
@@ -825,6 +833,58 @@ pub mod tests {
         let (got, clean) = server.join().unwrap();
         assert_eq!(got, ["bye", "close"]);
         assert!(clean, "the closing handshake finished");
+    }
+
+    /// A request switched to WS or SSE from a kind with a body keeps that body, with no tab
+    /// left to see it: it must not go out on the handshake's GET.
+    #[test]
+    fn a_websocket_or_sse_handshake_carries_no_body() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut head = Vec::new();
+                let mut byte = [0u8];
+                while !head.ends_with(b"\r\n\r\n") && s.read(&mut byte).unwrap() == 1 {
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_lowercase();
+                s.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                    .unwrap();
+                heads.push(head);
+            }
+            heads
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        let client = rt.block_on(crate::net::build_client(net)).unwrap().http;
+        let req = |method: &str| Request {
+            method: method.into(),
+            url: format!("http://{addr}/"),
+            body: Body::Json {
+                text: r#"{"query": "", "variables": {}}"#.into(),
+            },
+            ..Default::default()
+        };
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        rt.block_on(websocket(client.clone(), req("WS"), &mut rx, |_| {}));
+        rt.block_on(sse(client, req("SSE"), &mut String::new(), |_| {}));
+        for head in server.join().unwrap() {
+            assert!(head.starts_with("get "), "{head}");
+            assert!(
+                !head.contains("content-length") && !head.contains("content-type"),
+                "{head}"
+            );
+        }
     }
 
     #[test]
@@ -1425,6 +1485,8 @@ pub mod tests {
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(Frame::Text("first".into())).unwrap();
+        // Not an event: said so, and the connection carries on (an Error ended it).
+        tx.send(Frame::Text("[1, 2]".into())).unwrap();
         tx.send(Frame::Text("second 2".into())).unwrap();
         let tx = std::sync::Mutex::new(Some(tx));
         let events = std::sync::Mutex::new(Vec::new());
@@ -1449,6 +1511,7 @@ pub mod tests {
             [
                 Event::Open("connected to /chat".into()),
                 Event::Out(r#"["first"]"#.into()),
+                Event::Info("not sent: the array starts with the event name".into()),
                 Event::Out(r#"["second",2]"#.into()),
                 Event::Closed("disconnected".into()),
             ]

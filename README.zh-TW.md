@@ -118,6 +118,11 @@ MQTT：
   Socket.IO、gRPC、MQTT 可接收的訊息大小上限。WebSocket、Socket.IO、SSE、MQTT 的連線若不是按
   「中斷連線」而結束，可依設定的次數與間隔連續重新連線：SSE 會以 `Last-Event-ID` 送出最後的事件
   ID，MQTT 會重新訂閱主題。
+- 每種請求只顯示用得到的分頁。GraphQL 一開就是查詢（Query）；WebSocket 與 SSE 沒有 Body
+  （交握只是一般的 GET），且與 Socket.IO、MQTT 一樣沒有腳本、Vars、Asserts（串流不會執行它們）；
+  gRPC 有 JSON 的 Message 與 Metadata，但沒有 Params（URL 就是伺服器）。Socket.IO 的 JSON body
+  即驗證酬載（Auth payload）。驗證方式只列出該種請求送得出的（MQTT 只有 Basic）。請求從 GraphQL
+  改成串流或 gRPC 時，留下的查詢會被捨棄，不會被送出。
 
 ## 驗證
 

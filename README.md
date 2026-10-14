@@ -136,6 +136,12 @@ beside it puts a kept one back in the box. Clicking a message shows its payload 
   connection takes in. A WebSocket, Socket.IO, SSE or MQTT connection that ends without
   Disconnect can open again, up to a set number of times in a row at a set interval: SSE
   sends the last event ID as `Last-Event-ID`, and MQTT subscribes to its topics again.
+- Each kind shows only the tabs it uses. GraphQL opens on its Query; WebSocket and SSE have
+  no Body (the handshake is a plain GET) and, like Socket.IO and MQTT, no Scripts, Vars or
+  Asserts, which don't run on streams; gRPC has a JSON Message and Metadata but no Params
+  (the URL is the server). Socket.IO's JSON body is its Auth payload. The Auth types offered
+  are the ones the kind can send (MQTT: Basic only). A query left behind when a request
+  turns from GraphQL into a stream or gRPC is dropped rather than sent.
 
 ## Authentication
 

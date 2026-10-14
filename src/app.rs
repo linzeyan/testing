@@ -163,6 +163,29 @@ enum ReqTab {
     Properties,
 }
 
+impl ReqTab {
+    /// The sub-tabs a kind of request has, in order; the first is where it lands when the
+    /// tab shown doesn't apply to it. Examples follow when there are any.
+    fn of(method: &str) -> &'static [ReqTab] {
+        use ReqTab::*;
+        match method {
+            // The query is the request, as Postman and Hoppscotch put it first.
+            "GRAPHQL" => &[
+                Body, Params, Headers, Auth, Scripts, Vars, Asserts, Settings, Docs,
+            ],
+            // The handshake is a GET with no body, and nothing runs scripts on a stream.
+            "WS" | "SSE" => &[Params, Headers, Auth, Settings, Docs],
+            "SOCKETIO" => &[Params, Headers, Body, Auth, Settings, Docs],
+            "MQTT" => &[Topics, Properties, Auth, Settings, Docs],
+            // The URL is the server: params would end up in the method's path.
+            "GRPC" => &[Body, Headers, Auth, Scripts, Vars, Asserts, Settings, Docs],
+            _ => &[
+                Params, Headers, Body, Auth, Scripts, Vars, Asserts, Settings, Docs,
+            ],
+        }
+    }
+}
+
 /// App settings' tabs.
 #[derive(PartialEq, Clone, Copy)]
 enum SettingsTab {
@@ -353,6 +376,8 @@ struct StreamSession {
     outgoing: Option<Outgoing>,
     /// gRPC: (proto, method), to check messages before they are sent.
     grpc: Option<(String, String)>,
+    /// Socket.IO, whose messages are checked before they are sent too.
+    socketio: bool,
     /// What the compose box takes, shown while it's empty.
     hint: &'static str,
     live: bool,
@@ -2349,6 +2374,7 @@ impl App {
                 (None, false) => t("Message"),
             },
             grpc,
+            socketio,
             live: true,
             compose: old.as_ref().map(|s| s.compose.clone()).unwrap_or_default(),
             encoding: is_ws.then(|| old.and_then(|s| s.encoding).unwrap_or(0)),
@@ -4541,7 +4567,14 @@ impl App {
                 // one: a switch either way carries the query over, as the JSON that goes out.
                 let gql = open.draft.method == "GRAPHQL";
                 if gql != matches!(open.draft.body, Body::GraphQL { .. }) {
-                    open.draft.body = std::mem::take(&mut open.draft.body).graphql_switched(gql);
+                    let body = std::mem::take(&mut open.draft.body);
+                    // Not to a stream or gRPC: the query's JSON went out as a handshake
+                    // body, an auth payload or a request message nobody wrote.
+                    let http = !model::is_streaming(&open.draft.method) && open.draft.method != "GRPC";
+                    open.draft.body = match gql || http {
+                        true => body.graphql_switched(gql),
+                        false => Body::None,
+                    };
                     if gql {
                         self.req_tab = ReqTab::Body;
                     }
@@ -4557,6 +4590,9 @@ impl App {
                 let hint = match open.draft.method.as_str() {
                     "MQTT" => "mqtt://{{broker}}:1883",
                     "SOCKETIO" => "http://{{host}}:3000/namespace",
+                    "WS" => "wss://{{host}}/socket",
+                    // The server only: the method comes from the picker.
+                    "GRPC" => "http://{{host}}:50051",
                     _ => "https://{{host}}/path",
                 };
                 let url = var_edit(
@@ -4616,13 +4652,18 @@ impl App {
                     let label = RichText::new(if streaming { t("Connect") } else { t("Send") })
                         .strong()
                         .color(Color32::WHITE);
-                    send |= ui
-                        .add_sized(
-                            button,
-                            egui::Button::new(label).fill(Color32::from_rgb(40, 110, 200)),
-                        )
-                        .on_hover_text(ui.ctx().format_shortcut(&SEND))
-                        .clicked();
+                    // A call needs its method: Send only failed with `Method "" should look
+                    // like package.Service/Method`.
+                    let ready = open.draft.method != "GRPC" || !open.draft.rpc.trim().is_empty();
+                    let key = ui.ctx().format_shortcut(&SEND);
+                    send |= (ui.add_enabled_ui(ready, |ui| {
+                        let fill = Color32::from_rgb(40, 110, 200);
+                        ui.add_sized(button, egui::Button::new(label).fill(fill))
+                    }))
+                    .inner
+                    .on_hover_text(key)
+                    .on_disabled_hover_text(t("Pick a method first (↻ asks the server for them)"))
+                    .clicked();
                 }
                 if downloadable {
                     // As tall as Send beside it.
@@ -4690,96 +4731,71 @@ impl App {
                     }
                 };
                 let current = &mut self.req_tab;
-                // MQTT has no query, headers or body: topics take their place.
-                let mqtt = open.draft.method == "MQTT";
-                let http_only = [ReqTab::Params, ReqTab::Headers, ReqTab::Body];
-                let mqtt_only = [ReqTab::Topics, ReqTab::Properties];
-                if mqtt && http_only.contains(current) {
-                    *current = ReqTab::Topics;
-                } else if !mqtt && mqtt_only.contains(current) {
-                    *current = ReqTab::Params;
+                let d = &open.draft;
+                let (method, kinds) = (d.method.as_str(), ReqTab::of(&d.method));
+                let examples = d.examples.len();
+                if !kinds.contains(current) && !(*current == ReqTab::Examples && examples > 0) {
+                    *current = kinds[0];
                 }
-                if mqtt {
-                    let topics = open.draft.mqtt.topics.iter();
-                    let on = topics.filter(|t| t.enabled && !t.filter.is_empty()).count();
-                    sub_tab(ui, current, ReqTab::Topics, tab(on, t("Topics")), false);
-                    let m = &open.draft.mqtt;
-                    let extras = [
-                        !m.content_type.trim().is_empty(),
-                        !m.response_topic.trim().is_empty(),
-                        m.expiry_secs > 0,
-                    ];
-                    let properties =
-                        count(&m.user_properties) + extras.into_iter().filter(|&set| set).count();
-                    sub_tab(
-                        ui,
-                        current,
-                        ReqTab::Properties,
-                        tab(properties, t("Properties")),
-                        false,
-                    );
-                } else {
-                    let params = count(&open.draft.params) + count(&open.draft.path_vars);
-                    sub_tab(ui, current, ReqTab::Params, tab(params, t("Params")), false);
-                    let headers = count(&open.draft.headers);
-                    sub_tab(
-                        ui,
-                        current,
-                        ReqTab::Headers,
-                        tab(headers, t("Headers")),
-                        false,
-                    );
-                    match open.draft.method == "GRAPHQL" {
-                        true => sub_tab(ui, current, ReqTab::Body, t("Query"), false),
-                        false => {
-                            let set = !open.draft.body.is_empty();
-                            sub_tab(ui, current, ReqTab::Body, t("Body"), set)
+                let shown = kinds.iter().chain((examples > 0).then_some(&ReqTab::Examples));
+                for &kind in shown {
+                    let (label, set) = match kind {
+                        ReqTab::Params => (tab(count(&d.params) + count(&d.path_vars), t("Params")), false),
+                        // gRPC's name for them, as in Postman: they go out as metadata.
+                        ReqTab::Headers => {
+                            let name = if method == "GRPC" { t("Metadata") } else { t("Headers") };
+                            (tab(count(&d.headers), name), false)
                         }
-                    };
-                }
-                let auth = !matches!(open.draft.effective_auth(), Auth::None | Auth::Inherit);
-                sub_tab(ui, current, ReqTab::Auth, t("Auth"), auth);
-                let scripts = !open.draft.pre_request.trim().is_empty()
-                    || !open.draft.tests.trim().is_empty();
-                sub_tab(ui, current, ReqTab::Scripts, t("Scripts"), scripts);
-                let vars = count(&open.draft.response_vars);
-                sub_tab(ui, current, ReqTab::Vars, tab(vars, t("Vars")), false);
-                let asserts = count(&open.draft.asserts);
-                sub_tab(
-                    ui,
-                    current,
-                    ReqTab::Asserts,
-                    tab(asserts, t("Asserts")),
-                    false,
-                );
-                // How the request connects, whatever its kind; MQTT and Socket.IO add
-                // their own protocol's settings.
-                let default = open.draft.settings.is_default()
-                    && match open.draft.method.as_str() {
-                        "MQTT" => {
-                            open.draft.mqtt.client_id.is_empty()
-                                && !open.draft.mqtt.v5
-                                && open.draft.mqtt.keep_alive_secs == 60
-                                && open.draft.mqtt.clean_session
-                                && open.draft.mqtt.will_topic.trim().is_empty()
+                        ReqTab::Body => {
+                            let name = match method {
+                                "GRAPHQL" => t("Query"),
+                                "GRPC" => t("Message"),
+                                "SOCKETIO" => t("Auth payload"),
+                                _ => t("Body"),
+                            };
+                            (name.to_owned(), method != "GRAPHQL" && !d.body.is_empty())
                         }
-                        "SOCKETIO" => open.draft.socketio.is_default(),
-                        _ => true,
+                        ReqTab::Auth => {
+                            let auth = d.effective_auth();
+                            (t("Auth").to_owned(), !matches!(auth, Auth::None | Auth::Inherit))
+                        }
+                        ReqTab::Scripts => {
+                            let set = !d.pre_request.trim().is_empty() || !d.tests.trim().is_empty();
+                            (t("Scripts").to_owned(), set)
+                        }
+                        ReqTab::Vars => (tab(count(&d.response_vars), t("Vars")), false),
+                        ReqTab::Asserts => (tab(count(&d.asserts), t("Asserts")), false),
+                        // How the request connects, whatever its kind; MQTT and Socket.IO
+                        // add their own protocol's settings.
+                        ReqTab::Settings => {
+                            let default = d.settings.is_default()
+                                && match method {
+                                    "MQTT" => d.mqtt.with_default_connection() == d.mqtt,
+                                    "SOCKETIO" => d.socketio.is_default(),
+                                    _ => true,
+                                };
+                            (t("Settings").to_owned(), !default)
+                        }
+                        ReqTab::Docs => (t("Docs").to_owned(), !d.description.trim().is_empty()),
+                        ReqTab::Topics => {
+                            let topics = d.mqtt.topics.iter();
+                            let on = topics.filter(|t| t.enabled && !t.filter.is_empty()).count();
+                            (tab(on, t("Topics")), false)
+                        }
+                        ReqTab::Properties => {
+                            let m = &d.mqtt;
+                            let extras = [
+                                !m.content_type.trim().is_empty(),
+                                !m.response_topic.trim().is_empty(),
+                                m.expiry_secs > 0,
+                            ];
+                            let n = count(&m.user_properties)
+                                + extras.into_iter().filter(|&set| set).count();
+                            (tab(n, t("Properties")), false)
+                        }
+                        ReqTab::Examples => (tab(examples, t("Examples")), false),
                     };
-                sub_tab(ui, current, ReqTab::Settings, t("Settings"), !default);
-                let docs = !open.draft.description.trim().is_empty();
-                sub_tab(ui, current, ReqTab::Docs, t("Docs"), docs);
-                let examples = open.draft.examples.len();
-                if examples > 0 {
-                    sub_tab(
-                        ui,
-                        current,
-                        ReqTab::Examples,
-                        tab(examples, t("Examples")),
-                        false,
-                    );
-                } else if *current == ReqTab::Examples {
-                    *current = ReqTab::Params;
+                    sub_tab(ui, current, kind, label, set);
                 }
             });
             ui.separator();
@@ -4794,10 +4810,13 @@ impl App {
                     }
                     ReqTab::Headers => {
                         kv_table(ui, "headers", &mut open.draft.headers, &all_vars, true);
-                        let (wire, _) = open.draft.resolved(&all_vars);
-                        let own = &open.draft.headers;
-                        let auto = http::auto_headers(wire, own, &self.network);
-                        change_defaults |= auto_headers_ui(ui, auto);
+                        // What an HTTP send adds; a gRPC call goes out its own way.
+                        if open.draft.method != "GRPC" {
+                            let (wire, _) = open.draft.resolved(&all_vars);
+                            let own = &open.draft.headers;
+                            let auto = http::auto_headers(wire, own, &self.network);
+                            change_defaults |= auto_headers_ui(ui, auto);
+                        }
                     }
                     ReqTab::Body => {
                         // GRAPHQL requests are always a query; no body type to pick.
@@ -4806,6 +4825,17 @@ impl App {
                         {
                             fetch_schema |=
                                 graphql_editor(ui, query, variables, &all_vars, &mut self.explorer);
+                            return;
+                        }
+                        if let "GRPC" | "SOCKETIO" = open.draft.method.as_str() {
+                            json_body_editor(ui, &mut open.draft.body, &all_vars);
+                            if open.draft.method == "SOCKETIO" {
+                                ui.add_space(8.0);
+                                ui.weak(match open.draft.socketio.v2 {
+                                    true => t("v2 has no auth payload: a JSON body isn't sent. Put what the server checks in Params; they go on the handshake's query."),
+                                    false => t("A JSON body is sent as the auth payload when joining the namespace."),
+                                });
+                            }
                             return;
                         }
                         fetch_schema |= body_editor(
@@ -4821,6 +4851,7 @@ impl App {
                         &mut open.draft.auth,
                         &all_vars,
                         open.draft.inherited.auth.as_ref(),
+                        &open.draft.method,
                     ),
                     ReqTab::Scripts => {
                         let json_response = match self.response.as_ref().map(|s| &s.result) {
@@ -4872,20 +4903,32 @@ impl App {
                     }
                     ReqTab::Properties => {
                         let m = &mut open.draft.mqtt;
-                        publish_properties(ui, m);
-                        ui.add_space(8.0);
-                        kv_table(
-                            ui,
-                            "mqtt-properties",
-                            &mut m.user_properties,
-                            &all_vars,
-                            true,
-                        );
-                        ui.add_space(8.0);
-                        ui.weak(match m.v5 {
-                            true => t("Sent with every message you publish."),
-                            false => t("Message properties need MQTT 5.0 (Settings)."),
+                        // Greyed on 3.1.1, with the way out first: editable, they failed
+                        // only on Publish, in the status bar.
+                        if !m.v5 {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(ORANGE, t("Message properties need MQTT 5.0."));
+                                if ui.small_button(t("Use MQTT 5.0")).clicked() {
+                                    m.v5 = true;
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
+                        ui.add_enabled_ui(m.v5, |ui| {
+                            publish_properties(ui, m);
+                            ui.add_space(8.0);
+                            kv_table(
+                                ui,
+                                "mqtt-properties",
+                                &mut m.user_properties,
+                                &all_vars,
+                                true,
+                            );
                         });
+                        if m.v5 {
+                            ui.add_space(8.0);
+                            ui.weak(t("Sent with every message you publish."));
+                        }
                     }
                     ReqTab::Examples => examples_editor(ui, &mut open.draft.examples),
                     ReqTab::Docs => docs_editor(ui, &mut open.draft.description),
@@ -4958,6 +5001,12 @@ impl App {
                     }
                     None if open.draft.method == "GRPC" => {
                         ui.weak(t("Press Connect to start the call. The body is the first message (for a client stream, an array is several, empty is none). Scripts don't run for streams."));
+                    }
+                    None if open.draft.method == "SOCKETIO" => {
+                        ui.weak(t("Press Connect to join the namespace, then send events: a name, then its argument. Scripts don't run for Socket.IO."));
+                    }
+                    None if open.draft.method == "GRAPHQL" => {
+                        ui.weak(t("A subscription: press Connect to start it; each event shows here. Scripts don't run for subscriptions."));
                     }
                     None => {
                         ui.weak(t("Press Connect to open the stream. Scripts don't run for WebSocket/SSE."));
@@ -5941,7 +5990,7 @@ impl App {
                     }
                     FolderTab::Auth => {
                         let parent = ed.parent.auth.as_ref();
-                        auth_editor(ui, &mut ed.folder.auth, &vars, parent);
+                        auth_editor(ui, &mut ed.folder.auth, &vars, parent, "");
                         ui.weak(t("Requests set to \"Inherit from parent\" use this."));
                     }
                     FolderTab::Scripts => scripts_editor(
@@ -8524,6 +8573,41 @@ fn from_bulk(text: &str, old: &[KeyValue]) -> Vec<KeyValue> {
         .collect()
 }
 
+/// Beautify, a hint while it isn't JSON, and the editor.
+fn json_editor(ui: &mut egui::Ui, text: &mut String, vars: &HashMap<String, String>) {
+    ui.horizontal(|ui| {
+        if ui.small_button(t("Beautify")).clicked()
+            && let Some(pretty) = http::pretty_json(text)
+        {
+            *text = pretty;
+        }
+        // Parsing it each frame is what an uneditable body can do without.
+        if !text.trim().is_empty()
+            && text.len() <= crate::varedit::MAX_EDIT
+            && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(text)
+        {
+            // Only a hint: `{{var}}` placeholders legitimately make the raw text invalid.
+            ui.colored_label(ORANGE, tf("Not valid JSON: {}", &[&e]));
+        }
+    });
+    code_editor(ui, "body", text, vars, Some(Lang::Json));
+}
+
+/// A body that can only be JSON (a gRPC message, a Socket.IO auth payload), so no type
+/// to pick: Form or Binary there went out as `{}`. Another type shows empty, and typing
+/// makes it JSON.
+fn json_body_editor(ui: &mut egui::Ui, body: &mut Body, vars: &HashMap<String, String>) {
+    let mut typed = String::new();
+    let text = match body {
+        Body::Json { text } | Body::Text { text } => text,
+        _ => &mut typed,
+    };
+    json_editor(ui, text, vars);
+    if !typed.is_empty() {
+        *body = Body::Json { text: typed };
+    }
+}
+
 /// Returns true when the GraphQL explorer asked to fetch the schema.
 fn body_editor(
     ui: &mut egui::Ui,
@@ -8575,24 +8659,7 @@ fn body_editor(
         Body::None => {
             ui.weak(t("This request has no body."));
         }
-        Body::Json { text } => {
-            ui.horizontal(|ui| {
-                if ui.small_button(t("Beautify")).clicked()
-                    && let Some(pretty) = http::pretty_json(text)
-                {
-                    *text = pretty;
-                }
-                // Parsing it each frame is what an uneditable body can do without.
-                if !text.trim().is_empty()
-                    && text.len() <= crate::varedit::MAX_EDIT
-                    && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(text)
-                {
-                    // Only a hint: `{{var}}` placeholders legitimately make the raw text invalid.
-                    ui.colored_label(ORANGE, tf("Not valid JSON: {}", &[&e]));
-                }
-            });
-            code_editor(ui, "body", text, vars, Some(Lang::Json));
-        }
+        Body::Json { text } => json_editor(ui, text, vars),
         Body::Text { text } => {
             // The language is the Content-Type header row, as Postman imports come in: one
             // place to see and change it.
@@ -9434,11 +9501,14 @@ fn code_editor(
 }
 
 /// `inherited`: what "Inherit from parent" currently resolves to, and from which folder.
+/// `method` narrows the types offered to what that kind of request can send ("" for a
+/// folder: any).
 fn auth_editor(
     ui: &mut egui::Ui,
     auth: &mut Auth,
     vars: &HashMap<String, String>,
     inherited: Option<&(String, Auth)>,
+    method: &str,
 ) {
     let (user, pass) = (String::new, String::new);
     let kinds = [
@@ -9506,11 +9576,20 @@ fn auth_editor(
             .find(|(_, k)| std::mem::discriminant(k) == d)
             .map_or("", |(l, _)| *l)
     };
+    // MQTT signs in with a username and password and nothing else; Digest and NTLM
+    // answer an HTTP challenge, which a stream or a gRPC call never gets to see.
+    let offered = |kind: &Auth| match method {
+        "MQTT" => matches!(kind, Auth::Inherit | Auth::None | Auth::Basic { .. }),
+        m if model::is_streaming(m) || m == "GRPC" => {
+            !matches!(kind, Auth::Digest { .. } | Auth::Ntlm(_))
+        }
+        _ => true,
+    };
     let current = std::mem::discriminant(&*auth);
     egui::ComboBox::from_id_salt("auth")
         .selected_text(label_of(auth))
         .show_ui(ui, |ui| {
-            for (label, kind) in &kinds {
+            for (label, kind) in kinds.iter().filter(|(_, k)| offered(k)) {
                 let same = std::mem::discriminant(kind) == current;
                 if ui.selectable_label(same, *label).clicked() && !same {
                     *auth = kind.clone();
@@ -9938,9 +10017,10 @@ fn mqtt_settings(
                     ui.selectable_value(&mut m.v5, false, "3.1.1");
                     ui.selectable_value(&mut m.v5, true, "5.0");
                 });
-            ui.weak(t(
-                "5.0 says why a broker refuses or hangs up, and has user properties",
-            ));
+            grid_hint(
+                ui,
+                t("5.0 says why a broker refuses or hangs up, and has user properties"),
+            );
             ui.end_row();
 
             ui.label(t("Client ID"));
@@ -9949,9 +10029,10 @@ fn mqtt_settings(
                     .hint_text(t("random"))
                     .desired_width(240.0),
             );
-            ui.weak(t(
-                "A broker drops the older of two connections with the same ID",
-            ));
+            grid_hint(
+                ui,
+                t("A broker drops the older of two connections with the same ID"),
+            );
             ui.end_row();
 
             ui.label(t("Keep alive"));
@@ -9960,14 +10041,15 @@ fn mqtt_settings(
                     .range(0..=3600)
                     .suffix(" s"),
             );
-            ui.weak(t("0 sends no pings"));
+            grid_hint(ui, t("0 sends no pings"));
             ui.end_row();
 
             ui.label(t("Clean session"));
             ui.checkbox(&mut m.clean_session, "");
-            ui.weak(t(
-                "Off: the broker keeps subscriptions and queued messages for this client ID",
-            ));
+            grid_hint(
+                ui,
+                t("Off: the broker keeps subscriptions and queued messages for this client ID"),
+            );
             ui.end_row();
 
             ui.label(t("Last will"));
@@ -9981,9 +10063,10 @@ fn mqtt_settings(
                 qos_box(ui, "will-qos", &mut m.will_qos);
                 ui.checkbox(&mut m.will_retain, t("Retain"));
             });
-            ui.weak(t(
-                "The broker publishes it if the connection drops without a goodbye",
-            ));
+            grid_hint(
+                ui,
+                t("The broker publishes it if the connection drops without a goodbye"),
+            );
             ui.end_row();
 
             ui.label(t("Will message"));
@@ -10007,13 +10090,19 @@ fn mqtt_settings(
                     ui.add(egui::DragValue::new(&mut m.will_expiry_secs).suffix(" s"));
                 });
             });
-            ui.weak(t(
-                "MQTT 5.0. Expiry 0: the broker keeps it until it's delivered",
-            ));
+            grid_hint(
+                ui,
+                t("MQTT 5.0. Expiry 0: the broker keeps it until it's delivered"),
+            );
             ui.end_row();
 
             connection_rows(ui, s, "MQTT", default_timeout_secs);
         });
+    // As every other kind's Settings tab has; topics and what to publish stay.
+    let reset = m.with_default_connection();
+    if reset_button(ui, s.is_default() && reset == *m) {
+        (*m, *s) = (reset, model::Settings::default());
+    }
     ui.add_space(8.0);
     ui.weak(t("Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// use the certificate settings in Network settings, and the connection goes through its proxy."));
 }
@@ -10024,12 +10113,15 @@ fn publish_properties(ui: &mut egui::Ui, m: &mut model::Mqtt) {
         .num_columns(3)
         .spacing([16.0, 6.0])
         .show(ui, |ui| {
+            // `min_size`, not just `desired_width`: a Grid cell is as wide as its column
+            // was last frame, the "0 s" below, which left these at 40 px.
             ui.label(t("Content type"));
             ui.add(
                 egui::TextEdit::singleline(&mut m.content_type)
                     .hint_text("application/json")
-                    .desired_width(240.0),
+                    .min_size(egui::vec2(240.0, 0.0)),
             );
+            grid_hint(ui, t("What the payload is, for the receiver"));
             ui.end_row();
 
             ui.label(t("Response topic"));
@@ -10037,14 +10129,14 @@ fn publish_properties(ui: &mut egui::Ui, m: &mut model::Mqtt) {
                 egui::TextEdit::singleline(&mut m.response_topic)
                     .hint_text("replies/42")
                     .font(egui::TextStyle::Monospace)
-                    .desired_width(240.0),
+                    .min_size(egui::vec2(240.0, 0.0)),
             );
-            ui.weak(t("Where the receiver should answer"));
+            grid_hint(ui, t("Where the receiver should answer"));
             ui.end_row();
 
             ui.label(t("Expires after"));
             ui.add(egui::DragValue::new(&mut m.expiry_secs).suffix(" s"));
-            ui.weak(t("0: the broker keeps it until it's delivered"));
+            grid_hint(ui, t("0: the broker keeps it until it's delivered"));
             ui.end_row();
         });
 }
@@ -10068,9 +10160,10 @@ fn socketio_settings(
                     .font(egui::TextStyle::Monospace)
                     .min_size(egui::vec2(240.0, 0.0)),
             );
-            ui.weak(t(
-                "Where the server mounts Socket.IO; the URL's path is still the namespace",
-            ));
+            grid_hint(
+                ui,
+                t("Where the server mounts Socket.IO; the URL's path is still the namespace"),
+            );
             ui.end_row();
 
             ui.label(t("Client version"));
@@ -10082,21 +10175,20 @@ fn socketio_settings(
                     ui.selectable_value(&mut s.v2, false, "v3, v4");
                     ui.selectable_value(&mut s.v2, true, "v2");
                 });
-            ui.weak(match s.v2 {
-                true => t("Socket.IO 2.x servers"),
-                false => t("Socket.IO 3.x and 4.x servers"),
-            });
+            grid_hint(
+                ui,
+                match s.v2 {
+                    true => t("Socket.IO 2.x servers"),
+                    false => t("Socket.IO 3.x and 4.x servers"),
+                },
+            );
             ui.end_row();
 
             connection_rows(ui, settings, "SOCKETIO", default_timeout_secs);
         });
-    ui.add_space(8.0);
-    ui.weak(match s.v2 {
-        true => t(
-            "v2 has no auth payload: a JSON body isn't sent. Put what the server checks in Params; they go on the handshake's query.",
-        ),
-        false => t("A JSON body is sent as the auth payload when joining the namespace."),
-    });
+    if reset_button(ui, s.is_default() && settings.is_default()) {
+        (*s, *settings) = Default::default();
+    }
 }
 
 fn settings_editor(
@@ -10111,13 +10203,21 @@ fn settings_editor(
         .show(ui, |ui| {
             connection_rows(ui, s, method, default_timeout_secs)
         });
-    ui.add_space(8.0);
-    if ui
-        .add_enabled(!s.is_default(), egui::Button::new(t("Reset to defaults")))
-        .clicked()
-    {
+    if reset_button(ui, s.is_default()) {
         *s = model::Settings::default();
     }
+}
+
+/// Under a Settings tab; true when pressed. Greyed when there's nothing to reset.
+fn reset_button(ui: &mut egui::Ui, default: bool) -> bool {
+    ui.add_space(8.0);
+    (ui.add_enabled(!default, egui::Button::new(t("Reset to defaults")))).clicked()
+}
+
+/// A settings grid's third column. Wrapped: a Grid doesn't wrap by itself, so a long
+/// one ran past the pane's edge, which has no sideways scroll.
+fn grid_hint(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(egui::Label::new(RichText::new(text).weak()).wrap())
 }
 
 /// The Settings tab's rows for how a `method` request connects, in a 3-column grid: each
@@ -10147,12 +10247,12 @@ fn connection_rows(
                     ui.selectable_value(&mut s.http_version, v, name(v));
                 }
             });
-        ui.weak(t("Auto uses HTTP/2 when an https server offers it"));
+        grid_hint(ui, t("Auto uses HTTP/2 when an https server offers it"));
         ui.end_row();
 
         ui.label(t("Follow redirects"));
         ui.checkbox(&mut s.follow_redirects, "");
-        ui.weak(t("Off shows the 3xx response itself"));
+        grid_hint(ui, t("Off shows the 3xx response itself"));
         ui.end_row();
 
         ui.label(t("Maximum redirects"));
@@ -10171,24 +10271,24 @@ fn connection_rows(
             follows,
             egui::Checkbox::new(&mut s.follow_original_method, ""),
         );
-        ui.weak(t("Keep the method and body on a 301, 302 or 303"));
+        grid_hint(ui, t("Keep the method and body on a 301, 302 or 303"));
         ui.end_row();
 
         ui.label(t("Follow Authorization header"));
         ui.add_enabled(follows, egui::Checkbox::new(&mut s.follow_auth_header, ""));
-        ui.weak(t("Keep it when a redirect goes to another host"));
+        grid_hint(ui, t("Keep it when a redirect goes to another host"));
         ui.end_row();
 
         ui.label(t("Remove referer header on redirect"));
         ui.add_enabled(follows, egui::Checkbox::new(&mut s.remove_referer, ""));
-        ui.weak(t("Don't tell the next host which URL redirected"));
+        grid_hint(ui, t("Don't tell the next host which URL redirected"));
         ui.end_row();
     }
 
     ui.label(t("Verify TLS certificate"));
     ui.checkbox(&mut s.verify_tls, "");
     if s.verify_tls {
-        ui.weak(t("Off accepts any certificate, for this request only"));
+        grid_hint(ui, t("Off accepts any certificate, for this request only"));
     } else {
         ui.colored_label(RED, t("Any server certificate is accepted"));
     }
@@ -10197,7 +10297,10 @@ fn connection_rows(
     if !(grpc || mqtt) {
         ui.label(t("Cookie jar"));
         ui.checkbox(&mut s.cookies, "");
-        ui.weak(t("Send stored cookies and keep the ones the server sets"));
+        grid_hint(
+            ui,
+            t("Send stored cookies and keep the ones the server sets"),
+        );
         ui.end_row();
     }
 
@@ -10235,7 +10338,7 @@ fn connection_rows(
             })
             .custom_parser(|t| t.trim().trim_end_matches("ms").trim().parse().ok()),
     );
-    ui.weak(hint);
+    grid_hint(ui, hint);
     ui.end_row();
 
     // A connection that stays open, which a request/response or a gRPC call doesn't.
@@ -10249,7 +10352,10 @@ fn connection_rows(
                     v => v.to_string(),
                 }),
         );
-        ui.weak(t("In a row, when the connection ends without Disconnect"));
+        grid_hint(
+            ui,
+            t("In a row, when the connection ends without Disconnect"),
+        );
         ui.end_row();
 
         ui.label(t("Reconnection interval"));
@@ -10281,7 +10387,7 @@ fn connection_rows(
         if s.disable_tls12 && s.disable_tls13 {
             ui.colored_label(RED, t("No TLS version is left: https requests fail"));
         } else {
-            ui.weak(t("Only for servers that mishandle one of them"));
+            grid_hint(ui, t("Only for servers that mishandle one of them"));
         }
         ui.end_row();
 
@@ -10292,7 +10398,10 @@ fn connection_rows(
             .map(String::as_str)
             .collect();
         if unknown.is_empty() {
-            ui.weak(t("Offered in the order checked; none checked offers all"));
+            grid_hint(
+                ui,
+                t("Offered in the order checked; none checked offers all"),
+            );
         } else {
             let names = unknown.join(", ");
             ui.colored_label(ORANGE, tf("Not available here, skipped: {}", &[&names]));
@@ -10307,7 +10416,7 @@ fn connection_rows(
         if ui.checkbox(&mut strict, "").changed() {
             s.insecure_parser = !strict;
         }
-        ui.weak(t("Off accepts responses with malformed headers"));
+        grid_hint(ui, t("Off accepts responses with malformed headers"));
         ui.end_row();
     }
 
@@ -10329,14 +10438,17 @@ fn connection_rows(
                 })
                 .custom_parser(|t| t.trim().trim_end_matches("MB").trim().parse().ok()),
         );
-        ui.weak(t("A larger message received is an error"));
+        grid_hint(ui, t("A larger message received is an error"));
         ui.end_row();
     }
 
     if grpc {
         ui.label(t("Include default values"));
         ui.checkbox(&mut s.include_defaults, "");
-        ui.weak(t("Show the fields proto3 leaves out at 0, \"\" or false"));
+        grid_hint(
+            ui,
+            t("Show the fields proto3 leaves out at 0, \"\" or false"),
+        );
         ui.end_row();
     }
 }
@@ -10855,6 +10967,10 @@ impl StreamSession {
             Some(Outgoing::Text(tx)) => {
                 if let Some((proto, rpc)) = &self.grpc {
                     crate::grpc::check(proto, rpc, &self.compose)?;
+                }
+                // Here, beside the box, rather than lost in the log as the task's own.
+                if self.socketio {
+                    stream::event_args(&self.compose)?;
                 }
                 let frame = match self.encoding {
                     Some(1) => stream::Frame::Binary(model::decode_base64(&self.compose)?),
@@ -13765,6 +13881,114 @@ mod ui_tests {
         assert!(h.state().load.is_none(), "back to the response");
     }
 
+    /// Each kind of request shows the tabs it uses and no others: a WebSocket's Body went
+    /// out on its handshake, gRPC's Params broke the call's path, and streams had Scripts
+    /// that never run. A body from another kind doesn't come along either.
+    #[test]
+    fn each_kind_shows_the_tabs_it_uses_and_drops_what_it_cannot_send() {
+        let mut h = with_request("kind-tabs");
+        let set = |h: &mut Harness<'_, App>, method: &str| {
+            h.state_mut().open.as_mut().unwrap().draft.method = method.into();
+            h.run();
+        };
+        let shows = |h: &Harness<'_, App>, label: &str| h.query_by_label(label).is_some();
+        h.state_mut().req_tab = ReqTab::Scripts;
+        set(&mut h, "WS");
+        assert!(!shows(&h, "Body") && !shows(&h, "Scripts") && !shows(&h, "Asserts"));
+        assert!(
+            h.state().req_tab == ReqTab::Params,
+            "off a tab it doesn't have"
+        );
+        set(&mut h, "MQTT");
+        assert!(shows(&h, "Topics") && !shows(&h, "Scripts") && !shows(&h, "Params"));
+        set(&mut h, "SOCKETIO");
+        assert!(shows(&h, "Auth payload") && !shows(&h, "Vars"));
+        set(&mut h, "GRPC");
+        assert!(shows(&h, "Message") && shows(&h, "Metadata") && shows(&h, "Scripts"));
+        assert!(!shows(&h, "Params"));
+        // Nothing to call yet: Send waits for a method rather than failing on "".
+        assert!(button(&h, "Send").accesskit_node().is_disabled());
+        h.state_mut().open.as_mut().unwrap().draft.rpc = "pkg.Svc/Get".into();
+        h.run();
+        assert!(!button(&h, "Send").accesskit_node().is_disabled());
+        set(&mut h, "GRAPHQL");
+        // The tab, not the editor's own "Query" label below it.
+        let left = |h: &Harness<'_, App>, label: &str| {
+            h.get_all_by_label(label).next().unwrap().rect().left()
+        };
+        assert!(
+            left(&h, "Query") < left(&h, "Params"),
+            "the query comes first"
+        );
+        // Its query as JSON would go out as a handshake body or a gRPC message.
+        set(&mut h, "WS");
+        assert_eq!(draft(&h).body, Body::None);
+
+        // MQTT signs in with Basic only; Digest and NTLM need an HTTP challenge.
+        let offered = |h: &mut Harness<'_, App>, method: &str| {
+            set(h, method);
+            h.state_mut().req_tab = ReqTab::Auth;
+            h.run();
+            let combo = egui_kittest::kittest::By::new().role(Role::ComboBox);
+            h.get(combo.value("Inherit from parent")).click();
+            h.run();
+            let all = ["Basic auth", "Bearer token", "Digest auth", "NTLM"];
+            let got: Vec<_> = all
+                .into_iter()
+                .filter(|l| h.query_by_label(l).is_some())
+                .collect();
+            h.key_press(Key::Escape);
+            h.run();
+            got
+        };
+        assert_eq!(offered(&mut h, "MQTT"), ["Basic auth"]);
+        assert_eq!(offered(&mut h, "WS"), ["Basic auth", "Bearer token"]);
+        assert_eq!(offered(&mut h, "GET").len(), 4);
+    }
+
+    /// MQTT 5 properties can't be set on 3.1.1 (they failed only on Publish), and the tab
+    /// says how to get them. Reset on MQTT keeps the topics.
+    #[test]
+    fn mqtt_properties_wait_for_5_and_reset_keeps_the_topics() {
+        let mut h = with_request("mqtt-props");
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        d.method = "MQTT".into();
+        d.mqtt.topics = vec![model::Topic {
+            filter: "a/#".into(),
+            ..Default::default()
+        }];
+        h.state_mut().req_tab = ReqTab::Properties;
+        h.run();
+        fn field<'h>(h: &'h Harness<'_, App>) -> egui_kittest::Node<'h> {
+            let mut all = h.get_all_by_role(Role::TextInput);
+            all.find(|n| n.accesskit_node().placeholder() == Some("application/json"))
+                .unwrap()
+        }
+        assert!(field(&h).accesskit_node().is_disabled());
+        h.get_by_label("Use MQTT 5.0").click();
+        h.run();
+        assert!(draft(&h).mqtt.v5 && !field(&h).accesskit_node().is_disabled());
+        // As wide as asked: the grid once squeezed it to 40 px.
+        assert!(field(&h).rect().width() >= 240.0, "{:?}", field(&h).rect());
+
+        h.state_mut().req_tab = ReqTab::Settings;
+        h.run();
+        // Hints wrap: the Last will row's QoS and Retain pushed them past the edge.
+        let hint = "Off: the broker keeps subscriptions and queued messages for this client ID";
+        let right = h.get_by_label(hint).rect().right();
+        assert!(right <= 1200.0, "cut off at {right}");
+        // Below the fold of a long tab: by accessibility rather than a pointer.
+        h.get_by_label("Reset to defaults").click_accesskit();
+        h.run();
+        let m = &draft(&h).mqtt;
+        assert!(!m.v5 && m.topics.len() == 1, "{m:?}");
+        assert!(
+            button(&h, "Reset to defaults")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
     /// Each kind of dialog keeps its own size: the shortcut list once opened as short as
     /// the Import box before it, cut mid-row.
     #[test]
@@ -16185,10 +16409,23 @@ mod ui_tests {
             v2: true,
         };
         assert_eq!(draft(&h).socketio, want);
-        assert!(h.query_by_label_contains("no auth payload").is_some());
         shot(&mut h, "68-socketio-settings");
+        // Where the payload is typed, it says v2 sends none.
+        h.get_by_label("Auth payload").click();
+        h.run();
+        assert!(h.query_by_label_contains("no auth payload").is_some());
         h.get_by_label("Connect").click();
         wait_live(&mut h, |app| got(app, r#"welcome {"n":1}"#));
+        // Not an event: refused beside the box, and the connection goes on.
+        h.state_mut().stream.as_mut().unwrap().compose = "[1, 2]".into();
+        h.get_by_label("Send").click();
+        h.run_steps(2);
+        assert!(
+            h.state().status.contains("event name"),
+            "{}",
+            h.state().status
+        );
+        assert!(h.state().stream.as_ref().unwrap().live);
         h.get_by_label("Disconnect").click();
         h.run();
         let (pings, sent) = server.join().unwrap();
