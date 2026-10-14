@@ -754,8 +754,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Manual", "手動"),
     ("Manual proxy", "手動代理伺服器"),
     (
-        "Markdown, for the docs a folder's right-click menu copies (\"Copy docs as Markdown\").",
-        "Markdown，用於資料夾右鍵選單複製的文件（「複製文件為 Markdown」）。",
+        "Markdown. A folder's right-click menu exports these docs as Markdown or OpenAPI.",
+        "Markdown 格式。資料夾的右鍵選單可將這些文件匯出為 Markdown 或 OpenAPI。",
     ),
     ("Match case", "大小寫須相符"),
     ("Max", "最大"),

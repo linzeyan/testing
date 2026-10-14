@@ -85,7 +85,9 @@ closes it.
 **Params, headers and variables**
 
 - A description per param, header and form field; Bulk Edit edits those tables as
-  `key: value` lines.
+  `key: value` lines. Filled tables keep Key / Value / Description titles over their columns.
+- A `{{variable}}` nothing defines is named beside the request's tabs, with "Define in…"
+  to add it to the active environment (or the globals).
 - Path variables: `/users/:id` (or OpenAPI's `/users/{id}`, as copied from Swagger UI) gets
   an `id` row under Params, is coloured in the URL bar, filled in on Send and kept on Postman
   import and export.
@@ -94,7 +96,8 @@ closes it.
   or the globals); the text itself stays as it is, as in Postman. A new variable is secret
   (kept on this machine) unless its Secret box is unticked.
 - Header names and Content-Type values complete while typing. The Headers tab folds out what
-  Send adds (Host, auth, Content-Type…) and where each comes from; "Change the defaults…" opens
+  Send adds (Host, auth, Content-Type…) in the table's columns, credentials masked, and where
+  each comes from; "Change the defaults…" opens
   Settings > Network, where User-Agent, Accept and gzip's Accept-Encoding are set for every
   request that doesn't set its own. An empty User-Agent sends none; an empty Accept still sends
   `*/*`, which the HTTP client always adds.
@@ -112,7 +115,8 @@ closes it.
 - An environment can have a colour (prod in red), shown on its selector and as a strip
   across the top.
 - Folder settings (right-click a folder) hold variables, auth and scripts shared by every
-  request inside, like Postman's collection and folder settings.
+  request inside, like Postman's collection and folder settings. A request's inherited auth
+  names the folder it comes from and opens that folder's Auth tab.
 
 **Network** (Settings > Network; the status bar shows the proxy in use and opens it)
 

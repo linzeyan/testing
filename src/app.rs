@@ -4511,6 +4511,8 @@ impl App {
             .rev()
             .collect();
         let mut folder_clicked: Option<PathBuf> = None;
+        // Opened on its Auth tab: asked for from an inherited auth.
+        let mut folder_auth = false;
         let mut rename = false;
         // Before `streaming`: whether a gRPC method streams comes from its proto.
         let grpc_source = (open.draft.method == "GRPC").then(|| {
@@ -4850,16 +4852,11 @@ impl App {
             // A pre-request script may define them; only warn when nothing could.
             let scripted = !open.draft.pre_request.trim().is_empty()
                 || !open.draft.inherited.pre_request.is_empty();
-            if !missing.is_empty() && !scripted {
-                ui.horizontal(|ui| {
-                    ui.colored_label(ORANGE, tf("Undefined: {}", &[&missing.join(", ")]));
-                    // Without an environment, Globals is where a value works right away.
-                    let target = self.active_env.as_deref().unwrap_or(t("Globals"));
-                    if ui.small_button(tf("Define in {}…", &[&target])).clicked() {
-                        define = Some(missing.clone());
-                    }
-                });
+            if scripted {
+                missing.clear();
             }
+            // Without an environment, Globals is where a value works right away.
+            let target = self.active_env.as_deref().unwrap_or(t("Globals"));
             ui.add_space(2.0);
             // Wraps: a narrow pane cut the last tabs off.
             ui.horizontal_wrapped(|ui| {
@@ -4939,6 +4936,15 @@ impl App {
                     };
                     sub_tab(ui, current, kind, label, set);
                 }
+                // After the tabs: on a row of its own it came and went while `{{…}}` was
+                // typed, moving the editor below under the pointer.
+                if !missing.is_empty() {
+                    ui.add_space(12.0);
+                    ui.colored_label(ORANGE, tf("Undefined: {}", &[&missing.join(", ")]));
+                    if ui.small_button(tf("Define in {}…", &[&target])).clicked() {
+                        define = Some(missing.clone());
+                    }
+                }
             });
             ui.separator();
             egui::ScrollArea::vertical()
@@ -4996,13 +5002,18 @@ impl App {
                             egui::Id::new(("body-stash", &open.path)),
                         );
                     }
-                    ReqTab::Auth => auth_editor(
-                        ui,
-                        &mut open.draft.auth,
-                        &all_vars,
-                        open.draft.inherited.auth.as_ref(),
-                        &open.draft.method,
-                    ),
+                    ReqTab::Auth => {
+                        let d = &mut open.draft;
+                        let inherited = d.inherited.auth.as_ref();
+                        if auth_editor(ui, &mut d.auth, &all_vars, inherited, &d.method)
+                            && let Some((name, _)) = inherited
+                        {
+                            folder_clicked = (open.path.ancestors())
+                                .find(|dir| store::folder_name(&root, dir) == *name)
+                                .map(Path::to_path_buf);
+                            folder_auth = true;
+                        }
+                    }
                     ReqTab::Scripts => {
                         let json_response = match self.response.as_ref().map(|s| &s.result) {
                             Some(Ok(view))
@@ -5315,6 +5326,10 @@ impl App {
         if let Some(dir) = folder_clicked {
             self.reveal = Some(dir.clone());
             self.open_folder_editor(dir);
+            if folder_auth && let Some(ed) = &mut self.folder_editor {
+                // Not the Variables tab's blank row: it isn't drawn on this one.
+                (ed.tab, self.focus_request) = (FolderTab::Auth, None);
+            }
         }
         if rename && let Some(open) = &self.open {
             let path = open.path.clone();
@@ -8637,18 +8652,30 @@ fn auto_headers_ui(ui: &mut egui::Ui, auto: Vec<(String, String, &str)>) -> bool
     let mut change = false;
     egui::CollapsingHeader::new(title)
         .id_salt("auto-headers")
-        .show(ui, |ui| {
-            egui::Grid::new("auto-headers-grid")
-                .num_columns(3)
-                .spacing([16.0, 4.0])
-                .show(ui, |ui| {
-                    for (name, value, from) in auto {
-                        ui.weak(name);
-                        ui.weak(clip(&value, 80)).on_hover_text(value);
-                        ui.weak(tf("from {}", &[&from]));
-                        ui.end_row();
-                    }
+        .show_unindented(ui, |ui| {
+            // In the columns of the table above, as `kv_table` sizes them, greyed: more rows
+            // of it that Send fills in.
+            let key_width = (ui.available_width() * 0.25).clamp(100.0, 200.0);
+            let rest = (ui.available_width() - key_width - 90.0).max(120.0);
+            for (name, value, from) in auto {
+                ui.horizontal(|ui| {
+                    ui.add_visible(false, egui::Checkbox::new(&mut true, ""));
+                    ui.add_enabled_ui(false, |ui| {
+                        let mut name = name.as_str();
+                        ui.add(egui::TextEdit::singleline(&mut name).desired_width(key_width));
+                        // A credential stays hidden as in the Auth tab; "<fetched on Send>"
+                        // and "Digest … (…)" only say what will go there.
+                        let secret = from == "Auth" && !value.contains(['<', '…']);
+                        let mut shown = value.as_str();
+                        let field = egui::TextEdit::singleline(&mut shown).password(secret);
+                        let field = ui.add(field.desired_width(rest * 0.6));
+                        if !secret {
+                            field.on_disabled_hover_text(&value);
+                        }
+                    });
+                    ui.weak(tf("from {}", &[&from]));
                 });
+            }
             change = ui
                 .small_button(t("Change the defaults…"))
                 .on_hover_text(t(
@@ -8760,6 +8787,25 @@ fn kv_table(
     let mut remove = None;
     let mut blank = KeyValue::new("", "");
     let existing = rows.len();
+    // Titles over the columns, as Postman's: the hints that name them are gone once a row
+    // is filled. Each starts where its fields' text does.
+    if existing > 0 {
+        ui.horizontal(|ui| {
+            ui.add_visible(false, egui::Checkbox::new(&mut true, ""));
+            // As wide as the field below, item spacing included; 4 is a TextEdit's margin.
+            let mut title = |text: &str, width: f32| {
+                ui.add_space(4.0);
+                let used = ui.weak(text).rect.width();
+                ui.add_space((width - 4.0 - used).max(0.0));
+            };
+            // Key and Value everywhere: the Vars and Asserts notes explain them by those names.
+            title(t("Key"), key_width);
+            title(t("Value"), value_width);
+            if describe {
+                title(t("Description"), desc_width);
+            }
+        });
+    }
     // Plain rows, not egui::Grid: Grid clamps a cell to last frame's column width, so
     // text fields that start narrow stay narrow forever.
     for (i, row) in rows
@@ -9036,6 +9082,8 @@ fn body_editor(
             });
             let shown = shown.map_or("Text", |(label, _)| *label);
             ui.horizontal(|ui| {
+                // The header's own name: what the combo changes, untranslated as in the table.
+                ui.label("Content-Type");
                 egui::ComboBox::from_id_salt("raw-type")
                     .selected_text(shown)
                     .show_ui(ui, |ui| {
@@ -9905,14 +9953,14 @@ fn fill_rows(ui: &egui::Ui, style: egui::TextStyle) -> usize {
 
 /// `inherited`: what "Inherit from parent" currently resolves to, and from which folder.
 /// `method` narrows the types offered to what that kind of request can send ("" for a
-/// folder: any).
+/// folder: any). True when that folder's settings were asked for.
 fn auth_editor(
     ui: &mut egui::Ui,
     auth: &mut Auth,
     vars: &HashMap<String, String>,
     inherited: Option<&(String, Auth)>,
     method: &str,
-) {
+) -> bool {
     let (user, pass) = (String::new, String::new);
     let kinds = [
         (t("Inherit from parent"), Auth::Inherit),
@@ -10360,13 +10408,25 @@ fn auth_editor(
             });
         }
     }
+    let mut follow = false;
     match auth {
-        Auth::Inherit => {
-            ui.weak(match inherited {
-                Some((folder, a)) => tf("Uses {} from folder \"{}\".", &[&label_of(a), &folder]),
-                None => t("No folder above sets auth, so none is sent.").to_owned(),
-            });
-        }
+        Auth::Inherit => match inherited {
+            Some((folder, a)) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(tf("Uses {} from folder \"{}\".", &[&label_of(a), &folder]));
+                    // From a request only: a folder's editor is a dialog of its own, with
+                    // edits that going to its parent would leave behind.
+                    let settings = match folder.contains('/') {
+                        true => t("Folder settings…"),
+                        false => t("Collection settings…"),
+                    };
+                    follow = !method.is_empty() && ui.link(settings).clicked();
+                });
+            }
+            None => {
+                ui.weak(t("No folder above sets auth, so none is sent."));
+            }
+        },
         Auth::None => {
             ui.weak(t(
                 "Sent without credentials, whatever the folders above set.",
@@ -10439,17 +10499,21 @@ fn auth_editor(
             ));
         }
     }
+    follow
 }
 
 fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
     ui.horizontal_wrapped(|ui| {
         ui.weak(t(
-            "Markdown, for the docs a folder's right-click menu copies (\"Copy docs as Markdown\").",
+            "Markdown. A folder's right-click menu exports these docs as Markdown or OpenAPI.",
         ));
         // Offered, not shown in the box: grey text there read as docs already written.
         let template = t("## What it's for\n\n## When to use it\n\n## What comes back\n");
         if description.is_empty()
-            && ui.button(t("Insert template")).on_hover_text(template).clicked()
+            && ui
+                .button(t("Insert template"))
+                .on_hover_text(template)
+                .clicked()
         {
             description.push_str(template);
         }
@@ -15424,8 +15488,113 @@ mod ui_tests {
         h.get_by_label_contains("added on Send").click();
         h.run();
         shot(&mut h, "52-auto-headers");
-        assert!(h.query_by_label("Bearer t0k").is_some());
         assert!(h.query_by_label("from Auth").is_some());
+        // The token stays masked, as on the Auth tab: the screen may be shared.
+        let values = |h: &Harness<'_, App>| -> Vec<String> {
+            (h.get_all_by_role(Role::TextInput))
+                .filter_map(|n| n.value())
+                .collect()
+        };
+        assert!(
+            !values(&h).iter().any(|v| v.contains("t0k")),
+            "{:?}",
+            values(&h)
+        );
+        let masked = h
+            .get_by_role(Role::PasswordInput)
+            .value()
+            .unwrap_or_default();
+        assert!(!masked.is_empty() && !masked.contains("t0k"));
+        // More rows of the table above: each in its column.
+        let by_value = |h: &Harness<'_, App>, v: &str| {
+            let mut fields = h.get_all_by_role(Role::TextInput);
+            fields
+                .find(|n| n.value().as_deref() == Some(v))
+                .unwrap()
+                .rect()
+                .left()
+        };
+        let by_hint = |h: &Harness<'_, App>, hint: &str| {
+            let mut fields = h.get_all_by_role(Role::TextInput);
+            let field = fields.find(|n| n.accesskit_node().placeholder() == Some(hint));
+            field.unwrap().rect().left()
+        };
+        assert_eq!(by_value(&h, "host"), by_hint(&h, "Key"));
+        assert_eq!(by_value(&h, "api.test"), by_hint(&h, "Value"));
+        // What only says what will go there isn't masked.
+        h.state_mut().open.as_mut().unwrap().draft.auth = Auth::Digest {
+            username: "u".into(),
+            password: "p".into(),
+        };
+        h.run();
+        assert!(
+            values(&h).iter().any(|v| v.starts_with("Digest … (")),
+            "{:?}",
+            values(&h)
+        );
+    }
+
+    /// Filled rows lose their hints; titles over the columns keep saying which is which.
+    #[test]
+    fn a_filled_table_keeps_its_column_titles() {
+        let mut h = with_request("titles");
+        h.state_mut().req_tab = ReqTab::Headers;
+        h.run();
+        assert!(
+            h.query_by_label("Key").is_none(),
+            "an empty table has its hints"
+        );
+        h.state_mut().open.as_mut().unwrap().draft.headers = vec![KeyValue::new("X-A", "1")];
+        h.run();
+        // Each title starts where its column's text does, inside the field's margin.
+        let text_left = |h: &Harness<'_, App>, value: &str| {
+            let field = (h.get_all_by_role(Role::TextInput))
+                .find(|n| n.value().as_deref() == Some(value))
+                .unwrap();
+            field.rect().left() + 4.0
+        };
+        for (title, value) in [("Key", "X-A"), ("Value", "1")] {
+            let title = h.get_by_label(title).rect().left();
+            assert!(
+                (title - text_left(&h, value)).abs() < 1.0,
+                "{title} {value}"
+            );
+        }
+        h.get_by_label("Description");
+    }
+
+    /// An inherited auth names its folder and opens it: where to change it, not just what.
+    #[test]
+    fn inherited_auth_opens_the_folder_that_sets_it() {
+        let ws = workspace("inherit-link");
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let users = ws.create_folder(&api, "users").unwrap();
+        let folder = crate::model::Folder {
+            auth: Auth::Bearer { token: "t".into() },
+            ..Default::default()
+        };
+        ws.save_folder(&api, &folder).unwrap();
+        ws.create_request(&users, "r").unwrap();
+        let mut h = harness(ws);
+        h.run();
+        h.state_mut().activate(users.join("r.toml"), true);
+        h.state_mut().req_tab = ReqTab::Auth;
+        h.run();
+        assert!(h.query_by_label_contains("from folder \"api\"").is_some());
+        // The nearest folder that sets it, a collection, not the request's own folder.
+        h.get_by_label("Collection settings…").click();
+        h.run();
+        let ed = h.state().folder_editor.as_ref().unwrap();
+        assert!(ed.dir == api && ed.tab == FolderTab::Auth);
+        // Not from a folder's own editor, a dialog with edits of its own. (The request
+        // behind it off its Auth tab, so only the dialog says it.)
+        let app = h.state_mut();
+        app.req_tab = ReqTab::Params;
+        app.open_folder_editor(users);
+        (app.folder_editor.as_mut().unwrap().tab, app.focus_request) = (FolderTab::Auth, None);
+        h.run();
+        assert!(h.query_by_label_contains("from folder \"api\"").is_some());
+        assert!(h.query_by_label("Collection settings…").is_none());
     }
 
     /// A body too big for RAM needs a way to disk: Send ▾ asks where (named after the
@@ -16750,6 +16919,8 @@ mod ui_tests {
         h.state_mut().open.as_mut().unwrap().draft.body = Body::Text { text };
         h.state_mut().req_tab = ReqTab::Body;
         h.run();
+        // Named for what it changes.
+        h.get_by_label("Content-Type");
         let content_type = |h: &Harness<'_, App>| {
             let headers = &draft(h).headers;
             let row = headers.iter().find(|r| r.key == "Content-Type");
@@ -17210,8 +17381,12 @@ mod ui_tests {
         type_into(&mut h, 3, "1-based");
         assert_eq!(draft(&h).params[0].description, "1-based");
         assert_eq!(draft(&h).url, "http://x/a?page=2&q=b&debug");
-        // Unticking a row drops it from the URL but keeps it in the table.
-        h.get_all_by_role(Role::CheckBox).next().unwrap().click();
+        // Unticking a row drops it from the URL but keeps it in the table. (The first real
+        // box: the titles row has a hidden one to line up with the rows.)
+        (h.get_all_by_role(Role::CheckBox))
+            .find(|n| !n.accesskit_node().is_disabled())
+            .unwrap()
+            .click();
         h.run();
         shot(&mut h, "10-params-sync");
         assert_eq!(draft(&h).url, "http://x/a?q=b&debug");
@@ -17236,7 +17411,26 @@ mod ui_tests {
     #[test]
     fn undefined_variable_is_defined_from_the_request_in_one_step() {
         let mut h = with_request("define");
+        let tabs = |h: &Harness<'_, App>| h.get_by_label("Params").rect();
+        let before = tabs(&h);
         type_into(&mut h, 0, "{{base}}/x");
+        // Beside the tabs: the editor below stays where it was while `{{…}}` is typed.
+        let warning = h.get_by_label("Undefined: base").rect();
+        assert_eq!(tabs(&h), before);
+        assert!(warning.top() < before.bottom() && warning.bottom() > before.top());
+        // A pre-request script may set it: only warned of when nothing could.
+        let script = "pm.variables.set('base', 'http://x')";
+        h.state_mut().open.as_mut().unwrap().draft.pre_request = script.into();
+        h.run();
+        assert!(h.query_by_label_contains("Undefined").is_none());
+        h.state_mut()
+            .open
+            .as_mut()
+            .unwrap()
+            .draft
+            .pre_request
+            .clear();
+        h.run();
         h.get_by_label("Define in dev…").click();
         h.run();
         shot(&mut h, "20-define");
