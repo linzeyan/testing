@@ -1716,6 +1716,13 @@ const ZH_TW: &[(&str, &str)] = &[
         "收到更大的訊息即視為錯誤",
     ),
     ("Include default values", "包含預設值欄位"),
+    ("Reconnection attempts", "重新連線次數"),
+    ("Never", "不重連"),
+    (
+        "In a row, when the connection ends without Disconnect",
+        "連線不是按「中斷連線」而結束時，連續嘗試的次數",
+    ),
+    ("Reconnection interval", "重新連線間隔"),
     (
         "Show the fields proto3 leaves out at 0, \"\" or false",
         "顯示 proto3 因值為 0、\"\" 或 false 而省略的欄位",

@@ -10194,6 +10194,36 @@ fn connection_rows(
     ui.weak(hint);
     ui.end_row();
 
+    // A connection that stays open, which a request/response or a gRPC call doesn't.
+    if ws || sse || mqtt {
+        ui.label(t("Reconnection attempts"));
+        ui.add(
+            egui::DragValue::new(&mut s.reconnect_attempts)
+                .range(0..=100)
+                .custom_formatter(|v, _| match v {
+                    0.0 => t("Never").to_owned(),
+                    v => v.to_string(),
+                }),
+        );
+        ui.weak(t("In a row, when the connection ends without Disconnect"));
+        ui.end_row();
+
+        ui.label(t("Reconnection interval"));
+        let default = tf("Default ({} s)", &[&(model::RECONNECT_EVERY_MS / 1000)]);
+        ui.add_enabled(
+            s.reconnect_attempts > 0,
+            egui::DragValue::new(&mut s.reconnect_interval_ms)
+                .range(0..=600_000)
+                .speed(100)
+                .custom_formatter(move |v, _| match v {
+                    0.0 => default.clone(),
+                    v => format!("{v} ms"),
+                })
+                .custom_parser(|t| t.trim().trim_end_matches("ms").trim().parse().ok()),
+        );
+        ui.end_row();
+    }
+
     // MQTT's TLS is the network settings' as they are.
     if !mqtt {
         // Rarely needed, so below the ones that are.
@@ -15974,7 +16004,7 @@ mod ui_tests {
     #[test]
     fn every_kind_of_request_has_the_settings_its_client_uses() {
         let mut h = with_request("kinds");
-        const ROWS: [&str; 14] = [
+        const ROWS: [&str; 15] = [
             "HTTP version",
             "Follow original HTTP method",
             "Verify TLS certificate",
@@ -15984,6 +16014,7 @@ mod ui_tests {
             "Connect timeout",
             "Response timeout",
             "Deadline",
+            "Reconnection attempts",
             "Disabled TLS versions",
             "Maximum message size",
             "Include default values",
@@ -16009,6 +16040,7 @@ mod ui_tests {
                     "Verify TLS certificate",
                     "Cookie jar",
                     "Response timeout",
+                    "Reconnection attempts",
                     "Disabled TLS versions",
                 ],
             ),
@@ -16018,6 +16050,7 @@ mod ui_tests {
                     "Verify TLS certificate",
                     "Cookie jar",
                     "Handshake timeout",
+                    "Reconnection attempts",
                     "Disabled TLS versions",
                     "Maximum message size",
                 ],
@@ -16028,6 +16061,7 @@ mod ui_tests {
                     "Verify TLS certificate",
                     "Cookie jar",
                     "Handshake timeout",
+                    "Reconnection attempts",
                     "Disabled TLS versions",
                     "Maximum message size",
                     "Handshake path",
@@ -16048,6 +16082,7 @@ mod ui_tests {
                 vec![
                     "Verify TLS certificate",
                     "Connect timeout",
+                    "Reconnection attempts",
                     "Maximum message size",
                     "Client ID",
                 ],

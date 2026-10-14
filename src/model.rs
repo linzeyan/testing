@@ -118,6 +118,13 @@ pub struct Settings {
     /// gRPC: replies show the fields proto3 leaves out at their defaults (0, "", false).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub include_defaults: bool,
+    /// WebSocket, Socket.IO, SSE, MQTT: how many times in a row a connection that ends
+    /// without Disconnect is opened again; 0 never.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reconnect_attempts: u32,
+    /// The wait before each of those; 0 is 5 s (see `reconnect_every`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reconnect_interval_ms: u32,
 }
 
 impl Default for Settings {
@@ -138,9 +145,14 @@ impl Default for Settings {
             insecure_parser: false,
             max_message_mb: 0,
             include_defaults: false,
+            reconnect_attempts: 0,
+            reconnect_interval_ms: 0,
         }
     }
 }
+
+/// The wait between reconnection attempts unless a request sets its own.
+pub const RECONNECT_EVERY_MS: u64 = 5000;
 
 impl Settings {
     pub fn is_default(&self) -> bool {
@@ -153,6 +165,13 @@ impl Settings {
             0 => default,
             mb => (mb as usize) << 20,
         }
+    }
+
+    pub fn reconnect_every(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(match self.reconnect_interval_ms {
+            0 => RECONNECT_EVERY_MS,
+            ms => ms.into(),
+        })
     }
 
     /// reqwest's redirect policy turns a POST into a GET on 301/302 and drops

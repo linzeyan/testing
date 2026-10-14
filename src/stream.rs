@@ -8,7 +8,7 @@ use reqwest_websocket::{CloseCode, Message, Upgrade};
 use tokio::sync::mpsc;
 
 use crate::http::{self, error_chain};
-use crate::model::{Body, Request};
+use crate::model::{Body, KeyValue, Request};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
@@ -61,7 +61,8 @@ pub fn subscribes(req: &Request) -> bool {
 
 /// Connects a resolved stream request of any kind and runs it until either side ends it.
 /// `text` carries what is sent on WebSocket, Socket.IO and gRPC streams, `mqtt` an MQTT
-/// session's publishes; dropping a sender disconnects gracefully.
+/// session's publishes; dropping a sender disconnects gracefully. A connection that ends
+/// otherwise opens again as many times in a row as the request's settings say.
 pub async fn connect(
     clients: &crate::net::Clients,
     net: crate::net::Network,
@@ -97,19 +98,82 @@ pub async fn connect(
                 true => clients.websocket_for(&req.settings, &req.url),
                 false => clients.for_settings(&req.settings, &req.url),
             };
-            match http {
-                Ok(http) if ws => websocket(http, req, text, emit).await,
-                Ok(http) if sio => socketio(http, req, text, emit).await,
-                Ok(http) if upgrades => graphql(http, req, emit).await,
-                Ok(http) => sse(http, req, emit).await,
-                Err(e) => emit(Event::Error(crate::i18n::tf("Network settings: {}", &[&e]))),
+            let http = match http {
+                Ok(http) => http,
+                Err(e) => {
+                    return emit(Event::Error(crate::i18n::tf("Network settings: {}", &[&e])));
+                }
+            };
+            let (tries, every) = (
+                req.settings.reconnect_attempts,
+                req.settings.reconnect_every(),
+            );
+            let (mut text, mut tried, mut last_id) = (text, 0, String::new());
+            loop {
+                // How it ended waits until it's known whether the connection opens again:
+                // the window takes Closed and Error as the end of the session.
+                let end = std::sync::Mutex::new(None);
+                let opened = std::sync::atomic::AtomicBool::new(false);
+                let relay = |e: Event| match e {
+                    Event::Closed(_) | Event::Error(_) => *end.lock().unwrap() = Some(e),
+                    e => {
+                        if matches!(e, Event::Open(_)) {
+                            opened.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        emit(e)
+                    }
+                };
+                let (http, mut req) = (http.clone(), req.clone());
+                if ws {
+                    websocket(http, req, &mut text, relay).await
+                } else if sio {
+                    socketio(http, req, &mut text, relay).await
+                } else if upgrades {
+                    graphql(http, req, relay).await
+                } else {
+                    // Picks up where the stream left off, as EventSource does.
+                    if !last_id.is_empty() {
+                        req.headers.push(KeyValue::new("Last-Event-ID", &last_id));
+                    }
+                    sse(http, req, &mut last_id, relay).await
+                }
+                let end = end.into_inner().unwrap();
+                let end = end.unwrap_or(Event::Closed("connection closed".into()));
+                // Counted in a row: a connection that opened starts the count over.
+                if opened.into_inner() {
+                    tried = 0;
+                }
+                // Disconnect lets go of the sender; SSE's ends the task instead.
+                let asked = (ws || sio) && text.is_closed();
+                if asked || tried >= tries {
+                    return emit(end);
+                }
+                tried += 1;
+                let why = match &end {
+                    Event::Closed(why) | Event::Error(why) => why.as_str(),
+                    _ => "",
+                };
+                emit(Event::Info(reconnecting(why, tried, tries, every)));
+                tokio::time::sleep(every).await;
             }
         }
     }
 }
 
-/// Reads an event stream until the server ends it; `emit` receives every event.
-pub async fn sse(client: reqwest::Client, mut req: Request, emit: impl Fn(Event)) {
+/// What the log says between a connection that ended and the next attempt.
+pub fn reconnecting(why: &str, tried: u32, tries: u32, every: std::time::Duration) -> String {
+    let secs = every.as_secs_f32();
+    format!("{why}; reconnecting in {secs} s ({tried} of {tries})")
+}
+
+/// Reads an event stream until the server ends it; `emit` receives every event, and
+/// `last_id` the last event ID the server set.
+pub async fn sse(
+    client: reqwest::Client,
+    mut req: Request,
+    last_id: &mut String,
+    emit: impl Fn(Event),
+) {
     if let Err(e) = http::with_token(&client, &mut req, false).await {
         return emit(Event::Error(e));
     }
@@ -155,10 +219,12 @@ pub async fn sse(client: reqwest::Client, mut req: Request, emit: impl Fn(Event)
     let mut body = resp.bytes_stream();
     while let Some(chunk) = body.next().await {
         match chunk {
-            Ok(bytes) => parser
-                .feed(&bytes)
-                .into_iter()
-                .for_each(|e| emit(Event::In(e))),
+            Ok(bytes) => {
+                (parser.feed(&bytes).into_iter()).for_each(|e| emit(Event::In(e)));
+                if !parser.id.is_empty() {
+                    *last_id = std::mem::take(&mut parser.id);
+                }
+            }
             Err(e) => return emit(Event::Error(error_chain(&e))),
         }
     }
@@ -170,7 +236,7 @@ pub async fn sse(client: reqwest::Client, mut req: Request, emit: impl Fn(Event)
 pub async fn websocket(
     client: reqwest::Client,
     mut req: Request,
-    mut outgoing: mpsc::UnboundedReceiver<Frame>,
+    outgoing: &mut mpsc::UnboundedReceiver<Frame>,
     emit: impl Fn(Event),
 ) {
     if let Err(e) = http::with_token(&client, &mut req, false).await {
@@ -353,7 +419,7 @@ pub async fn graphql(client: reqwest::Client, req: Request, emit: impl Fn(Event)
 pub async fn socketio(
     client: reqwest::Client,
     req: Request,
-    mut outgoing: mpsc::UnboundedReceiver<Frame>,
+    outgoing: &mut mpsc::UnboundedReceiver<Frame>,
     emit: impl Fn(Event),
 ) {
     let mut url = match reqwest::Url::parse(&http::wire_url(&req.url)) {
@@ -563,6 +629,8 @@ struct SseParser {
     event: String,
     data: Vec<String>,
     data_len: usize,
+    /// The last `id:` since it was taken: what a reconnection sends as Last-Event-ID.
+    id: String,
 }
 
 /// A line, or one event's data, past this keeps its start: a server that never sends a
@@ -610,7 +678,9 @@ impl SseParser {
                     self.data.push(value.to_owned());
                 }
                 "event" => self.event = value.to_owned(),
-                _ => {} // id / retry don't change what we display
+                // The spec ignores an ID with a NUL in it.
+                "id" if !value.contains('\0') => self.id = value.to_owned(),
+                _ => {} // retry: the request's settings say when to reconnect
             }
         }
         if self.buf.len() > MAX_SSE {
@@ -682,7 +752,9 @@ pub mod tests {
             ..Default::default()
         };
         let events = std::sync::Mutex::new(Vec::new());
-        rt.block_on(sse(client, req, |e| events.lock().unwrap().push(e)));
+        rt.block_on(sse(client, req, &mut String::new(), |e| {
+            events.lock().unwrap().push(e)
+        }));
         let events = events.into_inner().unwrap();
         assert!(
             matches!(&events[0], Event::Open(s) if s.contains("text/event-stream")),
@@ -745,10 +817,10 @@ pub mod tests {
             ..Default::default()
         };
         // Queued and hung up before connecting, as MCP's stream_request does.
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(Frame::Text("bye".into())).unwrap();
         drop(tx);
-        rt.block_on(websocket(client, req, rx, |_| {}));
+        rt.block_on(websocket(client, req, &mut rx, |_| {}));
         drop(rt);
         let (got, clean) = server.join().unwrap();
         assert_eq!(got, ["bye", "close"]);
@@ -790,11 +862,11 @@ pub mod tests {
             url: format!("ws://{addr}/socket"),
             ..Default::default()
         };
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let events = std::sync::Mutex::new(Vec::new());
         let tx = std::sync::Mutex::new(Some(tx));
         let send = |f: Frame| tx.lock().unwrap().as_ref().unwrap().send(f).unwrap();
-        rt.block_on(websocket(client, req, rx, |e| {
+        rt.block_on(websocket(client, req, &mut rx, |e| {
             // Reply once the server's echo arrives, then hang up by dropping the sender.
             match &e {
                 Event::In(t) if t == "hello" => send(Frame::Text("ping".into())),
@@ -865,10 +937,10 @@ pub mod tests {
             ..Default::default()
         };
         let first_event = |client: reqwest::Client| {
-            let (tx, rx) = mpsc::unbounded_channel::<Frame>();
+            let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
             let tx = std::sync::Mutex::new(Some(tx));
             let events = std::sync::Mutex::new(Vec::new());
-            rt.block_on(websocket(client, req.clone(), rx, |e| {
+            rt.block_on(websocket(client, req.clone(), &mut rx, |e| {
                 drop(tx.lock().unwrap().take()); // hang up after the first event
                 events.lock().unwrap().push(e);
             }));
@@ -880,6 +952,117 @@ pub mod tests {
         assert!(matches!(&plain, Event::Error(_)), "{plain:?}");
         let ws = clients.websocket_for(&req.settings, &req.url).unwrap();
         assert_eq!(first_event(ws), Event::Open("connected".into()));
+    }
+
+    /// A connection the server drops opens again as the settings say, while the window
+    /// sees no end until nothing more is tried; Disconnect ends it for good. SSE picks up
+    /// after the last event ID it was given, as EventSource does.
+    #[test]
+    fn a_dropped_stream_reconnects_and_sse_resumes_where_it_left_off() {
+        use std::io::{Read, Write};
+        // The first connection says "one" and drops without a Close; the second, "two".
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (n, s) in listener.incoming().take(2).enumerate() {
+                let mut ws = tungstenite::accept(s.unwrap()).unwrap();
+                ws.send(tungstenite::Message::text(["one", "two"][n]))
+                    .unwrap();
+                while n == 1 && ws.read().is_ok() {}
+            }
+        });
+        // Each connection one event, then the stream ends; returns the Last-Event-ID lines.
+        let sse_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let sse_addr = sse_listener.local_addr().unwrap();
+        let resumed = std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            for (n, s) in sse_listener.incoming().take(2).enumerate() {
+                let mut s = s.unwrap();
+                let mut buf = [0; 4096];
+                let n_read = s.read(&mut buf).unwrap();
+                let head = String::from_utf8_lossy(&buf[..n_read]).to_lowercase();
+                asked.push(
+                    head.lines()
+                        .find(|l| l.starts_with("last-event-id"))
+                        .map(str::to_owned),
+                );
+                let event: &[u8] = [&b"id: 7\ndata: a\n\n"[..], b"data: b\n\n"][n];
+                let ok = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+                s.write_all(&[&ok[..], event].concat()).unwrap();
+            }
+            asked
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        let clients = rt.block_on(crate::net::build_client(net.clone())).unwrap();
+        let settings = crate::model::Settings {
+            reconnect_attempts: 1,
+            reconnect_interval_ms: 100,
+            ..Default::default()
+        };
+        // Hangs up on "two".
+        let events = |req: Request| {
+            let (tx, rx) = mpsc::unbounded_channel::<Frame>();
+            let (_mqtt, mqtt_rx) = mpsc::unbounded_channel();
+            let tx = std::sync::Mutex::new(Some(tx));
+            let events = std::sync::Mutex::new(Vec::new());
+            rt.block_on(connect(&clients, net.clone(), req, rx, mqtt_rx, |e| {
+                if matches!(&e, Event::In(t) if t == "two") {
+                    drop(tx.lock().unwrap().take());
+                }
+                events.lock().unwrap().push(e);
+            }));
+            events.into_inner().unwrap()
+        };
+        let again = |t: &str| t.ends_with("; reconnecting in 0.1 s (1 of 1)");
+
+        let ws = Request {
+            method: "WS".into(),
+            url: format!("ws://{addr}/"),
+            settings: settings.clone(),
+            ..Default::default()
+        };
+        let got = events(ws);
+        assert!(
+            matches!(&got[..], [
+                Event::Open(_),
+                Event::In(one),
+                Event::Info(info),
+                Event::Open(_),
+                Event::In(two),
+                Event::Closed(end),
+            ] if one == "one" && again(info) && two == "two" && end == "disconnected"),
+            "{got:?}"
+        );
+
+        let sse = Request {
+            method: "SSE".into(),
+            url: format!("http://{sse_addr}/"),
+            settings,
+            ..Default::default()
+        };
+        // The server is gone by the third try, which ends it.
+        let got = events(sse);
+        assert!(
+            matches!(&got[..], [
+                Event::Open(_),
+                Event::In(a),
+                Event::Info(first),
+                Event::Open(_),
+                Event::In(b),
+                Event::Info(second),
+                Event::Error(_),
+            ] if a == "a" && b == "b" && again(first) && again(second)),
+            "{got:?}"
+        );
+        let asked = resumed.join().unwrap();
+        assert_eq!(asked, [None, Some("last-event-id: 7".to_owned())]);
     }
 
     /// A stream connects the way its Settings tab says: they used to stop at plain HTTP,
@@ -1165,10 +1348,10 @@ pub mod tests {
             },
             ..Default::default()
         };
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let tx = std::sync::Mutex::new(Some(tx));
         let events = std::sync::Mutex::new(Vec::new());
-        rt.block_on(socketio(client, req, rx, |e| {
+        rt.block_on(socketio(client, req, &mut rx, |e| {
             match &e {
                 Event::In(t) if t.starts_with("welcome") => {
                     let tx = tx.lock().unwrap();
@@ -1240,12 +1423,12 @@ pub mod tests {
             url: format!("http://{addr}/chat"),
             ..Default::default()
         };
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(Frame::Text("first".into())).unwrap();
         tx.send(Frame::Text("second 2".into())).unwrap();
         let tx = std::sync::Mutex::new(Some(tx));
         let events = std::sync::Mutex::new(Vec::new());
-        rt.block_on(socketio(client, req, rx, |e| {
+        rt.block_on(socketio(client, req, &mut rx, |e| {
             if matches!(&e, Event::Out(a) if a.contains("second")) {
                 drop(tx.lock().unwrap().take());
             }
@@ -1340,10 +1523,10 @@ pub mod tests {
                 },
                 ..Default::default()
             };
-            let (tx, rx) = mpsc::unbounded_channel::<Frame>();
+            let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
             let tx = std::sync::Mutex::new(Some(tx));
             let events = std::sync::Mutex::new(Vec::new());
-            rt.block_on(socketio(client.clone(), req, rx, |e| {
+            rt.block_on(socketio(client.clone(), req, &mut rx, |e| {
                 drop(tx.lock().unwrap().take()); // hang up once connected
                 events.lock().unwrap().push(e);
             }));
@@ -1469,10 +1652,10 @@ pub mod tests {
                 },
                 ..Default::default()
             };
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::unbounded_channel();
             let tx = std::sync::Mutex::new(Some(tx));
             let events = std::sync::Mutex::new(Vec::new());
-            rt.block_on(socketio(client, req, rx, |e| {
+            rt.block_on(socketio(client, req, &mut rx, |e| {
                 match &e {
                     Event::In(t) if t.starts_with("welcome") => {
                         let tx = tx.lock().unwrap();

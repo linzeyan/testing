@@ -84,27 +84,52 @@ pub async fn session(
     if let Err(e) = update(&client, &acks, &mut have, want).await {
         return emit(Event::Error(e));
     }
+    // Disconnect was asked for: the goodbye ends the session, whatever the settings say.
+    let asked = std::sync::atomic::AtomicBool::new(false);
+    // A broker that forgot this client (clean session) forgot its subscriptions too.
+    let resubscribe = tokio::sync::Notify::new();
     let send = async {
-        while let Some(command) = commands.recv().await {
-            let sent = match command {
-                Command::Publish(p) => {
-                    let shown = shown(&p.topic, Some(&p.v5()), p.payload.as_bytes());
-                    client.publish(p).await.map(|()| emit(Event::Out(shown)))
+        loop {
+            let sent = tokio::select! {
+                command = commands.recv() => match command {
+                    Some(Command::Publish(p)) => {
+                        let shown = shown(&p.topic, Some(&p.v5()), p.payload.as_bytes());
+                        client.publish(p).await.map(|()| emit(Event::Out(shown)))
+                    }
+                    Some(Command::Topics(want)) => update(&client, &acks, &mut have, want).await,
+                    None => break,
+                },
+                () = resubscribe.notified() => {
+                    let want = std::mem::take(&mut have);
+                    update(&client, &acks, &mut have, want).await
                 }
-                Command::Topics(want) => update(&client, &acks, &mut have, want).await,
             };
             if let Err(e) = sent {
                 return emit(Event::Error(e));
             }
         }
+        asked.store(true, std::sync::atomic::Ordering::Relaxed);
         // The receiving side reports the goodbye once it has gone out.
         client.disconnect().await;
         std::future::pending().await
     };
+    let (tries, every) = (
+        req.settings.reconnect_attempts,
+        req.settings.reconnect_every(),
+    );
+    let gives_up = |tried| asked.load(std::sync::atomic::Ordering::Relaxed) || tried >= tries;
     let receive = async {
+        // In a row: a connection that opens starts the count over.
+        let (mut tried, mut reconnected) = (0, false);
         loop {
             match events.poll().await {
-                Ok(Got::Connected) => emit(Event::Open("connected".into())),
+                Ok(Got::Connected) => {
+                    if std::mem::take(&mut reconnected) {
+                        resubscribe.notify_one();
+                    }
+                    tried = 0;
+                    emit(Event::Open("connected".into()))
+                }
                 Ok(Got::Message(text)) => emit(Event::In(text)),
                 Ok(Got::SubAck(codes)) => {
                     let names = acks.subs.lock().unwrap().pop_front().unwrap_or_default();
@@ -115,11 +140,19 @@ pub async fn session(
                         emit(Event::Info(format!("unsubscribed: {name}")))
                     }
                 }
-                Ok(Got::Gone(why)) => return emit(Event::Closed(why)),
+                Ok(Got::Gone(why)) if gives_up(tried) => return emit(Event::Closed(why)),
                 Ok(Got::Other) => {}
                 // Polling again would reconnect; someone testing a broker wants to see why
-                // it failed instead.
-                Err(e) => return emit(Event::Error(e)),
+                // it failed instead, unless the request says to reconnect.
+                Err(e) if gives_up(tried) => return emit(Event::Error(e)),
+                Ok(Got::Gone(why)) | Err(why) => {
+                    tried += 1;
+                    emit(Event::Info(crate::stream::reconnecting(
+                        &why, tried, tries, every,
+                    )));
+                    tokio::time::sleep(every).await;
+                    reconnected = true;
+                }
             }
         }
     };
@@ -1285,6 +1318,112 @@ pub mod tests {
             target("WSS://b.test/mqtt").unwrap(),
             (Wire::Wss, "wss://b.test/mqtt".into(), 443)
         );
+    }
+
+    /// A broker that drops the connection is reconnected to as the settings say, the count
+    /// starting over once one opens, and the topics subscribed to again: with a clean
+    /// session it forgot them, and messages for them would never come.
+    #[test]
+    fn a_dropped_connection_reconnects_and_subscribes_again() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let broker = std::thread::spawn(move || {
+            let mut subscribed = Vec::new();
+            for (n, s) in listener.incoming().take(3).enumerate() {
+                let mut s = s.unwrap();
+                // A client that never subscribes again fails the test instead of hanging it.
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buf = BytesMut::new();
+                let mut next = |s: &mut TcpStream| loop {
+                    match Packet::read(&mut buf, MAX_PACKET) {
+                        Ok(p) => return p,
+                        Err(rumqttc::Error::InsufficientBytes(_)) => s.fill(&mut buf),
+                        Err(e) => panic!("{e:?}"),
+                    }
+                };
+                let send = |s: &mut TcpStream, p: Packet| {
+                    let mut out = BytesMut::new();
+                    p.write(&mut out, MAX_PACKET).unwrap();
+                    s.put(&out);
+                };
+                let Packet::Connect(_) = next(&mut s) else {
+                    panic!("CONNECT first");
+                };
+                let ok = ConnAck::new(ConnectReturnCode::Success, false);
+                send(&mut s, Packet::ConnAck(ok));
+                let Packet::Subscribe(sub) = next(&mut s) else {
+                    panic!("SUBSCRIBE next");
+                };
+                subscribed.push(
+                    (sub.filters.iter())
+                        .map(|f| f.path.clone())
+                        .collect::<Vec<_>>(),
+                );
+                let codes = (sub.filters.iter()).map(|f| SubscribeReasonCode::Success(f.qos));
+                send(
+                    &mut s,
+                    Packet::SubAck(SubAck::new(sub.pkid, codes.collect())),
+                );
+                // The first two drop without a goodbye, once the SUBACK is read: dropped
+                // with it, rumqttc reports the drop first.
+                if n < 2 {
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                let hello = rumqttc::Publish::new("a/1", QoS::AtMostOnce, "hello");
+                send(&mut s, Packet::Publish(hello));
+                loop {
+                    match next(&mut s) {
+                        Packet::Disconnect => break,
+                        // Subscribing twice would show here.
+                        Packet::Subscribe(sub) => {
+                            subscribed.push(vec![sub.filters[0].path.clone()])
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            subscribed
+        });
+        let mut req = request(format!("mqtt://127.0.0.1:{port}"), false);
+        req.mqtt.topics.truncate(1);
+        (
+            req.settings.reconnect_attempts,
+            req.settings.reconnect_interval_ms,
+        ) = (1, 100);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let events = std::sync::Mutex::new(Vec::new());
+        rt.block_on(session(req, Network::default(), Route::Direct, rx, |e| {
+            if matches!(e, Event::In(_)) {
+                drop(tx.lock().unwrap().take());
+            }
+            events.lock().unwrap().push(e);
+        }));
+        let events = events.into_inner().unwrap();
+        let subscribed = |e: &Event| *e == Event::Info("subscribed: a/# (QoS 1)".into());
+        assert!(
+            matches!(&events[..], [
+                Event::Open(_),
+                s1,
+                Event::Info(again1),
+                Event::Open(_),
+                s2,
+                Event::Info(again2),
+                Event::Open(_),
+                s3,
+                Event::In(hello),
+                Event::Closed(end),
+            ] if [s1, s2, s3].into_iter().all(subscribed)
+                && [again1, again2].iter().all(|t| t.ends_with("reconnecting in 0.1 s (1 of 1)"))
+                && hello == "[a/1] hello" && end == "disconnected"),
+            "{events:?}"
+        );
+        assert_eq!(broker.join().unwrap(), [["a/#"], ["a/#"], ["a/#"]]);
     }
 
     /// Connecting waits as long as an HTTP request would unless the request says; the

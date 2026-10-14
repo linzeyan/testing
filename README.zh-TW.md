@@ -115,7 +115,9 @@ MQTT：
 - 每種請求都有「設定」分頁，只列出該用戶端用得到的項目：適用時的憑證驗證、Cookie、TLS 版本
   與加密套件；WebSocket 與 Socket.IO 的交握逾時；SSE 等待串流開始的時間；gRPC 的期限（也以
   `grpc-timeout` 告知伺服器）與在回應中列出預設值欄位；MQTT 的連線逾時；以及 WebSocket、
-  Socket.IO、gRPC、MQTT 可接收的訊息大小上限。
+  Socket.IO、gRPC、MQTT 可接收的訊息大小上限。WebSocket、Socket.IO、SSE、MQTT 的連線若不是按
+  「中斷連線」而結束，可依設定的次數與間隔連續重新連線：SSE 會以 `Last-Event-ID` 送出最後的事件
+  ID，MQTT 會重新訂閱主題。
 
 ## 驗證
 

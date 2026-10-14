@@ -133,7 +133,9 @@ beside it puts a kept one back in the box. Clicking a message shows its payload 
   Socket.IO handshake timeout; how long SSE waits for the stream to start; gRPC's deadline
   (also sent as `grpc-timeout`) and replies that list the fields at their default values;
   MQTT's connect timeout; and the largest message a WebSocket, Socket.IO, gRPC or MQTT
-  connection takes in.
+  connection takes in. A WebSocket, Socket.IO, SSE or MQTT connection that ends without
+  Disconnect can open again, up to a set number of times in a row at a set interval: SSE
+  sends the last event ID as `Last-Event-ID`, and MQTT subscribes to its topics again.
 
 ## Authentication
 
