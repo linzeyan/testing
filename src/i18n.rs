@@ -358,6 +358,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Copy as Postman environment", "複製為 Postman 環境"),
     ("Copy body", "複製內容"),
     ("Copy docs as Markdown", "複製文件為 Markdown"),
+    ("Export docs as Markdown…", "匯出文件為 Markdown…"),
+    ("Export as OpenAPI…", "匯出為 OpenAPI…"),
     ("Copy the timeline", "複製時間軸"),
     (
         "Created: the request succeeded and a new resource was created.",
@@ -1069,6 +1071,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Saved as \"{}\"", "已另存為「{}」"),
     ("Saved example \"{}\"", "已儲存範例「{}」"),
     ("Saved {}", "已儲存 {}"),
+    (
+        "Saved {}; left out {} it can't describe: streams, gRPC, or a second request to the same method and path",
+        "已儲存 {}；略過 {} 個無法描述的請求：串流、gRPC，或同一方法與路徑的第二個請求",
+    ),
     (
         "Saved {} (cut at 16 MiB) to {}",
         "已將 {}（截斷於 16 MiB）儲存到 {}",

@@ -302,8 +302,14 @@ last carries over between kinds.
 | MQTT | mosquitto, paho-mqtt, mqtt.js, paho Go |
 | gRPC | grpcurl, grpc-js, grpcio, by the method's streaming shape |
 
-Markdown API docs come from request and folder descriptions and saved examples:
-right-click a folder > "Copy docs as Markdown", or `apitool-cli docs`.
+API docs come from request and folder descriptions and saved examples: right-click a
+folder (or More above the collections) > "Copy docs as Markdown", "Export docs as
+Markdown…" or "Export as OpenAPI…", or `apitool-cli docs`. The OpenAPI 3.1 document (YAML,
+or JSON for a .json file) imports back as the same requests: the server from `{{baseUrl}}`
+with the folder's value, `:id` and `{{var}}` path segments as path parameters, query
+parameters that are off as optional, a tag per subfolder, bodies and saved examples with a
+schema read off them, and auth as its security scheme, never a credential. Streams, gRPC
+and a second request to a method and path already taken are left out, and counted.
 
 ## Runner, load test and mock server
 
@@ -324,7 +330,8 @@ right-click a folder > "Copy docs as Markdown", or `apitool-cli docs`.
 
 ```
 apitool-cli <folder|request> [options]   run requests and their tests
-apitool-cli docs [folder] [-o api.md]     Markdown API docs (default: stdout)
+apitool-cli docs [folder] [-o api.md]     Markdown API docs (default: stdout);
+                                          -o api.yaml or api.json writes OpenAPI 3.1
 apitool-cli mock [folder] [--port 3000]   mock server on localhost
 apitool-cli mcp [--window]                MCP server over stdio
 ```

@@ -274,8 +274,13 @@ Java、C#、PHP、Ruby、Rust、Swift 或 Kotlin。二進位內容會讀入對�
 | MQTT | mosquitto、paho-mqtt、mqtt.js、paho Go |
 | gRPC | grpcurl、grpc-js、grpcio，依方法的串流形式產生 |
 
-Markdown API 文件由請求與資料夾的說明及已儲存的範例產生：在資料夾上按右鍵 >「複製文件為
-Markdown」，或執行 `apitool-cli docs`。
+API 文件由請求與資料夾的說明及已儲存的範例產生：在資料夾上按右鍵（或集合上方的「更多」）>
+「複製文件為 Markdown」、「匯出文件為 Markdown…」或「匯出為 OpenAPI…」，或執行
+`apitool-cli docs`。OpenAPI 3.1 文件（YAML；檔名為 .json 時輸出 JSON）匯入後會還原成同樣的
+請求：server 取自 `{{baseUrl}}` 與資料夾裡的值，`:id` 與 `{{變數}}` 路徑段落成為 path 參數，
+停用的 query 參數標為選填，每個子資料夾一個 tag，內容與已儲存的範例附上依內容推得的 schema，
+驗證只寫成 security scheme，不含任何憑證。串流、gRPC，以及同一方法與路徑的第二個請求會略過並
+計數。
 
 ## 執行器、負載測試與模擬伺服器
 
@@ -294,7 +299,8 @@ Markdown」，或執行 `apitool-cli docs`。
 
 ```
 apitool-cli <folder|request> [options]   執行請求與其測試
-apitool-cli docs [folder] [-o api.md]     產生 Markdown API 文件（預設輸出到 stdout）
+apitool-cli docs [folder] [-o api.md]     產生 Markdown API 文件（預設輸出到 stdout）；
+                                          -o api.yaml 或 api.json 則輸出 OpenAPI 3.1
 apitool-cli mock [folder] [--port 3000]   在 localhost 啟動模擬伺服器
 apitool-cli mcp [--window]                以 stdio 提供 MCP 伺服器
 ```

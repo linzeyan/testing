@@ -781,6 +781,8 @@ enum TreeAction {
     Run(PathBuf),
     FolderSettings(PathBuf),
     CopyDocs(PathBuf),
+    /// To a file: OpenAPI when true, else Markdown.
+    ExportDocs(PathBuf, bool),
     CopyPostman(PathBuf),
     Mock(PathBuf),
     /// A folder clicked: where the tree is now.
@@ -3717,6 +3719,15 @@ impl App {
                     self.copy_docs(&root, ui.ctx());
                     ui.close();
                 }
+                for (label, openapi) in [
+                    (t("Export docs as Markdown…"), false),
+                    (t("Export as OpenAPI…"), true),
+                ] {
+                    if ui.button(label).clicked() {
+                        ui.close();
+                        self.export_dialog(&root, openapi);
+                    }
+                }
                 if ui.button(t("Copy as Postman collection")).clicked() {
                     self.copy_postman(&root, ui.ctx());
                     ui.close();
@@ -3901,6 +3912,7 @@ impl App {
                 TreeAction::Run(path) => self.open_runner(path),
                 TreeAction::FolderSettings(dir) => self.open_folder_editor(dir),
                 TreeAction::CopyDocs(dir) => self.copy_docs(&dir, ui.ctx()),
+                TreeAction::ExportDocs(dir, openapi) => self.export_dialog(&dir, openapi),
                 TreeAction::CopyPostman(dir) => self.copy_postman(&dir, ui.ctx()),
                 TreeAction::Mock(dir) => self.start_mock(dir, ui.ctx()),
                 TreeAction::Move(paths, folder) => {
@@ -4036,6 +4048,41 @@ impl App {
             }
             Err(e) => self.status = e,
         }
+    }
+
+    fn export_dialog(&mut self, dir: &Path, openapi: bool) {
+        let name = match dir == self.ws.collections() {
+            true => "API".to_owned(),
+            false => {
+                crate::store::unescape_name(&dir.file_name().unwrap_or_default().to_string_lossy())
+            }
+        };
+        let (file, filters): (_, &[(&str, &[&str])]) = match openapi {
+            true => (
+                format!("{name}.yaml"),
+                &[("OpenAPI", &["yaml", "yml", "json"])],
+            ),
+            false => (format!("{name}.md"), &[("Markdown", &["md"])]),
+        };
+        if let Some(to) = pick_file(&file, filters, true) {
+            self.export_docs(dir, Path::new(&to));
+        }
+    }
+
+    fn export_docs(&mut self, dir: &Path, to: &Path) {
+        let shown = to.display();
+        let written = crate::docs::for_file(&self.ws, dir, to).and_then(|(text, left)| {
+            std::fs::write(to, text).map_err(|e| format!("{shown}: {e}"))?;
+            Ok(left)
+        });
+        self.status = match written {
+            Ok(0) => tf("Saved {}", &[&shown]),
+            Ok(n) => tf(
+                "Saved {}; left out {} it can't describe: streams, gRPC, or a second request to the same method and path",
+                &[&shown, &n],
+            ),
+            Err(e) => e,
+        };
     }
 
     /// Port 3000 when free, so a frontend can keep one base URL across restarts.
@@ -8083,6 +8130,9 @@ fn folder_menu(
         t("Copy docs as Markdown"),
         TreeAction::CopyDocs(path.clone()),
     );
+    let docs = |openapi| TreeAction::ExportDocs(path.clone(), openapi);
+    item(ui, t("Export docs as Markdown…"), docs(false));
+    item(ui, t("Export as OpenAPI…"), docs(true));
     item(
         ui,
         t("Copy as Postman collection"),
@@ -13724,6 +13774,56 @@ mod ui_tests {
         h.run();
         type_into(&mut h, 1, "acc");
         assert!(h.query_by_label("Accept").is_none());
+    }
+
+    /// A folder's menu exports its docs to a file in the format the file's name asks for:
+    /// Markdown, or OpenAPI as YAML or JSON. What OpenAPI can't hold is counted, not lost
+    /// unsaid.
+    #[test]
+    fn a_folder_exports_its_docs_as_markdown_or_openapi() {
+        let ws = workspace("export-docs");
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let get = Request {
+            url: "https://api.test/users/:id".into(),
+            ..Default::default()
+        };
+        ws.save_request(&api.join("get user.toml"), &get).unwrap();
+        let live = Request {
+            method: "WS".into(),
+            url: "wss://api.test/live".into(),
+            ..Default::default()
+        };
+        ws.save_request(&api.join("live.toml"), &live).unwrap();
+        let mut h = harness(ws);
+        h.run();
+        h.get_all_by_label("api").next().unwrap().click_secondary();
+        h.run();
+        assert!(h.query_by_label("Export docs as Markdown…").is_some());
+        assert!(h.query_by_label("Export as OpenAPI…").is_some());
+
+        let dir = std::env::temp_dir().join(format!("apitool-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        h.state_mut().export_docs(&api, &dir.join("api.yaml"));
+        assert!(
+            h.state().status.contains("left out 1"),
+            "{}",
+            h.state().status
+        );
+        let yaml = std::fs::read_to_string(dir.join("api.yaml")).unwrap();
+        assert!(yaml.starts_with("openapi: 3.1.0\n") && yaml.contains("/users/{id}:"));
+        h.state_mut().export_docs(&api, &dir.join("api.json"));
+        let json = std::fs::read_to_string(dir.join("api.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc["servers"][0]["url"], "https://api.test");
+        h.state_mut().export_docs(&api, &dir.join("api.md"));
+        let md = std::fs::read_to_string(dir.join("api.md")).unwrap();
+        assert!(md.starts_with("# api\n"), "{md}");
+        assert!(
+            h.state().status.starts_with("Saved "),
+            "{}",
+            h.state().status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

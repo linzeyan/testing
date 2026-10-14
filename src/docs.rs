@@ -28,6 +28,25 @@ pub fn markdown(ws: &Workspace, scope: &Path) -> Result<String, String> {
     Ok(out)
 }
 
+/// What a file named `file` holds: Markdown for .md, else OpenAPI (JSON for .json, else
+/// YAML); and how many requests OpenAPI left out.
+pub fn for_file(ws: &Workspace, scope: &Path, file: &Path) -> Result<(String, usize), String> {
+    let ext = file
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    if matches!(ext.as_str(), "md" | "markdown") {
+        return Ok((markdown(ws, scope)?, 0));
+    }
+    let (doc, left) = crate::openapi::export(ws, scope)?;
+    let text = match ext.as_str() {
+        "json" => serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?,
+        _ => serde_yaml_ng::to_string(&doc).map_err(|e| e.to_string())?,
+    };
+    Ok((text, left))
+}
+
 pub(crate) fn find<'a>(nodes: &'a [Node], dir: &Path) -> Option<&'a [Node]> {
     nodes.iter().find_map(|n| match n {
         Node::Folder { path, children, .. } if path == dir => Some(&children[..]),

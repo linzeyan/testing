@@ -9,7 +9,7 @@ use crate::{net, store};
 
 const USAGE: &str = "usage: apitool-cli <folder|request> [options]
        apitool-cli mcp [--workspace <dir>] [--window]
-       apitool-cli docs [folder] [--workspace <dir>] [-o <file.md>]
+       apitool-cli docs [folder] [--workspace <dir>] [-o <file.md|.yaml|.json>]
        apitool-cli mock [folder] [--workspace <dir>] [--port <n>]
 
 Runs every request under the folder or request, named as in the tree (`users`,
@@ -19,7 +19,8 @@ test fails.
 `mcp` serves the workspace to an LLM client (Model Context Protocol over stdio); with
 `--window`, it relays to the open apitool window instead (Settings > MCP), which can then
 be operated too.
-`docs` writes Markdown API docs (default: the whole collection, to stdout).
+`docs` writes Markdown API docs (default: the whole collection, to stdout), or OpenAPI
+3.1 to a .yaml or .json file.
 `mock` answers HTTP calls with the saved examples (default port 3000, localhost only).
 
 options:
@@ -234,12 +235,17 @@ fn docs(args: &[String]) -> Result<bool, String> {
     let (target, values) = folder_args(args, &["--workspace", "-o"])?;
     let output = values.get("-o").map(|p| absolute(p.as_ref())).transpose()?;
     let (ws, dir) = open_folder(target, &values)?;
-    let md = crate::docs::markdown(&ws, &dir)?;
     match output {
         Some(path) => {
-            std::fs::write(&path, md).map_err(|e| format!("write {}: {e}", path.display()))?
+            let (text, left) = crate::docs::for_file(&ws, &dir, &path)?;
+            std::fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+            if left > 0 {
+                eprintln!(
+                    "left out {left} that OpenAPI can't describe: streams, gRPC, or a second request to the same method and path"
+                );
+            }
         }
-        None => print!("{md}"),
+        None => print!("{}", crate::docs::markdown(&ws, &dir)?),
     }
     Ok(true)
 }

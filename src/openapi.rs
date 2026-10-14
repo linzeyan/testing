@@ -2,14 +2,17 @@
 //! operation, a folder per tag, `{{baseUrl}}` from the first server, auth from the
 //! security schemes, bodies and saved examples from the schemas' examples (or a sample
 //! built from the schema), so Send and the mock server work right after the import.
+//! And back: a folder's requests as an OpenAPI 3.1 document (`export`).
 
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
 use crate::model::{Auth, Body, Example, Folder, Grant, KeyValue, OAuth2, Request};
 use crate::postman::Import;
-use crate::store::{copy_name, escape_name};
+use crate::store::{Node, Workspace, copy_name, escape_name, folder_name};
 
 const METHODS: &[&str] = &[
     "get", "put", "post", "delete", "options", "head", "patch", "trace", "query",
@@ -643,6 +646,424 @@ impl<'a> Spec<'a> {
     }
 }
 
+/// The requests under `scope` (a folder, or the collections root) as an OpenAPI 3.1
+/// document, read back by `import` as the same requests: a path per URL (`:id` and
+/// `{{var}}` segments as path parameters), the server as the URL's start (`{{baseUrl}}` a
+/// server variable defaulting to the folder's value), a tag per subfolder, off query
+/// parameters as optional, bodies and saved examples as examples with a schema read off
+/// them. Like the Markdown docs it holds no credentials: auth is its security scheme only.
+/// Also returns how many were left out: streams, gRPC, and a second request to a method
+/// and path already taken.
+pub fn export(ws: &Workspace, scope: &Path) -> Result<(Value, usize), String> {
+    let root = ws.collections();
+    let tree = ws.tree();
+    let (title, nodes) = match scope == root {
+        true => ("API".to_owned(), &tree[..]),
+        false => {
+            let nodes = crate::docs::find(&tree, scope)
+                .ok_or_else(|| format!("no folder at {}", scope.display()))?;
+            (folder_name(&root, scope), nodes)
+        }
+    };
+    let mut info = json!({ "title": title, "version": "1.0.0" });
+    if scope != root {
+        let about = ws.load_folder(scope)?.description;
+        if !about.trim().is_empty() {
+            info["description"] = about.trim().into();
+        }
+    }
+    let mut out = Out::default();
+    out.walk(ws, nodes, "")?;
+    if out.count == 0 {
+        return Err(format!(
+            "no requests under {title} that OpenAPI can describe"
+        ));
+    }
+    // The server most requests use is the document's (the first such on a tie); a
+    // request elsewhere names its own.
+    let most = (0..out.servers.len()).max_by_key(|&i| (out.servers[i].1.len(), Reverse(i)));
+    let mut doc = json!({ "openapi": "3.1.0", "info": info });
+    if let Some(i) = most {
+        doc["servers"] = json!([out.servers[i].0]);
+    }
+    if !out.tags.is_empty() {
+        doc["tags"] = out.tags.into();
+    }
+    doc["paths"] = out.paths.into();
+    for (i, (server, ops)) in out.servers.into_iter().enumerate() {
+        if Some(i) == most {
+            continue;
+        }
+        for (path, method) in ops {
+            doc["paths"][&path][&method]["servers"] = json!([server.clone()]);
+        }
+    }
+    if !out.schemes.is_empty() {
+        let schemes: Map<String, Value> = out.schemes.into_iter().collect();
+        doc["components"] = json!({ "securitySchemes": schemes });
+    }
+    Ok((doc, out.left))
+}
+
+#[derive(Default)]
+struct Out {
+    paths: Map<String, Value>,
+    /// Each server, with the (path, method) of the requests on it.
+    servers: Vec<(Value, Vec<(String, String)>)>,
+    tags: Vec<Value>,
+    /// Security schemes by name, each written once however many requests use it.
+    schemes: Vec<(String, Value)>,
+    count: usize,
+    left: usize,
+}
+
+impl Out {
+    fn walk(&mut self, ws: &Workspace, nodes: &[Node], tag: &str) -> Result<(), String> {
+        for node in nodes {
+            match node {
+                Node::Request { name, path, .. } => {
+                    self.operation(&ws.load_request(path)?, name, tag)
+                }
+                Node::Folder {
+                    name,
+                    path,
+                    children,
+                } => {
+                    let tag = match tag {
+                        "" => name.clone(),
+                        outer => format!("{outer} / {name}"),
+                    };
+                    let mut entry = json!({ "name": tag });
+                    let about = ws.load_folder(path)?.description;
+                    if !about.trim().is_empty() {
+                        entry["description"] = about.trim().into();
+                    }
+                    self.tags.push(entry);
+                    self.walk(ws, children, &tag)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn operation(&mut self, req: &Request, name: &str, tag: &str) {
+        let method = match req.method.as_str() {
+            "GRAPHQL" => "post".to_owned(),
+            "SSE" => "get".to_owned(),
+            m => m.to_lowercase(),
+        };
+        let (start, path) = server_and_path(&req.url);
+        let (path, names) = path_template(path);
+        // QUERY is OpenAPI 3.2's.
+        if method == "query"
+            || !METHODS.contains(&method.as_str())
+            || self
+                .paths
+                .get(&path)
+                .is_some_and(|item| !item[&method].is_null())
+        {
+            self.left += 1;
+            return;
+        }
+        let mut op = json!({ "summary": name });
+        if !tag.is_empty() {
+            op["tags"] = json!([tag]);
+        }
+        if !req.description.trim().is_empty() {
+            op["description"] = req.description.trim().into();
+        }
+        let mut params = Vec::new();
+        for n in &names {
+            let row = req.path_vars.iter().find(|r| r.key == *n);
+            let value = (row.map(|r| r.value.as_str()))
+                .or(req.inherited.vars.get(n).map(String::as_str))
+                .unwrap_or_default();
+            let about = row.map_or("", |r| r.description.as_str());
+            params.push(param(n, "path", true, value, about));
+        }
+        // OpenAPI ignores these as header parameters: the body and security say them.
+        let implied = ["accept", "content-type", "authorization"];
+        for (rows, place) in [(&req.params, "query"), (&req.headers, "header")] {
+            for r in rows.iter().filter(|r| !r.key.trim().is_empty()) {
+                if place == "query" || !implied.contains(&r.key.to_lowercase().as_str()) {
+                    // Off is optional, as `import` turns optional ones off.
+                    params.push(param(&r.key, place, r.enabled, &r.value, &r.description));
+                }
+            }
+        }
+        if !params.is_empty() {
+            op["parameters"] = params.into();
+        }
+        let body = match &req.body {
+            b @ Body::GraphQL { .. } => b.clone().graphql_switched(false),
+            b => b.clone(),
+        };
+        if let Some(body) = request_body(&body, &req.headers) {
+            op["requestBody"] = body;
+        }
+        let responses = responses(&req.examples);
+        if !responses.is_empty() {
+            op["responses"] = responses.into();
+        }
+        if let Some((name, scheme, scopes)) = scheme(req.effective_auth()) {
+            let name = self.scheme_name(name, scheme);
+            op["security"] = json!([{ name: scopes }]);
+        }
+        if !start.is_empty() {
+            let server = server(start, &req.inherited.vars);
+            let at = (path.clone(), method.clone());
+            match self.servers.iter_mut().find(|(s, _)| *s == server) {
+                Some((_, ops)) => ops.push(at),
+                None => self.servers.push((server, vec![at])),
+            }
+        }
+        let item = self.paths.entry(path).or_insert_with(|| json!({}));
+        item[&method] = op;
+        self.count += 1;
+    }
+
+    /// `base`, or `base2`, … when a different scheme already has that name.
+    fn scheme_name(&mut self, base: &str, scheme: Value) -> String {
+        if let Some((name, _)) = self.schemes.iter().find(|(_, s)| *s == scheme) {
+            return name.clone();
+        }
+        let taken = |n: &String| self.schemes.iter().any(|(m, _)| m == n);
+        let name = (std::iter::once(base.to_owned()))
+            .chain((2..).map(|n| format!("{base}{n}")))
+            .find(|n| !taken(n))
+            .expect("some name is free");
+        self.schemes.push((name.clone(), scheme));
+        name
+    }
+}
+
+/// `{{baseUrl}}/users/:id?x=1` → (`{{baseUrl}}`, `/users/:id`): the path starts at the
+/// first '/' after the scheme's `://`.
+fn server_and_path(url: &str) -> (&str, &str) {
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    let host = url.find("://").map_or(0, |i| i + 3);
+    match url[host..].find('/') {
+        Some(i) => url.split_at(host + i),
+        None => (url, "/"),
+    }
+}
+
+/// `/users/:id/{{version}}` → `/users/{id}/{version}`, and the names in order.
+fn path_template(path: &str) -> (String, Vec<String>) {
+    let mut names = Vec::new();
+    let segments: Vec<String> = (path.split('/'))
+        .map(|seg| match crate::model::path_var(seg) {
+            Some(name) => {
+                names.push(name.to_owned());
+                format!("{{{name}}}")
+            }
+            None => single_braces(seg, &mut names),
+        })
+        .collect();
+    (segments.join("/"), names)
+}
+
+/// `{{name}}` → `{name}`, OpenAPI's template, with each name pushed to `names`.
+fn single_braces(text: &str, names: &mut Vec<String>) -> String {
+    let (mut out, mut rest) = (String::new(), text);
+    while let Some(open) = rest.find("{{") {
+        let Some(len) = rest[open + 2..].find("}}") else {
+            break;
+        };
+        let name = rest[open + 2..open + 2 + len].trim();
+        out.push_str(&rest[..open]);
+        out.push_str(&format!("{{{name}}}"));
+        names.push(name.to_owned());
+        rest = &rest[open + 2 + len + 2..];
+    }
+    out + rest
+}
+
+fn server(start: &str, vars: &HashMap<String, String>) -> Value {
+    // Sent over http when it names no scheme; a variable may hold one.
+    let start = match start.contains("://") || start.starts_with("{{") {
+        true => start.to_owned(),
+        false => format!("http://{start}"),
+    };
+    let mut names = Vec::new();
+    let mut s = json!({ "url": single_braces(&start, &mut names) });
+    if !names.is_empty() {
+        let defaults: Map<String, Value> = (names.into_iter())
+            .map(|n| {
+                let value = vars.get(&n).cloned().unwrap_or_default();
+                (n, json!({ "default": value }))
+            })
+            .collect();
+        s["variables"] = defaults.into();
+    }
+    s
+}
+
+fn param(name: &str, place: &str, required: bool, value: &str, about: &str) -> Value {
+    let mut p = json!({
+        "name": name,
+        "in": place,
+        "required": required,
+        "schema": { "type": "string" },
+    });
+    if !value.is_empty() {
+        p["example"] = value.into();
+    }
+    if !about.trim().is_empty() {
+        p["description"] = about.trim().into();
+    }
+    p
+}
+
+fn request_body(body: &Body, headers: &[KeyValue]) -> Option<Value> {
+    let declared = (headers.iter())
+        .find(|h| h.enabled && h.key.eq_ignore_ascii_case("content-type"))
+        .map(|h| h.value.trim())
+        .filter(|v| !v.is_empty());
+    let mime = |default: &str| declared.unwrap_or(default).to_owned();
+    let binary = json!({ "schema": { "type": "string", "format": "binary" } });
+    let (mime, media) = match body {
+        Body::None | Body::GraphQL { .. } => return None,
+        Body::Json { text } => (
+            mime("application/json"),
+            match serde_json::from_str::<Value>(text) {
+                Ok(v) => json!({ "schema": schema_of(&v), "example": v }),
+                // `{{variables}}` where a value goes: the text as it is.
+                Err(_) => json!({ "example": text }),
+            },
+        ),
+        Body::Text { text } => (
+            mime("text/plain"),
+            json!({ "schema": { "type": "string" }, "example": text }),
+        ),
+        Body::Form { fields } => (
+            "application/x-www-form-urlencoded".into(),
+            form(fields, false),
+        ),
+        Body::Multipart { parts } => ("multipart/form-data".into(), form(parts, true)),
+        Body::File { .. } | Body::Base64 { .. } | Body::Hex { .. } => {
+            (mime("application/octet-stream"), binary)
+        }
+    };
+    Some(json!({ "content": { mime: media } }))
+}
+
+/// Fields as an object's properties, each value its example; a multipart `@path` is a file.
+/// The ones on are required.
+fn form(fields: &[KeyValue], files: bool) -> Value {
+    let (mut properties, mut required) = (Map::new(), Vec::new());
+    for f in fields.iter().filter(|f| !f.key.is_empty()) {
+        let mut p = match files && f.value.starts_with('@') {
+            true => json!({ "type": "string", "format": "binary" }),
+            false => json!({ "type": "string", "example": f.value }),
+        };
+        if !f.description.trim().is_empty() {
+            p["description"] = f.description.trim().into();
+        }
+        properties.insert(f.key.clone(), p);
+        if f.enabled {
+            required.push(f.key.clone());
+        }
+    }
+    json!({ "schema": { "type": "object", "properties": properties, "required": required } })
+}
+
+/// Saved examples by status, then content type: one is the `example`, several are
+/// `examples` by name. The first one's name describes the status.
+fn responses(examples: &[Example]) -> Map<String, Value> {
+    let mut groups: Vec<((u16, &str), Vec<&Example>)> = Vec::new();
+    for ex in examples {
+        let mime = ex.content_type.split(';').next().unwrap_or_default().trim();
+        let key = (ex.status, if mime.is_empty() { "text/plain" } else { mime });
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, list)) => list.push(ex),
+            None => groups.push((key, vec![ex])),
+        }
+    }
+    let mut out = Map::new();
+    for ((status, mime), list) in groups {
+        let value = |ex: &Example| match mime.contains("json") {
+            true => serde_json::from_str(&ex.body).unwrap_or_else(|_| ex.body.clone().into()),
+            false => Value::String(ex.body.clone()),
+        };
+        let resp = (out.entry(status.to_string()))
+            .or_insert_with(|| json!({ "description": list[0].name }));
+        resp["content"][mime] = match &list[..] {
+            [one] => {
+                let v = value(one);
+                json!({ "schema": schema_of(&v), "example": v })
+            }
+            many => {
+                let named: Map<String, Value> = (many.iter())
+                    .map(|ex| (ex.name.clone(), json!({ "value": value(ex) })))
+                    .collect();
+                json!({ "examples": named })
+            }
+        };
+    }
+    out
+}
+
+/// A schema read off a value: its types, an object's properties, an array's first item.
+fn schema_of(v: &Value) -> Value {
+    match v {
+        Value::Null => json!({ "type": "null" }),
+        Value::Bool(_) => json!({ "type": "boolean" }),
+        Value::Number(n) if n.is_f64() => json!({ "type": "number" }),
+        Value::Number(_) => json!({ "type": "integer" }),
+        Value::String(_) => json!({ "type": "string" }),
+        Value::Array(items) => {
+            json!({ "type": "array", "items": items.first().map_or(json!({}), schema_of) })
+        }
+        Value::Object(o) => {
+            let properties: Map<String, Value> =
+                (o.iter()).map(|(k, v)| (k.clone(), schema_of(v))).collect();
+            json!({ "type": "object", "properties": properties })
+        }
+    }
+}
+
+/// The security scheme for an auth (a name for it, the scheme, the scopes asked for), for
+/// those OpenAPI has: no credentials, only how they're sent.
+fn scheme(auth: &Auth) -> Option<(&'static str, Value, Vec<String>)> {
+    let http = |scheme: &str| json!({ "type": "http", "scheme": scheme });
+    Some(match auth {
+        Auth::Bearer { .. } => ("bearerAuth", http("bearer"), Vec::new()),
+        Auth::Jwt(_) => {
+            let jwt = json!({ "type": "http", "scheme": "bearer", "bearerFormat": "JWT" });
+            ("bearerAuth", jwt, Vec::new())
+        }
+        Auth::Basic { .. } => ("basicAuth", http("basic"), Vec::new()),
+        Auth::Digest { .. } => ("digestAuth", http("digest"), Vec::new()),
+        Auth::ApiKey { key, in_query, .. } => {
+            let place = if *in_query { "query" } else { "header" };
+            let key = json!({ "type": "apiKey", "name": key, "in": place });
+            ("apiKey", key, Vec::new())
+        }
+        Auth::OAuth2(o) => {
+            let scopes: Vec<String> = o.scope.split_whitespace().map(str::to_owned).collect();
+            let (flow, mut f) = match o.grant {
+                Grant::ClientCredentials => {
+                    ("clientCredentials", json!({ "tokenUrl": o.token_url }))
+                }
+                Grant::Password => ("password", json!({ "tokenUrl": o.token_url })),
+                Grant::AuthorizationCode => (
+                    "authorizationCode",
+                    json!({ "authorizationUrl": o.auth_url, "tokenUrl": o.token_url }),
+                ),
+                Grant::Implicit => ("implicit", json!({ "authorizationUrl": o.auth_url })),
+            };
+            let named: Map<String, Value> =
+                (scopes.iter()).map(|s| (s.clone(), json!(""))).collect();
+            f["scopes"] = named.into();
+            let oauth = json!({ "type": "oauth2", "flows": { flow: f } });
+            ("oauth2", oauth, scopes)
+        }
+        // OAuth 1, the signed ones (AWS, Hawk, EdgeGrid) and NTLM have none.
+        _ => return None,
+    })
+}
+
 fn example(name: &str, status: u16, mime: &str, body: &Value) -> Example {
     Example {
         name: name.to_owned(),
@@ -877,5 +1298,122 @@ components:
         assert_eq!(add.examples[0].body, "{\n  \"n\": 1\n}");
         assert!(matches!(r["PUT items"].body, Body::Multipart { .. }));
         assert_eq!(warnings, ["PUT items: cookie parameter \"c\" left out"]);
+    }
+
+    /// A folder exported and imported again gives back its requests: the server as
+    /// {{baseUrl}} with the folder's value, path and query parameters (off ones optional),
+    /// bodies, examples and auth, but never a credential. What OpenAPI can't hold is
+    /// counted, not dropped unsaid, and a request elsewhere keeps its own server.
+    #[test]
+    fn an_exported_folder_imports_back_as_the_same_requests() {
+        let root = std::env::temp_dir().join(format!("apitool-oas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::open(root.clone()).unwrap();
+        let shop = ws.create_folder(&ws.collections(), "shop").unwrap();
+        let folder = Folder {
+            description: "The shop.".into(),
+            vars: vec![KeyValue::new("baseUrl", "https://shop.test/v1")],
+            auth: Auth::Bearer {
+                token: "s3cret".into(),
+            },
+            ..Default::default()
+        };
+        ws.save_folder(&shop, &folder).unwrap();
+        let orders = ws.create_folder(&shop, "orders").unwrap();
+        let mut debug = KeyValue::new("debug", "1");
+        debug.enabled = false;
+        let json = |name: &str, status, body: &str| Example {
+            name: name.into(),
+            status,
+            content_type: "application/json".into(),
+            body: body.into(),
+        };
+        let get = Request {
+            url: "{{baseUrl}}/orders/:id?expand=items".into(),
+            path_vars: vec![KeyValue::new("id", "7")],
+            params: vec![KeyValue::new("expand", "items"), debug],
+            examples: vec![json("found", 200, r#"{"id": 7}"#), json("gone", 404, "{}")],
+            ..Default::default()
+        };
+        ws.save_request(&orders.join("get order.toml"), &get)
+            .unwrap();
+        let create = Request {
+            method: "POST".into(),
+            url: "{{baseUrl}}/orders".into(),
+            body: Body::Json {
+                text: r#"{"sku": "a1", "qty": 2}"#.into(),
+            },
+            auth: Auth::Basic {
+                username: "me".into(),
+                password: "hunter2".into(),
+            },
+            ..Default::default()
+        };
+        ws.save_request(&orders.join("create order.toml"), &create)
+            .unwrap();
+        // Not for OpenAPI: a stream, and a second GET of a path already taken.
+        let live = Request {
+            method: "WS".into(),
+            url: "{{baseUrl}}/live".into(),
+            ..Default::default()
+        };
+        ws.save_request(&shop.join("live.toml"), &live).unwrap();
+        ws.save_request(&orders.join("get order again.toml"), &get)
+            .unwrap();
+        let ping = Request {
+            url: "https://status.test/ping".into(),
+            ..Default::default()
+        };
+        ws.save_request(&shop.join("ping.toml"), &ping).unwrap();
+
+        let (doc, left) = export(&ws, &shop).unwrap();
+        let text = doc.to_string();
+        assert!(
+            !text.contains("s3cret") && !text.contains("hunter2"),
+            "{text}"
+        );
+        assert_eq!(left, 2);
+        let base = json!({ "url": "{baseUrl}", "variables": { "baseUrl": { "default": "https://shop.test/v1" } } });
+        assert_eq!(doc["servers"], json!([base]));
+        assert_eq!(
+            doc["paths"]["/ping"]["get"]["servers"][0]["url"],
+            "https://status.test"
+        );
+        // OpenAPI's templating, which tools other than `import` read.
+        let mut paths: Vec<_> = doc["paths"].as_object().unwrap().keys().collect();
+        paths.sort();
+        assert_eq!(paths, ["/orders", "/orders/{id}", "/ping"]);
+
+        let Import::Collection {
+            folders,
+            requests,
+            warnings,
+            ..
+        } = import(&doc)
+        else {
+            panic!("not a collection")
+        };
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(folders[0].1.vars, folder.vars);
+        assert_eq!(folders[0].1.description, "The shop.");
+        let r: HashMap<_, _> = requests.into_iter().collect();
+        let back = &r["orders/get order"];
+        assert_eq!(back.url, get.url);
+        assert_eq!(
+            (&back.path_vars, &back.params),
+            (&get.path_vars, &get.params)
+        );
+        let statuses: Vec<_> = back.examples.iter().map(|e| e.status).collect();
+        assert_eq!(statuses, [200, 404]);
+        assert_eq!(back.examples[0].body, "{\n  \"id\": 7\n}");
+        assert!(matches!(back.auth, Auth::Bearer { .. }), "{:?}", back.auth);
+        let made = &r["orders/create order"];
+        let Body::Json { text } = &made.body else {
+            panic!("{:?}", made.body)
+        };
+        let sent: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(sent, json!({ "sku": "a1", "qty": 2 }));
+        assert!(matches!(made.auth, Auth::Basic { .. }), "{:?}", made.auth);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
