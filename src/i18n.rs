@@ -1736,6 +1736,13 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Double-click to rename", "按兩下可重新命名"),
     ("Variable", "變數"),
     ("Close the runner", "關閉執行器"),
+    ("Filter by name or URL", "依名稱或 URL 篩選"),
+    ("Flags", "旗標"),
+    ("Show secret values", "顯示秘密值"),
+    (
+        "For each request, unless its Settings tab sets its own",
+        "套用到每個請求，除非請求的「設定」分頁另有設定",
+    ),
     ("Copy the headers", "複製標頭"),
     ("Copied the timeline", "已複製時間軸"),
     ("Copied the headers", "已複製標頭"),

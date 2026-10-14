@@ -102,7 +102,10 @@ beside it puts a kept one back in the box. Clicking a message shows its payload 
   Insomnia's `{% prompt %}` imports as one.
 - Quick look (the eye by the environment) docks a panel of every variable in scope, grouped as
   environment, folders and globals, the overridden ones struck through. Environment and global
-  values edit in place: Enter keeps the change, Esc puts it back.
+  values edit in place: Enter keeps the change, Esc puts it back. Secret values show as dots
+  until its eye shows them, as in the environment editor.
+- The environment list edits any environment (✎) without switching to it, and ends with
+  "New environment".
 - An environment can have a colour (prod in red), shown on its selector and as a strip
   across the top.
 - Folder settings (right-click a folder) hold variables, auth and scripts shared by every
@@ -207,6 +210,7 @@ The Tests tab filters All / Passed / Failed, with counts.
   or, on XML, XPath (`//item[@id='b']/name/text()`, prefixes ignored). The last 10 come back
   from Recent; Save… still writes the whole body.
 - Find (Ctrl+F): match case, whole word or regular expression; counts up to 10 000 hits.
+  The filter and the find stay on when the request is sent again.
 - PNG, JPEG, GIF (its first frame) and WebP show as pictures, SVG too (Preview, beside Pretty and Raw), PDF page by
   page; other binary bodies show their size. "Open in browser" shows an HTML, PDF or SVG one
   (a PDF in the system's viewer).
@@ -217,7 +221,9 @@ The Tests tab filters All / Passed / Failed, with counts.
   handshake, waiting (TTFB) and download, and the size for headers vs body.
 - The Timeline tab: the request as it went out (headers the HTTP client adds and jar cookies
   included), each redirect and the peer address.
-- The Cookies tab: what the response sets.
+- The Cookies tab: what the response sets, as the jar keeps it: the host when there's no
+  Domain, the URL's directory when there's no Path, Max-Age as a time, and the HttpOnly,
+  Secure and SameSite flags. One for another site's domain is turned down and not listed.
 
 **Keeping**
 
@@ -226,6 +232,8 @@ The Tests tab filters All / Passed / Failed, with counts.
   boxes.
 - The History menu in the response bar: the last 10 responses of each request, kept on disk
   with 1 MiB of body each. Request history and saved response examples too.
+- The sidebar's History: each send with how long ago, filtered by name or URL; a click
+  brings back what was sent.
 
 **Big bodies**: text bodies past 5 MiB wait behind "Show anyway / Save to file…"; bodies
 past 16 MiB keep only their start, to spare RAM. Send and download keeps a whole one.
@@ -295,7 +303,8 @@ lists the everyday ones and `Ctrl+/` for the rest.
 
 Ctrl+K finds a request by folder and name (letters in order are enough) or by part of its URL, a folder (its
 settings) or an environment, and does what a button does (new request, network settings,
-cookies, side by side…).
+cookies, side by side…). With nothing typed it lists the open tabs, then environments and
+actions.
 
 ## Import and export
 

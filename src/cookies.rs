@@ -19,31 +19,45 @@ pub struct Row {
     pub value: String,
     /// `None` for a session cookie.
     pub expires: Option<String>,
+    /// HttpOnly, Secure and SameSite, those set.
+    pub flags: String,
 }
 
-/// The cookies a response sets, in header order. Domain and path are as the header gives
-/// them (empty: the request's host and path).
-pub fn from_response(headers: &[(String, String)]) -> Vec<Row> {
+fn row(c: &cookie_store::Cookie) -> Row {
+    let flags = [
+        c.http_only()
+            .unwrap_or(false)
+            .then(|| "HttpOnly".to_owned()),
+        c.secure().unwrap_or(false).then(|| "Secure".to_owned()),
+        c.same_site().map(|s| format!("SameSite={s}")),
+    ];
+    Row {
+        domain: String::from(&c.domain),
+        path: String::from(&c.path),
+        name: c.name().to_owned(),
+        value: c.value().to_owned(),
+        expires: match &c.expires {
+            cookie_store::CookieExpiration::AtUtc(t) => Some(format!(
+                "{} {:02}:{:02} UTC",
+                t.date(),
+                t.hour(),
+                t.minute()
+            )),
+            cookie_store::CookieExpiration::SessionEnd => None,
+        },
+        flags: flags.into_iter().flatten().collect::<Vec<_>>().join(", "),
+    }
+}
+
+/// The cookies a response from `url` sets, in header order, as the jar keeps them: no
+/// Domain is the host, no Path the URL's directory, Max-Age a time like Expires. Ones the
+/// jar turns down (another site's domain) are left out.
+pub fn from_response(headers: &[(String, String)], url: &Url) -> Vec<Row> {
     let set = headers
         .iter()
         .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"));
-    set.filter_map(|(_, v)| RawCookie::parse(v.as_str()).ok())
-        .map(|c| Row {
-            domain: c.domain().unwrap_or_default().to_owned(),
-            path: c.path().unwrap_or_default().to_owned(),
-            name: c.name().to_owned(),
-            value: c.value().to_owned(),
-            expires: match (c.max_age(), c.expires_datetime()) {
-                (Some(age), _) => Some(format!("in {} s", age.whole_seconds())),
-                (None, Some(t)) => Some(format!(
-                    "{} {:02}:{:02} UTC",
-                    t.date(),
-                    t.hour(),
-                    t.minute()
-                )),
-                (None, None) => None,
-            },
-        })
+    set.filter_map(|(_, v)| cookie_store::Cookie::parse(v.as_str(), url).ok())
+        .map(|c| row(&c))
         .collect()
 }
 
@@ -82,24 +96,7 @@ impl Jar {
     /// Unexpired cookies, by domain then name.
     pub fn rows(&self) -> Vec<Row> {
         let store = self.read();
-        let mut rows: Vec<Row> = store
-            .iter_unexpired()
-            .map(|c| Row {
-                domain: String::from(&c.domain),
-                path: String::from(&c.path),
-                name: c.name().to_owned(),
-                value: c.value().to_owned(),
-                expires: match &c.expires {
-                    cookie_store::CookieExpiration::AtUtc(t) => Some(format!(
-                        "{} {:02}:{:02} UTC",
-                        t.date(),
-                        t.hour(),
-                        t.minute()
-                    )),
-                    cookie_store::CookieExpiration::SessionEnd => None,
-                },
-            })
-            .collect();
+        let mut rows: Vec<Row> = store.iter_unexpired().map(row).collect();
         rows.sort_by(|a, b| (&a.domain, &a.name).cmp(&(&b.domain, &b.name)));
         rows
     }

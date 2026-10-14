@@ -570,6 +570,8 @@ struct ResponseView {
     filter_error: String,
     /// The body as shown before a filter replaced `text`.
     unfiltered: Option<String>,
+    /// What its Set-Cookie headers set, read once: Max-Age counts from when it came.
+    cookies: Vec<crate::cookies::Row>,
     /// Over `LARGE_BODY`: `text` is the body as received, not laid out until "Show
     /// anyway"; true if its type is one shown raw.
     held: Option<bool>,
@@ -663,7 +665,7 @@ struct Row {
     in_string: bool,
 }
 
-/// Find-in-body state. Lives in the view, so a new response starts a fresh search.
+/// Find-in-body state. Lives in the view; a resend carries the query over, not the hits.
 #[derive(Default)]
 struct Find {
     /// The find row shows under the response bar.
@@ -923,6 +925,8 @@ pub struct App {
     /// Oldest first.
     history: Vec<HistoryEntry>,
     show_history: bool,
+    /// History rows whose name or URL contains it.
+    history_filter: String,
     /// Sidebar filter: requests whose name contains it, and the folders leading to them.
     tree_filter: String,
     /// Rows picked with Ctrl or Shift+click; empty while just the open request is.
@@ -1005,6 +1009,8 @@ pub struct App {
     vars: HashMap<String, String>,
     /// Workspace-wide variables (globals.toml + globals.secret.toml), below any environment.
     globals: HashMap<String, String>,
+    /// Names of the secret ones in `vars` and `globals`, masked in the Variables panel.
+    secrets: HashSet<String>,
     quick_look: bool,
     /// Focus to move to on the next frame, once the target widget exists.
     focus_request: Option<egui::Id>,
@@ -1078,6 +1084,7 @@ impl App {
             envs: ws.env_names(),
             history: ws.load_history(),
             show_history: false,
+            history_filter: String::new(),
             tree_filter: String::new(),
             tree_picked: Vec::new(),
             reveal: None,
@@ -1128,6 +1135,7 @@ impl App {
             active_env: None,
             vars: HashMap::new(),
             globals: HashMap::new(),
+            secrets: HashSet::new(),
             quick_look: false,
             focus_request: None,
             open: None,
@@ -1777,6 +1785,16 @@ impl App {
             .map(|n| load(Some(&n)))
             .unwrap_or_default();
         (self.globals, self.vars) = (globals, vars);
+        let env = self.active_env.as_deref();
+        let secret = |env| {
+            self.ws
+                .load_env(env)
+                .map_or_else(|_| Vec::new(), |(_, s)| s)
+        };
+        let rows = secret(None)
+            .into_iter()
+            .chain(env.map(|e| secret(Some(e))).into_iter().flatten());
+        self.secrets = rows.filter(|r| r.enabled).map(|r| r.key).collect();
     }
 
     /// `add` appends empty rows for these keys, e.g. the undefined names in the URL.
@@ -2601,7 +2619,35 @@ impl App {
                 if to_tests {
                     self.resp_tab = RespTab::Tests;
                 }
-                self.response = Some(shown());
+                let mut next = shown();
+                // So are the filter and the find: a resend is mostly to watch that part change.
+                if let Some(Shown {
+                    result: Ok(old), ..
+                }) = self.response.take()
+                    && let Ok(view) = &mut next.result
+                {
+                    if view.other.is_some() && !old.filter.is_empty() {
+                        view.filter = old.filter;
+                        view.apply_filter();
+                    }
+                    let Find {
+                        open,
+                        query,
+                        case,
+                        word,
+                        regex,
+                        ..
+                    } = old.find;
+                    view.find = Find {
+                        open,
+                        query,
+                        case,
+                        word,
+                        regex,
+                        ..Default::default()
+                    };
+                }
+                self.response = Some(next);
             } else if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path)
                 && let Some(p) = &mut t.parked
             {
@@ -2912,7 +2958,13 @@ fn into_view(mut head: http::Response) -> ResponseView {
     };
     // Drawn first, as Postman's Preview does; Pretty and Raw show the XML.
     let preview = held.is_none() && head.bytes.is_none() && external_type(&head) == Some("svg");
+    // The last redirect's target answered with these headers.
+    let url = (head.sent.hops.last()).map_or(&head.sent.url, |(_, to)| to);
+    let cookies = reqwest::Url::parse(url)
+        .map(|url| crate::cookies::from_response(&head.headers, &url))
+        .unwrap_or_default();
     ResponseView {
+        cookies,
         head,
         line_starts: match held {
             Some(_) => Vec::new(),
@@ -3657,12 +3709,6 @@ impl App {
         ui.horizontal(|ui| {
             ui.strong(t("Environment"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, icon::PLUS, t("New environment"), None)
-                    .on_hover_text(t("New environment"))
-                    .clicked()
-                {
-                    self.dialog = Some(Dialog::name(NameKind::NewEnv, ""));
-                }
                 if ui
                     .button(t("Globals"))
                     .on_hover_text(t("Variables available in every environment"))
@@ -4201,14 +4247,27 @@ impl App {
                     }
                 }
             });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.history_filter)
+                    .hint_text(t("Filter by name or URL"))
+                    .desired_width(f32::INFINITY),
+            );
         }
+        let query = self.history_filter.trim().to_lowercase();
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
                 if self.history.is_empty() {
                     ui.weak(t("Requests you send show up here."));
                 }
+                let mut shown = 0;
                 for (i, e) in self.history.iter().enumerate().rev() {
+                    let name = store::unescape_path(&e.path);
+                    let hit = |s: &str| s.to_lowercase().contains(&query);
+                    if !query.is_empty() && !hit(&name) && !hit(&e.request.url) {
+                        continue;
+                    }
+                    shown += 1;
                     let method = &e.request.method;
                     let row = ui.horizontal(|ui| {
                         method_badge(ui, method, 4);
@@ -4222,20 +4281,30 @@ impl App {
                                 .small()
                                 .color(status_color(e.status)),
                         );
-                        ui.add(
-                            egui::Label::new(store::unescape_path(&e.path))
-                                .truncate()
-                                .sense(egui::Sense::click()),
-                        )
+                        // On the row: sends of one request were identical rows until hovered.
+                        let right = egui::Layout::right_to_left(egui::Align::Center);
+                        ui.with_layout(right, |ui| {
+                            ui.label(RichText::new(ago(e.at)).small().weak());
+                            let left = egui::Layout::left_to_right(egui::Align::Center);
+                            ui.with_layout(left, |ui| {
+                                let name = egui::Label::new(name).truncate();
+                                ui.add(name.sense(egui::Sense::click()))
+                            })
+                            .inner
+                        })
+                        .inner
                     });
                     let note = match e.body_dropped {
                         true => format!("\n{}", t("Body was too large to keep")),
                         false => String::new(),
                     };
-                    let hover = format!("{}\n{} · {} ms{note}", e.request.url, ago(e.at), e.ms);
+                    let hover = format!("{}\n{} ms{note}", e.request.url, e.ms);
                     if row.inner.on_hover_text(hover).clicked() {
                         restore = Some(i);
                     }
+                }
+                if shown == 0 && !self.history.is_empty() {
+                    ui.weak(t("Nothing matches."));
                 }
             });
         if let Some(i) = restore {
@@ -5365,6 +5434,7 @@ impl App {
             Dialog::Switch { .. } => switch_targets(&self.tree, &self.ws.collections(), &self.envs),
             _ => Vec::new(),
         };
+        let tabs: Vec<&PathBuf> = self.tabs.iter().map(|t| &t.path).collect();
         let folders: Vec<(String, PathBuf)> = match dialog {
             Dialog::Name {
                 kind: NameKind::SaveAs { .. } | NameKind::NewRequest(_),
@@ -5665,8 +5735,19 @@ impl App {
                         edit.request_focus();
                     }
                     let typed = query.trim().to_lowercase();
+                    // Nothing typed: the open tabs, environments and actions, as VS Code's
+                    // and Postman's lists start. The 12 shortest labels were arbitrary.
                     let mut hits: Vec<_> = (targets.iter())
                         .filter_map(|t| {
+                            if typed.is_empty() {
+                                let at: (usize, usize) = match &t.2 {
+                                    Go::Request(p) => (0, tabs.iter().position(|q| *q == p)?),
+                                    Go::Env(_) => (1, 0),
+                                    Go::Action(_) => (2, 0),
+                                    Go::Folder(_) => return None,
+                                };
+                                return Some(((false, at.0, at.1), t, false));
+                            }
                             // A URL only holding what's typed: scattered letters are in most
                             // of them.
                             let url = (!typed.is_empty())
@@ -5890,7 +5971,10 @@ impl App {
                 ui.weak(tf("Written to {} in the workspace folder, for git.", &[&file]));
                 kv_table(ui, "env-shared", &mut ed.shared, &HashMap::new(), false);
                 ui.add_space(10.0);
-                ui.label(RichText::new(t("Secret")).strong());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(t("Secret")).strong());
+                    secrets_eye(ui, true);
+                });
                 ui.weak(t("Kept on this machine only (in apitool.db), never written to the files. \
                      Overrides shared values; values set by scripts land here."));
                 kv_table(ui, "env-secret", &mut ed.secret, &HashMap::new(), false);
@@ -6050,8 +6134,11 @@ impl App {
                 sub_tab(ui, &mut ed.tab, FolderTab::Docs, t("Docs"), docs);
             });
             ui.separator();
+            // One height for every tab: centred, a shorter one moved the whole window and
+            // its tabs out from under the pointer.
             egui::ScrollArea::vertical()
                 .max_height(420.0)
+                .auto_shrink(false)
                 .show(ui, |ui| match ed.tab {
                     FolderTab::Vars => {
                         ui.weak(t(
@@ -6160,7 +6247,12 @@ impl App {
                                 }
                                 ui.monospace(format!("{}={}", r.name, clip(&r.value, 60)));
                                 let expires = r.expires.as_deref().unwrap_or(t("Session"));
-                                ui.weak(format!("{} · {expires}", r.path));
+                                match r.flags.is_empty() {
+                                    true => ui.weak(format!("{} · {expires}", r.path)),
+                                    false => {
+                                        ui.weak(format!("{} · {expires} · {}", r.path, r.flags))
+                                    }
+                                };
                             });
                         }
                     });
@@ -6220,12 +6312,17 @@ impl App {
                         close = icon_button(ui, icon::X, t("Close"), None)
                             .on_hover_text(t("Close"))
                             .clicked();
+                        if !self.secrets.is_empty() {
+                            secrets_eye(ui, true);
+                        }
                     });
                 });
                 ui.weak(t(
                     "The nearest scope wins. Enter keeps an edited value, Esc puts it back.",
                 ));
                 ui.separator();
+                let shown = secrets_eye(ui, false);
+                let masked = |k: &str| !shown && self.secrets.contains(k);
                 let sorted = |vars: &HashMap<String, String>| {
                     let mut vars: Vec<(String, String)> =
                         vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -6258,7 +6355,9 @@ impl App {
                                     |ui| {
                                         for (k, v) in sorted(&self.vars) {
                                             let id = egui::Id::new(("qv-env", &k));
-                                            if let Some(new) = scope_var(ui, id, &k, &v, None, true)
+                                            let hide = masked(&k);
+                                            if let Some(new) =
+                                                scope_var(ui, id, &k, &v, None, true, hide)
                                             {
                                                 set = Some((env.clone(), k, new));
                                             }
@@ -6290,6 +6389,7 @@ impl App {
                                             &v,
                                             over,
                                             false,
+                                            false,
                                         );
                                     }
                                 });
@@ -6311,7 +6411,8 @@ impl App {
                                         None
                                     };
                                     let id = egui::Id::new(("qv-globals", &k));
-                                    if let Some(new) = scope_var(ui, id, &k, &v, over, true) {
+                                    let hide = masked(&k);
+                                    if let Some(new) = scope_var(ui, id, &k, &v, over, true, hide) {
                                         set = Some((None, k, new));
                                     }
                                 }
@@ -6344,7 +6445,8 @@ impl App {
 
 /// A row of the Variables panel. `over` names the scope whose value wins over this one;
 /// `edit` false is a value kept elsewhere (a folder's settings). Returns the new value once
-/// typed and confirmed: Enter or clicking away keeps it, Esc drops it.
+/// typed and confirmed: Enter or clicking away keeps it, Esc drops it. `masked` hides a
+/// secret's value.
 fn scope_var(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -6352,6 +6454,7 @@ fn scope_var(
     value: &str,
     over: Option<&str>,
     edit: bool,
+    masked: bool,
 ) -> Option<String> {
     let label = match over {
         Some(_) => RichText::new(name).monospace().strikethrough().weak(),
@@ -6371,6 +6474,7 @@ fn scope_var(
             .unwrap_or_else(|| value.to_owned());
         let field = egui::TextEdit::singleline(&mut text)
             .id(id)
+            .password(masked)
             .font(egui::TextStyle::Monospace)
             .desired_width(ui.available_width().max(80.0));
         let r = ui.add(field);
@@ -6384,6 +6488,8 @@ fn scope_var(
                 out = Some(text);
             }
         }
+    } else if masked {
+        ui.label(RichText::new("••••••••").monospace());
     } else {
         ui.label(RichText::new(clip(value, 60)).monospace())
             .on_hover_text(value);
@@ -6403,7 +6509,7 @@ impl App {
         if let Some(color) = self.env_color() {
             label = label.color(color).strong();
         }
-        let mut chosen = None;
+        let (mut chosen, mut edit, mut create) = (None, None, false);
         egui::ComboBox::from_id_salt("env")
             .selected_text(label)
             .width(150.0)
@@ -6415,16 +6521,36 @@ impl App {
                     chosen = Some(None);
                 }
                 for name in &self.envs {
-                    if ui
-                        .selectable_label(self.active_env.as_ref() == Some(name), name)
-                        .clicked()
-                    {
-                        chosen = Some(Some(name.clone()));
-                    }
+                    ui.horizontal(|ui| {
+                        // Without switching to it, as in Postman's list: only the active
+                        // one had an edit button.
+                        let label = tf("Edit {}", &[name]);
+                        if icon_button(ui, icon::PENCIL, &label, None)
+                            .on_hover_text(&label)
+                            .clicked()
+                        {
+                            edit = Some(name.clone());
+                        }
+                        if ui
+                            .selectable_label(self.active_env.as_ref() == Some(name), name)
+                            .clicked()
+                        {
+                            chosen = Some(Some(name.clone()));
+                        }
+                    });
                 }
+                ui.separator();
+                // Here, not beside Globals in the sidebar, where its + read as "add a global".
+                create = (ui.add(icon_text(ui, icon::PLUS, t("New environment")))).clicked();
             });
         if let Some(env) = chosen {
             self.set_env(env);
+        }
+        if let Some(name) = edit {
+            self.open_env_editor(Some(name), &[]);
+        }
+        if create {
+            self.dialog = Some(Dialog::name(NameKind::NewEnv, ""));
         }
     }
 
@@ -6984,17 +7110,6 @@ impl App {
                     // A copy until Apply or Close: a proxy URL half typed would be used.
                     let net = net_draft.get_or_insert_with(|| net_now.clone());
                     network_settings(ui, net, skipped.as_deref());
-                    ui.add_space(6.0);
-                    let changed = net != net_now;
-                    // Blue only when it would do something.
-                    let button = match changed {
-                        true => primary(t("Apply")),
-                        false => egui::Button::new(t("Apply")),
-                    };
-                    apply_net = (ui.add_enabled(changed, button))
-                        .on_hover_text(t("Closing Settings applies it too"))
-                        .clicked()
-                        || (changed && enter_pressed(ui));
                 }
                 SettingsTab::Updates => {
                     ui.vertical(|ui| {
@@ -7299,6 +7414,20 @@ impl App {
             ui.add_space(most - used + 6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 close = ui.button(t("Close")).clicked();
+                // By Close, as a dialog's buttons go: under the default headers it read
+                // as theirs.
+                if *tab == SettingsTab::Network {
+                    let changed = net_draft.as_ref().is_some_and(|n| n != net_now);
+                    // Blue only when it would do something.
+                    let button = match changed {
+                        true => primary(t("Apply")),
+                        false => egui::Button::new(t("Apply")),
+                    };
+                    apply_net = (ui.add_enabled(changed, button))
+                        .on_hover_text(t("Closing Settings applies it too"))
+                        .clicked()
+                        || (changed && enter_pressed(ui));
+                }
             });
         });
         if let Some(copied) = copied {
@@ -7520,14 +7649,16 @@ fn network_settings(ui: &mut egui::Ui, net: &mut Network, skipped: Option<&str>)
         );
     }
 
+    // A heading as the other sections have: a bare row, it floated between them.
     ui.add_space(8.0);
+    ui.label(RichText::new(t("Timeout")).strong());
     ui.horizontal(|ui| {
-        ui.label(t("Timeout"));
         ui.add(
             egui::DragValue::new(&mut net.timeout_secs)
                 .range(1..=3600)
                 .suffix(" s"),
         );
+        ui.weak(t("For each request, unless its Settings tab sets its own"));
     });
 
     ui.add_space(8.0);
@@ -8515,6 +8646,22 @@ fn auto_headers_ui(ui: &mut egui::Ui, auto: Vec<(String, String, &str)>) -> bool
 /// Key/value grid with a trailing blank row: typing into it creates a new row, like Postman.
 /// `describe` marks a request table: it gets a Description column (variables have none,
 /// as in Postman) and Bulk Edit. Returns whether any row changed.
+/// Whether secret variable values show, for the session; with `button`, the eye that
+/// flips it, in the environment editor and the Variables panel.
+fn secrets_eye(ui: &mut egui::Ui, button: bool) -> bool {
+    let id = egui::Id::new("secrets-shown");
+    let shown = ui.data(|d| d.get_temp(id)).unwrap_or(false);
+    if button
+        && icon_button(ui, icon::EYE, t("Show secret values"), Some(shown))
+            .on_hover_text(t("Show secret values"))
+            .clicked()
+    {
+        ui.data_mut(|d| d.insert_temp(id, !shown));
+        return !shown;
+    }
+    shown
+}
+
 fn kv_table(
     ui: &mut egui::Ui,
     id: &str,
@@ -8588,6 +8735,9 @@ fn kv_table(
         true => (rest * 0.6, rest * 0.4 - ui.spacing().item_spacing.x),
         false => (rest, 0.0),
     };
+    // An environment's secrets stay hidden until the eye by its title shows them, as an
+    // auth secret does; the screen may be shared.
+    let masked = id == "env-secret" && !secrets_eye(ui, false);
     let mut remove = None;
     let mut blank = KeyValue::new("", "");
     let existing = rows.len();
@@ -8620,20 +8770,30 @@ fn kv_table(
                 Complete::Words(if headers { HEADER_NAMES } else { &[] }),
                 |e| e.hint_text(key_hint).desired_width(key_width),
             );
-            var_edit(
-                ui,
-                egui::Id::new((id, i, 1)),
-                &mut row.value,
-                vars,
-                style,
-                false,
-                None,
-                match headers && row.key.trim().eq_ignore_ascii_case("content-type") {
-                    true => Complete::Words(CONTENT_TYPES),
-                    false => Complete::None,
-                },
-                |e| e.hint_text(value_hint).desired_width(value_width),
-            );
+            if masked {
+                ui.add(
+                    egui::TextEdit::singleline(&mut row.value)
+                        .id(egui::Id::new((id, i, 1)))
+                        .password(true)
+                        .hint_text(value_hint)
+                        .desired_width(value_width),
+                );
+            } else {
+                var_edit(
+                    ui,
+                    egui::Id::new((id, i, 1)),
+                    &mut row.value,
+                    vars,
+                    style,
+                    false,
+                    None,
+                    match headers && row.key.trim().eq_ignore_ascii_case("content-type") {
+                        true => Complete::Words(CONTENT_TYPES),
+                        false => Complete::None,
+                    },
+                    |e| e.hint_text(value_hint).desired_width(value_width),
+                );
+            }
             if describe {
                 ui.add(
                     egui::TextEdit::singleline(&mut row.description)
@@ -11746,8 +11906,7 @@ fn response_ui(
         RespTab::Console if shown.logs.is_empty() => RespTab::Body,
         RespTab::Headers if shown.result.is_err() => RespTab::Body,
         RespTab::Cookies
-            if (shown.result.as_ref())
-                .is_ok_and(|v| crate::cookies::from_response(&v.head.headers).is_empty())
+            if (shown.result.as_ref()).is_ok_and(|v| v.cookies.is_empty())
                 || shown.result.is_err() =>
         {
             RespTab::Body
@@ -11911,7 +12070,7 @@ fn response_ui(
                             RespTab::Headers,
                             tf("Headers ({})", &[&h.headers.len()]),
                         );
-                        let cookies = crate::cookies::from_response(&h.headers).len();
+                        let cookies = view.cookies.len();
                         if cookies > 0 {
                             ui.selectable_value(
                                 tab,
@@ -12048,21 +12207,28 @@ fn response_ui(
                 .auto_shrink(false)
                 .show(ui, |ui| {
                     egui::Grid::new("resp-cookies")
-                        .num_columns(5)
+                        .num_columns(6)
                         .striped(true)
                         .show(ui, |ui| {
-                            for title in
-                                [t("Name"), t("Value"), t("Domain"), t("Path"), t("Expires")]
-                            {
+                            let titles = [
+                                t("Name"),
+                                t("Value"),
+                                t("Domain"),
+                                t("Path"),
+                                t("Expires"),
+                                t("Flags"),
+                            ];
+                            for title in titles {
                                 ui.strong(title);
                             }
                             ui.end_row();
-                            for c in crate::cookies::from_response(&view.head.headers) {
+                            for c in &view.cookies {
                                 let expires = c.expires.as_deref().unwrap_or(t("Session"));
                                 for cell in [&c.name, &c.value, &c.domain, &c.path] {
                                     ui.add(egui::Label::new(cell.as_str()).selectable(true));
                                 }
                                 ui.label(expires);
+                                ui.label(&c.flags);
                                 ui.end_row();
                             }
                         });
@@ -13175,14 +13341,85 @@ mod ui_tests {
         h.run();
     }
 
+    /// Through the environment list, where New environment is.
+    fn new_env(h: &mut Harness<'_, App>) {
+        let list = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("No environment");
+        h.get(list).click();
+        h.run();
+        h.get_by_label("New environment").click();
+        h.run();
+    }
+
+    /// Secret values stay hidden in the environment editor and the Variables panel until
+    /// the eye shows them: the screen may be shared. Shared values show as they are.
+    #[test]
+    fn secret_values_are_masked_until_the_eye_shows_them() {
+        let ws = workspace("env-masked");
+        let (shared, secret) = (
+            KeyValue::new("host", "api.local"),
+            KeyValue::new("token", "s3cr3t"),
+        );
+        ws.save_env(Some("prod"), &[shared], &[secret]).unwrap();
+        let mut h = harness(ws);
+        h.state_mut().set_env(Some("prod".into()));
+        h.state_mut().quick_look = true;
+        h.run();
+        let seen = |h: &Harness<'_, App>, v: &str| {
+            (h.get_all_by_role(Role::TextInput))
+                .any(|n| n.accesskit_node().value().as_deref() == Some(v))
+        };
+        assert!(seen(&h, "api.local") && !seen(&h, "s3cr3t"), "the panel");
+        h.get_by_label("Show secret values").click();
+        h.run();
+        assert!(seen(&h, "s3cr3t"));
+        h.get_by_label("Show secret values").click();
+        h.state_mut().open_env_editor(Some("prod".into()), &[]);
+        h.run();
+        assert!(!seen(&h, "s3cr3t"), "the editor");
+        // Its own eye, over the panel's.
+        h.get_all_by_label("Show secret values")
+            .last()
+            .unwrap()
+            .click();
+        h.run();
+        assert!(seen(&h, "s3cr3t"));
+    }
+
+    /// Any environment is edited from the list without switching to it; the sidebar's +
+    /// beside Globals read as "add a global".
+    #[test]
+    fn an_environment_is_edited_from_the_list_without_switching() {
+        let ws = workspace("env-list");
+        for name in ["dev", "prod"] {
+            ws.save_env(Some(name), &[], &[]).unwrap();
+        }
+        let mut h = harness(ws);
+        h.run();
+        assert!(
+            h.query_by_label("New environment").is_none(),
+            "only in the list"
+        );
+        let list = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("No environment");
+        h.get(list).click();
+        h.run();
+        h.get_by_label("Edit prod").click();
+        h.run();
+        let editing = h.state().env_editor.as_ref().map(|e| e.env.clone());
+        assert_eq!(editing, Some(Some("prod".into())));
+        assert_eq!(h.state().active_env, None);
+    }
+
     #[test]
     fn new_environment_variable_resolves_in_the_url() {
         let mut h = harness(workspace("env"));
         h.run();
         shot(&mut h, "01-empty");
         // Keyboard only: Enter is OK in every dialog, Escape cancels.
-        h.get_by_label("New environment").click();
-        h.run();
+        new_env(&mut h);
         type_into(&mut h, 0, "dev");
         h.key_press(Key::Enter);
         h.run();
@@ -13242,8 +13479,7 @@ mod ui_tests {
     fn new_environment_opens_ready_to_type_and_never_drops_variables() {
         let mut h = harness(workspace("env-keys"));
         h.run();
-        h.get_by_label("New environment").click();
-        h.run();
+        new_env(&mut h);
         type_into(&mut h, 0, "dev");
         h.get_by_label("Create").click();
         h.run();
@@ -13334,6 +13570,9 @@ mod ui_tests {
             ProxyMode::System,
             "not before Apply"
         );
+        // Beside Close, the dialog's; under the default headers it read as theirs.
+        let row = |l: &str| h.get_by_label(l).rect().center().y;
+        assert_eq!(row("Apply"), row("Close"));
         h.get_by_label("Apply").click();
         h.run();
         assert_eq!(h.state().network.proxy, ProxyMode::None);
@@ -14106,6 +14345,49 @@ mod ui_tests {
         );
     }
 
+    /// Sends of one request were identical rows: each says when, and a filter finds one
+    /// by its name or its URL among the last 200.
+    #[test]
+    fn history_rows_say_when_and_filter_by_name_or_url() {
+        let mut h = with_request("history-filter");
+        let entry = |path: &str, url: &str, secs_ago: u64| {
+            let request = Request {
+                url: url.into(),
+                ..Default::default()
+            };
+            let mut e = HistoryEntry::new(path.into(), 200, 5, request);
+            e.at -= secs_ago;
+            e
+        };
+        h.state_mut().history = vec![
+            entry("users/list", "http://a/u", 7200),
+            entry("orders/get", "http://b/orders/1", 0),
+        ];
+        h.state_mut().show_history = true;
+        h.run();
+        assert!(h.query_by_label("2 h ago").is_some() && h.query_by_label("just now").is_some());
+        for step in 0..2 {
+            let field = (h.get_all_by_role(Role::TextInput))
+                .find(|n| n.accesskit_node().placeholder() == Some("Filter by name or URL"))
+                .unwrap();
+            match step {
+                0 => field.click(),
+                _ => field.type_text("B/ORDERS"),
+            }
+            h.run();
+        }
+        let rows = |h: &Harness<'_, App>| {
+            ["users/list", "orders/get"].map(|l| h.query_by_label(l).is_some())
+        };
+        assert_eq!(rows(&h), [false, true], "by URL, in any case");
+        h.state_mut().history_filter = "list".into();
+        h.run();
+        assert_eq!(rows(&h), [true, false], "by name");
+        h.state_mut().history_filter = "nope".into();
+        h.run();
+        assert!(h.query_by_label("Nothing matches.").is_some());
+    }
+
     /// Resending to watch a header is common: the tab being read stays. One the next
     /// response lacks falls back to the body with the body's tools, not to a blank strip.
     #[test]
@@ -14144,6 +14426,42 @@ mod ui_tests {
         let lit = body.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True);
         assert!(lit, "the tab shown is the one lit");
         button(&h, "Find");
+    }
+
+    /// Resending is mostly to watch one part of the body change: the JSON filter and the
+    /// find query that pick it out stay on the new response.
+    #[test]
+    fn a_resend_keeps_the_filter_and_the_find() {
+        let body = r#"{"items":[{"id":1},{"id":2}]}"#;
+        let addr = crate::http::tests::serve(move |_| {
+            (
+                "200 OK\r\ncontent-type: application/json".into(),
+                body.into(),
+            )
+        });
+        let mut h = with_request("resend-filter");
+        h.state_mut().open.as_mut().unwrap().draft.url = format!("http://{addr}/");
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| app.response.is_some());
+        fn view<'a>(h: &'a mut Harness<'_, App>) -> &'a mut ResponseView {
+            h.state_mut()
+                .response
+                .as_mut()
+                .unwrap()
+                .result
+                .as_mut()
+                .unwrap()
+        }
+        let v = view(&mut h);
+        v.filter = "$.items[*].id".into();
+        v.apply_filter();
+        (v.find.open, v.find.query) = (true, "2".into());
+        h.run();
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| app.history.len() == 2);
+        let v = view(&mut h);
+        assert_eq!((v.text.as_str(), v.raw()), ("[\n  1,\n  2\n]", body));
+        assert_eq!((v.find.open, v.find.query.as_str()), (true, "2"));
     }
 
     /// A failure says why in the bar, as Postman's does: the chain's last cause is the
@@ -15665,6 +15983,54 @@ mod ui_tests {
         assert_eq!(run.items.back().unwrap().iteration, 3 * MAX_RUN_ROWS - 1);
     }
 
+    /// The folder editor keeps one size across its tabs: centred, a shorter tab moved the
+    /// whole window, and the tabs out from under the pointer.
+    #[test]
+    fn the_folder_editor_stays_put_across_its_tabs() {
+        let ws = workspace("folder-tabs");
+        let dir = ws.create_folder(&ws.collections(), "f").unwrap();
+        let mut h = harness(ws);
+        h.state_mut().open_folder_editor(dir);
+        h.run();
+        let at = |h: &Harness<'_, App>| h.get_by_label("Docs").rect().top();
+        // From the second frame: a new window learns its size in its first.
+        h.get_by_label("Variables").click();
+        h.run();
+        let first = at(&h);
+        for tab in ["Auth", "Scripts", "Docs", "Variables"] {
+            h.get_by_label(tab).click();
+            h.run();
+            assert_eq!(at(&h), first, "moved on {tab}");
+        }
+    }
+
+    /// Ctrl+K with nothing typed starts where one goes most, the open tabs in their order,
+    /// then environments and actions; it listed the 12 shortest labels.
+    #[test]
+    fn ctrl_k_starts_from_the_open_tabs() {
+        let ws = workspace("switch-start");
+        let top = ws.collections();
+        let (zeta, yak) = (
+            ws.create_request(&top, "zeta").unwrap(),
+            ws.create_request(&top, "yak").unwrap(),
+        );
+        ws.create_request(&top, "b").unwrap();
+        ws.save_env(Some("prod"), &[], &[]).unwrap();
+        let mut h = harness(ws);
+        h.state_mut().activate(zeta.clone(), true);
+        h.state_mut().activate(yak, true);
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::K);
+        h.run();
+        assert!(
+            h.query_by_label("prod").is_some(),
+            "environments are listed"
+        );
+        h.key_press(Key::Enter);
+        h.run();
+        assert_eq!(h.state().open.as_ref().map(|o| o.path.clone()), Some(zeta));
+    }
+
     #[test]
     fn fuzzy_ranks_whole_words_before_scattered_letters() {
         assert_eq!(fuzzy("users/get user", "adm"), None);
@@ -16254,13 +16620,21 @@ mod ui_tests {
             headers,
             body: String::new(),
             truncated: false,
-            sent: Default::default(),
+            sent: http::Sent {
+                url: "https://api.example.com/v1/users".into(),
+                ..Default::default()
+            },
             bytes: None,
         };
         let headers = vec![
-            cookie("sid=abc; Path=/; Max-Age=3600; HttpOnly"),
+            cookie("sid=abc; Max-Age=3600; HttpOnly"),
             ("content-type".into(), "text/plain".into()),
-            cookie("theme=dark; Domain=example.com; Expires=Wed, 21 Oct 2037 07:28:00 GMT"),
+            cookie(
+                "theme=dark; Domain=example.com; Path=/; Expires=Wed, 21 Oct 2037 07:28:00 GMT; \
+                 Secure; SameSite=Lax",
+            ),
+            // Another site's: the jar turns it down, so it isn't listed as set.
+            cookie("evil=1; Domain=other.org"),
         ];
         h.state_mut().response = Some(Shown {
             result: Ok(into_view(head(headers))),
@@ -16272,15 +16646,21 @@ mod ui_tests {
         h.get_by_label("Cookies (2)").click();
         h.run();
         shot(&mut h, "48-response-cookies");
+        // As the jar keeps them: a missing Domain is the host and a missing Path the
+        // URL's directory, so the cells aren't blank; both expiries are times.
         for cell in [
             "sid",
             "abc",
-            "in 3600 s",
+            "api.example.com",
+            "/v1",
+            "HttpOnly",
             "example.com",
             "2037-10-21 07:28 UTC",
+            "Secure, SameSite=Lax",
         ] {
             assert!(h.query_by_label(cell).is_some(), "no {cell}");
         }
+        assert_eq!(h.query_all_by_label_contains(" UTC").count(), 2);
         // No Set-Cookie, no tab: it doesn't stay stuck on an empty one.
         h.state_mut().response.as_mut().unwrap().result = Ok(into_view(head(Vec::new())));
         h.run();
@@ -16621,12 +17001,13 @@ mod ui_tests {
         let mut h = with_request("globals");
         h.get_by_label("Globals").click();
         h.run();
-        // The modal's fields come after the request editor's: shared key/value, then secret.
+        // The modal's fields come after the request editor's: shared key/value, then the
+        // secret key; the secret value is masked, a password field.
         let inputs = h.get_all_by_role(Role::TextInput);
         let key = inputs
             .filter(|n| n.accesskit_node().placeholder() != Some(FILTER_HINT))
             .count()
-            - 4;
+            - 3;
         type_into(&mut h, key, "apiKey");
         type_into(&mut h, key + 1, "k-123");
         modal_save(&mut h);
