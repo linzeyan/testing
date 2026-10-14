@@ -199,8 +199,9 @@ fn sample_one(f: &FieldDescriptor, depth: usize) -> Value {
 }
 
 /// A string that suits a field named so: the dynamic variable for the first word of the
-/// name that has one (`user_id` is an id, `home_city` a city), else a word.
-fn text_for(name: &str) -> String {
+/// name that has one (`user_id` is an id, `home_city` a city), else a word. camelCase
+/// (GraphQL's, JSON's) reads as snake_case: `firstName` is a first name, `userID` an id.
+pub(crate) fn text_for(name: &str) -> String {
     const BY_WORD: &[(&str, &str)] = &[
         ("first_name", "$randomFirstName"),
         ("last_name", "$randomLastName"),
@@ -222,7 +223,16 @@ fn text_for(name: &str) -> String {
         ("message", "$randomLoremSentence"),
         ("text", "$randomLoremSentence"),
     ];
-    let name = name.to_lowercase();
+    let mut snake = String::new();
+    let mut lower = false;
+    for c in name.chars() {
+        if c.is_uppercase() && lower {
+            snake.push('_');
+        }
+        lower = c.is_lowercase() || c.is_ascii_digit();
+        snake.extend(c.to_lowercase());
+    }
+    let name = snake;
     let words: Vec<&str> = name.split('_').collect();
     let hit = |(word, _): &&(&str, &str)| match word.contains('_') {
         true => name.contains(word),

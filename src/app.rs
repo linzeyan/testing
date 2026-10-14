@@ -510,6 +510,8 @@ struct Explorer {
     replace: bool,
     /// Variables as JSON text instead of the form.
     vars_json: bool,
+    /// Variables and fields added start empty, not random (kept in the workspace state).
+    blank: bool,
 }
 
 struct ResponseView {
@@ -1112,6 +1114,7 @@ impl App {
             grpc_methods: None,
             explorer: Explorer {
                 replace: state.gql_replace,
+                blank: state.gql_blank,
                 ..Default::default()
             },
             load: None,
@@ -1364,6 +1367,7 @@ impl App {
             recent_filters: self.recent_filters.clone(),
             raw_types: self.raw_types.clone(),
             gql_replace: self.explorer.replace,
+            gql_blank: self.explorer.blank,
             run_orders: self.run_orders.clone(),
             run_options: self.run_options.clone(),
             appearance: self.appearance.clone(),
@@ -4320,7 +4324,7 @@ impl App {
         let mut define: Option<Vec<String>> = None;
         let mut fetch_schema = false;
         let mut change_defaults = false;
-        let replace_query = self.explorer.replace;
+        let explorer_flags = (self.explorer.replace, self.explorer.blank);
         let mut reflect = false;
         let mut example = None;
         let pending = self.pending.iter().find(|p| p.path == open.path);
@@ -5082,7 +5086,7 @@ impl App {
         if change_defaults {
             (self.settings, self.settings_tab) = (true, SettingsTab::Network);
         }
-        if self.explorer.replace != replace_query {
+        if (self.explorer.replace, self.explorer.blank) != explorer_flags {
             self.save_state();
         }
         if let Some(names) = define {
@@ -8899,6 +8903,11 @@ fn graphql_editor(
             ui.add_space(4.0);
             sub_tab(ui, &mut ex.vars_json, false, t("Form"), false);
             sub_tab(ui, &mut ex.vars_json, true, "JSON", false);
+            let mut random = !ex.blank;
+            ui.checkbox(&mut random, t("Fill in values")).on_hover_text(t(
+                "On: a variable or field added gets a random value of its type, as gRPC's Fill body does. Off: it starts empty.",
+            ));
+            ex.blank = !random;
             // Checked as sent: `{{n}}` may stand unquoted for a number.
             let text = graphql::without_variables(variables);
             if !variables.trim().is_empty()
@@ -8930,7 +8939,7 @@ fn graphql_editor(
                     );
                 } else {
                     let schema = ex.schema.as_ref().and_then(|s| s.as_ref().ok());
-                    variables_form(ui, query, variables, vars, schema);
+                    variables_form(ui, query, variables, vars, schema, !ex.blank);
                 }
             });
 
@@ -9048,8 +9057,11 @@ fn graphql_editor(
             false => schema.add(op, &path, query, variables),
         };
         if let Some((text, vars)) = picked {
+            *variables = match ex.blank {
+                true => vars,
+                false => schema.fill_nulls(&text, &vars),
+            };
             *query = text;
-            *variables = vars;
         }
     }
     fetch
@@ -9057,17 +9069,20 @@ fn graphql_editor(
 
 /// GraphQL variables as a form: a row for each variable the query declares, taking its
 /// value by its type (enums and inputs by the schema too), written back into the JSON
-/// text, which stays the one copy. A member the query doesn't declare gets a row too, to
-/// edit or remove.
+/// text, which stays the one copy. An input object lists all its fields, nested ones in
+/// the fields ticked, as Postman's does: an unticked field isn't sent. A ticked field
+/// starts random of its type (`random`), or empty. A member the query or the input type
+/// doesn't declare gets a row too, to edit or remove.
 fn variables_form(
     ui: &mut egui::Ui,
     query: &str,
     variables: &mut String,
     vars: &HashMap<String, String>,
     schema: Option<&graphql::Schema>,
+    random: bool,
 ) {
     use graphql::Input;
-    let Some(mut members) = graphql::members(variables) else {
+    let Some(members) = graphql::members(variables) else {
         ui.colored_label(
             ORANGE,
             t("These variables aren't a JSON object: fix them under JSON."),
@@ -9075,25 +9090,31 @@ fn variables_form(
         return;
     };
     let declared = graphql::declared(query);
-    let not_declared = t("not in the query");
-    // (name, type, default, required, declared)
-    let mut rows: Vec<(&str, &str, Option<&str>, bool, bool)> = (declared.iter())
-        .map(|d| {
-            (
-                &d.name[..],
-                &d.ty[..],
-                d.default.as_deref(),
-                d.required(),
-                true,
-            )
-        })
-        .collect();
-    for (name, _) in &members {
+    let raw_of = |name: &str| members.iter().find(|m| m.0 == name).map(|m| m.1.clone());
+    let mut lines = Vec::new();
+    for d in &declared {
+        let line = VarLine {
+            path: vec![d.name.clone()],
+            ty: d.ty.clone(),
+            default: d.default.clone(),
+            required: d.required(),
+            known: true,
+            raw: raw_of(&d.name),
+            ticked: None,
+            fields: false,
+        };
+        var_lines(&mut lines, schema, line);
+    }
+    for (name, raw) in &members {
         if !declared.iter().any(|d| d.name == *name) {
-            rows.push((name, not_declared, None, false, false));
+            lines.push(VarLine::unknown(
+                vec![name.clone()],
+                t("not in the query"),
+                raw,
+            ));
         }
     }
-    if rows.is_empty() {
+    if lines.is_empty() {
         ui.weak(t(
             "The query declares no variables. Declare them as in query Users($first: Int), or click a field with arguments in the schema.",
         ));
@@ -9101,35 +9122,49 @@ fn variables_form(
     }
     let font = egui::TextStyle::Monospace.resolve(ui.style());
     let (text_color, weak) = (ui.visuals().text_color(), ui.visuals().weak_text_color());
-    let label = |name: &str, ty: &str, color: Color32| {
+    let label = |line: &VarLine, color: Color32| {
         let mut job = egui::text::LayoutJob::default();
         let format = |c| egui::TextFormat::simple(font.clone(), c);
-        job.append(&format!("${name}"), 0.0, format(color));
-        job.append(&format!(" {ty}"), 4.0, format(weak));
+        let name = &line.path[line.path.len() - 1];
+        match line.path.len() {
+            1 => job.append(&format!("${name}"), 0.0, format(color)),
+            _ => job.append(name, 0.0, format(color)),
+        }
+        job.append(&format!(" {}", line.ty), 4.0, format(weak));
         job
     };
+    // A field sits under its input, past the ticks.
+    const INDENT: f32 = 18.0;
+    let tick = ui.spacing().icon_width + ui.spacing().icon_spacing;
+    let lead = |l: &VarLine| {
+        (l.path.len() - 1) as f32 * INDENT + if l.ticked.is_some() { tick } else { 0.0 }
+    };
     // Names and types in a column as wide as the widest, the values lined up after it.
-    let widest = (rows.iter())
-        .map(|r| {
-            ui.painter()
-                .layout_job(label(r.0, r.1, text_color))
-                .size()
-                .x
-        })
+    let widest = (lines.iter())
+        .map(|l| lead(l) + ui.painter().layout_job(label(l, text_color)).size().x)
         .fold(0.0, f32::max);
     let label_width = widest.min(ui.available_width() * 0.5);
     let side = button_height(ui);
+    let sample = |line: &VarLine| {
+        let name = &line.path[line.path.len() - 1];
+        schema.map_or(serde_json::Value::Null, |s| {
+            s.sample(name, &line.ty, random)
+        })
+    };
     let mut edit = None;
-    for &(name, ty, default, required, known) in &rows {
-        let raw = members.iter().find(|m| m.0 == name).map(|m| &m.1[..]);
-        let input = match known {
-            true => Input::of(ty, schema),
+    for line in &lines {
+        let input = match line.known {
+            true => Input::of(&line.ty, schema),
             false => Input::Json,
         };
-        let missing = required && raw.is_none_or(|r| r == "null");
+        let raw = line.raw.as_deref();
+        let top = line.path.len() == 1;
+        let missing = line.required && raw.is_none_or(|r| r == "null");
         let shown = input.shown(raw.unwrap_or_default());
-        let invalid = raw.is_some_and(|r| !input.valid(r));
-        let fill = schema.filter(|s| known && shown.is_empty() && s.is_input(ty));
+        let invalid = !line.fields && raw.is_some_and(|r| !input.valid(r));
+        // A list of inputs is typed as JSON, from its fields' sample.
+        let fill = schema
+            .filter(|s| line.known && !line.fields && shown.is_empty() && s.is_input(&line.ty));
         let mut typed = None;
         ui.horizontal(|ui| {
             let size = egui::vec2(label_width, side);
@@ -9138,19 +9173,50 @@ fn variables_form(
             let r = ui.allocate_ui_with_layout(size, layout, |ui| {
                 // Not shrunk to the text: the values start in one column.
                 ui.set_width(label_width);
-                ui.add(egui::Label::new(label(name, ty, color)).truncate())
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                ui.add_space((line.path.len() - 1) as f32 * INDENT);
+                match line.ticked {
+                    Some(ticked) => {
+                        let mut on = ticked;
+                        let r = ui.checkbox(&mut on, label(line, color));
+                        if r.changed() {
+                            edit = Some((line.path.clone(), on.then(|| sample(line).to_string())));
+                        }
+                        r.on_hover_text(match ticked {
+                            true => t("Sent; untick to leave it out"),
+                            false => t("Not sent; tick to add it"),
+                        })
+                    }
+                    None => ui.add(egui::Label::new(label(line, color)).truncate()),
+                }
             });
             if missing {
                 r.inner
                     .on_hover_text(t("Required: the server refuses the query without it."));
             }
-            let trailing = [invalid, fill.is_some(), !known]
+            if line.fields || line.ticked == Some(false) {
+                // An input object's fields are the rows below it.
+                if top && line.fields {
+                    let (glyph, why, value) = match raw.is_none_or(|r| r == "null") {
+                        true => (icon::WAND, t("Fill in its fields"), Some(sample(line))),
+                        false => (icon::TRASH, t("Leave it out"), None),
+                    };
+                    if icon_button(ui, glyph, why, None)
+                        .on_hover_text(why)
+                        .clicked()
+                    {
+                        edit = Some((line.path.clone(), value.map(|v| v.to_string())));
+                    }
+                }
+                return;
+            }
+            let trailing = [invalid, fill.is_some(), !line.known]
                 .iter()
                 .filter(|b| **b)
                 .count();
             let width =
                 ui.available_width() - trailing as f32 * (side + ui.spacing().item_spacing.x);
-            let id = egui::Id::new(("gql-var", name));
+            let id = egui::Id::new(("gql-var", &line.path));
             let options: Vec<&str> = match &input {
                 Input::Boolean => vec!["true", "false"],
                 Input::Choice(values) => values.iter().map(String::as_str).collect(),
@@ -9172,7 +9238,8 @@ fn variables_form(
                     });
             } else {
                 let mut text = shown.clone();
-                let hint = default.map_or(String::new(), |d| tf("{} (default)", &[&d]));
+                let hint =
+                    (line.default.as_ref()).map_or(String::new(), |d| tf("{} (default)", &[d]));
                 // Lists and inputs may run over several lines.
                 let json = input == Input::Json;
                 let r = var_edit(
@@ -9198,37 +9265,108 @@ fn variables_form(
                 };
                 icon_label(ui, icon::WARNING, Some(ORANGE)).on_hover_text(why);
             }
-            if let Some(s) = fill
+            if fill.is_some()
                 && icon_button(ui, icon::WAND, t("Fill in its fields"), None)
                     .on_hover_text(t("Fill in its fields"))
                     .clicked()
             {
-                typed = Some(s.sample(ty).to_string());
+                typed = Some(sample(line).to_string());
             }
-            if !known
+            if !line.known
                 && icon_button(ui, icon::TRASH, t("Remove"), None)
                     .on_hover_text(t("Remove"))
                     .clicked()
             {
-                typed = Some(String::new());
+                edit = Some((line.path.clone(), None));
             }
         });
         if let Some(typed) = typed {
-            edit = Some((name.to_owned(), input.stored(&typed)));
+            // A ticked field cleared stays sent, as an empty string or a null: unticking
+            // is what leaves it out.
+            let value = match (input.stored(&typed), top) {
+                (None, false) if input == Input::Text => Some("\"\"".into()),
+                (None, false) => Some("null".into()),
+                (value, _) => value,
+            };
+            edit = Some((line.path.clone(), value));
         }
     }
-    let Some((name, value)) = edit else {
-        return;
+    if let Some((path, value)) = edit
+        && let Some(text) = graphql::set_member(variables, &path, value)
+    {
+        *variables = text;
+    }
+}
+
+/// A row of the variables form: a variable, or a field of the input object it holds.
+struct VarLine {
+    /// The variable's name, then the fields down to this one.
+    path: Vec<String>,
+    ty: String,
+    default: Option<String>,
+    required: bool,
+    /// Declared by the query, or a field of its input type.
+    known: bool,
+    /// Its JSON text; None when it isn't in the value.
+    raw: Option<String>,
+    /// A field: whether it's sent. None for a variable.
+    ticked: Option<bool>,
+    /// An input object, its fields the rows that follow.
+    fields: bool,
+}
+
+impl VarLine {
+    fn unknown(path: Vec<String>, why: &str, raw: &str) -> VarLine {
+        VarLine {
+            ticked: (path.len() > 1).then_some(true),
+            path,
+            ty: why.to_owned(),
+            default: None,
+            required: false,
+            known: false,
+            raw: Some(raw.to_owned()),
+            fields: false,
+        }
+    }
+}
+
+/// `line`, then when it holds an input object, a row for each of its fields: all of them,
+/// the ones in its value ticked and opened in turn. An unticked field stays closed, so a
+/// type that holds itself (`not: Filter`) goes only as deep as the value does.
+fn var_lines(out: &mut Vec<VarLine>, schema: Option<&graphql::Schema>, mut line: VarLine) {
+    // One input object, not a list of them: a list is typed as JSON.
+    let fields = (schema.filter(|_| line.known && line.ticked != Some(false)))
+        .filter(|s| !line.ty.starts_with('[') && s.is_input(&line.ty))
+        .and_then(|s| s.fields_of(line.ty.trim_end_matches('!')));
+    let raw = line.raw.as_deref().filter(|r| *r != "null");
+    // A `{{variable}}` for the whole input is typed, not ticked.
+    let members = graphql::members(raw.unwrap_or_default());
+    let (Some(fields), Some(members)) = (fields, members) else {
+        return out.push(line);
     };
-    match (members.iter().position(|m| m.0 == name), value) {
-        (Some(i), Some(v)) => members[i].1 = v,
-        (Some(i), None) => {
-            members.remove(i);
-        }
-        (None, Some(v)) => members.push((name, v)),
-        (None, None) => {}
+    line.fields = true;
+    let path = line.path.clone();
+    out.push(line);
+    let below = |name: &str| [&path[..], &[name.to_owned()]].concat();
+    for f in fields {
+        let raw = members.iter().find(|m| m.0 == f.name).map(|m| m.1.clone());
+        let field = VarLine {
+            path: below(&f.name),
+            ty: f.ty.clone(),
+            default: None,
+            required: f.ty.ends_with('!'),
+            known: true,
+            ticked: Some(raw.is_some()),
+            raw,
+            fields: false,
+        };
+        var_lines(out, schema, field);
     }
-    *variables = graphql::object(&members);
+    for (name, raw) in &members {
+        if !fields.iter().any(|f| f.name == *name) {
+            out.push(VarLine::unknown(below(name), t("not in its type"), raw));
+        }
+    }
 }
 
 fn code_editor(
@@ -15994,21 +16132,77 @@ mod ui_tests {
         h.run();
         h.get_by_label("true").click();
         h.run();
-        // An input object fills in from the schema.
+        // An input object lists every field of its type before it has a value, as
+        // Postman's does: ticked ones are sent.
+        let ticked = |h: &Harness<'_, App>, label: &str| {
+            let node = h.get_all_by_label(label).next().unwrap();
+            node.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
+        };
+        for field in ["name String!", "email String", "friend UserInput"] {
+            assert!(!ticked(&h, field), "{field}");
+        }
+        // Filled in from the schema with random values of their types (an email for
+        // `email`): what it requires and its scalars. The input inside stays unticked and
+        // closed, or a type that holds itself would go on forever.
         h.get_by_label("Fill in its fields").click_accesskit();
         h.run();
+        let input = |h: &Harness<'_, App>| -> serde_json::Value {
+            let members = crate::graphql::members(&variables(h)).unwrap();
+            let raw = &members.iter().find(|m| m.0 == "input").unwrap().1;
+            serde_json::from_str(raw).unwrap()
+        };
+        let filled = input(&h);
+        assert!(
+            filled["name"].as_str().is_some_and(|n| !n.is_empty()),
+            "{filled}"
+        );
+        assert!(
+            filled["email"].as_str().is_some_and(|e| e.contains('@')),
+            "{filled}"
+        );
+        assert!(filled.get("friend").is_none(), "{filled}");
+        assert!(ticked(&h, "name String!") && !ticked(&h, "friend UserInput"));
+        assert!(h.query_by_label("Fill in its fields").is_none(), "filled");
+        // Cleared, a ticked field is still sent, empty: unticking is what leaves it out.
+        on_row(&h, "name String!", Role::TextInput).click();
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.key_press(Key::Backspace);
+        h.run();
+        assert_eq!(input(&h)["name"], "", "{}", input(&h));
+        // Ticked, the input inside fills in and lists its own fields; unticked, a field
+        // goes out of the value. The rest of the JSON stays as typed.
+        h.get_by_label("friend UserInput").click_accesskit();
+        h.run();
+        assert!(input(&h)["friend"]["name"].is_string(), "{}", input(&h));
+        assert_eq!(h.get_all_by_label("name String!").count(), 2);
+        h.get_all_by_label("email String")
+            .next()
+            .unwrap()
+            .click_accesskit();
+        h.run();
+        assert!(input(&h).get("email").is_none(), "{}", input(&h));
+        assert!(
+            variables(&h).contains("\"first\": {{n}},"),
+            "{}",
+            variables(&h)
+        );
         // Side by side, the whole form shows.
         h.set_size(egui::vec2(1600.0, 900.0));
         h.run();
         shot(&mut h, "74-graphql-variables-form");
         h.set_size(egui::vec2(1200.0, 800.0));
         h.run();
-        assert_eq!(
-            variables(&h),
-            "{\n  \"id\": \"u1\",\n  \"first\": {{n}},\n  \"role\": \"ADMIN\",\n  \
-             \"on\": true,\n  \"input\": {\"name\":\"\"}\n}"
-        );
-        assert!(h.query_by_label("Fill in its fields").is_none(), "filled");
+        // Fill in values off: a field ticked starts empty, and that's kept.
+        h.get_by_label("Fill in values").click_accesskit();
+        h.run();
+        h.get_all_by_label("email String")
+            .next()
+            .unwrap()
+            .click_accesskit();
+        h.run();
+        assert_eq!(input(&h)["email"], "");
+        assert!(h.state().ws.load_state().gql_blank);
         // Emptied, a variable is left out.
         on_row(&h, "$id ID!", Role::TextInput).click();
         h.run();
@@ -16110,7 +16304,13 @@ mod ui_tests {
             panic!("body changed type")
         };
         assert!(query.starts_with("query User($id: ID!) {"), "{query}");
-        assert_eq!(variables, "{\n  \"id\": null\n}");
+        // A new variable comes with a random value of its type, to send as it is.
+        let value = |text: &str, name: &str| {
+            let members = crate::graphql::members(text).unwrap();
+            members.into_iter().find(|m| m.0 == name).unwrap().1
+        };
+        let id = value(variables, "id");
+        assert_eq!(id.len(), 38, "a quoted UUID: {id}");
         // Further down, a click adds just that field's path to the query, its root's
         // argument declared; an enum's value isn't a field to add.
         h.get_by_label("role: Role").click_accesskit();
@@ -16129,7 +16329,12 @@ mod ui_tests {
             query.ends_with("  users(first: $first) {\n    role\n  }\n}\n"),
             "{query}"
         );
-        assert_eq!(variables, "{\n  \"id\": null,\n  \"first\": null\n}");
+        // Only the new one: what the earlier one holds is the user's by now.
+        assert_eq!(value(variables, "id"), id);
+        assert!(
+            value(variables, "first").parse::<u64>().is_ok(),
+            "{variables}"
+        );
 
         // Another root field joins the query too: one query asks for several.
         h.get_by_label("version: String").click_accesskit();

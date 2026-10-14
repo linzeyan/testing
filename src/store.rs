@@ -165,6 +165,8 @@ pub struct State {
     pub raw_types: Vec<String>,
     /// A clicked root field in the GraphQL explorer replaces the query; off, it joins it.
     pub gql_replace: bool,
+    /// Variables and fields added in the GraphQL form start empty, not random.
+    pub gql_blank: bool,
     /// What the collection runner runs, by scope (`Workspace::key`): its requests in run
     /// order, each ticked or not. Only scopes that differ from the tree with all ticked.
     pub run_orders: HashMap<String, Vec<(String, bool)>>,

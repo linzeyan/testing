@@ -769,47 +769,120 @@ fn string_end(b: &[u8], mut i: usize) -> usize {
 
 /// `members` as an object's text, one a line, the values as they are; none is no text.
 pub fn object(members: &[(String, String)]) -> String {
+    object_at(members, 0)
+}
+
+/// `object` for one `depth` objects in, indented to sit there; none is `{}` but at the top.
+fn object_at(members: &[(String, String)], depth: usize) -> String {
     if members.is_empty() {
-        return String::new();
+        return if depth == 0 {
+            String::new()
+        } else {
+            "{}".into()
+        };
     }
+    let pad = "  ".repeat(depth);
     let lines: Vec<_> = (members.iter())
-        .map(|(name, value)| format!("  {}: {value}", Value::from(name.as_str())))
+        .map(|(name, value)| format!("{pad}  {}: {value}", Value::from(name.as_str())))
         .collect();
-    format!("{{\n{}\n}}", lines.join(",\n"))
+    format!("{{\n{}\n{pad}}}", lines.join(",\n"))
+}
+
+/// `text` (an object, read as loosely as `members` reads it) with the member down `path`
+/// set to `value`, or taken out for None; the objects on the way are made as needed. The
+/// rest stays as written. None when something on the way isn't an object.
+pub fn set_member(text: &str, path: &[String], value: Option<String>) -> Option<String> {
+    set_at(text, path, value, 0)
+}
+
+fn set_at(text: &str, path: &[String], value: Option<String>, depth: usize) -> Option<String> {
+    let text = if text.trim() == "null" { "" } else { text };
+    let mut members = members(text)?;
+    let (name, rest) = path.split_first()?;
+    let at = members.iter().position(|m| m.0 == *name);
+    let value = match rest.is_empty() {
+        true => value,
+        false => {
+            let inner = at.map_or("", |i| members[i].1.as_str());
+            Some(set_at(inner, rest, value, depth + 1)?)
+        }
+    };
+    match (at, value) {
+        (Some(i), Some(v)) => members[i].1 = v,
+        (Some(i), None) => {
+            members.remove(i);
+        }
+        (None, Some(v)) => members.push((name.clone(), v)),
+        (None, None) => {}
+    }
+    Some(object_at(&members, depth))
 }
 
 impl Schema {
-    /// A value of type `ty` for the form to fill in: an input object with its scalar and
-    /// enum fields, and the input fields it requires. Optional inputs are left out: filter
+    /// A value of type `ty` for a variable or field called `name`: random of its type when
+    /// `random`, as gRPC's Fill body is (a string as its name suggests: an email, a city…),
+    /// else empty. An input object comes with its scalar and enum fields and the input
+    /// fields it requires. Optional inputs are left out, for the form to tick: filter
     /// inputs (`where: { AND: [...] }`) hold themselves and would fill a page.
-    pub fn sample(&self, ty: &str) -> Value {
-        self.sample_in(ty, 0)
+    pub fn sample(&self, name: &str, ty: &str, random: bool) -> Value {
+        self.sample_in(name, ty, random, 0)
     }
 
-    fn sample_in(&self, ty: &str, depth: usize) -> Value {
+    fn sample_in(&self, name: &str, ty: &str, random: bool, depth: usize) -> Value {
+        use crate::fake::below;
         let ty = ty.trim_end_matches('!');
         if let Some(inner) = ty.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
-            return Value::Array(vec![self.sample_in(inner, depth)]);
+            return Value::Array(vec![self.sample_in(name, inner, random, depth)]);
         }
-        match ty {
-            "Int" => 0.into(),
-            "Float" => 0.0.into(),
-            "Boolean" => false.into(),
-            "String" | "ID" => "".into(),
+        match (ty, random) {
+            ("Int", true) => below(1000).into(),
+            ("Float", true) => (below(100_000) as f64 / 100.0).into(),
+            ("Boolean", true) => (below(2) == 1).into(),
+            ("String", true) => crate::grpc::text_for(name).into(),
+            ("ID", true) => crate::fake::value("$randomUUID").into(),
+            ("Int", false) => 0.into(),
+            ("Float", false) => 0.0.into(),
+            ("Boolean", false) => false.into(),
+            ("String" | "ID", false) => "".into(),
             _ => match self.types.get(ty) {
-                Some(t) if t.kind == "ENUM" => {
-                    (t.fields.first()).map_or(Value::Null, |f| f.name.clone().into())
+                Some(t) if t.kind == "ENUM" && !t.fields.is_empty() => {
+                    let i = if random {
+                        below(t.fields.len() as u64)
+                    } else {
+                        0
+                    };
+                    t.fields[i as usize].name.clone().into()
                 }
                 Some(t) if t.kind == "INPUT_OBJECT" && depth < SELECT_DEPTH => {
                     let fields = (t.fields.iter())
                         .filter(|f| f.ty.ends_with('!') || !self.is_input(&f.ty))
-                        .map(|f| (f.name.clone(), self.sample_in(&f.ty, depth + 1)))
+                        .map(|f| {
+                            let value = self.sample_in(&f.name, &f.ty, random, depth + 1);
+                            (f.name.clone(), value)
+                        })
                         .collect();
                     Value::Object(fields)
                 }
                 _ => Value::Null,
             },
         }
+    }
+
+    /// `variables` with a random value for each variable `query` declares that is null, as
+    /// clicking a field in the explorer adds them; values already there are kept.
+    pub fn fill_nulls(&self, query: &str, variables: &str) -> String {
+        let Some(mut members) = members(variables) else {
+            return variables.to_owned();
+        };
+        for d in declared(query) {
+            if let Some(m) = members
+                .iter_mut()
+                .find(|(n, v)| *n == d.name && v == "null")
+            {
+                m.1 = self.sample(&d.name, &d.ty, true).to_string();
+            }
+        }
+        object(&members)
     }
 
     /// Whether `ty`'s named type is an input object.
@@ -1105,7 +1178,9 @@ pub(crate) mod tests {
                     { "name": "GUEST" }
                 ]},
                 { "kind": "INPUT_OBJECT", "name": "UserInput", "fields": null, "inputFields": [
-                    { "name": "name", "type": wrap("NON_NULL", named("SCALAR", "String")) }
+                    { "name": "name", "type": wrap("NON_NULL", named("SCALAR", "String")) },
+                    { "name": "email", "type": named("SCALAR", "String") },
+                    { "name": "friend", "type": named("INPUT_OBJECT", "UserInput") }
                 ]},
                 { "kind": "SCALAR", "name": "String", "fields": null },
                 { "kind": "OBJECT", "name": "__Type", "fields": [] }
@@ -1221,15 +1296,54 @@ pub(crate) mod tests {
         }));
         let schema = parse(&doc.to_string()).unwrap();
         // Optional inputs stay out; the required one comes with its fields.
+        let user = serde_json::json!({ "name": "", "email": "" });
         assert_eq!(
-            schema.sample("Filter!"),
-            serde_json::json!({ "role": "ADMIN", "user": { "name": "" }, "after": 0 })
+            schema.sample("where", "Filter!", false),
+            serde_json::json!({ "role": "ADMIN", "user": user, "after": 0 })
         );
+        // Random: the same shape, each value of its type, a string as its name suggests.
+        let random = schema.sample("where", "Filter!", true);
+        assert!(["ADMIN", "GUEST"].contains(&random["role"].as_str().unwrap()));
+        assert!(random["after"].is_u64(), "{random}");
+        assert!(
+            random["user"]["email"].as_str().unwrap().contains('@'),
+            "{random}"
+        );
+        assert!(random.get("and").is_none() && random.get("not").is_none());
+        // GraphQL names are camelCase.
+        assert!(crate::grpc::text_for("workEmail").contains('@'));
         assert_eq!(
-            schema.sample("[UserInput!]"),
-            serde_json::json!([{ "name": "" }])
+            schema.sample("users", "[UserInput!]", false),
+            serde_json::json!([user])
         );
         assert!(schema.is_input("[Filter!]!") && !schema.is_input("User"));
+    }
+
+    /// The form edits one member of the JSON text and leaves the rest as typed: an
+    /// unquoted `{{n}}` (a number filled in when sent) survives, the objects on the way are
+    /// made (a null one too), and what isn't an object is refused rather than overwritten.
+    #[test]
+    fn a_member_is_set_deep_in_the_text_and_the_rest_kept() {
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let city = path(&["input", "address", "city"]);
+        let text = "{\n  \"n\": {{n}},\n  \"input\": null\n}";
+        let set = set_member(text, &city, Some("\"Oslo\"".into())).unwrap();
+        assert_eq!(
+            set,
+            "{\n  \"n\": {{n}},\n  \"input\": {\n    \"address\": {\n      \"city\": \"Oslo\"\n    }\n  }\n}"
+        );
+        let back = set_member(&set, &city, None).unwrap();
+        assert_eq!(
+            back,
+            "{\n  \"n\": {{n}},\n  \"input\": {\n    \"address\": {}\n  }\n}"
+        );
+        let a = path(&["a"]);
+        assert_eq!(
+            set_member("", &a, Some("1".into())).unwrap(),
+            "{\n  \"a\": 1\n}"
+        );
+        assert_eq!(set_member("{\"a\": 1}", &a, None).unwrap(), "");
+        assert!(set_member("{\"a\": 1}", &path(&["a", "b"]), Some("1".into())).is_none());
     }
 
     #[test]
@@ -1493,7 +1607,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             names(schema.fields_of("UserInput").unwrap()),
-            ["name: String!"]
+            ["name: String!", "email: String", "friend: UserInput"]
         );
         let role = schema.fields_of("Role").unwrap();
         assert_eq!(names(role), ["ADMIN: ", "GUEST: "]);

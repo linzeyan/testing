@@ -39,7 +39,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | 協定 | 說明 |
 |---|---|
 | HTTP | 每個請求可個別設定 HTTP 版本、重新導向、TLS 驗證、Cookie 與逾時 |
-| GraphQL | 取得 schema 後，輸入查詢時會補全欄位；變數以表單填寫，查詢宣告的每個 `$變數` 一列（enum 與 Boolean 用下拉、數字可用 `{{變數}}`、input 可依 schema 填入欄位），也可切成 JSON；變數區固定在查詢下方，中間的分隔線可拖曳調整高度，查詢再長也不會把變數擠出畫面；`subscription` 透過 WebSocket 連線（graphql-transport-ws 或較舊的 graphql-ws），逐筆串流結果 |
+| GraphQL | 取得 schema 後，輸入查詢時會補全欄位；變數以表單填寫，查詢宣告的每個 `$變數` 一列（enum 與 Boolean 用下拉、數字可用 `{{變數}}`；input object 會列出該型別的所有欄位，勾選的欄位下再列出其巢狀欄位，只有勾選的才會送出，同 Postman），也可切成 JSON。新加入的變數或欄位預設填入該型別的隨機值，如同 gRPC 的 Fill body（關閉「填入值」則從空值開始）；變數區固定在查詢下方，中間的分隔線可拖曳調整高度，查詢再長也不會把變數擠出畫面；`subscription` 透過 WebSocket 連線（graphql-transport-ws 或較舊的 graphql-ws），逐筆串流結果 |
 | WebSocket | 文字或二進位訊息：Send 旁選 Base64 或 Hex，輸入框內容解碼後以一則二進位訊息送出；收到的二進位訊息顯示大小與 hex |
 | SSE | |
 | Socket.IO 2、3 與 4 | URL 的路徑即 namespace，JSON 內容即 auth payload（v2 沒有 auth payload，「參數」會附在交握的查詢字串上）；「設定」可指定交握路徑（空白即 `/socket.io/`）與用戶端版本；以 `event {"json": "arg"}` 或 `["event", …]` 陣列送出；會顯示 ack |
