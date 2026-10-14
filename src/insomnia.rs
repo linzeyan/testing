@@ -377,6 +377,8 @@ fn auth(a: &Value) -> Result<Auth, String> {
             password: s("password"),
             auth_url: s("authorizationUrl"),
             redirect_uri: s("redirectUrl"),
+            // Insomnia's "Credentials in body" is off unless ticked: the header.
+            basic_auth: a["credentialsInBody"] != true,
         }),
         "iam" => Auth::AwsV4(AwsV4 {
             access_key: s("accessKeyId"),
@@ -486,6 +488,21 @@ fn template(s: &str, unknown: &mut HashSet<String>) -> String {
 mod tests {
     use super::*;
     use crate::postman::Env;
+
+    /// Insomnia sends the client in a Basic header unless "Credentials in body" is ticked:
+    /// an import that put it in the form could fail where the request worked.
+    #[test]
+    fn oauth2_sends_the_client_as_insomnia_does() {
+        let basic = |a: Value| match auth(&a) {
+            Ok(Auth::OAuth2(o)) => o.basic_auth,
+            other => panic!("{other:?}"),
+        };
+        let a = json!({ "type": "oauth2", "grantType": "client_credentials" });
+        assert!(basic(a.clone()));
+        let mut body = a;
+        body["credentialsInBody"] = true.into();
+        assert!(!basic(body));
+    }
 
     type Parts = (
         Vec<(String, Folder)>,

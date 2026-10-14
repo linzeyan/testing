@@ -72,7 +72,7 @@ closes it.
 **Bodies**
 
 - JSON; text (Text, XML, HTML or JavaScript sets the Content-Type; XML has Beautify); form;
-  multipart (a value `@path` uploads a file).
+  multipart (a value `@path` uploads a file; each part's 📂 picks one).
 - Binary sends a file as it is, streamed from disk, its type guessed from the extension;
   or bytes pasted as Base64 (standard or URL-safe) or hex, decoded when sent. The size they
   decode to shows under them, a typo in orange; switching between the two keeps the bytes.
@@ -158,8 +158,8 @@ closes it.
 | API key | In a header or the query |
 | AWS Signature v4 | Signed over the final URL, headers and body on every send; S3 and session tokens included; Postman's awsv4 both ways |
 | OAuth 1.0a | HMAC-SHA1/256/512, RSA-SHA256/512, PLAINTEXT; signed over method, URL, query and form body; Postman and Insomnia import |
-| JWT Bearer | HS/RS/PS/ES 256–512 and EdDSA, signed on each send from a JSON payload with variables; Postman's jwt both ways |
-| OAuth 2.0 | Client credentials, password, implicit, and authorization code with PKCE |
+| JWT Bearer | HS/RS/PS/ES 256–512 and EdDSA, signed on each send from a JSON payload with variables; more header fields (`kid`…) as JSON; an HS secret given as Base64; sent after a prefix other than Bearer, or as a query parameter; Postman's jwt both ways |
+| OAuth 2.0 | Client credentials, password, implicit, and authorization code with PKCE; the client ID and secret go in the token request's body or as a Basic header (Postman's and Insomnia's choice comes along on import) |
 | Hawk | SHA-256 or SHA-1, a fresh nonce and timestamp per send, optionally the payload hash; Postman both ways, Insomnia import |
 | Akamai EdgeGrid | Signed over the method, URL, chosen headers and a POST's body; Postman both ways |
 | NTLM | NTLMv2 over HTTP/1.1, the challenge and answer on one connection; through a proxy only for https:// |

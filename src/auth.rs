@@ -248,10 +248,18 @@ async fn request_token(
     o: &OAuth2,
     form: &[(&str, String)],
 ) -> Result<Granted, String> {
-    let resp = client
-        .post(o.token_url.trim())
-        .header(reqwest::header::ACCEPT, "application/json")
-        .form(form)
+    let mut b =
+        (client.post(o.token_url.trim())).header(reqwest::header::ACCEPT, "application/json");
+    let mut form = form.to_vec();
+    if o.basic_auth {
+        // RFC 6749 2.3.1: each part form-encoded before the pair is, so a `:` in the ID
+        // can't split it; and not in the body as well, which the RFC forbids.
+        let enc = |s: &str| crate::sigv4::uri_encode(s, false);
+        b = b.basic_auth(enc(&o.client_id), Some(enc(&o.client_secret)));
+        form.retain(|(k, _)| !matches!(*k, "client_id" | "client_secret"));
+    }
+    let resp = b
+        .form(&form)
         .send()
         .await
         .map_err(|e| format!("OAuth 2.0 token request: {}", error_chain(&e)))?;
@@ -716,6 +724,42 @@ mod tests {
             panic!("signed in twice")
         }));
         assert_eq!(again.as_deref(), Ok("t1"));
+    }
+
+    /// client_secret_basic: some providers take the client only from the header, each part
+    /// form-encoded first (RFC 6749 2.3.1), and then not from the body as well.
+    #[test]
+    fn client_credentials_can_go_in_a_basic_header() {
+        use base64::Engine as _;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let addr = crate::http::tests::serve(|req| {
+            let (head, body) = req.split_once("\r\n\r\n").unwrap_or_default();
+            let basic = base64::engine::general_purpose::STANDARD.encode("my%20app:s%3Acret");
+            let header = format!("authorization: Basic {basic}");
+            match head.lines().any(|l| l.eq_ignore_ascii_case(&header))
+                && body == "grant_type=client_credentials"
+            {
+                true => (
+                    "200 OK\r\ncontent-type: application/json".into(),
+                    r#"{"access_token":"t"}"#.into(),
+                ),
+                false => ("400 Bad Request".into(), req.to_owned()),
+            }
+        });
+        let o = OAuth2 {
+            token_url: format!("http://{addr}/token"),
+            client_id: "my app".into(),
+            client_secret: "s:cret".into(),
+            basic_auth: true,
+            ..Default::default()
+        };
+        let no_browser = |_: &str| -> Result<(), String> { panic!("no sign-in") };
+        let got = rt.block_on(token(&client(&rt), &o, true, no_browser));
+        assert_eq!(got.as_deref(), Ok("t"));
+        TOKENS.lock().unwrap().remove(&cache_key(&o));
     }
 
     /// The implicit grant's token arrives in the redirect's fragment, which a browser never

@@ -8741,7 +8741,10 @@ fn kv_table(
         "asserts" => (ui.available_width() * 0.5).clamp(100.0, 400.0),
         _ => (ui.available_width() * 0.25).clamp(100.0, 200.0),
     };
-    let rest = (ui.available_width() - key_width - 90.0).max(120.0);
+    // A multipart value `@path` is a file: each part picks one, as Postman's rows do.
+    let files = id == "multipart";
+    let buttons = if files { 118.0 } else { 90.0 };
+    let rest = (ui.available_width() - key_width - buttons).max(120.0);
     let (value_width, desc_width) = match describe {
         true => (rest * 0.6, rest * 0.4 - ui.spacing().item_spacing.x),
         false => (rest, 0.0),
@@ -8812,6 +8815,16 @@ fn kv_table(
                         .hint_text(t("Description"))
                         .desired_width(desc_width),
                 );
+            }
+            if files && real {
+                let mut path = row.value.strip_prefix('@').unwrap_or_default().to_owned();
+                if browse(ui, &mut path, &[], false) {
+                    if row.key.is_empty() {
+                        let stem = Path::new(&path).file_stem().unwrap_or_default();
+                        row.key = stem.to_string_lossy().into_owned();
+                    }
+                    row.value = format!("@{path}");
+                }
             }
             if real
                 && icon_button(ui, icon::TRASH, t("Remove"), None)
@@ -9939,6 +9952,7 @@ fn auth_editor(
                 algorithm: "HS256".into(),
                 secret: pass(),
                 payload: model::JWT_CLAIMS.into(),
+                ..Default::default()
             }),
         ),
         (
@@ -10103,6 +10117,9 @@ fn auth_editor(
                 ui.end_row();
                 if j.alg().starts_with("HS") {
                     secret(ui, t("Secret"), &mut j.secret);
+                    ui.label("");
+                    ui.checkbox(&mut j.base64_secret, t("Secret is Base64"));
+                    ui.end_row();
                 } else {
                     ui.label(t("Private key"));
                     var_edit(
@@ -10122,6 +10139,24 @@ fn auth_editor(
                     );
                     ui.end_row();
                 }
+                // In the token's order: its header, then its claims.
+                ui.label(t("Header"));
+                var_edit(
+                    ui,
+                    egui::Id::new(("auth", "jwt-header")),
+                    &mut j.header,
+                    vars,
+                    egui::TextStyle::Monospace,
+                    true,
+                    Some(Lang::Json),
+                    Complete::None,
+                    |e| {
+                        e.hint_text(r#"{"kid": "key-1"}"#)
+                            .desired_rows(1)
+                            .desired_width(420.0)
+                    },
+                );
+                ui.end_row();
                 ui.label(t("Payload"));
                 var_edit(
                     ui,
@@ -10135,6 +10170,16 @@ fn auth_editor(
                     |e| e.desired_rows(4).desired_width(420.0),
                 );
                 ui.end_row();
+                ui.label(t("Add to"));
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut j.in_query, false, t("Header"));
+                    ui.selectable_value(&mut j.in_query, true, t("Query params"));
+                });
+                ui.end_row();
+                match j.in_query {
+                    false => text(ui, t("Prefix"), &mut j.prefix, "Bearer"),
+                    true => text(ui, t("Parameter"), &mut j.query_key, "token"),
+                }
             }
             Auth::Hawk(h) => {
                 text(ui, t("Auth ID"), &mut h.id, "");
@@ -10244,6 +10289,13 @@ fn auth_editor(
                 text(ui, t("Client ID"), &mut o.client_id, "");
                 if !implicit {
                     secret(ui, t("Client secret"), &mut o.client_secret);
+                    // Some providers take the client one way only.
+                    ui.label(t("Client authentication"));
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut o.basic_auth, false, t("In the body"));
+                        ui.selectable_value(&mut o.basic_auth, true, t("Basic Auth header"));
+                    });
+                    ui.end_row();
                 }
                 text(ui, t("Scope"), &mut o.scope, t("optional, space separated"));
                 if o.grant == model::Grant::Password {
@@ -15295,6 +15347,25 @@ mod ui_tests {
         assert!(h.query_by_label_contains("File not found").is_some());
     }
 
+    /// Each part picks its file, not only by typing `@path`; a form's fields send text only.
+    #[test]
+    fn every_multipart_part_can_pick_a_file() {
+        let mut h = with_request("multipart-browse");
+        h.state_mut().req_tab = ReqTab::Body;
+        let parts = vec![
+            KeyValue::new("note", "hi"),
+            KeyValue::new("photo", "@a.png"),
+        ];
+        h.state_mut().open.as_mut().unwrap().draft.body = Body::Multipart {
+            parts: parts.clone(),
+        };
+        h.run();
+        assert_eq!(h.query_all_by_label("Choose a file").count(), 2);
+        h.state_mut().open.as_mut().unwrap().draft.body = Body::Form { fields: parts };
+        h.run();
+        assert_eq!(h.query_all_by_label("Choose a file").count(), 0);
+    }
+
     /// Pasted Base64 shows how many bytes go out; Hex then spells the same bytes, and a
     /// typo is flagged before Send.
     #[test]
@@ -15420,6 +15491,10 @@ mod ui_tests {
         assert!(h.query_by_label_contains("Token gui-1").is_none());
         let kept = h.state().ws.load_tokens();
         assert!(!kept.contains("gui-1"), "{kept}");
+        // Picked under the secret, for providers that take the client only that way.
+        h.get_by_label("Basic Auth header").click();
+        h.run();
+        assert!(matches!(&draft(&h).auth, Auth::OAuth2(o) if o.basic_auth));
     }
 
     #[test]
@@ -20409,6 +20484,15 @@ mod ui_tests {
         h.run();
         assert!(combo(&h, "HS256") && h.query_by_role(Role::PasswordInput).is_some());
         assert!(h.query_by_label("Private key").is_none());
+        // Into the query instead: the field under it names the parameter, not the prefix.
+        assert!(h.query_by_label("Prefix").is_some());
+        h.get_by_label("Query params").click_accesskit();
+        h.run();
+        assert!(matches!(&draft(&h).auth, Auth::Jwt(j) if j.in_query));
+        assert!(h.query_by_label("Prefix").is_none() && h.query_by_label("Parameter").is_some());
+        h.get_by_label("Secret is Base64").click_accesskit();
+        h.run();
+        assert!(matches!(&draft(&h).auth, Auth::Jwt(j) if j.base64_secret));
         h.state_mut().open.as_mut().unwrap().draft.auth = Auth::OAuth1(model::OAuth1::default());
         h.run();
         assert!(combo(&h, "HMAC-SHA1"));

@@ -749,6 +749,21 @@ pub struct Jwt {
     pub secret: String,
     /// The claims, as JSON.
     pub payload: String,
+    /// More header fields, as a JSON object (`kid`, `x5t`…); `alg` stays the one picked.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub header: String,
+    /// An HS* secret written as Base64, as many providers hand it out: its bytes sign.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub base64_secret: bool,
+    /// Before the token in Authorization; empty: `Bearer`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    /// Sent as a query parameter instead of in Authorization.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub in_query: bool,
+    /// That parameter's name; empty: `token`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub query_key: String,
 }
 
 impl Jwt {
@@ -797,6 +812,10 @@ pub struct OAuth2 {
     /// Empty: `http://127.0.0.1:<a free port>/callback`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub redirect_uri: String,
+    /// The client ID and secret go to the token endpoint as a Basic header
+    /// (client_secret_basic) instead of in the form.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub basic_auth: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
@@ -831,6 +850,7 @@ impl Auth {
             Self::OAuth2(o) => {
                 *o == OAuth2 {
                     grant: o.grant,
+                    basic_auth: o.basic_auth,
                     ..Default::default()
                 }
             }
@@ -842,7 +862,10 @@ impl Auth {
                     ..Default::default()
                 }
             }
-            Self::Jwt(j) => j.secret.is_empty() && j.payload == JWT_CLAIMS,
+            Self::Jwt(j) => {
+                (j.secret.is_empty() && j.payload == JWT_CLAIMS)
+                    && (j.header.is_empty() && j.prefix.is_empty() && j.query_key.is_empty())
+            }
             Self::Hawk(h) => {
                 *h == Hawk {
                     algorithm: h.algorithm.clone(),
@@ -1131,6 +1154,7 @@ impl Request {
                     password: r(&o.password),
                     auth_url: r(&o.auth_url),
                     redirect_uri: r(&o.redirect_uri),
+                    basic_auth: o.basic_auth,
                 }),
                 // Becomes a header or a query parameter below.
                 Auth::ApiKey { .. } => Auth::None,
@@ -1153,6 +1177,11 @@ impl Request {
                     algorithm: j.algorithm.clone(),
                     secret: r(&j.secret),
                     payload: r(&j.payload),
+                    header: r(&j.header),
+                    base64_secret: j.base64_secret,
+                    prefix: r(&j.prefix),
+                    in_query: j.in_query,
+                    query_key: r(&j.query_key),
                 }),
                 Auth::Hawk(h) => Auth::Hawk(Hawk {
                     id: r(&h.id),
@@ -1601,6 +1630,50 @@ mod tests {
         assert_eq!(r.params, [KeyValue::new("q", "rust")]);
     }
 
+    /// What goes out keeps the auth's choices and resolves its text; a choice alone isn't
+    /// an edit (the auth still inherits), but typed text is.
+    #[test]
+    fn auth_options_resolve_and_count_as_edits() {
+        let vars = HashMap::from([("kid".to_owned(), "k1".to_owned())]);
+        let sent = |auth| {
+            Request {
+                auth,
+                ..Default::default()
+            }
+            .resolved(&vars)
+            .0
+            .auth
+        };
+        let o = Auth::OAuth2(OAuth2 {
+            token_url: "https://idp.test/token".into(),
+            basic_auth: true,
+            ..Default::default()
+        });
+        assert_eq!(sent(o.clone()), o);
+        let j = Jwt {
+            header: r#"{"kid": "{{kid}}"}"#.into(),
+            base64_secret: true,
+            prefix: "JWT".into(),
+            in_query: true,
+            query_key: "t".into(),
+            ..Default::default()
+        };
+        let header = r#"{"kid": "k1"}"#.into();
+        assert_eq!(sent(Auth::Jwt(j.clone())), Auth::Jwt(Jwt { header, ..j }));
+
+        let basic = OAuth2 {
+            basic_auth: true,
+            ..Default::default()
+        };
+        assert!(Auth::OAuth2(basic).is_unset());
+        let header = Jwt {
+            header: "{}".into(),
+            payload: JWT_CLAIMS.into(),
+            ..Default::default()
+        };
+        assert!(!Auth::Jwt(header).is_unset());
+    }
+
     #[test]
     fn toml_round_trip_keeps_every_field() {
         // Files are the source of truth (and synced via git): losing a field on save is data loss.
@@ -1765,6 +1838,7 @@ mod tests {
                 algorithm: "RS256".into(),
                 secret: "".into(),
                 payload: JWT_CLAIMS.into(),
+                ..Default::default()
             }),
         ];
         for (body, auth) in empty.into_iter().zip(blank) {

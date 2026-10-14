@@ -239,7 +239,17 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
             b
         }
         Auth::Bearer { token } => b.bearer_auth(token),
-        Auth::Jwt(j) => b.bearer_auth(crate::jwt::sign(&j)?),
+        Auth::Jwt(j) => {
+            let token = crate::jwt::sign(&j)?;
+            match (j.in_query, j.query_key.trim(), j.prefix.trim()) {
+                (true, "", _) => b.query(&[("token", token)]),
+                (true, key, _) => b.query(&[(key, token)]),
+                (false, _, "") => b.bearer_auth(token),
+                (false, _, prefix) => {
+                    b.header(reqwest::header::AUTHORIZATION, format!("{prefix} {token}"))
+                }
+            }
+        }
         Auth::Basic { username, password } => b.basic_auth(username, Some(password)),
         // These need a round trip first; `execute` and `with_token` take care of it.
         Auth::Digest { .. } => {
@@ -1291,6 +1301,7 @@ pub(crate) mod tests {
                 algorithm: "HS256".into(),
                 secret: "{{key}}".into(),
                 payload: r#"{"sub": "{{user}}"}"#.into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1314,6 +1325,7 @@ pub(crate) mod tests {
                 algorithm: "HS256".into(),
                 secret: secret.into(),
                 payload: r#"{"sub":"ada"}"#.into(),
+                ..Default::default()
             })
             .unwrap()
         };
@@ -1322,6 +1334,53 @@ pub(crate) mod tests {
             signed_with("k"),
             "the secret's variable is resolved too"
         );
+    }
+
+    /// Some APIs take the token under another scheme name, or only as a query parameter.
+    #[test]
+    fn a_jwt_goes_with_its_prefix_or_in_the_query() {
+        use crate::model::Jwt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let wire = |j: Jwt| {
+            let req = Request {
+                url: "http://x.test/a?b=1".into(),
+                auth: Auth::Jwt(Jwt {
+                    algorithm: "HS256".into(),
+                    secret: "k".into(),
+                    ..j
+                }),
+                ..Default::default()
+            };
+            build(&client(&rt), req).unwrap().build().unwrap()
+        };
+        let token = crate::jwt::sign(&Jwt {
+            secret: "k".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let w = wire(Jwt {
+            prefix: "JWT".into(),
+            ..Default::default()
+        });
+        let auth = w.headers()["authorization"].to_str().unwrap();
+        assert_eq!(auth, format!("JWT {token}"));
+        let w = wire(Jwt {
+            in_query: true,
+            query_key: "access_token".into(),
+            prefix: "JWT".into(),
+            ..Default::default()
+        });
+        let url = format!("http://x.test/a?b=1&access_token={token}");
+        assert_eq!(w.url().as_str(), url);
+        assert!(w.headers().get("authorization").is_none());
+        let w = wire(Jwt {
+            in_query: true,
+            ..Default::default()
+        });
+        assert!(w.url().as_str().ends_with(&format!("&token={token}")));
     }
 
     #[test]

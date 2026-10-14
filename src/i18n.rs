@@ -1752,6 +1752,12 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Its argument: JSON, or text", "事件的參數：JSON 或文字"),
     ("Connect first", "請先連線"),
     ("The operation to run", "要執行的操作"),
+    ("Client authentication", "用戶端驗證方式"),
+    ("In the body", "放在內容中"),
+    ("Basic Auth header", "Basic Auth 標頭"),
+    ("Secret is Base64", "秘密為 Base64 編碼"),
+    ("Prefix", "前綴"),
+    ("Parameter", "參數名稱"),
     ("Show secret values", "顯示秘密值"),
     (
         "For each request, unless its Settings tab sets its own",

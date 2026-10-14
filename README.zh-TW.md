@@ -65,7 +65,7 @@ MQTT：
 **內容**
 
 - JSON；文字（選 Text、XML、HTML 或 JavaScript 會設定對應的 Content-Type；XML 可美化）；表單；
-  multipart（值寫 `@path` 即上傳該檔案）。
+  multipart（值寫 `@path` 即上傳該檔案；每一列的 📂 都能直接選檔）。
 - 二進位：原樣送出檔案（從磁碟串流讀取，依副檔名判斷類型），或貼上 Base64（標準或 URL-safe）／hex，
   送出時解碼成位元組。下方顯示解碼後的大小，格式錯誤以橘色標示；兩者互切時位元組不變。
 - GraphQL 是獨立的請求類型（方法清單中的 GRAPHQL），不是內容類型。GraphQL 請求換成其他方法時，
@@ -137,8 +137,8 @@ MQTT：
 | API 金鑰 | 放在標頭或查詢字串 |
 | AWS Signature v4 | 每次傳送都對最終的 URL、標頭與內容簽章；支援 S3 與 session token；與 Postman 的 awsv4 雙向互通 |
 | OAuth 1.0a | HMAC-SHA1/256/512、RSA-SHA256/512、PLAINTEXT；對方法、URL、查詢字串與表單內容簽章；可從 Postman 與 Insomnia 匯入 |
-| JWT Bearer | HS/RS/PS/ES 256–512 與 EdDSA；每次傳送時以含變數的 JSON payload 簽發；與 Postman 的 jwt 雙向互通 |
-| OAuth 2.0 | Client credentials、password、implicit，以及搭配 PKCE 的 authorization code |
+| JWT Bearer | HS/RS/PS/ES 256–512 與 EdDSA；每次傳送時以含變數的 JSON payload 簽發；可用 JSON 加入其他標頭欄位（`kid` 等）；HS 秘密可用 Base64 提供；可改用 Bearer 以外的前綴，或改以查詢參數送出；與 Postman 的 jwt 雙向互通 |
+| OAuth 2.0 | Client credentials、password、implicit，以及搭配 PKCE 的 authorization code；client ID 與 secret 可放在 token 請求的內容中，或以 Basic 標頭送出（從 Postman、Insomnia 匯入時會沿用原本的設定） |
 | Hawk | SHA-256 或 SHA-1，每次傳送都用新的 nonce 與時間戳記，可選擇納入內容雜湊；與 Postman 雙向互通，可從 Insomnia 匯入 |
 | Akamai EdgeGrid | 對方法、URL、指定的標頭與 POST 內容簽章；與 Postman 雙向互通 |
 | NTLM | 透過 HTTP/1.1 的 NTLMv2，挑戰與回應走同一條連線；經由代理伺服器時只支援 https:// |

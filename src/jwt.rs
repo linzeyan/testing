@@ -26,20 +26,31 @@ pub fn sign(j: &Jwt) -> Result<String, String> {
     if !claims.is_object() {
         return Err("JWT payload: must be a JSON object of claims".into());
     }
-    let header = serde_json::json!({ "alg": j.alg(), "typ": "JWT" });
+    let mut header = serde_json::json!({ "alg": j.alg(), "typ": "JWT" });
+    if !j.header.trim().is_empty() {
+        let more: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&j.header).map_err(|e| format!("JWT header: {e}"))?;
+        header.as_object_mut().unwrap().extend(more);
+        // What signs it is the algorithm picked: a header naming another would lie.
+        header["alg"] = j.alg().into();
+    }
     let input = format!(
         "{}.{}",
         URL_SAFE_NO_PAD.encode(header.to_string()),
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
-    let sig = signature_of(j.alg(), &j.secret, input.as_bytes())?;
+    let secret = match j.base64_secret && j.alg().starts_with("HS") {
+        true => crate::model::decode_base64(&j.secret).map_err(|e| format!("JWT secret: {e}"))?,
+        false => j.secret.as_bytes().to_vec(),
+    };
+    let sig = signature_of(j.alg(), &secret, input.as_bytes())?;
     Ok(format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig)))
 }
 
-pub(crate) fn signature_of(alg: &str, secret: &str, msg: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn signature_of(alg: &str, secret: &[u8], msg: &[u8]) -> Result<Vec<u8>, String> {
     let rng = SystemRandom::new();
     let hs = |a| {
-        Ok(hmac::sign(&hmac::Key::new(a, secret.as_bytes()), msg)
+        Ok(hmac::sign(&hmac::Key::new(a, secret), msg)
             .as_ref()
             .to_vec())
     };
@@ -93,8 +104,8 @@ pub(crate) fn signature_of(alg: &str, secret: &str, msg: &[u8]) -> Result<Vec<u8
     }
 }
 
-fn key(alg: &str, pem: &str) -> Result<PrivateKeyDer<'static>, String> {
-    PrivateKeyDer::from_pem_slice(pem.trim().as_bytes())
+fn key(alg: &str, pem: &[u8]) -> Result<PrivateKeyDer<'static>, String> {
+    PrivateKeyDer::from_pem_slice(pem.trim_ascii())
         .map_err(|e| format!("JWT {alg} needs a PEM private key as the secret: {e}"))
 }
 
@@ -136,6 +147,7 @@ HVbhlnvmhVqnjypOaSnrvscI
             algorithm: algorithm.into(),
             secret: secret.into(),
             payload: payload.into(),
+            ..Default::default()
         }
     }
 
@@ -161,6 +173,28 @@ HVbhlnvmhVqnjypOaSnrvscI
     #[test]
     fn no_algorithm_signs_as_hs256() {
         assert_eq!(sign(&jwt("", "k", "{}")), sign(&jwt("HS256", "k", "{}")));
+    }
+
+    /// A provider's key ID goes in the header beside `alg`, which stays the one that signs;
+    /// a secret handed out as Base64 signs with the bytes it spells, not its letters.
+    #[test]
+    fn the_header_and_a_base64_secret_are_used_as_given() {
+        let j = Jwt {
+            header: r#"{"kid": "k1", "alg": "none"}"#.into(),
+            ..jwt("HS256", "k", "{}")
+        };
+        let (input, _) = split(&sign(&j).unwrap());
+        let header = URL_SAFE_NO_PAD
+            .decode(input.split('.').next().unwrap())
+            .unwrap();
+        assert_eq!(header, br#"{"alg":"HS256","typ":"JWT","kid":"k1"}"#);
+        let b64 = |secret: &str| Jwt {
+            base64_secret: true,
+            ..jwt("HS256", secret, "{}")
+        };
+        assert_eq!(sign(&b64("c2VjcmV0")), sign(&jwt("HS256", "secret", "{}")));
+        // A typo says so instead of signing with something else.
+        assert!(sign(&b64("not base64!")).is_err());
     }
 
     #[test]

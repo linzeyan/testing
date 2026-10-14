@@ -110,7 +110,7 @@ fn sign_with(req: &mut reqwest::Request, o: &OAuth1, at: u64, nonce: &str) -> Re
             };
             STANDARD.encode(crate::jwt::signature_of(
                 jwt,
-                &o.consumer_secret,
+                o.consumer_secret.as_bytes(),
                 base.as_bytes(),
             )?)
         }

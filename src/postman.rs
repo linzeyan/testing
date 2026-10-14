@@ -328,6 +328,8 @@ fn auth(v: &Value) -> Result<Auth, String> {
                 password: p("password"),
                 auth_url: p("authUrl"),
                 redirect_uri: p("redirect_uri"),
+                // Postman's default is the header: only "body" says otherwise.
+                basic_auth: p("client_authentication") != "body",
             })
         }
         "apikey" => Auth::ApiKey {
@@ -355,17 +357,22 @@ fn auth(v: &Value) -> Result<Auth, String> {
             token_secret: p("tokenSecret"),
             realm: p("realm"),
         }),
-        // Only the header form: a query-parameter token or base64 secret would go out wrong.
-        "jwt" if p("addTokenTo") == "queryParam" => {
-            return Err("jwt (token in the query)".into());
-        }
-        "jwt" if p("isSecretBase64Encoded") == "true" => {
-            return Err("jwt (base64-encoded secret)".into());
-        }
         "jwt" => {
+            // Postman's defaults ("{}", "Bearer", a `token` parameter) are the empty ones here.
             let mut j = Jwt {
                 algorithm: p("algorithm"),
                 payload: p("payload"),
+                header: Some(p("header"))
+                    .filter(|h| h.trim() != "{}")
+                    .unwrap_or_default(),
+                base64_secret: p("isSecretBase64Encoded") == "true",
+                prefix: Some(p("headerPrefix"))
+                    .filter(|h| h != "Bearer")
+                    .unwrap_or_default(),
+                in_query: p("addTokenTo") == "queryParam",
+                query_key: Some(p("queryParamKey"))
+                    .filter(|k| k != "token")
+                    .unwrap_or_default(),
                 ..Default::default()
             };
             j.secret = match j.alg().starts_with("HS") {
@@ -753,19 +760,31 @@ fn auth_json(auth: &Auth) -> Option<Value> {
                 ("addParamsToHeader", "true"),
             ],
         ),
-        Auth::Jwt(j) => typed(
-            "jwt",
-            &[
+        Auth::Jwt(j) => {
+            fn or<'a>(s: &'a str, default: &'a str) -> &'a str {
+                if s.is_empty() { default } else { s }
+            }
+            let mut rows = vec![
                 ("algorithm", j.alg()),
                 match j.alg().starts_with("HS") {
                     true => ("secret", j.secret.as_str()),
                     false => ("privateKey", j.secret.as_str()),
                 },
                 ("payload", j.payload.as_str()),
-                ("addTokenTo", "header"),
-                ("headerPrefix", "Bearer"),
-            ],
-        ),
+                ("header", or(&j.header, "{}")),
+                ("headerPrefix", or(&j.prefix, "Bearer")),
+                (
+                    "addTokenTo",
+                    if j.in_query { "queryParam" } else { "header" },
+                ),
+                ("queryParamKey", or(&j.query_key, "token")),
+            ];
+            // Off is left out, as for Hawk: Postman reads any string there as on.
+            if j.base64_secret {
+                rows.push(("isSecretBase64Encoded", "true"));
+            }
+            typed("jwt", &rows)
+        }
         Auth::AwsV4(a) => typed(
             "awsv4",
             &[
@@ -835,6 +854,10 @@ fn auth_json(auth: &Auth) -> Option<Value> {
                     ("password", o.password.as_str()),
                     ("authUrl", o.auth_url.as_str()),
                     ("redirect_uri", o.redirect_uri.as_str()),
+                    (
+                        "client_authentication",
+                        if o.basic_auth { "header" } else { "body" },
+                    ),
                 ],
             )
         }
@@ -905,6 +928,23 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    /// Postman sends the client in a Basic header unless told "body": an import that put
+    /// it in the form could fail where the collection worked.
+    #[test]
+    fn oauth2_sends_the_client_as_postman_does() {
+        let basic = |extra: Option<Value>| {
+            let mut params = vec![json!({ "key": "grant_type", "value": "client_credentials" })];
+            params.extend(extra);
+            match auth(&json!({ "type": "oauth2", "oauth2": params })) {
+                Ok(Auth::OAuth2(o)) => o.basic_auth,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(basic(None));
+        let body = json!({ "key": "client_authentication", "value": "body" });
+        assert!(!basic(Some(body)));
+    }
 
     /// Postman fills only `:id`; a `{id}` sent as is would reach the server literally.
     #[test]
@@ -1335,6 +1375,8 @@ mod tests {
                         token_url: "{{base}}/token".into(),
                         client_id: "spa".into(),
                         redirect_uri: "http://localhost:8765/cb".into(),
+                        // The folder's goes in the body: both ways make the trip.
+                        basic_auth: true,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -1363,6 +1405,10 @@ mod tests {
                         algorithm: "HS256".into(),
                         secret: "{{jwt_secret}}".into(),
                         payload: r#"{"sub": "ada"}"#.into(),
+                        header: r#"{"kid": "k1"}"#.into(),
+                        base64_secret: true,
+                        prefix: "JWT".into(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
@@ -1390,6 +1436,9 @@ mod tests {
                         algorithm: "RS256".into(),
                         secret: "{{private_key}}".into(),
                         payload: "{}".into(),
+                        in_query: true,
+                        query_key: "access_token".into(),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
