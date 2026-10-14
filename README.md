@@ -201,7 +201,8 @@ Without JavaScript:
   contract test generated from the response (array items merged; keys only some items have
   are left optional).
 
-The Tests tab filters All / Passed / Failed, with counts.
+The response's Tests tab is always there (before any test ran, it says where to add one) and
+filters All / Passed / Failed, with counts.
 
 ## Responses
 
@@ -216,7 +217,7 @@ The Tests tab filters All / Passed / Failed, with counts.
 - Find (Ctrl+F): match case, whole word or regular expression; counts up to 10 000 hits.
   The filter and the find stay on when the request is sent again.
 - PNG, JPEG, GIF (its first frame) and WebP show as pictures, SVG too (Preview, beside Pretty and Raw), PDF page by
-  page; other binary bodies show their size. "Open in browser" shows an HTML, PDF or SVG one
+  page; other binary bodies show their size and "Save to file…". "Open in browser" shows an HTML, PDF or SVG one
   (a PDF in the system's viewer).
 
 **Details**
@@ -224,7 +225,8 @@ The Tests tab filters All / Passed / Failed, with counts.
 - Hover the status code for what it means, the time for DNS lookup, TCP connect, TLS
   handshake, waiting (TTFB) and download, and the size for headers vs body.
 - The Timeline tab: the request as it went out (headers the HTTP client adds and jar cookies
-  included), each redirect and the peer address.
+  included), each redirect, the peer address and where the time went (DNS, TCP, TLS, TTFB,
+  download).
 - The Cookies tab: what the response sets, as the jar keeps it: the host when there's no
   Domain, the URL's directory when there's no Path, Max-Age as a time, and the HttpOnly,
   Secure and SameSite flags. One for another site's domain is turned down and not listed.
@@ -234,8 +236,9 @@ The Tests tab filters All / Passed / Failed, with counts.
 - Save… writes the body to a file (binary bodies byte for byte).
 - Select text in the body and right-click it to set it as a variable, as in a request's text
   boxes.
-- The History menu in the response bar: the last 10 responses of each request, kept on disk
-  with 1 MiB of body each. Request history and saved response examples too.
+- The History menu in the response bar: the last 10 responses of each request, each with its
+  status, time and size, kept on disk with 1 MiB of body each. Request history and saved
+  response examples too.
 - The sidebar's History: each send with how long ago, filtered by name or URL; a click
   brings back what was sent.
 
@@ -330,7 +333,7 @@ editor) as a Postman environment, its secrets as Postman's secret type.
 "</> Code" writes the request as curl, wget, HTTPie, PowerShell, raw HTTP, Python, fetch,
 axios, Go, Java, C#, PHP, Ruby, Rust, Swift or Kotlin. A Binary body reads its file, and
 `--data-binary @file` pastes back as one. Streams get their own clients; the language picked
-last carries over between kinds.
+last carries over between kinds. Long lines scroll sideways rather than wrap.
 
 | Kind | Clients |
 |---|---|

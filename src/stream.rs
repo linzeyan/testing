@@ -880,8 +880,12 @@ pub mod tests {
                     head.push(byte[0]);
                 }
                 let head = String::from_utf8_lossy(&head).to_lowercase();
-                s.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
-                    .unwrap();
+                // Closed, not kept alive: a pooled one picked up for the SSE request
+                // would leave this thread waiting on a second accept forever.
+                s.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                )
+                .unwrap();
                 heads.push(head);
             }
             heads

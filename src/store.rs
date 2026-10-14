@@ -65,6 +65,9 @@ pub struct ResponseMeta {
     pub at: u64,
     pub status: u16,
     pub ms: u64,
+    /// The body's size as kept, in bytes; `cut` when that's only its start.
+    pub size: usize,
+    pub cut: bool,
 }
 
 /// One request sent from the app, as it was edited at the time (variables unresolved).
@@ -559,7 +562,12 @@ impl Workspace {
     pub fn responses(&self, path: &Path) -> Vec<ResponseMeta> {
         let db = self.db();
         let rows = db
-            .prepare("SELECT id, at, status, ms FROM responses WHERE path = ?1 ORDER BY id DESC")
+            // The size from the kept JSON: no column of its own to fill for older rows.
+            .prepare(
+                "SELECT id, at, status, ms, length(CAST(json_extract(response, '$.body') AS BLOB)), \
+                 coalesce(json_extract(response, '$.truncated'), 0) \
+                 FROM responses WHERE path = ?1 ORDER BY id DESC",
+            )
             .and_then(|mut q| {
                 let rows = q.query_map([self.key(path)], |r| {
                     Ok(ResponseMeta {
@@ -567,6 +575,8 @@ impl Workspace {
                         at: r.get::<_, i64>(1)? as u64,
                         status: r.get(2)?,
                         ms: r.get::<_, i64>(3)? as u64,
+                        size: r.get::<_, Option<i64>>(4)?.unwrap_or_default() as usize,
+                        cut: r.get::<_, i64>(5)? != 0,
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -2197,6 +2207,9 @@ mod tests {
         // A big body keeps its start, cut on a character boundary, and says so.
         let kept = ws.load_response(big).unwrap();
         assert!(kept.truncated && kept.body.len() <= MAX_RESPONSE_BODY && kept.status == 500);
+        // History lists it by the bytes kept, and says there were more.
+        let meta = &ws.responses(&path)[0];
+        assert_eq!((meta.size, meta.cut), (kept.body.len(), true));
         for i in 0..MAX_RESPONSES {
             ws.add_response(&path, &resp(200 + i as u16, String::new()))
                 .unwrap();
@@ -2204,6 +2217,7 @@ mod tests {
         let list = ws.responses(&path);
         assert_eq!(list.len(), MAX_RESPONSES, "the oldest goes");
         assert_eq!((list[0].status, list[0].ms), (209, 7), "newest first");
+        assert!(!list[0].cut);
         assert_eq!(
             ws.last_statuses().get(&path),
             Some(&209),

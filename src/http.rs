@@ -36,6 +36,23 @@ pub struct Sent {
     pub dns: Option<Duration>,
 }
 
+impl Sent {
+    /// DNS, TCP and TLS of the connections opened, those that were measured; None when an
+    /// open one was reused.
+    pub fn connect_phases(&self) -> Option<Vec<(&'static str, Duration)>> {
+        let c = self.connect?;
+        let (dns, tls) = (self.dns.unwrap_or_default(), self.tls.unwrap_or_default());
+        let tcp = c.saturating_sub(dns).saturating_sub(tls);
+        let phases = [("DNS", self.dns), ("TCP", Some(tcp)), ("TLS", self.tls)];
+        Some(
+            phases
+                .into_iter()
+                .filter_map(|(n, d)| Some((n, d?)))
+                .collect(),
+        )
+    }
+}
+
 /// Only used to build requests, never to send: the code panel and the Headers tab rebuild
 /// every frame, and a client loads root certificates and system proxies when made.
 pub(crate) static OFFLINE: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
@@ -152,6 +169,18 @@ impl Response {
         let _ = writeln!(out, "< {} {} {}", self.version, self.status, self.reason);
         for (k, v) in &self.headers {
             let _ = writeln!(out, "< {k}: {v}");
+        }
+        // Where the time went, as the status bar's hover says it.
+        if let Some(waited) = s.waited {
+            let ms = |(name, d): (&str, Duration)| format!("{name} {} ms", d.as_millis());
+            let mut phases: Vec<String> = match s.connect_phases() {
+                Some(p) => p.into_iter().map(ms).collect(),
+                None => vec!["reused connection".into()],
+            };
+            let ttfb = waited.saturating_sub(s.connect.unwrap_or_default());
+            phases.push(ms(("waiting (TTFB)", ttfb)));
+            phases.push(ms(("download", self.elapsed.saturating_sub(waited))));
+            let _ = writeln!(out, "* {}", phases.join(", "));
         }
         let _ = write!(out, "* {} ms", self.elapsed.as_millis());
         out
@@ -1799,6 +1828,42 @@ pub(crate) mod tests {
         let second = rt.block_on(execute(c, req)).unwrap();
         assert!(first.sent.connect.is_some());
         assert_eq!(second.sent.connect, None);
+        // The Timeline says where the time went, as the status bar's hover does.
+        let (first, second) = (first.timeline(), second.timeline());
+        assert!(
+            first.contains("\n* TCP ") && first.contains(", waiting (TTFB) "),
+            "{first}"
+        );
+        assert!(
+            second.contains("\n* reused connection, waiting (TTFB) "),
+            "{second}"
+        );
+        assert!(second.contains(" ms, download "), "{second}");
+    }
+
+    /// TCP is what's left of the connect, TTFB what's left of the wait.
+    #[test]
+    fn the_timeline_splits_the_time_by_phase() {
+        let ms = Duration::from_millis;
+        let timed = Response {
+            status: 200,
+            reason: "OK".into(),
+            version: "HTTP/1.1".into(),
+            elapsed: ms(150),
+            headers: Vec::new(),
+            body: String::new(),
+            bytes: None,
+            truncated: false,
+            sent: Sent {
+                waited: Some(ms(100)),
+                connect: Some(ms(35)),
+                dns: Some(ms(10)),
+                tls: Some(ms(5)),
+                ..Default::default()
+            },
+        };
+        let line = "\n* DNS 10 ms, TCP 20 ms, TLS 5 ms, waiting (TTFB) 65 ms, download 50 ms\n";
+        assert!(timed.timeline().contains(line), "{}", timed.timeline());
     }
 
     /// The race the test above only loses now and then: a connect that finished beside

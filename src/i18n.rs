@@ -1485,8 +1485,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("{} min ago", "{} 分鐘前"),
     (
-        "{} of binary data, not shown ({}). Save… keeps it as received.",
-        "{} 的二進位資料，未顯示（{}）。「儲存…」會依原樣保存。",
+        "{} of binary data, not shown ({}).",
+        "{} 的二進位資料，未顯示（{}）。",
     ),
     (
         "{} tabs with unsaved edits left open",
@@ -1758,6 +1758,11 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Secret is Base64", "秘密為 Base64 編碼"),
     ("Prefix", "前綴"),
     ("Parameter", "參數名稱"),
+    ("Tests", "測試"),
+    (
+        "No tests ran. Add checks in the Asserts tab, or pm.test(…) in the Post-response script.",
+        "沒有執行任何測試。可在「斷言」分頁加入檢查，或在「回應後」指令碼使用 pm.test(…)。",
+    ),
     ("Show secret values", "顯示秘密值"),
     (
         "For each request, unless its Settings tab sets its own",

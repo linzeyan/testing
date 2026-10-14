@@ -4582,7 +4582,12 @@ impl App {
                         }
                         Ok(code) => {
                             let lang = crate::syntax::of_target(target);
-                            let mut layouter = crate::syntax::layouter(lang);
+                            let mut colored = crate::syntax::layouter(lang);
+                            // Unwrapped, scrolled sideways: wrapping at the panel's edge
+                            // broke URLs and tokens in two.
+                            let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _| {
+                                colored(ui, buf, f32::INFINITY)
+                            };
                             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
                                 ui.add(
                                     egui::TextEdit::multiline(&mut code.as_str())
@@ -11915,15 +11920,16 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
         .tint(ui.visuals().text_color());
     let menu = ui.menu_button((image, text), |ui| {
         for m in &past.list {
-            let text = RichText::new(format!("{}  ·  {} ms  ·  {}", m.status, m.ms, ago(m.at)))
-                .color(status_color(m.status));
+            let size = human_size(m.size) + if m.cut { "+" } else { "" };
+            let text = format!("{}  ·  {} ms  ·  {size}  ·  {}", m.status, m.ms, ago(m.at));
+            let text = RichText::new(text).color(status_color(m.status));
             ui.horizontal(|ui| {
                 if ui
-                    // Room for "200 · 12345 ms · 59 min ago", so the ×s line up; the
-                    // grow atom keeps the text at the left of the wider button.
+                    // Room for "200 · 12345 ms · 999.9 KB · 59 min ago", so the ×s line
+                    // up; the grow atom keeps the text at the left of the wider button.
                     .add(
                         egui::Button::selectable(shown == Some(m.id), (text, egui::Atom::grow()))
-                            .min_size(egui::vec2(200.0, 0.0)),
+                            .min_size(egui::vec2(270.0, 0.0)),
                     )
                     .clicked()
                 {
@@ -11987,21 +11993,10 @@ fn status_line(ui: &mut egui::Ui, view: &ResponseView) {
             1 => t(", the redirect included").into(),
             n => tf(", {} redirects included", &[&n]),
         };
-        let connect = match h.sent.connect {
-            Some(c) => {
-                let (dns, tls) = (h.sent.dns, h.sent.tls);
-                let tcp = (c.saturating_sub(dns.unwrap_or_default()))
-                    .saturating_sub(tls.unwrap_or_default());
-                let line = |name, d: Option<Duration>| {
-                    d.map_or(String::new(), |d| format!("{name} {} ms\n", d.as_millis()))
-                };
-                format!(
-                    "{}{}{}",
-                    line("DNS", dns),
-                    line("TCP", Some(tcp)),
-                    line("TLS", tls)
-                )
-            }
+        let connect: String = match h.sent.connect_phases() {
+            Some(phases) => (phases.iter())
+                .map(|(name, d)| format!("{name} {} ms\n", d.as_millis()))
+                .collect(),
             None => t("Reused an open connection\n").into(),
         };
         let connected = waited.saturating_sub(h.sent.connect.unwrap_or_default());
@@ -12064,7 +12059,6 @@ fn response_ui(
     // A tab from the previous run may not exist in this one; fall back to the body before
     // drawing, so the tab strip and the body's tools agree with what is shown.
     *tab = match *tab {
-        RespTab::Tests if shown.tests.is_empty() => RespTab::Body,
         RespTab::Console if shown.logs.is_empty() => RespTab::Body,
         RespTab::Headers if shown.result.is_err() => RespTab::Body,
         RespTab::Cookies
@@ -12251,16 +12245,14 @@ fn response_ui(
                         ui.selectable_value(tab, RespTab::Body, t("Error"));
                     }
                 }
-                if !shown.tests.is_empty() {
-                    let color = if passed == shown.tests.len() {
-                        GREEN
-                    } else {
-                        RED
+                // Always there, as Postman's Test Results: hidden, it was never found.
+                let label =
+                    match (shown.tests.len(), passed == shown.tests.len()) {
+                        (0, _) => RichText::new(t("Tests")),
+                        (n, all) => RichText::new(tf("Tests ({}/{})", &[&passed, &n]))
+                            .color(if all { GREEN } else { RED }),
                     };
-                    let label = RichText::new(tf("Tests ({}/{})", &[&passed, &shown.tests.len()]))
-                        .color(color);
-                    ui.selectable_value(tab, RespTab::Tests, label);
-                }
+                ui.selectable_value(tab, RespTab::Tests, label);
                 if !shown.logs.is_empty() {
                     ui.selectable_value(
                         tab,
@@ -12280,9 +12272,23 @@ fn response_ui(
     {
         ui.horizontal(|ui| find_bar(ui, view));
     }
+    // Beside the find bar, above the line: both narrow what the body below shows. A held
+    // body has no `other` yet.
+    if *tab == RespTab::Body
+        && let Ok(view) = &mut shown.result
+        && view.other.is_some()
+        && view.head.bytes.is_none()
+        && !view.preview
+    {
+        filter_bar(ui, view, recent);
+    }
     ui.separator();
     // A tab clicked above shows in this frame.
     match (*tab, &mut shown.result) {
+        (RespTab::Tests, _) if shown.tests.is_empty() => {
+            ui.add_space(8.0);
+            ui.weak(t("No tests ran. Add checks in the Asserts tab, or pm.test(…) in the Post-response script."));
+        }
         (RespTab::Tests, _) => {
             // None: all; else only passed (true) or failed (false) ones.
             let id = egui::Id::new("tests-filter");
@@ -12405,7 +12411,9 @@ fn response_ui(
                     ui.add(egui::Label::new(text).selectable(true).extend());
                 });
         }
-        (_, Ok(view)) if view.head.bytes.is_some() || view.preview => binary_body(ui, view),
+        (_, Ok(view)) if view.head.bytes.is_some() || view.preview => {
+            binary_body(ui, view, save_file)
+        }
         (_, Ok(view)) if view.held.is_some() => {
             ui.add_space(8.0);
             ui.label(tf(
@@ -12422,9 +12430,6 @@ fn response_ui(
             });
         }
         (_, Ok(view)) => {
-            if view.other.is_some() {
-                filter_bar(ui, view, recent);
-            }
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
             let font = egui::TextStyle::Monospace.resolve(ui.style());
             let char_w = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '0'));
@@ -12589,8 +12594,13 @@ fn response_ui(
 fn examples_editor(ui: &mut egui::Ui, examples: &mut Vec<Example>) {
     let mut remove = None;
     for (i, ex) in examples.iter_mut().enumerate() {
-        let title =
-            RichText::new(format!("{} · {}", ex.status, ex.name)).color(status_color(ex.status));
+        // One saved from a response is named "200 OK": the status once, not "200 · 200 OK".
+        let status = ex.status.to_string();
+        let title = match ex.name.starts_with(&status) {
+            true => ex.name.clone(),
+            false => format!("{status} · {}", ex.name),
+        };
+        let title = RichText::new(title).color(status_color(ex.status));
         egui::CollapsingHeader::new(title)
             .id_salt(("example", i))
             .show(ui, |ui| {
@@ -12745,7 +12755,7 @@ fn external_type(head: &http::Response) -> Option<&'static str> {
 
 /// A body that isn't text, or an SVG in Preview: shown when it's a picture, else only
 /// its size.
-fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
+fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView, save_file: &mut bool) {
     let ctx = ui.ctx().clone();
     // Before the drawing: a page turned here is drawn in the same frame.
     if view.pages > 1 {
@@ -12810,10 +12820,11 @@ fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView) {
         }
         Err(e) => {
             let size = human_size(view.raw_size);
-            ui.weak(tf(
-                "{} of binary data, not shown ({}). Save… keeps it as received.",
-                &[&size, &e],
-            ));
+            ui.weak(tf("{} of binary data, not shown ({}).", &[&size, &e]));
+            // A button that says it, rather than a note pointing at an icon in the bar.
+            if ui.button(t("Save to file…")).clicked() {
+                *save_file = true;
+            }
         }
     }
 }
@@ -14374,6 +14385,13 @@ mod ui_tests {
             "{code}"
         );
         shot(&mut h, "code-panel");
+        // A long line runs on, to be scrolled to, rather than breaking mid-URL at the edge.
+        h.state_mut().open.as_mut().unwrap().draft.url = "{{host}}/".to_owned() + &"x".repeat(400);
+        h.run();
+        let widest = (h.get_all_by_role(Role::MultilineTextInput))
+            .map(|n| n.rect().width())
+            .fold(0.0, f32::max);
+        assert!(widest > 1200.0, "wider than the window: {widest}");
         let mut h = harness(h.state().ws.clone());
         h.run();
         assert_eq!(h.state().code_lang, "Go (net/http)", "kept for next time");
@@ -16913,6 +16931,8 @@ mod ui_tests {
         h.get_by_label("History: just now").click();
         h.run();
         shot(&mut h, "46-response-history");
+        // Each says how big it was, to tell a full page from an error at a glance.
+        assert_eq!(h.get_all_by_label_contains(" B  ·  just now").count(), 2);
         // Newest first: the second entry is the first send.
         h.get_all_by_label_contains("200  ·  ")
             .nth(1)
@@ -16975,7 +16995,26 @@ mod ui_tests {
         );
         let open = h.state().open.as_ref().unwrap();
         assert!(open.dirty() && open.draft.examples.len() == 1);
-        h.get_by_label("Examples (1)");
+        h.get_by_label("Examples (1)").click();
+        (h.state_mut().open.as_mut().unwrap().draft.examples).push(Example {
+            name: "missing".into(),
+            status: 404,
+            ..Default::default()
+        });
+        h.run();
+        // The status once: a name saved from a response already starts with it.
+        assert!(h.query_by_label("200 · 200 OK").is_none());
+        h.get_by_label("404 · missing");
+    }
+
+    /// There before any test is, as in Postman: hidden until one ran, it was never found.
+    #[test]
+    fn the_tests_tab_says_how_to_add_a_test() {
+        let mut h = with_request("no-tests");
+        show_response(&mut h, "text/plain", "ok".into());
+        h.get_by_label("Tests").click();
+        h.run();
+        assert!(h.query_by_label_contains("No tests ran.").is_some());
     }
 
     #[test]
@@ -18403,6 +18442,23 @@ mod ui_tests {
             hints.contains(&"Filter: //item/@id".to_owned()),
             "{hints:?}"
         );
+        // Right under Find, above the line: both narrow the body, so they sit together.
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run();
+        let field = |h: &Harness<'_, App>, hint| {
+            (h.get_all_by_role(Role::TextInput))
+                .find(|n| n.accesskit_node().placeholder() == Some(hint))
+                .map(|n| n.rect())
+        };
+        let (find, filter) = (
+            field(&h, "Find").unwrap(),
+            field(&h, "Filter: //item/@id").unwrap(),
+        );
+        assert!(filter.top() - find.bottom() < 8.0, "{find:?} {filter:?}");
+        // Only over the body it filters.
+        h.get_by_label("Headers (1)").click();
+        h.run();
+        assert!(field(&h, "Filter: //item/@id").is_none());
         let view = h
             .state_mut()
             .response
@@ -18437,6 +18493,11 @@ mod ui_tests {
                 "{gone} waits for the body"
             );
         }
+        let filter = |h: &Harness<'_, App>| {
+            (h.get_all_by_role(Role::TextInput))
+                .any(|n| n.accesskit_node().placeholder() == Some("Filter: $.items[*].id"))
+        };
+        assert!(!filter(&h), "nor a filter to run over all of it");
         h.get_by_label("Save to file…").click();
         h.run();
         assert!(matches!(h.state().dialog, Some(Dialog::SaveBody { .. })));
@@ -18444,6 +18505,7 @@ mod ui_tests {
         h.get_by_label("Show anyway").click();
         h.run();
         assert!(h.query_by_label("Pretty").is_some());
+        assert!(filter(&h));
         let view = h
             .state()
             .response
@@ -18537,10 +18599,14 @@ mod ui_tests {
         show(&mut h, gif);
         h.get_by_label("120 × 80");
 
-        // Not a picture it reads: its size, and how to keep it.
+        // Not a picture it reads: its size, and a button to keep it.
         show(&mut h, b"PK\x03\x04\xff\xff".to_vec());
         assert!(h.query_by_label_contains("6 B of binary data").is_some());
         assert!(h.query_by_label("Open in browser").is_none());
+        assert!(h.state().dialog.is_none());
+        h.get_by_label("Save to file…").click();
+        h.run();
+        assert!(matches!(h.state().dialog, Some(Dialog::SaveBody { .. })));
     }
 
     /// What this pane can't draw goes to the browser (or PDF viewer) with the bytes that
