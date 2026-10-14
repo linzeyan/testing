@@ -518,6 +518,28 @@ impl Drop for MockServer {
     }
 }
 
+/// The capture pane: its flows stay after Stop, to look through, until it's closed.
+struct CaptureView {
+    flows: crate::capture::Flows,
+    /// While it listens.
+    server: Option<Listening>,
+    filter: String,
+    /// The flow shown under the list.
+    picked: Option<u64>,
+}
+
+/// Stops the capture proxy when dropped.
+struct Listening {
+    addr: std::net::SocketAddr,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
 /// Load-test pane for the open request; replaces the response pane while shown.
 struct LoadView {
     vus: usize,
@@ -725,6 +747,11 @@ enum NameKind {
         env: Option<String>,
         value: String,
         secret: bool,
+    },
+    /// A captured exchange to keep as a request in `folder`.
+    Captured {
+        folder: PathBuf,
+        request: Box<Request>,
     },
 }
 
@@ -1072,6 +1099,10 @@ pub struct App {
     /// The runner's chip is the active tab. Opening a request only hides it: its results,
     /// or a run still going, wait behind the chip instead of being dropped.
     runner_shown: bool,
+    capture: Option<CaptureView>,
+    /// The capture pane is in front, as `runner_shown`; there before a capture starts, to
+    /// say what it does.
+    capture_shown: bool,
     /// `State::run_orders`.
     run_orders: HashMap<String, Vec<(String, bool)>>,
     /// `State::run_options`.
@@ -1185,6 +1216,8 @@ impl App {
             failed: String::new(),
             status_since: (String::new(), Instant::now()),
             runner_shown: false,
+            capture: None,
+            capture_shown: false,
             run_orders: state.run_orders.clone(),
             run_options: state.run_options.clone(),
             next_run_id: 0,
@@ -1988,7 +2021,7 @@ impl App {
         log::debug!("open {}", self.ws.key(&path));
         // The tree is at the request now, not at the folder clicked before.
         self.tree_folder = None;
-        self.runner_shown = false;
+        (self.runner_shown, self.capture_shown) = (false, false);
         let current = self.open.as_ref().map(|o| o.path.clone());
         let kinds = |app: &Self| (app.open.as_ref()).map(|o| ReqTab::of(&o.draft.method));
         let before = kinds(self);
@@ -2808,6 +2841,8 @@ impl App {
         let name = name.trim().to_owned();
         let result = match kind {
             NameKind::NewRequest(dir) => self.ws.create_request(dir, &name).map(Some),
+            NameKind::Captured { folder, request } => (self.ws.create_request(folder, &name))
+                .and_then(|path| self.ws.save_request(&path, request).map(|()| Some(path))),
             NameKind::NewFolder(dir) => self.ws.create_folder(dir, &name).map(|_| None),
             // Never overwrite: an existing name would silently wipe that environment.
             NameKind::NewEnv | NameKind::DuplicateEnv(_) if self.envs.contains(&name) => {
@@ -3681,6 +3716,22 @@ impl App {
                     self.mock = None;
                     self.status = t("Mock server stopped").into();
                 }
+                // Always here: the pane has no other way in but the command palette.
+                let label = match self.capturing() {
+                    Some(addr) => {
+                        dot(ui, GREEN);
+                        tf("Capturing on {}", &[&addr])
+                    }
+                    None => t("Capture").into(),
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text(t("Capture what apps send through a local HTTP proxy"))
+                    .clicked()
+                {
+                    (self.capture_shown, self.runner_shown) = (true, false);
+                }
+                ui.separator();
                 // Before the path, which pushed it out of sight. A message fades; an error
                 // stays, red, until dismissed or replaced.
                 if self.status_since.0 != self.status {
@@ -4205,6 +4256,152 @@ impl App {
         };
     }
 
+    /// Port 9090 when free, as Proxyman's, so an app's proxy setting holds across restarts.
+    /// On 127.0.0.1 only: what reaches it goes out with this machine's network settings.
+    fn start_capture(&mut self, ctx: &egui::Context) {
+        let bound = self.rt.block_on(async {
+            match tokio::net::TcpListener::bind("127.0.0.1:9090").await {
+                Ok(l) => Ok(l),
+                Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0").await,
+            }
+        });
+        let (addr, listener) = match bound.and_then(|l| Ok((l.local_addr()?, l))) {
+            Ok(l) => l,
+            Err(e) => return self.fail(tf("Capture: {}", &[&e])),
+        };
+        let repaint = ctx.clone();
+        let view = self.capture.get_or_insert_with(|| CaptureView {
+            // Flows come in bursts: one frame for a burst.
+            flows: crate::capture::Flows::new(move || repaint.request_repaint_after(BATCHED)),
+            server: None,
+            filter: String::new(),
+            picked: None,
+        });
+        let (cell, net, tx, ctx) = (
+            self.client.clone(),
+            (self.network.clone(), self.cookies.clone()),
+            self.tx.clone(),
+            ctx.clone(),
+        );
+        let (flows, failed) = (view.flows.clone(), t("Capture: {}"));
+        let task = self.rt.spawn(async move {
+            // Through the proxy chosen for requests: a VDI may have no other way out.
+            match cell
+                .get_or_init(|| net::build_client_with_jar(net.0, net.1))
+                .await
+            {
+                Ok(clients) => crate::capture::serve(listener, clients.clone(), flows).await,
+                // The pane sees the task ended and offers Start again.
+                Err(e) => {
+                    let _ = tx.send(Msg::Status(fill(failed, &[e])));
+                    ctx.request_repaint();
+                }
+            }
+        });
+        view.server = Some(Listening {
+            addr,
+            abort: task.abort_handle(),
+        });
+    }
+
+    /// Where the capture proxy listens, if it still does.
+    fn capturing(&mut self) -> Option<std::net::SocketAddr> {
+        let view = self.capture.as_mut()?;
+        if view.server.as_ref().is_some_and(|s| s.abort.is_finished()) {
+            view.server = None;
+        }
+        view.server.as_ref().map(|s| s.addr)
+    }
+
+    fn capture_ui(&mut self, ui: &mut egui::Ui) {
+        let listening = self.capturing();
+        let (mut start, mut stop, mut export, mut open_as) = (false, false, false, None);
+        ui.horizontal(|ui| {
+            ui.heading(t("Capture"));
+            ui.add_space(8.0);
+            match listening {
+                Some(addr) => {
+                    dot(ui, GREEN);
+                    ui.label(tf("Listening on {}", &[&addr]));
+                    if icon_button(ui, icon::COPY, t("Copy the address"), None)
+                        .on_hover_text(t("Copy the address"))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(addr.to_string());
+                    }
+                    stop = ui.button(t("Stop")).clicked();
+                }
+                None => start = ui.add(primary(t("Start capturing"))).clicked(),
+            }
+        });
+        let addr = listening.map_or("127.0.0.1:9090".to_owned(), |a| a.to_string());
+        ui.weak(tf(
+            "Set {} as the HTTP proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS shows as tunnels, their host and size only.",
+            &[&addr],
+        ));
+        if let Some(CaptureView {
+            flows,
+            filter,
+            picked,
+            ..
+        }) = &mut self.capture
+        {
+            ui.horizontal(|ui| {
+                ui.weak(tf("{} flows", &[&flows.with(<[_]>::len)]));
+                if icon_button(ui, icon::ERASER, t("Clear"), None)
+                    .on_hover_text(t("Clear"))
+                    .clicked()
+                {
+                    flows.clear();
+                }
+                export = icon_button(ui, icon::EXPORT, t("Export as HAR…"), None)
+                    .on_hover_text(t("Export as HAR…"))
+                    .clicked();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(filter)
+                            .hint_text(t("Filter by URL or method"))
+                            .desired_width(200.0),
+                    );
+                });
+            });
+            ui.separator();
+            open_as = flows.with(|list| flow_list(ui, list, filter, picked));
+        }
+        if start {
+            self.start_capture(&ui.ctx().clone());
+        }
+        if stop && let Some(view) = &mut self.capture {
+            view.server = None;
+            self.status = t("Capture stopped").into();
+        }
+        if export && let Some(to) = pick_file("capture.har", &[("HAR", &["har", "json"])], true) {
+            self.export_capture(Path::new(&to));
+        }
+        if let Some((name, request)) = open_as {
+            let kind = NameKind::Captured {
+                folder: self.ws.collections(),
+                request: Box::new(request),
+            };
+            self.dialog = Some(Dialog::name(kind, name));
+        }
+    }
+
+    /// Every flow kept, as HAR.
+    fn export_capture(&mut self, to: &Path) {
+        let Some(view) = &self.capture else {
+            return;
+        };
+        let har = view
+            .flows
+            .with(|list| crate::capture::har(&list.iter().collect::<Vec<_>>()));
+        let text = serde_json::to_string_pretty(&har).unwrap_or_default();
+        match std::fs::write(to, text) {
+            Ok(()) => self.status = tf("Saved {}", &[&to.display()]),
+            Err(e) => self.fail(format!("{}: {e}", to.display())),
+        }
+    }
+
     /// Port 3000 when free, so a frontend can keep one base URL across restarts.
     fn start_mock(&mut self, dir: PathBuf, ctx: &egui::Context) {
         let requests = self.ws.load_requests_in(&dir).unwrap_or_default();
@@ -4354,17 +4551,28 @@ impl App {
             All,
             Reopen,
         }
-        // No request tab is lit while the runner's chip is.
+        // No request tab is lit while the runner's or the capture's chip is.
         let runner = self.runner.as_ref().filter(|_| self.runner_shown).is_some();
         let active = self
             .open
             .as_ref()
             .map(|o| o.path.clone())
-            .filter(|_| !runner);
+            .filter(|_| !runner && !self.capture_shown);
         let (mut show, mut close, mut menu) = (None, None, None);
         let (mut show_runner, mut close_runner) = (false, false);
+        let (mut show_capture, mut close_capture) = (false, false);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
+                if self.capture_shown || self.capture.is_some() {
+                    if self.capture.as_ref().is_some_and(|c| c.server.is_some()) {
+                        dot(ui, GREEN);
+                    }
+                    show_capture = tab_label(ui, self.capture_shown, t("Capture"), None).clicked();
+                    close_capture = icon_button(ui, icon::X, t("Close the capture"), None)
+                        .on_hover_text(t("Stops capturing and drops what it captured"))
+                        .clicked();
+                    ui.separator();
+                }
                 if let Some(view) = &self.runner {
                     if view.run.as_ref().is_some_and(RunState::running) {
                         ui.spinner();
@@ -4466,14 +4674,19 @@ impl App {
         } else if let Some(path) = show {
             self.activate(path, false);
         } else if show_runner {
-            self.runner_shown = true;
+            (self.runner_shown, self.capture_shown) = (true, false);
         } else if close_runner {
             self.close_runner();
+        } else if show_capture {
+            (self.capture_shown, self.runner_shown) = (true, false);
+        } else if close_capture {
+            (self.capture, self.capture_shown) = (None, false);
         }
     }
 
     fn main_area(&mut self, ui: &mut egui::Ui) {
-        if !self.tabs.is_empty() || self.runner.is_some() || self.hide_sidebar {
+        let capture = self.capture_shown || self.capture.is_some();
+        if !self.tabs.is_empty() || self.runner.is_some() || capture || self.hide_sidebar {
             egui::Panel::top("tabs").show(ui, |ui| {
                 if !self.hide_sidebar {
                     return self.tab_bar(ui);
@@ -4486,6 +4699,10 @@ impl App {
                     });
                 });
             });
+        }
+        if self.capture_shown {
+            self.capture_ui(ui);
+            return;
         }
         if self.runner.is_some() && self.runner_shown {
             self.runner_ui(ui);
@@ -5483,7 +5700,7 @@ impl App {
         let tabs: Vec<&PathBuf> = self.tabs.iter().map(|t| &t.path).collect();
         let folders: Vec<(String, PathBuf)> = match dialog {
             Dialog::Name {
-                kind: NameKind::SaveAs { .. } | NameKind::NewRequest(_),
+                kind: NameKind::SaveAs { .. } | NameKind::NewRequest(_) | NameKind::Captured { .. },
                 ..
             } => {
                 let root = self.ws.collections();
@@ -5518,7 +5735,7 @@ impl App {
             match dialog {
                 Dialog::Name { kind, name, error } => {
                     ui.heading(match kind {
-                        NameKind::NewRequest(_) => t("New request"),
+                        NameKind::NewRequest(_) | NameKind::Captured { .. } => t("New request"),
                         NameKind::NewFolder(dir) if *dir == collections => t("New collection"),
                         NameKind::NewFolder(_) => t("New folder"),
                         NameKind::Rename(_) => t("Rename"),
@@ -5538,7 +5755,10 @@ impl App {
                     // name had only a hint, gone once typed in.
                     let id = egui::Id::new("name-edit");
                     egui::Grid::new("name-fields").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                        if let NameKind::SaveAs { folder, .. } | NameKind::NewRequest(folder) = kind {
+                        if let NameKind::SaveAs { folder, .. }
+                        | NameKind::NewRequest(folder)
+                        | NameKind::Captured { folder, .. } = kind
+                        {
                             let shown = (folders.iter())
                                 .find(|(_, p)| p == folder)
                                 .map_or("", |(label, _)| label.as_str());
@@ -6615,7 +6835,7 @@ impl App {
             .is_some_and(RunState::running)
         {
             self.status = t("The collection runner is already running.").into();
-            self.runner_shown = true;
+            (self.runner_shown, self.capture_shown) = (true, false);
             return;
         }
         let title = if scope == self.ws.collections() {
@@ -6648,7 +6868,7 @@ impl App {
             error: String::new(),
             run: None,
         });
-        self.runner_shown = true;
+        (self.runner_shown, self.capture_shown) = (true, false);
     }
 
     /// "Folder/Request" relative to the collections root, without the extension.
@@ -7985,6 +8205,7 @@ enum Action {
     NewEnv,
     Globals,
     RunCollection,
+    Capture,
     ImportAny,
     Network,
     Cookies,
@@ -7995,12 +8216,13 @@ enum Action {
     Shortcuts,
 }
 
-const ACTIONS: [(&str, Action); 13] = [
+const ACTIONS: [(&str, Action); 14] = [
     (n_("New request"), Action::NewRequest),
     (n_("New collection"), Action::NewFolder),
     (n_("New environment"), Action::NewEnv),
     (n_("Edit globals"), Action::Globals),
     (n_("Run all collections"), Action::RunCollection),
+    (n_("Capture traffic (HTTP proxy)"), Action::Capture),
     (n_("Import (Postman, OpenAPI, Swagger)"), Action::ImportAny),
     (
         n_("Network settings (proxy, certificates)"),
@@ -8046,6 +8268,7 @@ impl App {
             Action::NewEnv => self.dialog = Some(Dialog::name(NameKind::NewEnv, "")),
             Action::Globals => self.open_env_editor(None, &[]),
             Action::RunCollection => self.open_runner(root),
+            Action::Capture => (self.capture_shown, self.runner_shown) = (true, false),
             Action::ImportAny => {
                 self.dialog = Some(Dialog::Paste {
                     text: String::new(),
@@ -11709,6 +11932,164 @@ impl StreamSession {
             let _ = tx.send(crate::mqtt::Command::Topics(want.collect()));
         }
     }
+}
+
+/// The capture's flows, newest at the bottom as they come, and the one picked under them,
+/// whole. Returns a request to open from it, and a name for it.
+fn flow_list(
+    ui: &mut egui::Ui,
+    list: &[crate::capture::Flow],
+    filter: &str,
+    picked: &mut Option<u64>,
+) -> Option<(String, Request)> {
+    let needle = filter.trim().to_lowercase();
+    let hits: Vec<_> = (list.iter())
+        .filter(|f| {
+            needle.is_empty()
+                || f.url.to_lowercase().contains(&needle)
+                || f.method.eq_ignore_ascii_case(&needle)
+        })
+        .collect();
+    let shown = picked.and_then(|id| list.iter().find(|f| f.id == id));
+    if shown.is_none() {
+        *picked = None;
+    }
+    let (mut open_as, mut close) = (None, false);
+    if let Some(f) = shown {
+        egui::Panel::bottom("capture-detail")
+            .resizable(true)
+            .default_size(220.0)
+            .show(ui, |ui| {
+                let text = flow_text(f);
+                ui.horizontal(|ui| {
+                    let open = ui.add_enabled(!f.tunnel(), egui::Button::new(t("Open as request")));
+                    let open = (open.on_hover_text(t(
+                        "A new request from what was sent, its answer saved as an example",
+                    )))
+                    .on_disabled_hover_text(t("A tunnel has no request to open"));
+                    if open.clicked() {
+                        open_as = captured_request(f);
+                    }
+                    if icon_button(ui, icon::COPY, t("Copy"), None)
+                        .on_hover_text(t("Copy"))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close = icon_button(ui, icon::X, t("Close"), None)
+                            .on_hover_text(t("Close"))
+                            .clicked();
+                    });
+                });
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        let text = RichText::new(text).monospace();
+                        ui.add(egui::Label::new(text).selectable(true).wrap());
+                    });
+            });
+    }
+    if close {
+        *picked = None;
+    }
+    if list.is_empty() {
+        ui.weak(t("Nothing captured yet."));
+        return open_as;
+    }
+    // Only the rows in view laid out, as the stream log: a busy app sends thousands.
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .stick_to_bottom(true)
+        .show_rows(ui, row_h, hits.len(), |ui, rows| {
+            for f in &hits[rows] {
+                ui.horizontal(|ui| {
+                    ui.set_height(row_h);
+                    ui.weak(RichText::new(clock(f.at, *UTC_OFFSET)).monospace());
+                    method_badge(ui, &f.method, 7);
+                    let (status, color) = match (f.status, &f.error) {
+                        (_, Some(_)) => ("ERR".to_owned(), RED),
+                        (Some(s), None) => (s.to_string(), status_color(s)),
+                        (None, None) => ("…".to_owned(), Color32::GRAY),
+                    };
+                    ui.label(
+                        RichText::new(format!("{status:<3}"))
+                            .monospace()
+                            .color(color),
+                    );
+                    let took = f
+                        .elapsed
+                        .map_or("…".to_owned(), |e| format!("{} ms", e.as_millis()));
+                    let size = human_size(f.response.size as usize);
+                    ui.weak(RichText::new(format!("{took:>8} {size:>9}")).monospace());
+                    let mut url = RichText::new(&f.url).monospace();
+                    if *picked == Some(f.id) {
+                        url = url.background_color(ui.visuals().selection.bg_fill);
+                    }
+                    let url = egui::Label::new(url).truncate().sense(egui::Sense::click());
+                    if ui.add(url).clicked() {
+                        *picked = (*picked != Some(f.id)).then_some(f.id);
+                    }
+                });
+            }
+        });
+    open_as
+}
+
+/// A flow as it went: the request, then the answer, each with its headers and the start
+/// of its body.
+fn flow_text(f: &crate::capture::Flow) -> String {
+    use std::fmt::Write;
+    // A body this long is a download, not something to read here; Copy has the same.
+    const SHOWN: usize = 64 * 1024;
+    let message = |out: &mut String, m: &crate::capture::Message| {
+        for (name, value) in &m.headers {
+            let _ = writeln!(out, "{name}: {value}");
+        }
+        if m.body.is_empty() {
+            return;
+        }
+        out.push('\n');
+        match std::str::from_utf8(&m.body) {
+            Ok(text) => out.push_str(&clip(text, SHOWN)),
+            Err(_) => out.push_str(&tf("({} of binary data)", &[&human_size(m.size as usize)])),
+        }
+        if m.cut() {
+            let (kept, all) = (human_size(m.body.len()), human_size(m.size as usize));
+            let _ = write!(out, "\n{}", tf("(the first {} of {})", &[&kept, &all]));
+        }
+        out.push('\n');
+    };
+    let mut out = format!("{} {}\n", f.method, f.url);
+    message(&mut out, &f.request);
+    if let Some(status) = f.status {
+        let _ = writeln!(out, "\n{status}");
+        message(&mut out, &f.response);
+    }
+    if f.tunnel() && f.elapsed.is_some() {
+        let (sent, received) = (
+            human_size(f.request.size as usize),
+            human_size(f.response.size as usize),
+        );
+        let _ = writeln!(out, "\n{}", tf("{} sent, {} received", &[&sent, &received]));
+    }
+    if let Some(e) = &f.error {
+        let _ = writeln!(out, "\n{e}");
+    }
+    out
+}
+
+/// What a captured exchange becomes as a request: as importing its HAR would make it,
+/// the answer saved as its example.
+fn captured_request(f: &crate::capture::Flow) -> Option<(String, Request)> {
+    let har = crate::capture::har(&[f]);
+    let crate::postman::Import::Collection { requests, .. } = crate::har::import(&har) else {
+        return None;
+    };
+    let (key, request) = requests.into_iter().next()?;
+    let name = key.rsplit('/').next().unwrap_or(&key);
+    Some((store::unescape_name(name), request))
 }
 
 fn stream_ui(
@@ -20351,6 +20732,74 @@ mod ui_tests {
     }
 
     /// Without settling: a live stream's spinner keeps repainting, which `run` rejects.
+    /// What an app sends through the capture proxy shows as a row; picked, it shows whole,
+    /// and opens as a request that resends it, the answer kept as its example. The
+    /// capture saves as a HAR for other tools.
+    #[test]
+    fn a_captured_exchange_opens_as_a_request_and_saves_as_har() {
+        use std::io::{Read, Write};
+        let server = crate::http::tests::serve(|_| ("200 OK".into(), r#"{"id":7}"#.into()));
+        let mut h = harness(workspace("capture"));
+        h.run();
+        h.get_by_label("Capture").click();
+        h.run();
+        h.get_by_label("Start capturing").click();
+        h.run();
+        let proxy = h.state_mut().capturing().expect("listening");
+        let url = format!("http://{server}/items/7");
+        let mut app = std::net::TcpStream::connect(proxy).unwrap();
+        write!(
+            app,
+            "GET {url} HTTP/1.1\r\nHost: {server}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut answer = String::new();
+        app.read_to_string(&mut answer).unwrap();
+        assert!(answer.ends_with(r#"{"id":7}"#), "{answer}");
+        wait_live(&mut h, |app| {
+            let flows = &app.capture.as_ref().unwrap().flows;
+            flows.with(|l| l.iter().any(|f| f.elapsed.is_some()))
+        });
+        let filter = |h: &mut Harness<'_, App>, text: &str| {
+            h.state_mut().capture.as_mut().unwrap().filter = text.into();
+            h.run();
+        };
+        filter(&mut h, "POST");
+        assert!(
+            h.query_by_label(&url).is_none(),
+            "a method narrows to its own"
+        );
+        filter(&mut h, "items/7");
+        h.get_by_label(&url).click();
+        h.run();
+        shot(&mut h, "t-capture");
+        let whole = (h.get_all_by_role(Role::Label))
+            .filter_map(|n| n.value())
+            .any(|v| v.contains("200") && v.ends_with("{\"id\":7}\n"));
+        assert!(whole, "the picked flow, whole");
+        h.get_by_label("Open as request").click();
+        h.run();
+        button(&h, "Create").click();
+        h.run();
+        assert!(
+            !h.state().capture_shown,
+            "the new request shows, not the capture"
+        );
+        let saved = draft(&h);
+        assert_eq!((saved.method.as_str(), saved.url.as_str()), ("GET", &*url));
+        let example = saved.examples.first().expect("the answer as an example");
+        assert_eq!(
+            (example.status, example.body.as_str()),
+            (200, r#"{"id":7}"#)
+        );
+
+        let to = std::env::temp_dir().join(format!("apitool-capture-{}.har", std::process::id()));
+        h.state_mut().export_capture(&to);
+        let har: serde_json::Value = serde_json::from_slice(&std::fs::read(&to).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&to);
+        assert_eq!(har["log"]["entries"][0]["request"]["url"], *url);
+    }
+
     fn wait_live(h: &mut Harness<'_, App>, done: impl Fn(&App) -> bool) {
         for _ in 0..200 {
             h.step();

@@ -1823,6 +1823,40 @@ const ZH_TW: &[(&str, &str)] = &[
         "Show the fields proto3 leaves out at 0, \"\" or false",
         "顯示 proto3 因值為 0、\"\" 或 false 而省略的欄位",
     ),
+    ("Capture", "擷取"),
+    ("Capture traffic (HTTP proxy)", "擷取流量（HTTP 代理）"),
+    (
+        "Capture what apps send through a local HTTP proxy",
+        "透過本機 HTTP 代理擷取應用程式送出的請求",
+    ),
+    ("Capture: {}", "擷取：{}"),
+    ("Capture stopped", "已停止擷取"),
+    ("Capturing on {}", "擷取中：{}"),
+    ("Close the capture", "關閉擷取"),
+    (
+        "Stops capturing and drops what it captured",
+        "停止擷取並捨棄已擷取的內容",
+    ),
+    ("Listening on {}", "監聽於 {}"),
+    ("Copy the address", "複製位址"),
+    ("Start capturing", "開始擷取"),
+    (
+        "Set {} as the HTTP proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS shows as tunnels, their host and size only.",
+        "把 {} 設為應用程式或系統的 HTTP 代理：送出的請求會顯示在這裡，並以 apitool 的網路設定轉送。HTTPS 顯示為通道，只有主機與大小。",
+    ),
+    ("{} flows", "{} 筆流量"),
+    ("Export as HAR…", "匯出為 HAR…"),
+    ("Filter by URL or method", "依 URL 或方法篩選"),
+    ("Nothing captured yet.", "尚未擷取到任何內容。"),
+    ("Open as request", "開成請求"),
+    (
+        "A new request from what was sent, its answer saved as an example",
+        "依送出的內容建立新請求，回應存為範例",
+    ),
+    ("A tunnel has no request to open", "通道沒有可開啟的請求"),
+    ("({} of binary data)", "（{} 二進位資料）"),
+    ("(the first {} of {})", "（只保留前 {}，共 {}）"),
+    ("{} sent, {} received", "送出 {}，收到 {}"),
 ];
 
 #[cfg(test)]

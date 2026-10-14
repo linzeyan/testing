@@ -78,6 +78,9 @@ rustls-platform-verifier = "0.7"
 rfd = { version = "0.17", default-features = false }
 # Already in the tree via reqwest's http2: the window's MCP endpoint also takes h2c.
 h2 = "0.4.19"
+# Already in the tree via reqwest, as a client: the capture proxy serves with it too, its
+# upgrades carrying CONNECT tunnels.
+hyper = { version = "1", features = ["server", "http1"] }
 bytes = "1"
 # Already in the tree via reqwest-websocket, whose handshake takes its config: the
 # largest message a WebSocket takes in.

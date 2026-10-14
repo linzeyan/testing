@@ -210,6 +210,9 @@ struct Variant {
     ciphers: Option<Vec<&'static str>>,
     /// Accepts malformed response headers.
     lenient: bool,
+    /// The capture proxy's: what an app sent goes on as it came, nothing added or decoded,
+    /// and no timeout to cut a long download or stream.
+    forward: bool,
 }
 
 impl From<&Settings> for Variant {
@@ -233,6 +236,7 @@ impl From<&Settings> for Variant {
                     .collect()
             }),
             lenient: s.insecure_parser,
+            forward: false,
         }
     }
 }
@@ -295,6 +299,20 @@ impl Clients {
             over: waiting,
         };
         Ok(((self.variants.build)(v, &self.jar, Some(handshake))?, over))
+    }
+
+    /// The client the capture proxy forwards a request for `url` with: the same proxy, CA
+    /// file and client certificate, no redirects followed and no cookies of the app's.
+    pub fn forward_for(&self, url: &str) -> Result<reqwest::Client, String> {
+        let defaults = Variant::from(&Settings::default());
+        self.variant(Variant {
+            redirects: None,
+            referer: false,
+            cookies: false,
+            cert: self.variants.net.host_cert(url),
+            forward: true,
+            ..defaults
+        })
     }
 
     /// The HTTP/2 client for a gRPC call to `url` with the request's settings.
@@ -435,24 +453,28 @@ pub async fn build_client_with_jar(
         // Replaces reqwest's own `*/*`; a request's Accept still wins over it.
         let accept = reqwest::header::HeaderValue::from_str(net.accept())
             .map_err(|_| format!("Accept {:?}: not a valid header value", net.accept()))?;
-        let mut b = reqwest::Client::builder()
-            .default_headers([(reqwest::header::ACCEPT, accept)].into_iter().collect())
-            .timeout(Duration::from_secs(net.timeout_secs.max(1)))
-            .tls_danger_accept_invalid_certs(net.insecure || v.insecure)
-            .redirect(match v.redirects {
-                // `Policy::limited`, plus noting each hop for the Timeline.
-                Some(n) => reqwest::redirect::Policy::custom(move |attempt| {
-                    // The first of `previous` is the URL asked for, not a redirect.
-                    if attempt.previous().len() > n as usize {
-                        return attempt.error("too many redirects");
-                    }
-                    let hop = (attempt.status().as_u16(), attempt.url().to_string());
-                    crate::http::trace(|t| t.hops.push(hop));
-                    attempt.follow()
-                }),
-                None => reqwest::redirect::Policy::none(),
-            });
-        if let Some(agent) = net.user_agent() {
+        let wait = Duration::from_secs(net.timeout_secs.max(1));
+        let mut b = match v.forward {
+            true => reqwest::Client::builder().connect_timeout(wait).no_gzip(),
+            false => reqwest::Client::builder()
+                .default_headers([(reqwest::header::ACCEPT, accept)].into_iter().collect())
+                .timeout(wait),
+        }
+        .tls_danger_accept_invalid_certs(net.insecure || v.insecure)
+        .redirect(match v.redirects {
+            // `Policy::limited`, plus noting each hop for the Timeline.
+            Some(n) => reqwest::redirect::Policy::custom(move |attempt| {
+                // The first of `previous` is the URL asked for, not a redirect.
+                if attempt.previous().len() > n as usize {
+                    return attempt.error("too many redirects");
+                }
+                let hop = (attempt.status().as_u16(), attempt.url().to_string());
+                crate::http::trace(|t| t.hops.push(hop));
+                attempt.follow()
+            }),
+            None => reqwest::redirect::Policy::none(),
+        });
+        if let Some(agent) = net.user_agent().filter(|_| !v.forward) {
             b = b.user_agent(agent);
         }
         if !net.gzip {

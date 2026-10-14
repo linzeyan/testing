@@ -375,6 +375,18 @@ and a second request to a method and path already taken are left out, and counte
   or `apitool-cli mock`. An `x-mock-response-name` or `x-mock-response-code` header picks
   the example.
 
+## Capture
+
+"Capture" in the status bar (or "Capture traffic" from Ctrl+K) opens a pane
+like Proxyman's or Charles's. Start capturing, then set the address shown, `127.0.0.1:9090`
+(another free port when that one is taken), as the HTTP proxy of an app or of the system.
+What it sends goes on with apitool's own network settings (its proxy, CA and client
+certificates) and shows as a row: time, method, status, duration, size, URL. A row opens
+underneath with both sides' headers and bodies; "Open as request" saves it as a new
+request, its answer as an example. The export icon writes every flow as HAR. HTTPS passes
+through as a tunnel, shown with its host and the bytes each way. The latest 1000 flows are
+kept, each body's first 256 KiB. WebSocket upgrades through the proxy aren't relayed.
+
 ## Command line
 
 ```
