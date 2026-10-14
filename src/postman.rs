@@ -686,6 +686,12 @@ fn body_json(body: &Body) -> Option<Value> {
             json!({ "mode": "formdata", "formdata": rows })
         }
         Body::File { path } => json!({ "mode": "file", "file": { "src": path } }),
+        // ponytail: Postman has no body of typed bytes; text ones go as raw, the rest is
+        // left out. A pre-request script decoding them is the way if that's ever needed.
+        typed @ (Body::Base64 { .. } | Body::Hex { .. }) => {
+            let text = String::from_utf8(typed.typed_bytes()?.ok()?).ok()?;
+            json!({ "mode": "raw", "raw": text })
+        }
         Body::GraphQL { query, variables } => {
             json!({ "mode": "graphql", "graphql": { "query": query, "variables": variables } })
         }

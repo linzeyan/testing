@@ -222,7 +222,21 @@ const ZH_TW: &[(&str, &str)] = &[
         "Below environments: an environment variable with the same name wins. Keep secrets in a secret environment.",
         "優先順序低於環境：同名的環境變數優先。秘密請放在秘密環境中。",
     ),
-    ("Binary", "二進位檔"),
+    // A file, or bytes typed as Base64 or hex.
+    ("Binary", "二進位"),
+    ("File", "檔案"),
+    (
+        "Base64 and hex are decoded and sent as a binary message",
+        "Base64 與 hex 會解碼後以二進位訊息送出",
+    ),
+    (
+        "Decoded when sent, once its variables are filled in.",
+        "送出時代入變數後再解碼。",
+    ),
+    (
+        "{} as sent · application/octet-stream unless set under Headers",
+        "送出 {} · 未在 Headers 設定時為 application/octet-stream",
+    ),
     ("Blue", "藍"),
     ("Body", "內容"),
     ("Body matches a JSON schema", "內容符合 JSON schema"),
@@ -631,7 +645,6 @@ const ZH_TW: &[(&str, &str)] = &[
         "Gone：資源曾經存在，但已永久移除。",
     ),
     ("Grant", "授權類型"),
-    ("GraphQL", "GraphQL"),
     ("Green", "綠"),
     ("Header", "標頭"),
     ("Header is present", "有某個標頭"),

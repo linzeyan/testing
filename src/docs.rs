@@ -131,6 +131,8 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
         Body::File { path } => {
             let _ = write!(out, "**Body:** the file `{path}`\n\n");
         }
+        Body::Base64 { text } => code(out, "Body (Base64)", "", text),
+        Body::Hex { text } => code(out, "Body (hex)", "", text),
         Body::GraphQL { query, variables } => {
             code(out, "Query", "graphql", query);
             if !variables.trim().is_empty() {

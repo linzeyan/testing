@@ -40,7 +40,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 |---|---|
 | HTTP | 每個請求可個別設定 HTTP 版本、重新導向、TLS 驗證、Cookie 與逾時 |
 | GraphQL | 取得 schema 後，輸入查詢時會補全欄位；變數以表單填寫，查詢宣告的每個 `$變數` 一列（enum 與 Boolean 用下拉、數字可用 `{{變數}}`、input 可依 schema 填入欄位），也可切成 JSON；變數區固定在查詢下方，中間的分隔線可拖曳調整高度，查詢再長也不會把變數擠出畫面；`subscription` 透過 WebSocket 連線（graphql-transport-ws 或較舊的 graphql-ws），逐筆串流結果 |
-| WebSocket | |
+| WebSocket | 文字或二進位訊息：Send 旁選 Base64 或 Hex，輸入框內容解碼後以一則二進位訊息送出；收到的二進位訊息顯示大小與 hex |
 | SSE | |
 | Socket.IO 2、3 與 4 | URL 的路徑即 namespace，JSON 內容即 auth payload（v2 沒有 auth payload，「參數」會附在交握的查詢字串上）；「設定」可指定交握路徑（空白即 `/socket.io/`）與用戶端版本；以 `event {"json": "arg"}` 或 `["event", …]` 陣列送出；會顯示 ack |
 | MQTT 3.1.1 與 5 | 透過 TCP、TLS 或 WebSocket（`mqtt://`、`mqtts://`、`ws://`、`wss://`），詳見下方 |
@@ -64,7 +64,10 @@ MQTT：
 
 - JSON；文字（選 Text、XML、HTML 或 JavaScript 會設定對應的 Content-Type；XML 可美化）；表單；
   multipart（值寫 `@path` 即上傳該檔案）。
-- 二進位檔：原樣送出檔案，從磁碟串流讀取，依副檔名判斷類型。
+- 二進位：原樣送出檔案（從磁碟串流讀取，依副檔名判斷類型），或貼上 Base64（標準或 URL-safe）／hex，
+  送出時解碼成位元組。下方顯示解碼後的大小，格式錯誤以橘色標示；兩者互切時位元組不變。
+- GraphQL 是獨立的請求類型（方法清單中的 GRAPHQL），不是內容類型。GraphQL 請求換成其他方法時，
+  查詢會變成實際送出的 JSON 內容；換回來時再從中讀回查詢。
 - 超過 128 KB 的文字（在內容、指令碼、範例或 Postman 匯入框中）會保留並照常送出，但不會排版
   供編輯：曾有 10 MB 的內容光是顯示就用掉 3.6 GB 記憶體。
 

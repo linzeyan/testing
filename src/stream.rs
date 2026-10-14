@@ -21,6 +21,28 @@ pub enum Event {
     Error(String),
 }
 
+/// What goes out on a WebSocket, Socket.IO or gRPC stream; only WebSocket sends bytes.
+pub enum Frame {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+impl Frame {
+    pub fn into_text(self) -> String {
+        match self {
+            Frame::Text(t) => t,
+            Frame::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+        }
+    }
+}
+
+/// A binary message as the log shows it: its size, then its bytes in hex.
+fn binary(b: &[u8]) -> String {
+    // The app keeps 64 KiB of an event's text; spelling out more is wasted work.
+    let shown = crate::model::encode_hex(&b[..b.len().min(32 << 10)]);
+    format!("<binary, {} bytes> {shown}", b.len())
+}
+
 /// A GraphQL query that subscribes: it streams over WebSocket instead of sending once.
 pub fn subscribes(req: &Request) -> bool {
     req.method == "GRAPHQL"
@@ -34,7 +56,7 @@ pub async fn connect(
     clients: &crate::net::Clients,
     net: crate::net::Network,
     req: Request,
-    text: mpsc::UnboundedReceiver<String>,
+    text: mpsc::UnboundedReceiver<Frame>,
     mqtt: mpsc::UnboundedReceiver<crate::mqtt::Command>,
     emit: impl Fn(Event),
 ) {
@@ -129,7 +151,7 @@ pub async fn sse(client: reqwest::Client, mut req: Request, emit: impl Fn(Event)
 pub async fn websocket(
     client: reqwest::Client,
     mut req: Request,
-    mut outgoing: mpsc::UnboundedReceiver<String>,
+    mut outgoing: mpsc::UnboundedReceiver<Frame>,
     emit: impl Fn(Event),
 ) {
     if let Err(e) = http::with_token(&client, &mut req, false).await {
@@ -152,11 +174,15 @@ pub async fn websocket(
     loop {
         tokio::select! {
             out = outgoing.recv() => match out {
-                Some(text) => {
-                    if let Err(e) = sink.send(Message::Text(text.clone())).await {
+                Some(frame) => {
+                    let (message, shown) = match frame {
+                        Frame::Text(t) => (Message::Text(t.clone()), t),
+                        Frame::Binary(b) => (Message::Binary(b.clone().into()), binary(&b)),
+                    };
+                    if let Err(e) = sink.send(message).await {
                         return emit(Event::Error(error_chain(&e)));
                     }
-                    emit(Event::Out(text));
+                    emit(Event::Out(shown));
                 }
                 None => {
                     hang_up(&mut sink, &mut stream).await;
@@ -165,7 +191,7 @@ pub async fn websocket(
             },
             incoming = stream.next() => match incoming {
                 Some(Ok(Message::Text(t))) => emit(Event::In(t)),
-                Some(Ok(Message::Binary(b))) => emit(Event::In(format!("<binary, {} bytes>", b.len()))),
+                Some(Ok(Message::Binary(b))) => emit(Event::In(binary(&b))),
                 Some(Ok(Message::Close { code, reason })) => {
                     return emit(Event::Closed(format!("closed by server ({code:?}) {reason}")));
                 }
@@ -306,7 +332,7 @@ pub async fn graphql(client: reqwest::Client, req: Request, emit: impl Fn(Event)
 pub async fn socketio(
     client: reqwest::Client,
     req: Request,
-    mut outgoing: mpsc::UnboundedReceiver<String>,
+    mut outgoing: mpsc::UnboundedReceiver<Frame>,
     emit: impl Fn(Event),
 ) {
     let mut url = match reqwest::Url::parse(&http::wire_url(&req.url)) {
@@ -369,7 +395,7 @@ pub async fn socketio(
                 }
             },
             out = outgoing.recv() => match out {
-                Some(text) => pending.push(text),
+                Some(frame) => pending.push(frame.into_text()),
                 None => {
                     let _ = sink.send(Message::Text(format!("41{prefix}"))).await;
                     hang_up(&mut sink, &mut stream).await;
@@ -698,7 +724,7 @@ pub mod tests {
         };
         // Queued and hung up before connecting, as MCP's stream_request does.
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send("bye".into()).unwrap();
+        tx.send(Frame::Text("bye".into())).unwrap();
         drop(tx);
         rt.block_on(websocket(client, req, rx, |_| {}));
         drop(rt);
@@ -723,6 +749,9 @@ pub mod tests {
                     )))
                     .unwrap();
                 }
+                if msg.is_binary() {
+                    ws.send(msg).unwrap();
+                }
             }
         });
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -742,17 +771,15 @@ pub mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let events = std::sync::Mutex::new(Vec::new());
         let tx = std::sync::Mutex::new(Some(tx));
+        let send = |f: Frame| tx.lock().unwrap().as_ref().unwrap().send(f).unwrap();
         rt.block_on(websocket(client, req, rx, |e| {
             // Reply once the server's echo arrives, then hang up by dropping the sender.
             match &e {
-                Event::In(t) if t == "hello" => tx
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .send("ping".into())
-                    .unwrap(),
-                Event::In(t) if t == "echo ping" => drop(tx.lock().unwrap().take()),
+                Event::In(t) if t == "hello" => send(Frame::Text("ping".into())),
+                // A binary message goes out as one, bytes intact: the server echoes it back.
+                Event::In(t) if t == "echo ping" => send(Frame::Binary(vec![0, 0xbe, 0xef])),
+                // Whatever comes back to it: one sent as text would leave this waiting forever.
+                Event::In(_) => drop(tx.lock().unwrap().take()),
                 _ => {}
             }
             events.lock().unwrap().push(e);
@@ -765,6 +792,8 @@ pub mod tests {
                 Event::In("hello".into()),
                 Event::Out("ping".into()),
                 Event::In("echo ping".into()),
+                Event::Out("<binary, 3 bytes> 00 be ef".into()),
+                Event::In("<binary, 3 bytes> 00 be ef".into()),
                 Event::Closed("disconnected".into()),
             ]
         );
@@ -814,7 +843,7 @@ pub mod tests {
             ..Default::default()
         };
         let first_event = |client: reqwest::Client| {
-            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            let (tx, rx) = mpsc::unbounded_channel::<Frame>();
             let tx = std::sync::Mutex::new(Some(tx));
             let events = std::sync::Mutex::new(Vec::new());
             rt.block_on(websocket(client, req.clone(), rx, |e| {
@@ -1008,7 +1037,7 @@ pub mod tests {
                     let tx = tx.lock().unwrap();
                     tx.as_ref()
                         .unwrap()
-                        .send(r#"say {"text": "hi"}"#.into())
+                        .send(Frame::Text(r#"say {"text": "hi"}"#.into()))
                         .unwrap();
                 }
                 Event::In(t) if t.starts_with("ack") => drop(tx.lock().unwrap().take()),
@@ -1075,8 +1104,8 @@ pub mod tests {
             ..Default::default()
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send("first".into()).unwrap();
-        tx.send("second 2".into()).unwrap();
+        tx.send(Frame::Text("first".into())).unwrap();
+        tx.send(Frame::Text("second 2".into())).unwrap();
         let tx = std::sync::Mutex::new(Some(tx));
         let events = std::sync::Mutex::new(Vec::new());
         rt.block_on(socketio(client, req, rx, |e| {
@@ -1174,7 +1203,7 @@ pub mod tests {
                 },
                 ..Default::default()
             };
-            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            let (tx, rx) = mpsc::unbounded_channel::<Frame>();
             let tx = std::sync::Mutex::new(Some(tx));
             let events = std::sync::Mutex::new(Vec::new());
             rt.block_on(socketio(client.clone(), req, rx, |e| {
@@ -1312,7 +1341,7 @@ pub mod tests {
                         let tx = tx.lock().unwrap();
                         tx.as_ref()
                             .unwrap()
-                            .send(r#"say {"text": "hi"}"#.into())
+                            .send(Frame::Text(r#"say {"text": "hi"}"#.into()))
                             .unwrap();
                     }
                     Event::In(t) if t.starts_with("ack") => drop(tx.lock().unwrap().take()),

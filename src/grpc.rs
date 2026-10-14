@@ -574,7 +574,7 @@ pub async fn call(client: reqwest::Client, req: Request) -> Result<Response, Str
 pub async fn stream(
     clients: &crate::net::Clients,
     mut req: Request,
-    mut outgoing: mpsc::UnboundedReceiver<String>,
+    mut outgoing: mpsc::UnboundedReceiver<crate::stream::Frame>,
     emit: impl Fn(Event),
 ) {
     // The gRPC client speaks only HTTP/2; the token endpoint gets the regular one.
@@ -624,7 +624,7 @@ pub async fn stream(
         tokio::select! {
             r = &mut send => break r,
             out = outgoing.recv(), if sender.is_some() => {
-                if !relay(&method, &mut sender, out, &emit) {
+                if !relay(&method, &mut sender, out.map(|f| f.into_text()), &emit) {
                     return;
                 }
             }
@@ -672,7 +672,7 @@ pub async fn stream(
                 });
             }
             out = outgoing.recv(), if sender.is_some() => {
-                if !relay(&method, &mut sender, out, &emit) {
+                if !relay(&method, &mut sender, out.map(|f| f.into_text()), &emit) {
                     return;
                 }
             }
@@ -1110,6 +1110,7 @@ service Shop { rpc Place(Order) returns (Order); }
             match &e {
                 Event::In(t) if t.contains("ada") => {
                     let next = r#"{"name": "bob", "times": 1}"#.to_owned();
+                    let next = crate::stream::Frame::Text(next);
                     tx.lock().unwrap().as_ref().unwrap().send(next).unwrap();
                 }
                 Event::In(t) if t.contains("bob") => drop(tx.lock().unwrap().take()),

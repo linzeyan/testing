@@ -436,6 +436,14 @@ pub enum Body {
     File {
         path: String,
     },
+    /// Bytes typed as Base64 or hex (`decode_base64`, `decode_hex`), decoded when sent: a
+    /// binary body with no file to keep beside the request.
+    Base64 {
+        text: String,
+    },
+    Hex {
+        text: String,
+    },
     #[serde(rename = "graphql")]
     GraphQL {
         query: String,
@@ -444,18 +452,104 @@ pub enum Body {
 }
 
 impl Body {
+    /// The body for a switch to the GRAPHQL method (`to_graphql`) or away from it: a query
+    /// becomes the JSON it goes out as, and that JSON a query again. Its text is kept as
+    /// typed, `{{variables}}` and all; anything else starts an empty query.
+    pub fn graphql_switched(self, to_graphql: bool) -> Body {
+        use crate::graphql::{members, object};
+        let (query, variables) = match (self, to_graphql) {
+            (Body::GraphQL { query, variables }, false) => {
+                let variables = match variables.trim() {
+                    "" => "{}".to_owned(),
+                    v => v.replace('\n', "\n  "),
+                };
+                let query = serde_json::Value::from(query);
+                let text = format!("{{\n  \"query\": {query},\n  \"variables\": {variables}\n}}");
+                return Body::Json { text };
+            }
+            (body, false) | (body @ Body::GraphQL { .. }, true) => return body,
+            (Body::Json { text }, true) => {
+                let members = members(&text).unwrap_or_default();
+                let take = |name: &str| members.iter().find(|m| m.0 == name).map(|m| m.1.trim());
+                let query = take("query").and_then(|q| serde_json::from_str(q).ok());
+                let variables = match take("variables") {
+                    None | Some("{}" | "null") => String::new(),
+                    Some(v) => object(&crate::graphql::members(v).unwrap_or_default()),
+                };
+                (query.unwrap_or_default(), variables)
+            }
+            (_, true) => Default::default(),
+        };
+        Body::GraphQL { query, variables }
+    }
+
+    /// The bytes a Base64 or hex body stands for; None for any other body.
+    pub fn typed_bytes(&self) -> Option<Result<Vec<u8>, String>> {
+        match self {
+            Body::Base64 { text } => Some(decode_base64(text)),
+            Body::Hex { text } => Some(decode_hex(text)),
+            _ => None,
+        }
+    }
+
     /// A type picked and nothing put in it. Sent, saved and shown as no body, so clicking
     /// a body type changes nothing until something is typed.
     pub fn is_empty(&self) -> bool {
         match self {
             Self::None => true,
             Self::Json { text } | Self::Text { text } => text.is_empty(),
+            Self::Base64 { text } | Self::Hex { text } => text.is_empty(),
             Self::Form { fields } => fields.is_empty(),
             Self::Multipart { parts } => parts.is_empty(),
             Self::File { path } => path.is_empty(),
             Self::GraphQL { query, variables } => query.is_empty() && variables.is_empty(),
         }
     }
+}
+
+/// Base64 as it comes from anywhere: the standard or URL-safe alphabet, padded or not,
+/// broken over lines.
+pub fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let clean: String = (text.chars())
+        .filter(|c| !c.is_whitespace() && *c != '=')
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            c => c,
+        })
+        .collect();
+    (base64::engine::general_purpose::STANDARD_NO_PAD.decode(clean))
+        .map_err(|e| format!("Not Base64: {e}"))
+}
+
+/// Hex as it's written: `deadbeef`, `de ad be ef`, `DE:AD`, `0xde, 0xad`.
+pub fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+    let digits: Vec<u8> = (text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ':' | '-')))
+        .flat_map(|w| {
+            let w = w
+                .strip_prefix("0x")
+                .or_else(|| w.strip_prefix("0X"))
+                .unwrap_or(w);
+            w.bytes()
+        })
+        .collect();
+    if let Some(bad) = digits.iter().find(|b| !b.is_ascii_hexdigit()) {
+        return Err(format!("Not hex: {:?} isn't a hex digit", *bad as char));
+    }
+    if digits.len() % 2 == 1 {
+        return Err("Not hex: an odd number of digits".into());
+    }
+    let value = |d: u8| (d as char).to_digit(16).unwrap_or(0) as u8;
+    Ok((digits.chunks(2))
+        .map(|p| value(p[0]) << 4 | value(p[1]))
+        .collect())
+}
+
+/// Bytes as hex pairs with spaces between, as `decode_hex` reads them back.
+pub fn encode_hex(bytes: &[u8]) -> String {
+    let pairs: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    pairs.join(" ")
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -942,6 +1036,8 @@ impl Request {
                     parts: kv(parts, &mut r),
                 },
                 Body::File { path } => Body::File { path: r(path) },
+                Body::Base64 { text } => Body::Base64 { text: r(text) },
+                Body::Hex { text } => Body::Hex { text: r(text) },
                 Body::GraphQL { query, variables } => Body::GraphQL {
                     query: r(query),
                     variables: r(variables),
@@ -1124,6 +1220,58 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Switching a GraphQL request to POST shows the JSON that went out, and back gives the
+    /// same query and variables: nothing typed is lost either way.
+    #[test]
+    fn a_query_survives_switching_the_method_away_and_back() {
+        let gql = Body::GraphQL {
+            query: "query U($id: ID!) { user(id: $id) { name } }".into(),
+            variables: "{\n  \"id\": \"{{userId}}\"\n}".into(),
+        };
+        let json = gql.clone().graphql_switched(false);
+        let Body::Json { text } = &json else {
+            panic!("{json:?}")
+        };
+        let sent: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            sent["query"],
+            "query U($id: ID!) { user(id: $id) { name } }"
+        );
+        assert_eq!(sent["variables"]["id"], "{{userId}}");
+        assert_eq!(json.graphql_switched(true), gql);
+        // A body that isn't a query starts an empty one; one already a query stays.
+        let other = Body::Text { text: "x".into() }.graphql_switched(true);
+        assert!(matches!(other, Body::GraphQL { query, .. } if query.is_empty()));
+        assert_eq!(gql.clone().graphql_switched(true), gql);
+    }
+
+    /// Bytes pasted from anywhere decode: a JWT's URL-safe unpadded Base64, a PEM's wrapped
+    /// lines, hex from a dump or a C array. A typo is refused, not sent as something else.
+    #[test]
+    fn typed_bytes_read_base64_and_hex_as_people_write_them() {
+        let hi = b"Hi?>".to_vec();
+        for b64 in ["SGk/Pg==", "SGk_Pg", "SGk/\nPg=="] {
+            assert_eq!(decode_base64(b64), Ok(hi.clone()), "{b64}");
+        }
+        for hex in [
+            "48693f3e",
+            "48 69 3F 3E",
+            "48:69:3f:3e",
+            "0x48, 0x69, 0x3f, 0x3e",
+        ] {
+            assert_eq!(decode_hex(hex), Ok(hi.clone()), "{hex}");
+        }
+        assert_eq!(decode_hex(&encode_hex(&hi)), Ok(hi));
+        assert!(decode_base64("SGk*").is_err());
+        assert!(decode_hex("486").is_err(), "odd digits");
+        assert!(decode_hex("48 zz").is_err());
+        let body = Body::Hex {
+            text: "00 ff".into(),
+        };
+        assert_eq!(body.typed_bytes(), Some(Ok(vec![0, 255])));
+        assert_eq!(Body::Text { text: "00".into() }.typed_bytes(), None);
+    }
 
     /// A request saved with settings from before the redirect, TLS and parser ones existed
     /// saves byte for byte as it did (the store keeps JSON, Sync writes TOML): new fields

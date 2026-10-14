@@ -42,7 +42,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 |---|---|
 | HTTP | HTTP version, redirects, TLS check, cookies and timeout per request |
 | GraphQL | Once the schema is fetched, fields complete as you type the query; variables fill in as a form, a row per `$variable` the query declares (enum and Boolean pickers, numbers that may be `{{variables}}`, inputs filled in from the schema), or as JSON, under the query with a divider to drag, so a long query doesn't push them off screen; a `subscription` connects over WebSocket (graphql-transport-ws or the older graphql-ws) and streams each result |
-| WebSocket | |
+| WebSocket | Text or binary messages: beside Send, Base64 or Hex sends the box decoded, as one binary message; received ones show their size and bytes in hex |
 | SSE | |
 | Socket.IO 2, 3 and 4 | The URL's path is the namespace and a JSON body the auth payload (v2 has none: Params go on the handshake's query); Settings sets the handshake path (`/socket.io/` if empty) and the client version; send `event {"json": "arg"}` or a `["event", …]` array; acks are shown |
 | MQTT 3.1.1 and 5 | Over TCP, TLS or WebSocket (`mqtt://`, `mqtts://`, `ws://`, `wss://`), see below |
@@ -70,7 +70,12 @@ beside it puts a kept one back in the box. Clicking a message shows its payload 
 
 - JSON; text (Text, XML, HTML or JavaScript sets the Content-Type; XML has Beautify); form;
   multipart (a value `@path` uploads a file).
-- Binary sends a file as it is, streamed from disk, its type guessed from the extension.
+- Binary sends a file as it is, streamed from disk, its type guessed from the extension;
+  or bytes pasted as Base64 (standard or URL-safe) or hex, decoded when sent. The size they
+  decode to shows under them, a typo in orange; switching between the two keeps the bytes.
+- GraphQL is a request type of its own (GRAPHQL in the method list), not a body type.
+  Switching a GraphQL request to another method turns its query into the JSON body it
+  sends, and switching back reads the query out of it again.
 - Text past 128 KB (in a body, script, example or the Postman import box) is kept and sent
   but not laid out for editing: a 10 MB body took 3.6 GB to show.
 

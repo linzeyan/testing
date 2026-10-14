@@ -178,10 +178,14 @@ impl Wire {
                 (k.as_str().to_owned(), v)
             })
             .collect();
-        let body = wire
-            .body()
-            .and_then(|b| b.as_bytes())
-            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let body = match wire.body().and_then(|b| b.as_bytes()) {
+            // Typed bytes (Base64, hex) that aren't text: no snippet can hold them as a
+            // literal, so nothing is made rather than something that sends other bytes.
+            Some(b) if std::str::from_utf8(b).is_err() => {
+                return Err("This body's bytes aren't text, which a snippet can't hold. Save them to a file and pick it under Binary > File.".into());
+            }
+            b => b.map(|b| String::from_utf8_lossy(b).into_owned()),
+        };
         Ok(Self {
             method: wire.method().as_str().to_owned(),
             url: wire.url().clone(),

@@ -286,6 +286,10 @@ pub fn build(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestB
                 .header(reqwest::header::CONTENT_LENGTH, len)
                 .body(tokio::fs::File::from_std(file))
         }
+        body @ (Body::Base64 { .. } | Body::Hex { .. }) => {
+            let bytes = body.typed_bytes().unwrap_or(Ok(Vec::new()))?;
+            typed(b, "application/octet-stream").body(bytes)
+        }
         Body::GraphQL { query, variables } => {
             let variables: serde_json::Value = if variables.trim().is_empty() {
                 serde_json::Value::Object(Default::default())
@@ -1192,6 +1196,33 @@ pub(crate) mod tests {
         assert!(wire.contains("content-length: 16"), "{wire}");
         assert!(wire.ends_with("\r\n\r\nnot really a png"), "{wire}");
         assert_eq!(shown(&resp), received(&resp));
+    }
+
+    /// Typed Base64 goes out as the bytes it spells, not as the letters; one that doesn't
+    /// decode stops the send instead of sending nothing.
+    #[test]
+    fn a_base64_body_goes_out_as_the_bytes_it_spells() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let req = |text: &str| Request {
+            method: "PUT".into(),
+            url: echo_server(),
+            body: Body::Base64 { text: text.into() },
+            ..Default::default()
+        };
+        let resp = rt
+            .block_on(execute(client(&rt), req("SGVsbG8sIHdvcmxk")))
+            .unwrap();
+        let wire = resp.body.to_lowercase();
+        assert!(
+            wire.contains("content-type: application/octet-stream"),
+            "{wire}"
+        );
+        assert!(wire.ends_with("\r\n\r\nhello, world"), "{wire}");
+        let bad = rt.block_on(execute(client(&rt), req("SGVsbG8*")));
+        assert!(bad.is_err_and(|e| e.contains("Base64")));
     }
 
     /// The Headers tab's "added on Send" plus the user's own must be exactly what arrives.

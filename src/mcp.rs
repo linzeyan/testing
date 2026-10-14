@@ -440,7 +440,7 @@ impl Server {
         let (mqtt_tx, mqtt_rx) = tokio::sync::mpsc::unbounded_channel();
         for payload in messages {
             if req.method != "MQTT" {
-                let _ = text_tx.send(payload);
+                let _ = text_tx.send(crate::stream::Frame::Text(payload));
                 continue;
             }
             let m = &req.mqtt;
@@ -1127,7 +1127,7 @@ fn tools(window: bool) -> Value {
             "headers": kv,
             "body": {
                 "type": "object",
-                "description": "One of {\"type\":\"none\"}, {\"type\":\"json\",\"text\":\"...\"}, {\"type\":\"text\",\"text\":\"...\"}, {\"type\":\"form\",\"fields\":[{\"key\",\"value\"}]}, {\"type\":\"multipart\",\"parts\":[{\"key\",\"value\"}]}, (a value \"@path\" uploads that file), {\"type\":\"file\",\"path\":\"...\"} (the file's bytes as the body), {\"type\":\"graphql\",\"query\":\"...\",\"variables\":\"<JSON text>\"}",
+                "description": "One of {\"type\":\"none\"}, {\"type\":\"json\",\"text\":\"...\"}, {\"type\":\"text\",\"text\":\"...\"}, {\"type\":\"form\",\"fields\":[{\"key\",\"value\"}]}, {\"type\":\"multipart\",\"parts\":[{\"key\",\"value\"}]}, (a value \"@path\" uploads that file), {\"type\":\"file\",\"path\":\"...\"} (the file's bytes as the body), {\"type\":\"base64\",\"text\":\"...\"} or {\"type\":\"hex\",\"text\":\"...\"} (the bytes they spell), {\"type\":\"graphql\",\"query\":\"...\",\"variables\":\"<JSON text>\"} (a GRAPHQL request's body)",
             },
             "auth": {
                 "type": "object",

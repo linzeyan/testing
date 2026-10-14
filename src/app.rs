@@ -357,6 +357,9 @@ struct StreamSession {
     hint: &'static str,
     live: bool,
     compose: String,
+    /// WebSocket: the compose box sent as text (0), or as the bytes it spells in Base64 (1)
+    /// or hex (2). None where messages are text only.
+    encoding: Option<usize>,
     filter: LogFilter,
     abort: tokio::task::AbortHandle,
 }
@@ -410,7 +413,7 @@ impl LogFilter {
 }
 
 enum Outgoing {
-    Text(tokio::sync::mpsc::UnboundedSender<String>),
+    Text(tokio::sync::mpsc::UnboundedSender<stream::Frame>),
     Mqtt(tokio::sync::mpsc::UnboundedSender<crate::mqtt::Command>),
 }
 
@@ -2327,6 +2330,7 @@ impl App {
                 Err(e) => emit(Event::Error(fill(failed, &[&e]))),
             }
         });
+        let old = self.stream.take();
         self.stream = Some(StreamSession {
             path: open.path.clone(),
             started,
@@ -2340,11 +2344,8 @@ impl App {
             },
             grpc,
             live: true,
-            compose: self
-                .stream
-                .take()
-                .map(|s| s.compose.clone())
-                .unwrap_or_default(),
+            compose: old.as_ref().map(|s| s.compose.clone()).unwrap_or_default(),
+            encoding: is_ws.then(|| old.and_then(|s| s.encoding).unwrap_or(0)),
             filter: LogFilter::default(),
             abort: task.abort_handle(),
         });
@@ -4470,15 +4471,14 @@ impl App {
             });
             ui.horizontal(|ui| {
                 method_picker(ui, &mut open.draft.method);
-                // GRAPHQL is a POST whose body is always a query; open the query editor.
-                if open.draft.method == "GRAPHQL"
-                    && !matches!(open.draft.body, Body::GraphQL { .. })
-                {
-                    open.draft.body = Body::GraphQL {
-                        query: String::new(),
-                        variables: String::new(),
-                    };
-                    self.req_tab = ReqTab::Body;
+                // GRAPHQL is a POST whose body is always a query, and the one way to send
+                // one: a switch either way carries the query over, as the JSON that goes out.
+                let gql = open.draft.method == "GRAPHQL";
+                if gql != matches!(open.draft.body, Body::GraphQL { .. }) {
+                    open.draft.body = std::mem::take(&mut open.draft.body).graphql_switched(gql);
+                    if gql {
+                        self.req_tab = ReqTab::Body;
+                    }
                 }
                 let button = [80.0, 22.0];
                 // gRPC answers aren't read as an HTTP body, so they can't go to a file.
@@ -8443,7 +8443,8 @@ fn body_editor(
         // JSON <-> Text keeps the text, since that switch is usually a content-type correction.
         // Built on a click only: the text moves over instead of being cloned every frame.
         type Make = fn(String) -> Body;
-        let options: [(&str, Make); 7] = [
+        // No GraphQL: that is a request type of its own (GRAPHQL), as in hoppscotch and bruno.
+        let options: [(&str, Make); 6] = [
             (t("None"), |_| Body::None),
             ("JSON", |text| Body::Json { text }),
             (t("Text"), |text| Body::Text { text }),
@@ -8452,12 +8453,14 @@ fn body_editor(
             (t("Binary"), |_| Body::File {
                 path: String::new(),
             }),
-            (t("GraphQL"), |_| Body::GraphQL {
-                query: String::new(),
-                variables: String::new(),
-            }),
         ];
-        let kind = std::mem::discriminant(&*body);
+        // Base64 and hex are Binary too, typed instead of read from a file.
+        let kind = match &*body {
+            Body::Base64 { .. } | Body::Hex { .. } => std::mem::discriminant(&Body::File {
+                path: String::new(),
+            }),
+            body => std::mem::discriminant(body),
+        };
         let mut chosen = None;
         for (label, make) in options {
             let current = std::mem::discriminant(&make(String::new())) == kind;
@@ -8567,6 +8570,58 @@ fn body_editor(
                 }
             }
         }
+        binary @ (Body::File { .. } | Body::Base64 { .. } | Body::Hex { .. }) => {
+            binary_editor(ui, binary, vars);
+        }
+        Body::GraphQL { query, variables } => {
+            return graphql_editor(ui, query, variables, vars, explorer);
+        }
+    }
+    false
+}
+
+/// Binary: a file's bytes, or bytes typed as Base64 or hex. Switching between the two
+/// writes the same bytes the other way.
+fn binary_editor(ui: &mut egui::Ui, body: &mut Body, vars: &HashMap<String, String>) {
+    use base64::Engine as _;
+    let mut pick = None;
+    ui.horizontal(|ui| {
+        for (label, which) in [(t("File"), 0), ("Base64", 1), ("Hex", 2)] {
+            let current = matches!(
+                (&*body, which),
+                (Body::File { .. }, 0) | (Body::Base64 { .. }, 1) | (Body::Hex { .. }, 2)
+            );
+            if ui.selectable_label(current, label).clicked() && !current {
+                pick = Some(which);
+            }
+        }
+    });
+    if let Some(which) = pick {
+        let typed = match &*body {
+            Body::Base64 { text } | Body::Hex { text } => text.clone(),
+            _ => String::new(),
+        };
+        // `{{variables}}` only decode once filled in: such text moves over as it is.
+        let bytes = (body.typed_bytes())
+            .and_then(Result::ok)
+            .filter(|_| !typed.contains("{{"));
+        *body = match which {
+            0 => Body::File {
+                path: String::new(),
+            },
+            1 => Body::Base64 {
+                text: bytes.map_or(typed, |b| {
+                    base64::engine::general_purpose::STANDARD.encode(b)
+                }),
+            },
+            _ => Body::Hex {
+                text: bytes.map_or(typed, |b| model::encode_hex(&b)),
+            },
+        };
+    }
+    let decoded = body.typed_bytes();
+    let base64 = matches!(body, Body::Base64 { .. });
+    match body {
         Body::File { path } => {
             ui.weak(t("The file's bytes are the body, as they are. Content-Type comes from the extension unless set under Headers. Or drop a file here."));
             if let Some(dropped) = dropped_files(ui).pop() {
@@ -8603,11 +8658,44 @@ fn body_editor(
                 }
             }
         }
-        Body::GraphQL { query, variables } => {
-            return graphql_editor(ui, query, variables, vars, explorer);
+        Body::Base64 { text } | Body::Hex { text } => {
+            let hint = match base64 {
+                true => "SGVsbG8sIHdvcmxk",
+                false => "48 65 6c 6c 6f  or  0x48,0x65",
+            };
+            var_edit(
+                ui,
+                egui::Id::new("body-bytes"),
+                text,
+                vars,
+                egui::TextStyle::Monospace,
+                true,
+                None,
+                Complete::None,
+                |e| {
+                    e.hint_text(hint)
+                        .desired_rows(6)
+                        .desired_width(f32::INFINITY)
+                },
+            );
+            match decoded {
+                _ if text.contains("{{") => {
+                    ui.weak(t("Decoded when sent, once its variables are filled in."));
+                }
+                Some(Ok(bytes)) => {
+                    ui.weak(tf(
+                        "{} as sent · application/octet-stream unless set under Headers",
+                        &[&human_size(bytes.len())],
+                    ));
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(ORANGE, e);
+                }
+                None => {}
+            }
         }
+        _ => {}
     }
-    false
 }
 
 /// Files dropped on the window this frame, relative to the workspace when inside it so they
@@ -10395,7 +10483,12 @@ impl StreamSession {
                 if let Some((proto, rpc)) = &self.grpc {
                     crate::grpc::check(proto, rpc, &self.compose)?;
                 }
-                let _ = tx.send(self.compose.clone());
+                let frame = match self.encoding {
+                    Some(1) => stream::Frame::Binary(model::decode_base64(&self.compose)?),
+                    Some(2) => stream::Frame::Binary(model::decode_hex(&self.compose)?),
+                    _ => stream::Frame::Text(self.compose.clone()),
+                };
+                let _ = tx.send(frame);
             }
             // An empty message is fine: retained, it clears what the broker keeps.
             Some(Outgoing::Mqtt(tx)) => {
@@ -10528,7 +10621,11 @@ fn stream_ui(
                         .id(id)
                         .desired_rows(2)
                         .font(egui::TextStyle::Monospace)
-                        .hint_text(s.hint)
+                        .hint_text(match s.encoding {
+                            Some(1) => "SGVsbG8sIHdvcmxk",
+                            Some(2) => "48 65 6c 6c 6f",
+                            _ => s.hint,
+                        })
                         .desired_width(ui.available_width() - send_w - 8.0),
                 );
             }
@@ -10539,6 +10636,15 @@ fn stream_ui(
                     .clicked()
                 {
                     sent = s.send_compose(Some(mqtt), vars);
+                }
+                if let Some(encoding) = &mut s.encoding {
+                    let names = [t("Text"), "Base64", "Hex"];
+                    egui::ComboBox::from_id_salt("ws-encoding")
+                        .width(send_w - 8.0)
+                        .show_index(ui, encoding, names.len(), |i| names[i])
+                        .on_hover_text(t(
+                            "Base64 and hex are decoded and sent as a binary message",
+                        ));
                 }
                 ui.horizontal(|ui| saved_messages(ui, &mut s.compose, saved));
             });
@@ -13643,6 +13749,31 @@ mod ui_tests {
         assert!(h.query_by_label_contains("File not found").is_some());
     }
 
+    /// Pasted Base64 shows how many bytes go out; Hex then spells the same bytes, and a
+    /// typo is flagged before Send.
+    #[test]
+    fn typed_bytes_switch_between_base64_and_hex_as_the_same_bytes() {
+        let mut h = with_request("typed-bytes");
+        h.state_mut().open.as_mut().unwrap().draft.body = Body::Base64 {
+            text: "SGVsbG8=".into(),
+        };
+        h.state_mut().req_tab = ReqTab::Body;
+        h.run();
+        assert!(h.query_by_label_contains("5 B as sent").is_some());
+        h.get_by_label("Hex").click();
+        h.run();
+        shot(&mut h, "51-typed-bytes");
+        let hex = "48 65 6c 6c 6f".to_owned();
+        assert_eq!(draft(&h).body, Body::Hex { text: hex });
+        h.get_by_label("Base64").click();
+        h.run();
+        let text = "SGVsbG8=".to_owned();
+        assert_eq!(draft(&h).body, Body::Base64 { text });
+        h.state_mut().open.as_mut().unwrap().draft.body = Body::Hex { text: "4".into() };
+        h.run();
+        assert!(h.query_by_label_contains("odd number").is_some());
+    }
+
     #[test]
     fn the_headers_tab_lists_what_send_adds() {
         let mut h = with_request("auto-headers");
@@ -13898,8 +14029,8 @@ mod ui_tests {
         assert_eq!(f.hits, [5]);
     }
 
-    /// On a live WebSocket: a message saved in the request comes back from its list, and
-    /// the log narrows to received messages and to text.
+    /// On a live WebSocket: a message saved in the request comes back from its list, hex
+    /// beside Send goes out as bytes, and the log narrows to received messages and to text.
     #[test]
     fn stream_messages_are_saved_and_the_log_filtered() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -13911,7 +14042,7 @@ mod ui_tests {
                         return;
                     };
                     while let Ok(m) = ws.read() {
-                        if m.is_text() && ws.send(m).is_err() {
+                        if (m.is_text() || m.is_binary()) && ws.send(m).is_err() {
                             return;
                         }
                     }
@@ -13960,6 +14091,22 @@ mod ui_tests {
             2,
             "sent and echoed"
         );
+        // Hex: the box goes out as the bytes it spells, one binary message; a typo stays
+        // in the box with the reason, instead of going out as something else.
+        let picker = egui_kittest::kittest::By::new()
+            .role(Role::ComboBox)
+            .value("Text");
+        h.get(picker).click();
+        h.run();
+        h.get_by_label("Hex").click();
+        h.run();
+        say(&mut h, "de ad", 3);
+        let bytes = "<binary, 2 bytes> de ad";
+        assert_eq!(h.get_all_by_label(bytes).count(), 2, "sent and echoed");
+        h.state_mut().stream.as_mut().unwrap().compose = "de a".into();
+        button(&h, "Send").click();
+        h.run_steps(2);
+        assert!(h.state().status.contains("Not hex"), "{}", h.state().status);
         // A message opened whole has its own Close: finding the row again to click it
         // twice is the only other way.
         h.get_all_by_label("beta").last().unwrap().click();
@@ -14788,6 +14935,38 @@ mod ui_tests {
         h.run();
         assert!(!h.state().hide_response);
         assert!(h.query_by_label("Timeline").is_some());
+    }
+
+    /// GraphQL is a request type, not a body type; leaving it shows the query as the JSON
+    /// that goes out, and coming back gives the query again.
+    #[test]
+    fn graphql_is_a_request_type_and_switching_keeps_the_query() {
+        let mut h = with_request("gql-switch");
+        h.state_mut().req_tab = ReqTab::Body;
+        h.state_mut().open.as_mut().unwrap().draft.method = "POST".into();
+        h.run();
+        assert!(h.query_by_label("Binary").is_some());
+        assert!(
+            h.query_by_label("GraphQL").is_none(),
+            "no GraphQL body type"
+        );
+        h.state_mut().open.as_mut().unwrap().draft.method = "GRAPHQL".into();
+        h.run();
+        let query = "{ me { id } }".to_owned();
+        if let Body::GraphQL { query: q, .. } = &mut h.state_mut().open.as_mut().unwrap().draft.body
+        {
+            *q = query.clone();
+        }
+        h.state_mut().open.as_mut().unwrap().draft.method = "POST".into();
+        h.run();
+        assert!(
+            matches!(&draft(&h).body, Body::Json { text } if text.contains(r#""query": "{ me { id } }""#)),
+            "{:?}",
+            draft(&h).body
+        );
+        h.state_mut().open.as_mut().unwrap().draft.method = "GRAPHQL".into();
+        h.run();
+        assert!(matches!(&draft(&h).body, Body::GraphQL { query: q, .. } if *q == query));
     }
 
     #[test]
