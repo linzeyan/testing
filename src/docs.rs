@@ -98,7 +98,7 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
                 m => m,
             }
         )),
-        Auth::Jwt(j) => Some(format!("JWT Bearer, signed with {}", j.algorithm)),
+        Auth::Jwt(j) => Some(format!("JWT Bearer, signed with {}", j.alg())),
         Auth::Basic { .. } => Some("Basic".into()),
         Auth::Digest { .. } => Some("Digest".into()),
         Auth::Hawk(h) => Some(format!(

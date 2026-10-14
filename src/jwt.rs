@@ -26,13 +26,13 @@ pub fn sign(j: &Jwt) -> Result<String, String> {
     if !claims.is_object() {
         return Err("JWT payload: must be a JSON object of claims".into());
     }
-    let header = serde_json::json!({ "alg": j.algorithm, "typ": "JWT" });
+    let header = serde_json::json!({ "alg": j.alg(), "typ": "JWT" });
     let input = format!(
         "{}.{}",
         URL_SAFE_NO_PAD.encode(header.to_string()),
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
-    let sig = signature_of(&j.algorithm, &j.secret, input.as_bytes())?;
+    let sig = signature_of(j.alg(), &j.secret, input.as_bytes())?;
     Ok(format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig)))
 }
 
@@ -154,6 +154,13 @@ HVbhlnvmhVqnjypOaSnrvscI
              eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.\
              SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
         );
+    }
+
+    /// An import can leave the algorithm empty: that signs as HS256, header included,
+    /// rather than failing every Send.
+    #[test]
+    fn no_algorithm_signs_as_hs256() {
+        assert_eq!(sign(&jwt("", "k", "{}")), sign(&jwt("HS256", "k", "{}")));
     }
 
     #[test]

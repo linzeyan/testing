@@ -3233,6 +3233,8 @@ impl eframe::App for App {
         self.receive(ui.ctx());
         self.serve_mcp(ui.ctx());
         self.tick_repeat(ui.ctx());
+        // A token forgotten on an Auth tab leaves the workspace too.
+        self.save_tokens();
         if self.auto_update
             && !matches!(self.update, Update::Checking | Update::Installing(_))
             && (self.updates).due(store::unix_now(), !matches!(self.update, Update::Idle))
@@ -4379,6 +4381,7 @@ impl App {
             .rev()
             .collect();
         let mut folder_clicked: Option<PathBuf> = None;
+        let mut rename = false;
         // Before `streaming`: whether a gRPC method streams comes from its proto.
         let grpc_source = (open.draft.method == "GRPC").then(|| {
             let url = open.draft.resolved(&all_vars).0.url;
@@ -4556,8 +4559,9 @@ impl App {
                             dot(ui, ORANGE).on_hover_text(t("Unsaved changes"));
                         }
                         let name = RichText::new(open.name()).strong();
-                        ui.add(egui::Label::new(name).truncate())
-                            .on_hover_text(open.name());
+                        let label = egui::Label::new(name).truncate().sense(egui::Sense::click());
+                        let hover = format!("{}\n{}", open.name(), t("Double-click to rename"));
+                        rename = ui.add(label).on_hover_text(hover).double_clicked();
                     });
                 });
             });
@@ -4844,6 +4848,7 @@ impl App {
                             &mut open.draft.headers,
                             &all_vars,
                             &mut self.explorer,
+                            egui::Id::new(("body-stash", &open.path)),
                         );
                     }
                     ReqTab::Auth => auth_editor(
@@ -5169,6 +5174,13 @@ impl App {
         if let Some(dir) = folder_clicked {
             self.reveal = Some(dir.clone());
             self.open_folder_editor(dir);
+        }
+        if rename && let Some(open) = &self.open {
+            let path = open.path.clone();
+            self.dialog = Some(Dialog::name(
+                NameKind::Rename(path.clone()),
+                leaf_name(&path),
+            ));
         }
     }
 
@@ -8424,8 +8436,18 @@ fn kv_table(
             return *rows != before;
         }
     }
+    // Vars and Asserts say what goes where. An assert's key is the long part, the path
+    // into the response; its value is an operator.
+    let (key_hint, value_hint) = match id {
+        "response-vars" => (t("Variable"), "res.body.token"),
+        "asserts" => ("res.body.items.length", "gt 0"),
+        _ => (t("Key"), t("Value")),
+    };
     // Narrower in a side-by-side pane, so the value keeps most of the room.
-    let key_width = (ui.available_width() * 0.25).clamp(100.0, 200.0);
+    let key_width = match id {
+        "asserts" => (ui.available_width() * 0.5).clamp(100.0, 400.0),
+        _ => (ui.available_width() * 0.25).clamp(100.0, 200.0),
+    };
     let rest = (ui.available_width() - key_width - 90.0).max(120.0);
     let (value_width, desc_width) = match describe {
         true => (rest * 0.6, rest * 0.4 - ui.spacing().item_spacing.x),
@@ -8461,7 +8483,7 @@ fn kv_table(
                 false,
                 None,
                 Complete::Words(if headers { HEADER_NAMES } else { &[] }),
-                |e| e.hint_text(t("Key")).desired_width(key_width),
+                |e| e.hint_text(key_hint).desired_width(key_width),
             );
             var_edit(
                 ui,
@@ -8475,7 +8497,7 @@ fn kv_table(
                     true => Complete::Words(CONTENT_TYPES),
                     false => Complete::None,
                 },
-                |e| e.hint_text(t("Value")).desired_width(value_width),
+                |e| e.hint_text(value_hint).desired_width(value_width),
             );
             if describe {
                 ui.add(
@@ -8615,43 +8637,61 @@ fn body_editor(
     headers: &mut Vec<KeyValue>,
     vars: &HashMap<String, String>,
     explorer: &mut Explorer,
+    stash: egui::Id,
 ) -> bool {
     ui.horizontal(|ui| {
-        // ponytail: switching to None/Form drops the text; keep a per-mode stash if that bites.
-        // JSON <-> Text keeps the text, since that switch is usually a content-type correction.
-        // Built on a click only: the text moves over instead of being cloned every frame.
+        // A type left behind is kept under `stash` (one per request) for coming back to, as
+        // Postman keeps each mode's: one stray click on None emptied a JSON body for good.
+        // JSON <-> Text moves the text instead, since that switch is usually a content-type
+        // correction. Built on a click only: the text moves over instead of being cloned
+        // every frame.
         type Make = fn(String) -> Body;
         // No GraphQL: that is a request type of its own (GRAPHQL), as in hoppscotch and bruno.
-        let options: [(&str, Make); 6] = [
-            (t("None"), |_| Body::None),
-            ("JSON", |text| Body::Json { text }),
-            (t("Text"), |text| Body::Text { text }),
-            (t("Form"), |_| Body::Form { fields: Vec::new() }),
-            (t("Multipart"), |_| Body::Multipart { parts: Vec::new() }),
-            (t("Binary"), |_| Body::File {
+        // Each with the Content-Type it goes out as: "Form" vs "Multipart" said nothing.
+        let options: [(&str, &str, Make); 6] = [
+            (t("None"), "", |_| Body::None),
+            ("JSON", "application/json", |text| Body::Json { text }),
+            (t("Text"), "text/plain", |text| Body::Text { text }),
+            (t("Form"), "application/x-www-form-urlencoded", |_| {
+                Body::Form { fields: Vec::new() }
+            }),
+            (t("Multipart"), "multipart/form-data", |_| Body::Multipart {
+                parts: Vec::new(),
+            }),
+            (t("Binary"), "application/octet-stream", |_| Body::File {
                 path: String::new(),
             }),
         ];
-        // Base64 and hex are Binary too, typed instead of read from a file.
-        let kind = match &*body {
-            Body::Base64 { .. } | Body::Hex { .. } => std::mem::discriminant(&Body::File {
-                path: String::new(),
-            }),
-            body => std::mem::discriminant(body),
+        let now = match &*body {
+            Body::None => 0,
+            Body::Json { .. } => 1,
+            Body::Text { .. } => 2,
+            Body::Form { .. } => 3,
+            Body::Multipart { .. } => 4,
+            // Base64 and hex are Binary too, typed instead of read from a file.
+            Body::File { .. } | Body::Base64 { .. } | Body::Hex { .. } => 5,
+            Body::GraphQL { .. } => options.len(),
         };
         let mut chosen = None;
-        for (label, make) in options {
-            let current = std::mem::discriminant(&make(String::new())) == kind;
-            if ui.selectable_label(current, label).clicked() && !current {
-                chosen = Some(make);
+        for (i, (label, mime, make)) in options.into_iter().enumerate() {
+            let mut r = ui.selectable_label(i == now, label);
+            if !mime.is_empty() {
+                r = r.on_hover_text(mime);
+            }
+            if r.clicked() && i != now {
+                chosen = Some((i, make));
             }
         }
-        if let Some(make) = chosen {
-            let text = match body {
-                Body::Json { text } | Body::Text { text } => std::mem::take(text),
-                _ => String::new(),
+        if let Some((i, make)) = chosen {
+            *body = match std::mem::take(body) {
+                Body::Json { text } | Body::Text { text } if matches!(i, 1 | 2) => make(text),
+                old => ui
+                    .data_mut(|d| {
+                        d.insert_temp(stash.with(now), old);
+                        d.remove_temp::<Body>(stash.with(i))
+                    })
+                    .unwrap_or_else(|| make(String::new())),
             };
-            *body = make(text);
         }
     });
     ui.add_space(4.0);
@@ -9483,6 +9523,7 @@ fn code_editor(
     vars: &HashMap<String, String>,
     lang: Option<Lang>,
 ) {
+    let rows = fill_rows(ui, egui::TextStyle::Monospace);
     var_edit(
         ui,
         egui::Id::new(id),
@@ -9494,10 +9535,29 @@ fn code_editor(
         Complete::None,
         |e| {
             e.code_editor()
-                .desired_rows(12)
+                .desired_rows(rows)
                 .desired_width(f32::INFINITY)
         },
     );
+}
+
+/// A Settings row's name and checkbox, the box named after the row for screen readers:
+/// bare, it read as "checkbox" and nothing more.
+fn check_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Response {
+    ui.label(label);
+    let r = ui.checkbox(on, "");
+    let (enabled, ticked) = (r.enabled(), *on);
+    r.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, ticked, label)
+    });
+    r
+}
+
+/// Rows for an editor to reach the bottom of its pane: a fixed 12 stopped above empty
+/// space in a tall pane, and ran past a short one.
+fn fill_rows(ui: &egui::Ui, style: egui::TextStyle) -> usize {
+    let row = ui.text_style_height(&style);
+    ((ui.available_height() - 12.0) / row).max(4.0) as usize
 }
 
 /// `inherited`: what "Inherit from parent" currently resolves to, and from which folder.
@@ -9587,6 +9647,7 @@ fn auth_editor(
     };
     let current = std::mem::discriminant(&*auth);
     egui::ComboBox::from_id_salt("auth")
+        .width(160.0)
         .selected_text(label_of(auth))
         .show_ui(ui, |ui| {
             for (label, kind) in kinds.iter().filter(|(_, k)| offered(k)) {
@@ -9612,17 +9673,45 @@ fn auth_editor(
         );
         ui.end_row();
     };
+    // Masked until the eye shows it, except a {{reference}}: that only names where the
+    // secret lives, and needs var_edit's colouring and completion, which its layouter
+    // gives up masking for. Both share an id, so the `{{` that flips one into the other
+    // keeps the focus and the cursor.
     let secret = |ui: &mut egui::Ui, label: &str, value: &mut String| {
         ui.label(label);
-        ui.add(
-            egui::TextEdit::singleline(value)
-                .password(true)
-                .desired_width(260.0),
-        );
+        let id = egui::Id::new(("auth", label));
+        let shown = id.with("shown");
+        let reveal = ui.data(|d| d.get_temp(shown)).unwrap_or(false);
+        let reference = value.trim_start().starts_with("{{");
+        ui.horizontal(|ui| {
+            if reveal || reference {
+                var_edit(
+                    ui,
+                    id,
+                    value,
+                    vars,
+                    egui::TextStyle::Body,
+                    false,
+                    None,
+                    Complete::None,
+                    |e| e.desired_width(420.0),
+                );
+            } else {
+                let edit = egui::TextEdit::singleline(value).id(id).password(true);
+                ui.add(edit.desired_width(420.0));
+            }
+            if !reference
+                && icon_button(ui, icon::EYE, t("Show the secret"), Some(reveal)).clicked()
+            {
+                ui.data_mut(|d| d.insert_temp(shown, !reveal));
+            }
+        });
         ui.end_row();
     };
+    // A fixed label column: switching types doesn't slide the fields sideways.
     egui::Grid::new("auth-fields")
         .num_columns(2)
+        .min_col_width(110.0)
         .spacing([8.0, 6.0])
         .show(ui, |ui| match auth {
             Auth::Inherit | Auth::None => {}
@@ -9645,8 +9734,12 @@ fn auth_editor(
             }
             Auth::OAuth1(o) => {
                 ui.label(t("Signature"));
+                // Empty after some imports: shown as what signing falls back to.
                 egui::ComboBox::from_id_salt("oauth1-method")
-                    .selected_text(o.signature_method.as_str())
+                    .selected_text(match o.signature_method.as_str() {
+                        "" => "HMAC-SHA1",
+                        m => m,
+                    })
                     .show_ui(ui, |ui| {
                         for m in crate::oauth1::METHODS {
                             ui.selectable_value(&mut o.signature_method, m.to_owned(), m);
@@ -9676,14 +9769,14 @@ fn auth_editor(
             Auth::Jwt(j) => {
                 ui.label(t("Algorithm"));
                 egui::ComboBox::from_id_salt("jwt-alg")
-                    .selected_text(j.algorithm.as_str())
+                    .selected_text(j.alg())
                     .show_ui(ui, |ui| {
                         for alg in crate::jwt::ALGORITHMS {
                             ui.selectable_value(&mut j.algorithm, alg.to_owned(), alg);
                         }
                     });
                 ui.end_row();
-                if j.algorithm.starts_with("HS") {
+                if j.alg().starts_with("HS") {
                     secret(ui, t("Secret"), &mut j.secret);
                 } else {
                     ui.label(t("Private key"));
@@ -9723,7 +9816,10 @@ fn auth_editor(
                 secret(ui, t("Auth key"), &mut h.key);
                 ui.label(t("Algorithm"));
                 egui::ComboBox::from_id_salt("hawk-alg")
-                    .selected_text(h.algorithm.as_str())
+                    .selected_text(match h.algorithm.as_str() {
+                        "" => "sha256",
+                        a => a,
+                    })
                     .show_ui(ui, |ui| {
                         for alg in crate::hawk::ALGORITHMS {
                             ui.selectable_value(&mut h.algorithm, alg.to_owned(), alg);
@@ -9839,6 +9935,49 @@ fn auth_editor(
                 }
             }
         });
+    if let Auth::OAuth2(o) = &*auth {
+        // Looked up as Send stores it: keyed by the resolved grant parameters.
+        let mut missing = Vec::new();
+        let mut r = |s: &str| model::resolve(s, vars, &mut missing);
+        let key = model::OAuth2 {
+            grant: o.grant,
+            token_url: r(&o.token_url),
+            client_id: r(&o.client_id),
+            scope: r(&o.scope),
+            username: r(&o.username),
+            ..Default::default()
+        };
+        if let Some((token, left)) = crate::auth::token_status(&key) {
+            ui.horizontal_wrapped(|ui| {
+                match left.is_zero() {
+                    true => ui.label(t("The token has expired; Send gets a new one.")),
+                    false => {
+                        let chars: Vec<char> = token.chars().collect();
+                        let short = match chars.len() > 16 {
+                            true => format!(
+                                "{}…{}",
+                                String::from_iter(&chars[..8]),
+                                String::from_iter(&chars[chars.len() - 4..])
+                            ),
+                            false => token.clone(),
+                        };
+                        let mins = left.as_secs().div_ceil(60).to_string();
+                        ui.label(tf("Token {}, expires in {} min", &[&short, &mins]))
+                    }
+                };
+                if ui.button(t("Copy")).clicked() {
+                    ui.ctx().copy_text(token.clone());
+                }
+                let forget = ui.button(t("Forget"));
+                if forget
+                    .on_hover_text(t("The next Send signs in from the start"))
+                    .clicked()
+                {
+                    crate::auth::forget(&key);
+                }
+            });
+        }
+    }
     match auth {
         Auth::Inherit => {
             ui.weak(match inherited {
@@ -9846,7 +9985,11 @@ fn auth_editor(
                 None => t("No folder above sets auth, so none is sent.").to_owned(),
             });
         }
-        Auth::None => {}
+        Auth::None => {
+            ui.weak(t(
+                "Sent without credentials, whatever the folders above set.",
+            ));
+        }
         Auth::OAuth2(o) if o.grant == model::Grant::AuthorizationCode => {
             ui.weak(t(
                 "Send opens your browser to sign in (with PKCE); the token is then reused until \
@@ -9931,7 +10074,7 @@ fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
     });
     ui.add(
         egui::TextEdit::multiline(description)
-            .desired_rows(12)
+            .desired_rows(fill_rows(ui, egui::TextStyle::Body))
             .desired_width(f32::INFINITY),
     );
 }
@@ -10044,8 +10187,7 @@ fn mqtt_settings(
             grid_hint(ui, t("0 sends no pings"));
             ui.end_row();
 
-            ui.label(t("Clean session"));
-            ui.checkbox(&mut m.clean_session, "");
+            check_row(ui, t("Clean session"), &mut m.clean_session);
             grid_hint(
                 ui,
                 t("Off: the broker keeps subscriptions and queued messages for this client ID"),
@@ -10250,8 +10392,7 @@ fn connection_rows(
         grid_hint(ui, t("Auto uses HTTP/2 when an https server offers it"));
         ui.end_row();
 
-        ui.label(t("Follow redirects"));
-        ui.checkbox(&mut s.follow_redirects, "");
+        check_row(ui, t("Follow redirects"), &mut s.follow_redirects);
         grid_hint(ui, t("Off shows the 3xx response itself"));
         ui.end_row();
 
@@ -10285,8 +10426,7 @@ fn connection_rows(
         ui.end_row();
     }
 
-    ui.label(t("Verify TLS certificate"));
-    ui.checkbox(&mut s.verify_tls, "");
+    check_row(ui, t("Verify TLS certificate"), &mut s.verify_tls);
     if s.verify_tls {
         grid_hint(ui, t("Off accepts any certificate, for this request only"));
     } else {
@@ -10295,8 +10435,7 @@ fn connection_rows(
     ui.end_row();
 
     if !(grpc || mqtt) {
-        ui.label(t("Cookie jar"));
-        ui.checkbox(&mut s.cookies, "");
+        check_row(ui, t("Cookie jar"), &mut s.cookies);
         grid_hint(
             ui,
             t("Send stored cookies and keep the ones the server sets"),
@@ -10411,9 +10550,8 @@ fn connection_rows(
 
     // HTTP/2 headers can't be malformed the way HTTP/1.1's can.
     if !(grpc || mqtt) {
-        ui.label(t("Enable strict HTTP parser"));
         let mut strict = !s.insecure_parser;
-        if ui.checkbox(&mut strict, "").changed() {
+        if check_row(ui, t("Enable strict HTTP parser"), &mut strict).changed() {
             s.insecure_parser = !strict;
         }
         grid_hint(ui, t("Off accepts responses with malformed headers"));
@@ -10443,8 +10581,7 @@ fn connection_rows(
     }
 
     if grpc {
-        ui.label(t("Include default values"));
-        ui.checkbox(&mut s.include_defaults, "");
+        check_row(ui, t("Include default values"), &mut s.include_defaults);
         grid_hint(
             ui,
             t("Show the fields proto3 leaves out at 0, \"\" or false"),
@@ -10709,7 +10846,7 @@ fn scripts_editor(
             .id(id)
             .code_editor()
             .layouter(&mut layouter)
-            .desired_rows(12)
+            .desired_rows(fill_rows(ui, egui::TextStyle::Monospace))
             .desired_width(f32::INFINITY),
     );
 }
@@ -12570,6 +12707,10 @@ fn method_picker(ui: &mut egui::Ui, method: &mut String) {
         .height(f32::INFINITY)
         .show_ui(ui, |ui| {
             for m in METHODS {
+                // HTTP verbs above, the other kinds of request below.
+                if *m == "GRAPHQL" {
+                    ui.separator();
+                }
                 let on = *method == *m;
                 if named(method_item(ui, m, on), method_name(m), Some(on)).clicked() {
                     (*m).clone_into(method);
@@ -13881,6 +14022,47 @@ mod ui_tests {
         assert!(h.state().load.is_none(), "back to the response");
     }
 
+    /// A stray click on another body type and back loses nothing, as in Postman: None
+    /// emptied a JSON body for good, and leaving Form dropped its rows.
+    #[test]
+    fn switching_the_body_type_and_back_keeps_what_was_there() {
+        let mut h = with_request("body-stash");
+        let json = Body::Json {
+            text: r#"{"a": 1}"#.into(),
+        };
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        (d.method, d.body) = ("POST".into(), json.clone());
+        h.state_mut().req_tab = ReqTab::Body;
+        h.run();
+        let pick = |h: &mut Harness<'_, App>, label: &str| {
+            h.get_by_label(label).click();
+            h.run();
+        };
+        pick(&mut h, "None");
+        assert_eq!(draft(&h).body, Body::None);
+        pick(&mut h, "JSON");
+        assert_eq!(draft(&h).body, json);
+        let form = Body::Form {
+            fields: vec![KeyValue::new("q", "1")],
+        };
+        h.state_mut().open.as_mut().unwrap().draft.body = form.clone();
+        pick(&mut h, "Multipart");
+        pick(&mut h, "Form");
+        assert_eq!(draft(&h).body, form);
+        // JSON <-> Text still carries the text across: that's a content-type fix.
+        pick(&mut h, "JSON");
+        if let Body::Json { text } = &mut h.state_mut().open.as_mut().unwrap().draft.body {
+            *text = "plain".into();
+        }
+        pick(&mut h, "Text");
+        assert_eq!(
+            draft(&h).body,
+            Body::Text {
+                text: "plain".into()
+            }
+        );
+    }
+
     /// Each kind of request shows the tabs it uses and no others: a WebSocket's Body went
     /// out on its handshake, gRPC's Params broke the call's path, and streams had Scripts
     /// that never run. A body from another kind doesn't come along either.
@@ -14622,10 +14804,12 @@ mod ui_tests {
     }
 
     /// An OAuth token outlives the window: saved to the workspace once granted, so the
-    /// next start doesn't sign in again.
+    /// next start doesn't sign in again. The Auth tab shows it (found from the variables
+    /// the grant was sent with), and Forget drops it from the workspace too.
     #[test]
     fn a_granted_oauth_token_is_saved_to_the_workspace() {
         let mut h = with_request("oauth-keep");
+        h.state_mut().set_var(None, "cid", "gui", false).unwrap();
         let provider = crate::http::tests::serve(|_| {
             let json = "200 OK\r\ncontent-type: application/json";
             (
@@ -14639,7 +14823,7 @@ mod ui_tests {
             d.auth = Auth::OAuth2(crate::model::OAuth2 {
                 grant: crate::model::Grant::ClientCredentials,
                 token_url: format!("http://{provider}/token"),
-                client_id: "gui".into(),
+                client_id: "{{cid}}".into(),
                 ..Default::default()
             });
         }
@@ -14649,6 +14833,16 @@ mod ui_tests {
         });
         let kept = h.state().ws.load_tokens();
         assert!(kept.contains("gui-1"), "{kept}");
+
+        h.state_mut().req_tab = ReqTab::Auth;
+        h.run();
+        // 3600 s less the 30 s refetch margin, rounded up.
+        assert!(h.query_by_label("Token gui-1, expires in 60 min").is_some());
+        button(&h, "Forget").click();
+        h.run();
+        assert!(h.query_by_label_contains("Token gui-1").is_none());
+        let kept = h.state().ws.load_tokens();
+        assert!(!kept.contains("gui-1"), "{kept}");
     }
 
     #[test]
@@ -16527,8 +16721,9 @@ mod ui_tests {
             h.run();
             h.get_by_label("Settings").click();
             h.run();
+            // A checkbox row is named twice: its label, and the box named after it.
             let shown: Vec<_> = (ROWS.into_iter())
-                .filter(|l| h.query_by_label(l).is_some())
+                .filter(|l| h.query_all_by_label(l).next().is_some())
                 .collect();
             assert_eq!(shown, want, "{method}");
         }
@@ -19055,6 +19250,227 @@ mod ui_tests {
         let shown = response.result.as_ref().unwrap();
         let got = (shown.head.status, shown.text.as_str());
         assert_eq!(got, (200, "CORP\\User"));
+    }
+
+    /// Body, script and docs editors reach the bottom of the pane: twelve rows stopped
+    /// above empty space, which read as the end of the page.
+    #[test]
+    fn editors_reach_the_bottom_of_the_pane() {
+        let mut h = with_request("fill");
+        h.set_size(egui::vec2(1600.0, 900.0));
+        h.state_mut().open.as_mut().unwrap().draft.body = Body::Text { text: "x".into() };
+        for (i, tab) in [ReqTab::Body, ReqTab::Scripts, ReqTab::Docs]
+            .into_iter()
+            .enumerate()
+        {
+            h.state_mut().req_tab = tab;
+            h.run();
+            let bottom = h.get_by_role(Role::MultilineTextInput).rect().bottom();
+            assert!(bottom > 820.0 && bottom <= 900.0, "tab {i}: {bottom}");
+        }
+    }
+
+    /// Each editor says what goes in it: Vars name a variable and take a path, an assert's
+    /// path gets the wide column (it's the long part), a Settings checkbox carries its
+    /// row's name for a screen reader, and No auth says it overrides the folders.
+    #[test]
+    fn each_editor_says_what_goes_in_it() {
+        use egui_kittest::kittest::By;
+        let mut h = with_request("says");
+        let field = |h: &Harness<'_, App>, hint: &str| {
+            (h.get_all_by_role(Role::TextInput))
+                .find(|n| n.accesskit_node().placeholder() == Some(hint))
+                .map(|n| n.rect())
+        };
+        h.state_mut().req_tab = ReqTab::Vars;
+        h.run();
+        let var = field(&h, "Variable").unwrap();
+        assert!(field(&h, "res.body.token").is_some());
+        h.state_mut().req_tab = ReqTab::Asserts;
+        h.run();
+        let path = field(&h, "res.body.items.length").unwrap();
+        assert!(field(&h, "gt 0").is_some());
+        assert!(path.width() > var.width() * 1.5, "{path:?} {var:?}");
+        h.state_mut().req_tab = ReqTab::Settings;
+        h.run();
+        let named = By::new().role(Role::CheckBox).label("Follow redirects");
+        assert!(h.query(named).is_some());
+        h.state_mut().req_tab = ReqTab::Auth;
+        h.state_mut().open.as_mut().unwrap().draft.auth = Auth::None;
+        h.run();
+        let none = "Sent without credentials, whatever the folders above set.";
+        assert!(h.query_by_label(none).is_some());
+    }
+
+    /// The name above the URL renames on a double-click, as a tab or a file name does.
+    #[test]
+    fn double_clicking_the_request_name_renames_it() {
+        use egui_kittest::kittest::By;
+        let mut h = with_request("rename-name");
+        let url_row = h.get(By::new().role(Role::ComboBox).value("GET")).rect();
+        // The tree and the tab say "r" too: the name is the one just above the URL.
+        let name = (h.get_all_by_label("r"))
+            .filter(|n| n.rect().bottom() <= url_row.top())
+            .max_by(|a, b| a.rect().bottom().total_cmp(&b.rect().bottom()))
+            .unwrap()
+            .rect();
+        // In one frame: the harness gives each queued event a frame of its own, a quarter
+        // second apart, which is too slow for a double click.
+        let at = name.center();
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        let button = egui::PointerButton::Primary;
+        let modifiers = Modifiers::NONE;
+        for pressed in [true, false, true, false] {
+            let click = egui::Event::PointerButton {
+                pos: at,
+                button,
+                pressed,
+                modifiers,
+            };
+            h.input_mut().events.push(click);
+        }
+        h.run();
+        let path = h.state().open.as_ref().unwrap().path.clone();
+        assert!(matches!(
+            &h.state().dialog,
+            Some(Dialog::Name { kind: NameKind::Rename(p), .. }) if *p == path
+        ));
+    }
+
+    /// A secret is masked until the eye shows it. A {{reference}} isn't the secret, only
+    /// where it lives: it shows, coloured and completed, and typing the `{{` that turns
+    /// a masked field into one keeps the focus, so the rest of the name lands there too.
+    #[test]
+    fn a_secret_is_masked_until_shown_and_a_reference_never_is() {
+        let mut h = with_request("secret");
+        h.state_mut().req_tab = ReqTab::Auth;
+        h.state_mut().open.as_mut().unwrap().draft.auth = Auth::Basic {
+            username: "ada".into(),
+            password: String::new(),
+        };
+        h.run();
+        let password = |h: &Harness<'_, App>| match &draft(h).auth {
+            Auth::Basic { password, .. } => password.clone(),
+            _ => unreachable!(),
+        };
+        let shown = |h: &Harness<'_, App>, v: &str| {
+            (h.get_all_by_role(Role::TextInput)).any(|n| n.value().as_deref() == Some(v))
+        };
+        h.get_by_role(Role::PasswordInput).click();
+        h.run();
+        h.get_by_role(Role::PasswordInput).type_text("hunter2");
+        h.run();
+        assert_eq!(password(&h), "hunter2");
+        let masked = h.get_by_role(Role::PasswordInput).value();
+        assert!(
+            masked.as_deref().is_some_and(|v| v != "hunter2"),
+            "{masked:?}"
+        );
+        assert!(!shown(&h, "hunter2"));
+
+        h.get_by_label("Show the secret").click();
+        h.run();
+        assert!(h.query_by_role(Role::PasswordInput).is_none());
+        assert!(shown(&h, "hunter2"));
+        h.get_by_label("Show the secret").click();
+        h.run();
+        assert!(!shown(&h, "hunter2"));
+
+        if let Auth::Basic { password, .. } = &mut h.state_mut().open.as_mut().unwrap().draft.auth {
+            password.clear();
+        }
+        h.run();
+        h.get_by_role(Role::PasswordInput).click();
+        h.run();
+        h.get_by_role(Role::PasswordInput).type_text("{{");
+        h.run();
+        h.get_by_label("Auth").type_text("pw}}");
+        h.run();
+        assert_eq!(password(&h), "{{pw}}");
+        assert!(shown(&h, "{{pw}}") && h.query_by_role(Role::PasswordInput).is_none());
+        assert!(h.query_by_label("Show the secret").is_none());
+    }
+
+    /// Switching auth types doesn't slide the form: every type's fields start at one x,
+    /// and a secret is as wide as the field above it. An algorithm an import left empty
+    /// shows the one signing uses, and JWT asks for the HS256 secret it signs with.
+    #[test]
+    fn auth_forms_line_up_and_an_empty_algorithm_shows_its_default() {
+        use egui_kittest::kittest::By;
+        let mut h = with_request("auth-forms");
+        h.state_mut().req_tab = ReqTab::Auth;
+        let basic = Auth::Basic {
+            username: "ada".into(),
+            password: String::new(),
+        };
+        let kinds = [
+            ("Bearer token", Auth::Bearer { token: "t".into() }),
+            ("Basic auth", basic.clone()),
+            (
+                "API key",
+                Auth::ApiKey {
+                    key: "k".into(),
+                    value: "v".into(),
+                    in_query: false,
+                },
+            ),
+            ("AWS Signature", Auth::AwsV4(model::AwsV4::default())),
+            ("OAuth 1.0", Auth::OAuth1(model::OAuth1::default())),
+            ("JWT Bearer", Auth::Jwt(model::Jwt::default())),
+            ("Hawk", Auth::Hawk(model::Hawk::default())),
+            (
+                "Akamai EdgeGrid",
+                Auth::EdgeGrid(model::EdgeGrid::default()),
+            ),
+            ("NTLM", Auth::Ntlm(model::Ntlm::default())),
+        ];
+        let roles = [
+            Role::TextInput,
+            Role::PasswordInput,
+            Role::MultilineTextInput,
+            Role::ComboBox,
+        ];
+        let mut starts = Vec::new();
+        for (label, auth) in kinds {
+            h.state_mut().open.as_mut().unwrap().draft.auth = auth;
+            h.run();
+            let picker = h.get(By::new().role(Role::ComboBox).value(label)).rect();
+            let left = (roles.iter().flat_map(|r| h.query_all_by_role(*r)))
+                .map(|n| n.rect())
+                .filter(|r| r.top() > picker.bottom() && r.left() >= picker.left())
+                .map(|r| r.left())
+                .fold(f32::INFINITY, f32::min);
+            starts.push((label, left));
+        }
+        assert!(starts.iter().all(|(_, x)| *x == starts[0].1), "{starts:?}");
+
+        h.state_mut().open.as_mut().unwrap().draft.auth = basic;
+        h.run();
+        let username = (h.get_all_by_role(Role::TextInput))
+            .find(|n| n.value().as_deref() == Some("ada"))
+            .unwrap()
+            .rect();
+        let password = h.get_by_role(Role::PasswordInput).rect();
+        assert_eq!(
+            (password.left(), password.width()),
+            (username.left(), username.width())
+        );
+
+        // Empty, as some imports leave them: what signing falls back to is what shows.
+        let combo = |h: &Harness<'_, App>, v: &str| {
+            h.query(By::new().role(Role::ComboBox).value(v)).is_some()
+        };
+        h.state_mut().open.as_mut().unwrap().draft.auth = Auth::Jwt(model::Jwt::default());
+        h.run();
+        assert!(combo(&h, "HS256") && h.query_by_role(Role::PasswordInput).is_some());
+        assert!(h.query_by_label("Private key").is_none());
+        h.state_mut().open.as_mut().unwrap().draft.auth = Auth::OAuth1(model::OAuth1::default());
+        h.run();
+        assert!(combo(&h, "HMAC-SHA1"));
+        h.state_mut().open.as_mut().unwrap().draft.auth = Auth::Hawk(model::Hawk::default());
+        h.run();
+        assert!(combo(&h, "sha256"));
     }
 
     /// Every protocol against public servers, through the same Send and Connect as a click:

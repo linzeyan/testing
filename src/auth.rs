@@ -12,7 +12,7 @@ use crate::model::{Grant, OAuth2};
 
 /// Tokens by grant parameters. The workspace keeps them across runs (see `export`).
 static TOKENS: LazyLock<Mutex<HashMap<String, Cached>>> = LazyLock::new(Default::default);
-/// Tokens granted so far: a saver compares it with the count it last saved.
+/// Tokens granted or forgotten so far: a saver compares it with the count it last saved.
 static GRANTS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -105,6 +105,25 @@ pub fn cached_token(o: &OAuth2) -> Option<String> {
         .get(&cache_key(o))
         .filter(|c| Instant::now() < c.until)
         .map(|c| c.token.clone())
+}
+
+/// The cached token and how long it has left (zero once expired), for the Auth tab.
+pub fn token_status(o: &OAuth2) -> Option<(String, Duration)> {
+    let tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    let c = tokens.get(&cache_key(o))?;
+    Some((
+        c.token.clone(),
+        c.until.saturating_duration_since(Instant::now()),
+    ))
+}
+
+/// Drops the token and its refresh token, so the next Send signs in from the start. Counts
+/// as a grant, for the saver to drop it from the workspace too.
+pub fn forget(o: &OAuth2) {
+    let mut tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    if tokens.remove(&cache_key(o)).is_some() {
+        GRANTS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// `fresh` skips the cache, after the API rejected the cached token.

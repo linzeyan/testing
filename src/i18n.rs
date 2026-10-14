@@ -1728,6 +1728,23 @@ const ZH_TW: &[(&str, &str)] = &[
         "連線不是按「中斷連線」而結束時，連續嘗試的次數",
     ),
     ("Reconnection interval", "重新連線間隔"),
+    ("Show the secret", "顯示機密內容"),
+    (
+        "The token has expired; Send gets a new one.",
+        "權杖已過期；傳送時會取得新的。",
+    ),
+    ("Token {}, expires in {} min", "權杖 {}，{} 分鐘後過期"),
+    ("Forget", "清除"),
+    (
+        "The next Send signs in from the start",
+        "下次傳送會從頭登入",
+    ),
+    ("Double-click to rename", "按兩下可重新命名"),
+    ("Variable", "變數"),
+    (
+        "Sent without credentials, whatever the folders above set.",
+        "不帶任何憑證送出，不論上層資料夾怎麼設定。",
+    ),
     ("Session", "工作階段"),
     ("Click again to clear all", "再點一次即全部清除"),
     ("Click again to clear history", "再點一次即清除歷史紀錄"),

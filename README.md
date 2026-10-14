@@ -159,7 +159,13 @@ beside it puts a kept one back in the box. Clicking a message shows its payload 
 
 For authorization code and implicit, Send opens the browser to sign in and catches the
 redirect on 127.0.0.1. An expired token is renewed with the refresh token when the provider
-gives one, without signing in again. Tokens are kept in the workspace across restarts.
+gives one, without signing in again. Tokens are kept in the workspace across restarts. The
+Auth tab shows the current token and when it expires, with Copy and Forget (the next Send
+then signs in from the start).
+
+Secrets (passwords, client secrets, keys) are masked until the eye shows them; a value that
+is a `{{variable}}` is shown and completed like any other field. An algorithm an import left
+empty is the one Postman defaults to (HS256 for JWT).
 
 ## Scripts and tests
 
@@ -237,7 +243,8 @@ past 16 MiB keep only their start, to spare RAM. Send and download keeps a whole
   its dialog can pick another folder.
 - Save ⏷ "Save as…" saves the edits as a new request (`folder/name`); the original stays as
   saved.
-- A `folder › request` breadcrumb, whose folders open their settings.
+- A `folder › request` breadcrumb, whose folders open their settings; a double-click on the
+  request's name renames it.
 
 **Tabs**: a click in the tree previews a request; a double-click or an edit keeps its tab. A
 middle click closes one. Right-click a tab to duplicate it, or to close others, those to the

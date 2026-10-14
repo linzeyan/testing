@@ -747,6 +747,16 @@ pub struct Jwt {
     pub payload: String,
 }
 
+impl Jwt {
+    /// What it's signed with: Postman's HS256 when an import left `algorithm` empty.
+    pub fn alg(&self) -> &str {
+        match self.algorithm.trim() {
+            "" => "HS256",
+            a => a,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[serde(default)]
 pub struct AwsV4 {

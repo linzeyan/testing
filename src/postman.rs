@@ -363,15 +363,16 @@ fn auth(v: &Value) -> Result<Auth, String> {
             return Err("jwt (base64-encoded secret)".into());
         }
         "jwt" => {
-            let algorithm = p("algorithm");
-            Auth::Jwt(Jwt {
-                secret: match algorithm.starts_with("HS") {
-                    true => p("secret"),
-                    false => p("privateKey"),
-                },
-                algorithm,
+            let mut j = Jwt {
+                algorithm: p("algorithm"),
                 payload: p("payload"),
-            })
+                ..Default::default()
+            };
+            j.secret = match j.alg().starts_with("HS") {
+                true => p("secret"),
+                false => p("privateKey"),
+            };
+            Auth::Jwt(j)
         }
         "awsv4" => Auth::AwsV4(AwsV4 {
             access_key: p("accessKey"),
@@ -755,8 +756,8 @@ fn auth_json(auth: &Auth) -> Option<Value> {
         Auth::Jwt(j) => typed(
             "jwt",
             &[
-                ("algorithm", j.algorithm.as_str()),
-                match j.algorithm.starts_with("HS") {
+                ("algorithm", j.alg()),
+                match j.alg().starts_with("HS") {
                     true => ("secret", j.secret.as_str()),
                     false => ("privateKey", j.secret.as_str()),
                 },
@@ -1544,5 +1545,23 @@ mod tests {
         let row = |r: &Value| r["key"] == "includePayloadHash";
         let rows = auth_json(&off).unwrap()["hawk"].as_array().unwrap().clone();
         assert!(!rows.iter().any(row));
+    }
+
+    /// JWT rows with no algorithm are Postman's HS256: the secret is what's read, not a
+    /// private key, and the export names the algorithm instead of leaving it to guess.
+    #[test]
+    fn a_jwt_with_no_algorithm_is_hs256() {
+        let rows = json!({ "type": "jwt", "jwt": [
+            { "key": "secret", "value": "{{s}}" },
+            { "key": "privateKey", "value": "pem" },
+            { "key": "payload", "value": "{}" }
+        ]});
+        let Ok(Auth::Jwt(j)) = auth(&rows) else {
+            panic!("not JWT");
+        };
+        assert_eq!((j.alg(), j.secret.as_str()), ("HS256", "{{s}}"));
+        let out = auth_json(&Auth::Jwt(j)).unwrap();
+        let named = |r: &Value| r["key"] == "algorithm" && r["value"] == "HS256";
+        assert!(out["jwt"].as_array().unwrap().iter().any(named));
     }
 }
