@@ -22,9 +22,9 @@ use crate::model::{Auth, Request};
 use crate::net::{Network, Route};
 use crate::stream::Event;
 
-/// ponytail: incoming and outgoing messages are capped at 1 MiB; raise it when a broker's
-/// messages are bigger (each one is held whole in RAM).
-const MAX_PACKET: usize = 1 << 20;
+/// The largest message either way unless the request's settings raise it: each one is
+/// held whole in RAM.
+pub const MAX_PACKET: usize = 1 << 20;
 
 pub struct Publish {
     pub topic: String,
@@ -430,11 +430,19 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
         Wire::Wss => Transport::wss_with_config(tls(&req.url)?),
     };
     let keep_alive = Duration::from_secs(m.keep_alive_secs.into());
+    let max = req.settings.max_message(MAX_PACKET);
+    // As for an HTTP request: its own timeout, else the network settings'. rumqttc counts
+    // whole seconds.
+    let wait = match req.settings.timeout_ms {
+        0 => net.timeout_secs.max(1),
+        ms => ms.div_ceil(1000),
+    };
     if m.v5 {
         let mut o = v5::MqttOptions::new(id, address, port);
         o.set_keep_alive(keep_alive)
             .set_clean_start(m.clean_session)
-            .set_max_packet_size(Some(MAX_PACKET as u32))
+            .set_max_packet_size(Some(u32::try_from(max).unwrap_or(u32::MAX)))
+            .set_connection_timeout(wait)
             .set_transport(transport);
         if let Some(p) = proxy {
             o.set_proxy(p);
@@ -468,7 +476,7 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
     let mut o = rumqttc::MqttOptions::new(id, address, port);
     o.set_keep_alive(keep_alive)
         .set_clean_session(m.clean_session)
-        .set_max_packet_size(MAX_PACKET, MAX_PACKET)
+        .set_max_packet_size(max, max)
         .set_transport(transport);
     if let Some(p) = proxy {
         o.set_proxy(p);
@@ -480,7 +488,10 @@ fn connect(req: &Request, net: &Network, route: &Route) -> Result<(Client, Event
     if let Some((user, password)) = login {
         o.set_credentials(user, password);
     }
-    let (c, e) = rumqttc::AsyncClient::new(o, 16);
+    let (c, mut e) = rumqttc::AsyncClient::new(o, 16);
+    let mut n = rumqttc::NetworkOptions::new();
+    n.set_connection_timeout(wait);
+    e.set_network_options(n);
     Ok((Client::V3(c), Events::V3(e)))
 }
 
@@ -1274,5 +1285,31 @@ pub mod tests {
             target("WSS://b.test/mqtt").unwrap(),
             (Wire::Wss, "wss://b.test/mqtt".into(), 443)
         );
+    }
+
+    /// Connecting waits as long as an HTTP request would unless the request says; the
+    /// largest message, both ways, is 1 MiB unless it says otherwise.
+    #[test]
+    fn the_settings_tab_sets_the_connect_timeout_and_largest_message() {
+        let net = Network {
+            timeout_secs: 7,
+            ..Default::default()
+        };
+        let options = |req: &Request| match connect(req, &net, &Route::Direct).unwrap().1 {
+            Events::V3(e) => (
+                e.network_options.connection_timeout(),
+                e.mqtt_options.max_packet_size(),
+            ),
+            Events::V5(e) => (
+                e.options.connection_timeout(),
+                e.options.max_packet_size().unwrap() as usize,
+            ),
+        };
+        for v5 in [false, true] {
+            let mut req = request("mqtt://127.0.0.1:1".into(), v5);
+            assert_eq!(options(&req), (7, MAX_PACKET), "v5: {v5}");
+            (req.settings.timeout_ms, req.settings.max_message_mb) = (1500, 4);
+            assert_eq!(options(&req), (2, 4 << 20), "v5: {v5}");
+        }
     }
 }

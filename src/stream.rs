@@ -43,6 +43,16 @@ fn binary(b: &[u8]) -> String {
     format!("<binary, {} bytes> {shown}", b.len())
 }
 
+/// tungstenite's own limit on a message taken in, kept unless the request sets one.
+pub const WS_MAX_MESSAGE: usize = 64 << 20;
+
+fn ws_config(s: &crate::model::Settings) -> tungstenite::protocol::WebSocketConfig {
+    // A frame is never larger than the message it carries.
+    let max = Some(s.max_message(WS_MAX_MESSAGE));
+    let config = tungstenite::protocol::WebSocketConfig::default();
+    config.max_message_size(max).max_frame_size(max)
+}
+
 /// A GraphQL query that subscribes: it streams over WebSocket instead of sending once.
 pub fn subscribes(req: &Request) -> bool {
     req.method == "GRAPHQL"
@@ -83,10 +93,9 @@ pub async fn connect(
         method => {
             let (ws, sio) = (method.eq_ignore_ascii_case("WS"), method == "SOCKETIO");
             let upgrades = ws || sio || subscribes(&req);
-            // Streams keep the default settings; only the host's certificate varies.
             let http = match upgrades {
-                true => clients.websocket_for(&req.url),
-                false => clients.for_settings(&Default::default(), &req.url),
+                true => clients.websocket_for(&req.settings, &req.url),
+                false => clients.for_settings(&req.settings, &req.url),
             };
             match http {
                 Ok(http) if ws => websocket(http, req, text, emit).await,
@@ -108,6 +117,12 @@ pub async fn sse(client: reqwest::Client, mut req: Request, emit: impl Fn(Event)
         .headers
         .iter()
         .any(|h| h.key.eq_ignore_ascii_case("accept"));
+    // Some servers hold the head back until their first event, so there's no limit on
+    // the wait unless the request sets one.
+    let wait = match req.settings.timeout_ms {
+        0 => std::time::Duration::MAX,
+        ms => std::time::Duration::from_millis(ms),
+    };
     let mut b = match http::build(&client, req) {
         // The client's timeout covers the whole body; a stream lasts until someone ends it.
         Ok(b) => b.timeout(std::time::Duration::MAX),
@@ -116,9 +131,13 @@ pub async fn sse(client: reqwest::Client, mut req: Request, emit: impl Fn(Event)
     if wants_accept {
         b = b.header(ACCEPT, "text/event-stream");
     }
-    let resp = match b.send().await {
-        Ok(r) => r,
-        Err(e) => return emit(Event::Error(error_chain(&e))),
+    let resp = match tokio::time::timeout(wait, b.send()).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return emit(Event::Error(error_chain(&e))),
+        Err(_) => {
+            let ms = wait.as_millis();
+            return emit(Event::Error(format!("no answer within {ms} ms")));
+        }
     };
     let status = resp.status();
     let content_type = resp
@@ -157,11 +176,12 @@ pub async fn websocket(
     if let Err(e) = http::with_token(&client, &mut req, false).await {
         return emit(Event::Error(e));
     }
+    let config = ws_config(&req.settings);
     let b = match http::build(&client, req) {
         Ok(b) => b,
         Err(e) => return emit(Event::Error(e)),
     };
-    let socket = match b.upgrade().send().await {
+    let socket = match b.upgrade().web_socket_config(config).send().await {
         Ok(resp) => resp.into_websocket().await,
         Err(e) => Err(e),
     };
@@ -261,6 +281,7 @@ pub async fn graphql(client: reqwest::Client, req: Request, emit: impl Fn(Event)
     let sent = b
         .upgrade()
         .protocols(["graphql-transport-ws", "graphql-ws"])
+        .web_socket_config(ws_config(&req.settings))
         .send()
         .await;
     let socket = match sent {
@@ -362,11 +383,12 @@ pub async fn socketio(
     if let Err(e) = http::with_token(&client, &mut upgrade, false).await {
         return emit(Event::Error(e));
     }
+    let config = ws_config(&upgrade.settings);
     let b = match http::build(&client, upgrade) {
         Ok(b) => b,
         Err(e) => return emit(Event::Error(e)),
     };
-    let socket = match b.upgrade().send().await {
+    let socket = match b.upgrade().web_socket_config(config).send().await {
         Ok(resp) => resp.into_websocket().await,
         Err(e) => Err(e),
     };
@@ -856,8 +878,123 @@ pub mod tests {
         // a real one answers in HTTP/2), so the test does reach the failure.
         let plain = first_event(clients.http.clone());
         assert!(matches!(&plain, Event::Error(_)), "{plain:?}");
-        let ws = clients.websocket_for(&req.url).unwrap();
+        let ws = clients.websocket_for(&req.settings, &req.url).unwrap();
         assert_eq!(first_event(ws), Event::Open("connected".into()));
+    }
+
+    /// A stream connects the way its Settings tab says: they used to stop at plain HTTP,
+    /// so a self-signed wss:// server couldn't be reached however the request was set.
+    #[test]
+    fn streams_connect_the_way_their_settings_say() {
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(own.signing_key.serialize_der());
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![own.cert.der().clone()], key.unwrap())
+            .unwrap();
+        let config = std::sync::Arc::new(config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Says a 2 MiB message once connected.
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+                if let Ok(mut ws) = tungstenite::accept(rustls::StreamOwned::new(conn, s)) {
+                    let _ = ws.send(tungstenite::Message::text("x".repeat(2 << 20)));
+                    while ws.read().is_ok() {}
+                }
+            }
+        });
+        // Takes the request and never answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let quiet = silent.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let held: Vec<_> = silent.incoming().take(1).collect();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            drop(held);
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        let clients = rt.block_on(crate::net::build_client(net.clone())).unwrap();
+        // Every event up to the first message, then hangs up.
+        let events = |req: Request| {
+            let (tx, rx) = mpsc::unbounded_channel::<Frame>();
+            let (_mqtt, mqtt_rx) = mpsc::unbounded_channel();
+            let tx = std::sync::Mutex::new(Some(tx));
+            let events = std::sync::Mutex::new(Vec::new());
+            rt.block_on(connect(&clients, net.clone(), req, rx, mqtt_rx, |e| {
+                if matches!(e, Event::In(_)) {
+                    drop(tx.lock().unwrap().take());
+                }
+                events.lock().unwrap().push(e);
+            }));
+            events.into_inner().unwrap()
+        };
+        let ws = |settings: crate::model::Settings| Request {
+            method: "WS".into(),
+            url: format!("wss://{addr}/"),
+            settings,
+            ..Default::default()
+        };
+        let unchecked = crate::model::Settings {
+            verify_tls: false,
+            ..Default::default()
+        };
+
+        let got = events(ws(Default::default()));
+        assert!(
+            matches!(got.as_slice(), [Event::Error(e)] if e.contains("certificate")),
+            "{got:?}"
+        );
+        let got = events(ws(unchecked.clone()));
+        assert!(
+            matches!(&got[..], [Event::Open(_), Event::In(t), ..] if t.len() == 2 << 20),
+            "{got:?}"
+        );
+        // SSE too: past the certificate, this server turns a plain GET away.
+        let sse = Request {
+            method: "SSE".into(),
+            url: format!("https://{addr}/"),
+            settings: unchecked.clone(),
+            ..Default::default()
+        };
+        let got = events(sse);
+        assert!(
+            matches!(got.as_slice(), [Event::Error(e)] if !e.contains("certificate")),
+            "{got:?}"
+        );
+        let small = crate::model::Settings {
+            max_message_mb: 1,
+            ..unchecked
+        };
+        let got = events(ws(small));
+        assert!(
+            matches!(got.as_slice(), [Event::Open(_), Event::Error(e)] if e.contains("too long")),
+            "{got:?}"
+        );
+
+        let sse = Request {
+            method: "SSE".into(),
+            url: format!("http://{quiet}/events"),
+            settings: crate::model::Settings {
+                timeout_ms: 300,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            events(sse),
+            [Event::Error("no answer within 300 ms".into())]
+        );
     }
 
     /// The handshake against a server that insists on its subprotocol: init, ack,

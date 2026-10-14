@@ -264,14 +264,15 @@ impl Clients {
     }
 
     /// The client for a WebSocket handshake to `url` (WebSocket, Socket.IO, GraphQL
-    /// subscriptions). The handshake is an HTTP/1.1 upgrade: offered h2 as well, a server
-    /// such as Cloudflare picks it, and the upgrade then fails.
-    pub fn websocket_for(&self, url: &str) -> Result<reqwest::Client, String> {
-        let settings = Settings {
-            http_version: HttpVersion::Http1,
-            ..Default::default()
-        };
-        self.for_settings(&settings, url)
+    /// subscriptions) with the request's settings. The handshake is an HTTP/1.1 upgrade:
+    /// offered h2 as well, a server such as Cloudflare picks it, and the upgrade then fails.
+    pub fn websocket_for(&self, s: &Settings, url: &str) -> Result<reqwest::Client, String> {
+        let cert = self.variants.net.host_cert(url);
+        self.variant(Variant {
+            version: HttpVersion::Http1,
+            cert,
+            ..s.into()
+        })
     }
 
     /// A client for one NTLM handshake to `url`, never cached: NTLM signs in a connection,
@@ -296,12 +297,13 @@ impl Clients {
         Ok(((self.variants.build)(v, &self.jar, Some(handshake))?, over))
     }
 
-    /// The HTTP/2 client for a gRPC call to `url`.
-    pub fn grpc_for(&self, url: &str) -> Result<reqwest::Client, String> {
+    /// The HTTP/2 client for a gRPC call to `url` with the request's settings.
+    pub fn grpc_for(&self, s: &Settings, url: &str) -> Result<reqwest::Client, String> {
         let cert = self.variants.net.host_cert(url);
         self.variant(Variant {
+            version: HttpVersion::Http2,
             cert,
-            ..grpc_variant()
+            ..s.into()
         })
     }
 
@@ -1142,6 +1144,32 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// gRPC and WebSocket clients are built from the request's settings, with the HTTP
+    /// version each must speak: a gRPC call to a self-signed server can skip the check.
+    #[test]
+    fn grpc_and_websocket_clients_take_the_requests_settings() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let net = Network {
+            proxy: ProxyMode::None,
+            ..Default::default()
+        };
+        let clients = rt.block_on(build_client(net)).unwrap();
+        let unchecked = Settings {
+            verify_tls: false,
+            http_version: HttpVersion::Http1,
+            ..Default::default()
+        };
+        clients.grpc_for(&unchecked, "http://x").unwrap();
+        clients.websocket_for(&unchecked, "http://x").unwrap();
+        let built = clients.variants.built.lock().unwrap();
+        let mut got: Vec<_> = (built.keys()).map(|v| (v.version, v.insecure)).collect();
+        got.sort_by_key(|(v, _)| *v == HttpVersion::Http1);
+        assert_eq!(
+            got,
+            [(HttpVersion::Http2, true), (HttpVersion::Http1, true)]
+        );
     }
 
     /// An authenticate message on a new connection is refused, so while a handshake lasts

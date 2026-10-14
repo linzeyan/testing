@@ -1139,14 +1139,14 @@ fn tools(window: bool) -> Value {
             "rpc": { "type": "string", "description": "gRPC: package.Service/Method" },
             "settings": {
                 "type": "object",
-                "description": "HTTP only; omit for the defaults",
+                "description": "How the request connects; each kind uses what applies to it (gRPC and WebSocket fix their own HTTP version). Omit for the defaults",
                 "properties": {
                     "http_version": { "type": "string", "enum": ["auto", "http1", "http2"], "default": "auto" },
                     "follow_redirects": { "type": "boolean", "default": true },
                     "max_redirects": { "type": "integer", "default": 10 },
                     "verify_tls": { "type": "boolean", "default": true },
                     "cookies": { "type": "boolean", "default": true, "description": "Send and store cookies" },
-                    "timeout_ms": { "type": "integer", "default": 0, "description": "0 = the network settings' timeout" },
+                    "timeout_ms": { "type": "integer", "default": 0, "description": "0 = the network settings' timeout. WebSocket/Socket.IO: the handshake's; MQTT: connecting's; gRPC: the call's deadline (also sent as grpc-timeout)" },
                     "follow_original_method": { "type": "boolean", "default": false, "description": "A 301/302/303 keeps the method and body instead of switching to GET" },
                     "follow_auth_header": { "type": "boolean", "default": false, "description": "Keep Authorization when a redirect goes to another host" },
                     "remove_referer": { "type": "boolean", "default": false, "description": "No Referer header on redirects" },
@@ -1154,6 +1154,8 @@ fn tools(window: bool) -> Value {
                     "disable_tls13": { "type": "boolean", "default": false, "description": "Don't offer TLS 1.3" },
                     "ciphers": { "type": "array", "items": { "type": "string" }, "description": "Cipher suites offered, in order, by OpenSSL name (e.g. ECDHE-RSA-AES128-GCM-SHA256, TLS_AES_128_GCM_SHA256); empty = all" },
                     "insecure_parser": { "type": "boolean", "default": false, "description": "Accept responses with malformed headers" },
+                    "max_message_mb": { "type": "integer", "default": 0, "description": "WebSocket, Socket.IO, gRPC, MQTT: the largest message taken in, in MB; 0 = 64 for WebSocket and Socket.IO, 16 for gRPC, 1 for MQTT" },
+                    "include_defaults": { "type": "boolean", "default": false, "description": "gRPC: replies include the fields proto3 leaves out at 0, \"\" or false" },
                 },
             },
             "socketio": {

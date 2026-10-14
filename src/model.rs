@@ -111,6 +111,13 @@ pub struct Settings {
     /// Accepts responses with malformed headers, as Postman's `insecureHTTPParser`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub insecure_parser: bool,
+    /// The largest message a WebSocket, Socket.IO, gRPC or MQTT connection takes in, in
+    /// MB; 0 is each one's own limit (see `max_message`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub max_message_mb: u32,
+    /// gRPC: replies show the fields proto3 leaves out at their defaults (0, "", false).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub include_defaults: bool,
 }
 
 impl Default for Settings {
@@ -129,6 +136,8 @@ impl Default for Settings {
             disable_tls13: false,
             ciphers: Vec::new(),
             insecure_parser: false,
+            max_message_mb: 0,
+            include_defaults: false,
         }
     }
 }
@@ -136,6 +145,14 @@ impl Default for Settings {
 impl Settings {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The largest message taken in, in bytes; `default` when none is set.
+    pub fn max_message(&self, default: usize) -> usize {
+        match self.max_message_mb {
+            0 => default,
+            mb => (mb as usize) << 20,
+        }
     }
 
     /// reqwest's redirect policy turns a POST into a GET on 301/302 and drops

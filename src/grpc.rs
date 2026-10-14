@@ -294,14 +294,20 @@ fn wire(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestBuilde
         req.url.trim().trim_end_matches('/'),
         req.rpc.trim()
     );
+    let deadline = req.settings.timeout_ms;
     let wire = Request {
         url,
         body: Body::None,
         ..req
     };
-    Ok(http::build(client, wire)?
+    let b = (http::build(client, wire)?)
         .header("content-type", "application/grpc")
-        .header("te", "trailers"))
+        .header("te", "trailers");
+    // The deadline, told to the server too, so it stops working on a call given up on.
+    Ok(match deadline {
+        0 => b,
+        ms => b.header("grpc-timeout", format!("{ms}m")),
+    })
 }
 
 /// `grpc-status` and `grpc-message` as a result.
@@ -316,13 +322,20 @@ fn status(code: Option<&str>, message: Option<&str>) -> Result<(), String> {
     }
 }
 
-/// Takes the first response message off `buf` once it has fully arrived.
-fn take_message(method: &MethodDescriptor, buf: &mut Vec<u8>) -> Option<Result<Value, String>> {
+/// Takes the first response message off `buf` once it has fully arrived, as the request's
+/// settings have it shown.
+fn take_message(
+    method: &MethodDescriptor,
+    buf: &mut Vec<u8>,
+    s: &crate::model::Settings,
+) -> Option<Result<Value, String>> {
     let len = u32::from_be_bytes(buf.get(1..5)?.try_into().unwrap()) as usize;
     // The length prefix allows 4 GiB; buffering toward that would sink the machine.
-    if len > crate::http::MAX_BODY {
+    let max = s.max_message(crate::http::MAX_BODY);
+    if len > max {
         return Some(Err(format!(
-            "A {len}-byte response message is over the 16 MiB limit"
+            "A {len}-byte response message is over the {} MB limit (Settings)",
+            max >> 20
         )));
     }
     if buf.len() < 5 + len {
@@ -332,10 +345,14 @@ fn take_message(method: &MethodDescriptor, buf: &mut Vec<u8>) -> Option<Result<V
     if frame[0] != 0 {
         return Some(Err("Compressed gRPC responses are not supported".into()));
     }
+    let options = prost_reflect::SerializeOptions::new().skip_default_fields(!s.include_defaults);
     Some(
         DynamicMessage::decode(method.output(), &frame[5..])
             .map_err(|e| format!("Response message: {e}"))
-            .and_then(|m| serde_json::to_value(&m).map_err(|e| e.to_string())),
+            .and_then(|m| {
+                (m.serialize_with_options(serde_json::value::Serializer, &options))
+                    .map_err(|e| e.to_string())
+            }),
     )
 }
 
@@ -524,6 +541,7 @@ pub async fn call(client: reqwest::Client, req: Request) -> Result<Response, Str
         frames.extend(encode(&method, msg)?);
     }
     let started = Instant::now();
+    let settings = req.settings.clone();
     let resp = wire(&client, req)?
         .body(frames)
         .send()
@@ -554,7 +572,7 @@ pub async fn call(client: reqwest::Client, req: Request) -> Result<Response, Str
     self::status(get("grpc-status"), get("grpc-message"))?;
 
     let (mut messages, mut buf) = (Vec::new(), bytes.to_vec());
-    while let Some(msg) = take_message(&method, &mut buf) {
+    while let Some(msg) = take_message(&method, &mut buf, &settings) {
         messages.push(msg?);
     }
     if !buf.is_empty() {
@@ -591,7 +609,7 @@ pub async fn stream(
     if let Err(e) = http::with_token(&clients.http, &mut req, false).await {
         return emit(Event::Error(e));
     }
-    let grpc = match clients.grpc_for(&req.url) {
+    let grpc = match clients.grpc_for(&req.settings, &req.url) {
         Ok(c) => c,
         Err(e) => return emit(Event::Error(e)),
     };
@@ -609,14 +627,15 @@ pub async fn stream(
         Some((Ok::<_, std::convert::Infallible>(frame), rx))
     });
     let opened = format!("calling {}", req.rpc.trim());
+    let settings = req.settings.clone();
     let send = match wire(&grpc, req) {
-        // A stream lasts until someone ends it, not until the network timeout.
-        Ok(b) => b
-            .timeout(Duration::MAX)
-            .body(reqwest::Body::wrap_stream(body))
-            .send(),
+        // A stream lasts until someone ends it, not until the network timeout; a
+        // deadline of its own (set by `wire`) ends it then.
+        Ok(b) if settings.timeout_ms == 0 => b.timeout(Duration::MAX),
+        Ok(b) => b,
         Err(e) => return emit(Event::Error(e)),
     };
+    let send = send.body(reqwest::Body::wrap_stream(body)).send();
     emit(Event::Open(opened));
     let mut sender = Some(tx);
     for msg in first {
@@ -659,7 +678,7 @@ pub async fn stream(
                     Some(Ok(frame)) => match frame.into_data() {
                         Ok(data) => {
                             buf.extend_from_slice(&data);
-                            while let Some(msg) = take_message(&method, &mut buf) {
+                            while let Some(msg) = take_message(&method, &mut buf, &settings) {
                                 match msg {
                                     Ok(msg) => emit(Event::In(msg.to_string())),
                                     Err(e) => return emit(Event::Error(e)),
@@ -865,6 +884,8 @@ pub(crate) mod tests {
                         }
                         assert!(path.starts_with("/greet.v1.Greeter/"));
                         assert_eq!(req.headers()["content-type"], "application/grpc");
+                        let deadline = (req.headers().get("grpc-timeout"))
+                            .map(|v| v.to_str().unwrap().to_owned());
                         let input = pool.get_message_by_name("greet.v1.HelloRequest").unwrap();
                         let output = pool.get_message_by_name("greet.v1.HelloReply").unwrap();
                         let head = |extra: Option<(&str, &str)>| {
@@ -896,10 +917,19 @@ pub(crate) mod tests {
                                         .unwrap();
                                     return;
                                 }
+                                let message = match name.as_str() {
+                                    // Never answers, for a deadline to end.
+                                    "never" => return std::future::pending().await,
+                                    "deadline" => deadline.clone().unwrap_or_default(),
+                                    // Proto3 leaves it out, as an empty string.
+                                    "quiet" => String::new(),
+                                    "big" => "x".repeat(17 << 20),
+                                    _ => format!("hi {name} x{times}"),
+                                };
                                 let mut reply = DynamicMessage::new(output.clone());
                                 reply.set_field_by_name(
                                     "message",
-                                    prost_reflect::Value::String(format!("hi {name} x{times}")),
+                                    prost_reflect::Value::String(message),
                                 );
                                 let payload = reply.encode_to_vec();
                                 let mut frame = vec![0];
@@ -1076,6 +1106,86 @@ service Shop { rpc Place(Order) returns (Order); }
             panic!("expected NOT_FOUND")
         };
         assert_eq!(err, "gRPC NOT_FOUND (5): no such user");
+    }
+
+    /// A call goes as its Settings tab says: the deadline ends it and reaches the server,
+    /// the message size limit can be raised and lowered, and replies can show the fields
+    /// proto3 leaves out.
+    #[test]
+    fn a_call_goes_as_its_settings_say() {
+        use crate::model::Settings;
+        let proto = proto_file();
+        let url = server(pool(&proto).unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ..Default::default()
+        };
+        let clients = rt.block_on(crate::net::build_client(net)).unwrap();
+        let hello = |name: &str, settings: Settings| Request {
+            method: "GRPC".into(),
+            url: url.clone(),
+            proto: proto.clone(),
+            rpc: "greet.v1.Greeter/Hello".into(),
+            body: Body::Json {
+                text: format!(r#"{{"name": "{name}"}}"#),
+            },
+            settings,
+            ..Default::default()
+        };
+        let send = |name: &str, settings: Settings| {
+            let grpc = clients.grpc_for(&settings, &url).unwrap();
+            rt.block_on(call(grpc, hello(name, settings)))
+        };
+        let deadline = |ms| Settings {
+            timeout_ms: ms,
+            ..Default::default()
+        };
+
+        assert_eq!(send("quiet", Settings::default()).unwrap().body, "{}");
+        let defaults = Settings {
+            include_defaults: true,
+            ..Default::default()
+        };
+        assert_eq!(send("quiet", defaults).unwrap().body, r#"{"message":""}"#);
+
+        let body = send("deadline", deadline(5000)).unwrap().body;
+        assert_eq!(body, r#"{"message":"5000m"}"#);
+        let err = send("never", deadline(300)).err().unwrap();
+        assert!(err.contains("timed out"), "{err}");
+        // A live call too, which otherwise waits for as long as the stream lasts.
+        let events = Mutex::new(Vec::new());
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let live = stream(&clients, hello("never", deadline(300)), rx, |e| {
+            events.lock().unwrap().push(e)
+        });
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(10), live).await })
+            .expect("the deadline ended it");
+        let events = events.into_inner().unwrap();
+        assert!(
+            matches!(events.last(), Some(Event::Error(e)) if e.contains("timed out")),
+            "{events:?}"
+        );
+
+        let err = send("big", Settings::default()).err().unwrap();
+        assert!(err.contains("over the 16 MB limit"), "{err}");
+        let roomy = Settings {
+            max_message_mb: 20,
+            ..Default::default()
+        };
+        // {"message":"…"}
+        assert_eq!(send("big", roomy).unwrap().body.len(), (17 << 20) + 14);
+        let tight = Settings {
+            max_message_mb: 1,
+            ..Default::default()
+        };
+        let small = send("quiet", tight.clone()).map(|r| r.body);
+        assert_eq!(small.as_deref(), Ok("{}"), "small ones still pass");
+        let err = send("big", tight).err().unwrap();
+        assert!(err.contains("over the 1 MB limit"), "{err}");
     }
 
     #[test]

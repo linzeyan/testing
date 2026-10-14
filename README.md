@@ -128,6 +128,12 @@ beside it puts a kept one back in the box. Clicking a message shows its payload 
   off TLS 1.2 or 1.3; pick the cipher suites offered; turn off the strict HTTP parser for
   servers that send malformed headers. Postman's `protocolProfileBehavior` and curl's
   `--post301`, `--location-trusted`, `--tlsv1.3`, `--ciphers` carry them.
+- Every kind of request has a Settings tab with what its client uses: the certificate
+  check, cookies, TLS versions and cipher suites wherever they apply; the WebSocket and
+  Socket.IO handshake timeout; how long SSE waits for the stream to start; gRPC's deadline
+  (also sent as `grpc-timeout`) and replies that list the fields at their default values;
+  MQTT's connect timeout; and the largest message a WebSocket, Socket.IO, gRPC or MQTT
+  connection takes in.
 
 ## Authentication
 

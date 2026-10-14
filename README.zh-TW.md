@@ -112,6 +112,10 @@ MQTT：
   保留 Authorization；重新導向時移除 Referer；停用 TLS 1.2 或 1.3；指定提供的加密套件；伺服器
   回傳格式不正確的標頭時，可關閉嚴格 HTTP 解析。Postman 的 `protocolProfileBehavior` 與 curl 的
   `--post301`、`--location-trusted`、`--tlsv1.3`、`--ciphers` 都會帶上這些設定。
+- 每種請求都有「設定」分頁，只列出該用戶端用得到的項目：適用時的憑證驗證、Cookie、TLS 版本
+  與加密套件；WebSocket 與 Socket.IO 的交握逾時；SSE 等待串流開始的時間；gRPC 的期限（也以
+  `grpc-timeout` 告知伺服器）與在回應中列出預設值欄位；MQTT 的連線逾時；以及 WebSocket、
+  Socket.IO、gRPC、MQTT 可接收的訊息大小上限。
 
 ## 驗證
 

@@ -4737,26 +4737,21 @@ impl App {
                     tab(asserts, t("Asserts")),
                     false,
                 );
-                // How a single HTTP exchange goes out, MQTT's connection or Socket.IO's
-                // handshake; other streams and gRPC have none.
-                if !matches!(open.draft.method.as_str(), "WS" | "SSE" | "GRPC") {
-                    let default = match mqtt {
-                        true => {
+                // How the request connects, whatever its kind; MQTT and Socket.IO add
+                // their own protocol's settings.
+                let default = open.draft.settings.is_default()
+                    && match open.draft.method.as_str() {
+                        "MQTT" => {
                             open.draft.mqtt.client_id.is_empty()
                                 && !open.draft.mqtt.v5
                                 && open.draft.mqtt.keep_alive_secs == 60
                                 && open.draft.mqtt.clean_session
                                 && open.draft.mqtt.will_topic.trim().is_empty()
                         }
-                        false if open.draft.method == "SOCKETIO" => {
-                            open.draft.socketio.is_default()
-                        }
-                        false => open.draft.settings.is_default(),
+                        "SOCKETIO" => open.draft.socketio.is_default(),
+                        _ => true,
                     };
-                    sub_tab(ui, current, ReqTab::Settings, t("Settings"), !default);
-                } else if *current == ReqTab::Settings {
-                    *current = ReqTab::Params;
-                }
+                sub_tab(ui, current, ReqTab::Settings, t("Settings"), !default);
                 let docs = !open.draft.description.trim().is_empty();
                 sub_tab(ui, current, ReqTab::Docs, t("Docs"), docs);
                 let examples = open.draft.examples.len();
@@ -4843,14 +4838,15 @@ impl App {
                         ui.add_space(8.0);
                         ui.weak(t(ASSERTS_HINT));
                     }
-                    ReqTab::Settings if open.draft.method == "MQTT" => {
-                        mqtt_settings(ui, &mut open.draft.mqtt)
-                    }
-                    ReqTab::Settings if open.draft.method == "SOCKETIO" => {
-                        socketio_settings(ui, &mut open.draft.socketio)
-                    }
                     ReqTab::Settings => {
-                        settings_editor(ui, &mut open.draft.settings, self.network.timeout_secs)
+                        let (d, timeout) = (&mut open.draft, self.network.timeout_secs);
+                        match d.method.as_str() {
+                            "MQTT" => mqtt_settings(ui, &mut d.mqtt, &mut d.settings, timeout),
+                            "SOCKETIO" => {
+                                socketio_settings(ui, &mut d.socketio, &mut d.settings, timeout)
+                            }
+                            method => settings_editor(ui, &mut d.settings, method, timeout),
+                        }
                     }
                     ReqTab::Topics => {
                         if topics_editor(ui, &mut open.draft.mqtt.topics, live)
@@ -5173,7 +5169,7 @@ impl App {
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
                 .await
             {
-                Ok(client) => match client.grpc_for(&req.url) {
+                Ok(client) => match client.grpc_for(&req.settings, &req.url) {
                     Ok(grpc) => crate::grpc::reflect(&grpc, &req).await,
                     Err(e) => Err(fill(failed, &[&e])),
                 },
@@ -9880,7 +9876,12 @@ fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) 
     done
 }
 
-fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
+fn mqtt_settings(
+    ui: &mut egui::Ui,
+    m: &mut model::Mqtt,
+    s: &mut model::Settings,
+    default_timeout_secs: u64,
+) {
     egui::Grid::new("mqtt-settings")
         .num_columns(3)
         .spacing([16.0, 10.0])
@@ -9966,6 +9967,8 @@ fn mqtt_settings(ui: &mut egui::Ui, m: &mut model::Mqtt) {
                 "MQTT 5.0. Expiry 0: the broker keeps it until it's delivered",
             ));
             ui.end_row();
+
+            connection_rows(ui, s, "MQTT", default_timeout_secs);
         });
     ui.add_space(8.0);
     ui.weak(t("Username and password go in Auth (Basic). ws:// and wss:// carry MQTT over WebSocket (path as the broker says, often /mqtt). mqtts:// and wss:// use the certificate settings in Network settings, and the connection goes through its proxy."));
@@ -10002,7 +10005,12 @@ fn publish_properties(ui: &mut egui::Ui, m: &mut model::Mqtt) {
         });
 }
 
-fn socketio_settings(ui: &mut egui::Ui, s: &mut model::SocketIo) {
+fn socketio_settings(
+    ui: &mut egui::Ui,
+    s: &mut model::SocketIo,
+    settings: &mut model::Settings,
+    default_timeout_secs: u64,
+) {
     egui::Grid::new("socketio-settings")
         .num_columns(3)
         .spacing([16.0, 10.0])
@@ -10035,6 +10043,8 @@ fn socketio_settings(ui: &mut egui::Ui, s: &mut model::SocketIo) {
                 false => t("Socket.IO 3.x and 4.x servers"),
             });
             ui.end_row();
+
+            connection_rows(ui, settings, "SOCKETIO", default_timeout_secs);
         });
     ui.add_space(8.0);
     ui.weak(match s.v2 {
@@ -10045,121 +10055,17 @@ fn socketio_settings(ui: &mut egui::Ui, s: &mut model::SocketIo) {
     });
 }
 
-fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_secs: u64) {
-    use model::HttpVersion;
+fn settings_editor(
+    ui: &mut egui::Ui,
+    s: &mut model::Settings,
+    method: &str,
+    default_timeout_secs: u64,
+) {
     egui::Grid::new("settings")
         .num_columns(3)
         .spacing([16.0, 10.0])
         .show(ui, |ui| {
-            ui.label(t("HTTP version"));
-            let name = |v: HttpVersion| match v {
-                HttpVersion::Auto => t("Auto"),
-                HttpVersion::Http1 => "HTTP/1.1",
-                HttpVersion::Http2 => "HTTP/2",
-            };
-            egui::ComboBox::from_id_salt("http-version")
-                .selected_text(name(s.http_version))
-                .show_ui(ui, |ui| {
-                    for v in [HttpVersion::Auto, HttpVersion::Http1, HttpVersion::Http2] {
-                        ui.selectable_value(&mut s.http_version, v, name(v));
-                    }
-                });
-            ui.weak(t("Auto uses HTTP/2 when an https server offers it"));
-            ui.end_row();
-
-            ui.label(t("Follow redirects"));
-            ui.checkbox(&mut s.follow_redirects, "");
-            ui.weak(t("Off shows the 3xx response itself"));
-            ui.end_row();
-
-            ui.label(t("Maximum redirects"));
-            ui.add_enabled(
-                s.follow_redirects,
-                egui::DragValue::new(&mut s.max_redirects).range(1..=50),
-            );
-            ui.end_row();
-
-            let follows = s.follow_redirects;
-            ui.label(t("Follow original HTTP method"));
-            ui.add_enabled(follows, egui::Checkbox::new(&mut s.follow_original_method, ""));
-            ui.weak(t("Keep the method and body on a 301, 302 or 303"));
-            ui.end_row();
-
-            ui.label(t("Follow Authorization header"));
-            ui.add_enabled(follows, egui::Checkbox::new(&mut s.follow_auth_header, ""));
-            ui.weak(t("Keep it when a redirect goes to another host"));
-            ui.end_row();
-
-            ui.label(t("Remove referer header on redirect"));
-            ui.add_enabled(follows, egui::Checkbox::new(&mut s.remove_referer, ""));
-            ui.weak(t("Don't tell the next host which URL redirected"));
-            ui.end_row();
-
-            ui.label(t("Verify TLS certificate"));
-            ui.checkbox(&mut s.verify_tls, "");
-            if s.verify_tls {
-                ui.weak(t("Off accepts any certificate, for this request only"));
-            } else {
-                ui.colored_label(RED, t("Any server certificate is accepted"));
-            }
-            ui.end_row();
-
-            ui.label(t("Cookie jar"));
-            ui.checkbox(&mut s.cookies, "");
-            ui.weak(t("Send stored cookies and keep the ones the server sets"));
-            ui.end_row();
-
-            ui.label(t("Timeout"));
-            let default = tf("Default ({} s)", &[&default_timeout_secs]);
-            ui.add(
-                egui::DragValue::new(&mut s.timeout_ms)
-                    .range(0..=3_600_000)
-                    .speed(100)
-                    .custom_formatter(move |v, _| match v {
-                        0.0 => default.clone(),
-                        v => format!("{v} ms"),
-                    })
-                    .custom_parser(|t| t.trim().trim_end_matches("ms").trim().parse().ok()),
-            );
-            ui.weak(t("0 uses the network settings' timeout"));
-            ui.end_row();
-
-            // Rarely needed, so below the ones that are.
-            ui.label(t("Disabled TLS versions")).on_hover_text(t(
-                "apitool's TLS (rustls) has only TLS 1.2 and 1.3: SSL, TLS 1.0 and 1.1 are never offered and can't be turned on.",
-            ));
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut s.disable_tls12, "TLS 1.2");
-                ui.checkbox(&mut s.disable_tls13, "TLS 1.3");
-            });
-            if s.disable_tls12 && s.disable_tls13 {
-                ui.colored_label(RED, t("No TLS version is left: https requests fail"));
-            } else {
-                ui.weak(t("Only for servers that mishandle one of them"));
-            }
-            ui.end_row();
-
-            ui.label(t("Cipher suites"));
-            cipher_picker(ui, &mut s.ciphers);
-            let unknown: Vec<&str> = (s.ciphers.iter())
-                .filter(|c| net::cipher(c).is_none())
-                .map(String::as_str)
-                .collect();
-            if unknown.is_empty() {
-                ui.weak(t("Offered in the order checked; none checked offers all"));
-            } else {
-                let names = unknown.join(", ");
-                ui.colored_label(ORANGE, tf("Not available here, skipped: {}", &[&names]));
-            }
-            ui.end_row();
-
-            ui.label(t("Enable strict HTTP parser"));
-            let mut strict = !s.insecure_parser;
-            if ui.checkbox(&mut strict, "").changed() {
-                s.insecure_parser = !strict;
-            }
-            ui.weak(t("Off accepts responses with malformed headers"));
-            ui.end_row();
+            connection_rows(ui, s, method, default_timeout_secs)
         });
     ui.add_space(8.0);
     if ui
@@ -10167,6 +10073,197 @@ fn settings_editor(ui: &mut egui::Ui, s: &mut model::Settings, default_timeout_s
         .clicked()
     {
         *s = model::Settings::default();
+    }
+}
+
+/// The Settings tab's rows for how a `method` request connects, in a 3-column grid: each
+/// kind gets what its client uses and no more.
+fn connection_rows(
+    ui: &mut egui::Ui,
+    s: &mut model::Settings,
+    method: &str,
+    default_timeout_secs: u64,
+) {
+    use model::HttpVersion;
+    let (sse, grpc, mqtt) = (method == "SSE", method == "GRPC", method == "MQTT");
+    // A WebSocket handshake is HTTP/1.1, as gRPC is HTTP/2, whatever is picked.
+    let ws = matches!(method, "WS" | "SOCKETIO");
+    let http = !(sse || grpc || mqtt || ws);
+    if http || sse {
+        ui.label(t("HTTP version"));
+        let name = |v: HttpVersion| match v {
+            HttpVersion::Auto => t("Auto"),
+            HttpVersion::Http1 => "HTTP/1.1",
+            HttpVersion::Http2 => "HTTP/2",
+        };
+        egui::ComboBox::from_id_salt("http-version")
+            .selected_text(name(s.http_version))
+            .show_ui(ui, |ui| {
+                for v in [HttpVersion::Auto, HttpVersion::Http1, HttpVersion::Http2] {
+                    ui.selectable_value(&mut s.http_version, v, name(v));
+                }
+            });
+        ui.weak(t("Auto uses HTTP/2 when an https server offers it"));
+        ui.end_row();
+
+        ui.label(t("Follow redirects"));
+        ui.checkbox(&mut s.follow_redirects, "");
+        ui.weak(t("Off shows the 3xx response itself"));
+        ui.end_row();
+
+        ui.label(t("Maximum redirects"));
+        ui.add_enabled(
+            s.follow_redirects,
+            egui::DragValue::new(&mut s.max_redirects).range(1..=50),
+        );
+        ui.end_row();
+    }
+
+    // apitool follows these redirects itself (`http::follow`), which a stream doesn't.
+    if http {
+        let follows = s.follow_redirects;
+        ui.label(t("Follow original HTTP method"));
+        ui.add_enabled(
+            follows,
+            egui::Checkbox::new(&mut s.follow_original_method, ""),
+        );
+        ui.weak(t("Keep the method and body on a 301, 302 or 303"));
+        ui.end_row();
+
+        ui.label(t("Follow Authorization header"));
+        ui.add_enabled(follows, egui::Checkbox::new(&mut s.follow_auth_header, ""));
+        ui.weak(t("Keep it when a redirect goes to another host"));
+        ui.end_row();
+
+        ui.label(t("Remove referer header on redirect"));
+        ui.add_enabled(follows, egui::Checkbox::new(&mut s.remove_referer, ""));
+        ui.weak(t("Don't tell the next host which URL redirected"));
+        ui.end_row();
+    }
+
+    ui.label(t("Verify TLS certificate"));
+    ui.checkbox(&mut s.verify_tls, "");
+    if s.verify_tls {
+        ui.weak(t("Off accepts any certificate, for this request only"));
+    } else {
+        ui.colored_label(RED, t("Any server certificate is accepted"));
+    }
+    ui.end_row();
+
+    if !(grpc || mqtt) {
+        ui.label(t("Cookie jar"));
+        ui.checkbox(&mut s.cookies, "");
+        ui.weak(t("Send stored cookies and keep the ones the server sets"));
+        ui.end_row();
+    }
+
+    let (label, hint) = match method {
+        "WS" | "SOCKETIO" => (
+            t("Handshake timeout"),
+            t("How long connecting may take; 0 uses the network settings' timeout"),
+        ),
+        "MQTT" => (
+            t("Connect timeout"),
+            t("How long connecting may take; 0 uses the network settings' timeout"),
+        ),
+        "SSE" => (
+            t("Response timeout"),
+            t("How long the server may take to start the stream; 0 waits as long as it takes"),
+        ),
+        "GRPC" => (
+            t("Deadline"),
+            t("The call fails past it; 0 uses the network settings' timeout, or none for a stream"),
+        ),
+        _ => (t("Timeout"), t("0 uses the network settings' timeout")),
+    };
+    ui.label(label);
+    let default = match sse {
+        true => t("None").to_owned(),
+        false => tf("Default ({} s)", &[&default_timeout_secs]),
+    };
+    ui.add(
+        egui::DragValue::new(&mut s.timeout_ms)
+            .range(0..=3_600_000)
+            .speed(100)
+            .custom_formatter(move |v, _| match v {
+                0.0 => default.clone(),
+                v => format!("{v} ms"),
+            })
+            .custom_parser(|t| t.trim().trim_end_matches("ms").trim().parse().ok()),
+    );
+    ui.weak(hint);
+    ui.end_row();
+
+    // MQTT's TLS is the network settings' as they are.
+    if !mqtt {
+        // Rarely needed, so below the ones that are.
+        ui.label(t("Disabled TLS versions")).on_hover_text(t(
+            "apitool's TLS (rustls) has only TLS 1.2 and 1.3: SSL, TLS 1.0 and 1.1 are never offered and can't be turned on.",
+        ));
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut s.disable_tls12, "TLS 1.2");
+            ui.checkbox(&mut s.disable_tls13, "TLS 1.3");
+        });
+        if s.disable_tls12 && s.disable_tls13 {
+            ui.colored_label(RED, t("No TLS version is left: https requests fail"));
+        } else {
+            ui.weak(t("Only for servers that mishandle one of them"));
+        }
+        ui.end_row();
+
+        ui.label(t("Cipher suites"));
+        cipher_picker(ui, &mut s.ciphers);
+        let unknown: Vec<&str> = (s.ciphers.iter())
+            .filter(|c| net::cipher(c).is_none())
+            .map(String::as_str)
+            .collect();
+        if unknown.is_empty() {
+            ui.weak(t("Offered in the order checked; none checked offers all"));
+        } else {
+            let names = unknown.join(", ");
+            ui.colored_label(ORANGE, tf("Not available here, skipped: {}", &[&names]));
+        }
+        ui.end_row();
+    }
+
+    // HTTP/2 headers can't be malformed the way HTTP/1.1's can.
+    if !(grpc || mqtt) {
+        ui.label(t("Enable strict HTTP parser"));
+        let mut strict = !s.insecure_parser;
+        if ui.checkbox(&mut strict, "").changed() {
+            s.insecure_parser = !strict;
+        }
+        ui.weak(t("Off accepts responses with malformed headers"));
+        ui.end_row();
+    }
+
+    if ws || grpc || mqtt {
+        ui.label(t("Maximum message size"));
+        let own = match method {
+            "GRPC" => crate::http::MAX_BODY,
+            "MQTT" => crate::mqtt::MAX_PACKET,
+            _ => crate::stream::WS_MAX_MESSAGE,
+        };
+        let default = tf("Default ({} MB)", &[&(own >> 20)]);
+        // MQTT's own ceiling is 256 MB.
+        ui.add(
+            egui::DragValue::new(&mut s.max_message_mb)
+                .range(0..=256)
+                .custom_formatter(move |v, _| match v {
+                    0.0 => default.clone(),
+                    v => format!("{v} MB"),
+                })
+                .custom_parser(|t| t.trim().trim_end_matches("MB").trim().parse().ok()),
+        );
+        ui.weak(t("A larger message received is an error"));
+        ui.end_row();
+    }
+
+    if grpc {
+        ui.label(t("Include default values"));
+        ui.checkbox(&mut s.include_defaults, "");
+        ui.weak(t("Show the fields proto3 leaves out at 0, \"\" or false"));
+        ui.end_row();
     }
 }
 
@@ -15869,6 +15966,105 @@ mod ui_tests {
         let (pings, sent) = server.join().unwrap();
         assert!(pings >= 2, "{pings} pings");
         assert_eq!(sent, ["40/chat,", "41/chat,", ""]);
+    }
+
+    /// Every kind of request has a Settings tab with what its client uses: WebSocket, SSE
+    /// and gRPC had none, so a self-signed server or a slow call couldn't be dealt with,
+    /// and rows a kind ignores would only mislead.
+    #[test]
+    fn every_kind_of_request_has_the_settings_its_client_uses() {
+        let mut h = with_request("kinds");
+        const ROWS: [&str; 14] = [
+            "HTTP version",
+            "Follow original HTTP method",
+            "Verify TLS certificate",
+            "Cookie jar",
+            "Timeout",
+            "Handshake timeout",
+            "Connect timeout",
+            "Response timeout",
+            "Deadline",
+            "Disabled TLS versions",
+            "Maximum message size",
+            "Include default values",
+            "Client ID",
+            "Handshake path",
+        ];
+        for (method, want) in [
+            (
+                "GET",
+                vec![
+                    "HTTP version",
+                    "Follow original HTTP method",
+                    "Verify TLS certificate",
+                    "Cookie jar",
+                    "Timeout",
+                    "Disabled TLS versions",
+                ],
+            ),
+            (
+                "SSE",
+                vec![
+                    "HTTP version",
+                    "Verify TLS certificate",
+                    "Cookie jar",
+                    "Response timeout",
+                    "Disabled TLS versions",
+                ],
+            ),
+            (
+                "WS",
+                vec![
+                    "Verify TLS certificate",
+                    "Cookie jar",
+                    "Handshake timeout",
+                    "Disabled TLS versions",
+                    "Maximum message size",
+                ],
+            ),
+            (
+                "SOCKETIO",
+                vec![
+                    "Verify TLS certificate",
+                    "Cookie jar",
+                    "Handshake timeout",
+                    "Disabled TLS versions",
+                    "Maximum message size",
+                    "Handshake path",
+                ],
+            ),
+            (
+                "GRPC",
+                vec![
+                    "Verify TLS certificate",
+                    "Deadline",
+                    "Disabled TLS versions",
+                    "Maximum message size",
+                    "Include default values",
+                ],
+            ),
+            (
+                "MQTT",
+                vec![
+                    "Verify TLS certificate",
+                    "Connect timeout",
+                    "Maximum message size",
+                    "Client ID",
+                ],
+            ),
+        ] {
+            h.state_mut().open.as_mut().unwrap().draft.method = method.into();
+            h.run();
+            h.get_by_label("Settings").click();
+            h.run();
+            let shown: Vec<_> = (ROWS.into_iter())
+                .filter(|l| h.query_by_label(l).is_some())
+                .collect();
+            assert_eq!(shown, want, "{method}");
+        }
+        h.state_mut().open.as_mut().unwrap().draft.method = "GRPC".into();
+        h.run();
+        shot(&mut h, "98-grpc-settings");
     }
 
     /// Topics subscribe on Connect, Send publishes where the request says, and a topic

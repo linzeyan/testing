@@ -79,6 +79,9 @@ rfd = { version = "0.17", default-features = false }
 # Already in the tree via reqwest's http2: the window's MCP endpoint also takes h2c.
 h2 = "0.4.19"
 bytes = "1"
+# Already in the tree via reqwest-websocket, whose handshake takes its config: the
+# largest message a WebSocket takes in.
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux has no dialog of its own: ask the desktop portal.
@@ -95,4 +98,3 @@ egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
 # Already in the tree via eframe: its WindowSettings checks the copy in app.rs.
 egui-winit = { version = "0.36.2", default-features = false, features = ["serde"] }
 rcgen = "0.14"
-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }

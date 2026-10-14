@@ -1692,6 +1692,34 @@ const ZH_TW: &[(&str, &str)] = &[
         "Send signs in with NTLMv2 over HTTP/1.1: a challenge and answer on one connection, so the body goes twice. Through a proxy only https:// URLs work (a plain HTTP proxy may switch connections), and servers that only offer Kerberos aren't supported.",
         "傳送時以 NTLMv2 透過 HTTP/1.1 登入：挑戰與回應走同一條連線，因此內容會送出兩次。經由代理伺服器時只有 https:// 網址可用（一般 HTTP 代理可能換連線），也不支援只提供 Kerberos 的伺服器。",
     ),
+    // Connection settings of streams and gRPC
+    ("Handshake timeout", "交握逾時"),
+    ("Connect timeout", "連線逾時"),
+    (
+        "How long connecting may take; 0 uses the network settings' timeout",
+        "連線最久可花多少時間；0 表示沿用網路設定的逾時",
+    ),
+    ("Response timeout", "回應逾時"),
+    (
+        "How long the server may take to start the stream; 0 waits as long as it takes",
+        "伺服器開始傳送串流前最久等多少時間；0 表示一直等",
+    ),
+    ("Deadline", "期限"),
+    (
+        "The call fails past it; 0 uses the network settings' timeout, or none for a stream",
+        "超過即呼叫失敗；0 表示沿用網路設定的逾時，串流則不設限",
+    ),
+    ("Maximum message size", "訊息大小上限"),
+    ("Default ({} MB)", "預設 ({} MB)"),
+    (
+        "A larger message received is an error",
+        "收到更大的訊息即視為錯誤",
+    ),
+    ("Include default values", "包含預設值欄位"),
+    (
+        "Show the fields proto3 leaves out at 0, \"\" or false",
+        "顯示 proto3 因值為 0、\"\" 或 false 而省略的欄位",
+    ),
 ];
 
 #[cfg(test)]
