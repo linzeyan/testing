@@ -401,8 +401,12 @@ Rules, as Proxyman's tools, apply to every exchange whose URL matches (anywhere 
 file and never reaches the server; **Map Remote** sends to another server (its scheme, host
 and port; the path and query stay); **Request header** and **Response header** set one, or
 remove it when the value is empty; **Throttle** holds the request, then lets the answer
-through at most so many KiB/s. A row a rule changed has an orange dot, and its detail says
-what changed. HTTPS needs "Decrypt HTTPS" on for rules to see inside.
+through at most so many KiB/s; **Breakpoint** holds the request before it goes on, the
+answer before the app gets it, or both. A held exchange shows atop the pane as text (its
+first line, a header a line, a blank line, the body): edit it, then **Continue** sends what
+it says, or **Abort** answers the app with a 502. A binary body goes on as it was unless its
+note is typed over; Stop drops whatever is held. A row a rule changed has an orange dot, and
+its detail says what changed. HTTPS needs "Decrypt HTTPS" on for rules to see inside.
 
 ## Command line
 

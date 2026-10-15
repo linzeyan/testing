@@ -187,6 +187,77 @@ pub struct Controls {
     /// Decrypting's CA while it's on; tunnels pass untouched while it's None.
     pub decrypt: Mutex<Option<Arc<Ca>>>,
     pub rules: Mutex<Vec<Rule>>,
+    /// Exchanges held at a breakpoint, oldest first, for the pane to let go or drop.
+    pub paused: Mutex<Vec<Paused>>,
+}
+
+/// An exchange held at a breakpoint, as the text it goes on as.
+pub struct Paused {
+    pub id: u64,
+    /// The answer, not the request.
+    pub response: bool,
+    /// Its first line, a header a line, a blank line, the body.
+    pub text: String,
+    done: tokio::sync::oneshot::Sender<String>,
+}
+
+impl Paused {
+    /// Goes on as `text` says. Dropped instead, it's aborted: the app gets a 502.
+    pub fn resume(self) {
+        let _ = self.done.send(self.text);
+    }
+}
+
+const ABORTED: &str = "Aborted at a breakpoint";
+
+impl Controls {
+    /// Held for the pane, which lets it go as edited (its first line, headers, body) or
+    /// drops it (None).
+    async fn pause(
+        &self,
+        flows: &Flows,
+        id: u64,
+        first: String,
+        headers: &HeaderMap,
+        body: &[u8],
+        response: bool,
+    ) -> Option<(String, HeaderMap, Bytes)> {
+        let mut text = format!("{first}\n");
+        for (name, value) in pairs(headers) {
+            text.push_str(&format!("{name}: {value}\n"));
+        }
+        // A body that isn't text goes on as it was unless its note is typed over: as text
+        // it would come back mangled.
+        let note = format!("({} bytes of binary data, sent as they were)", body.len());
+        let shown = std::str::from_utf8(body).ok();
+        text = format!("{text}\n{}", shown.unwrap_or(&note));
+        let (done, edited) = tokio::sync::oneshot::channel();
+        let paused = Paused {
+            id,
+            response,
+            text,
+            done,
+        };
+        self.paused.lock().unwrap().push(paused);
+        // The pane redraws, showing it.
+        flows.update(id, |_| {});
+        let edited = edited.await.ok()?;
+        let (head, typed) = edited.split_once("\n\n").unwrap_or((edited.as_str(), ""));
+        let mut lines = head.lines();
+        let first = lines.next().unwrap_or_default().trim().to_owned();
+        let mut headers = HeaderMap::new();
+        for (name, value) in lines.filter_map(|line| line.split_once(':')) {
+            let name = hyper::header::HeaderName::from_bytes(name.trim().as_bytes());
+            if let (Ok(name), Ok(value)) = (name, HeaderValue::from_str(value.trim())) {
+                headers.append(name, value);
+            }
+        }
+        let body = match shown {
+            None if typed.trim() == note => Bytes::copy_from_slice(body),
+            _ => Bytes::from(typed.to_owned()),
+        };
+        Some((first, headers, body))
+    }
 }
 
 /// Proxyman's tools, as a rule: what to do to an exchange whose URL `matches` it.
@@ -210,6 +281,9 @@ pub enum Act {
     /// Held this long before going on, and the answer at most this fast (0: as fast as
     /// it comes).
     Throttle { delay_ms: u64, kib_per_s: u64 },
+    /// Held for the pane to edit and let go: the request before it goes on, the answer
+    /// before the app gets it.
+    Breakpoint { request: bool, response: bool },
 }
 
 /// A rule's URL: found anywhere in the URL, `*` for any run of characters, case aside.
@@ -303,8 +377,7 @@ async fn exchange(
     {
         return text(StatusCode::LOOP_DETECTED, LOOP);
     }
-    let rules = controls.rules.lock().unwrap().clone();
-    forward(req, clients, flows, &rules).await
+    forward(req, clients, flows, controls).await
 }
 
 const LOOP: &str = "apitool's capture proxy would be its own upstream: in apitool's network \
@@ -351,8 +424,9 @@ async fn forward(
     req: Request<Incoming>,
     clients: &Clients,
     flows: &Flows,
-    rules: &[Rule],
+    controls: &Controls,
 ) -> Response<Body> {
+    let rules = controls.rules.lock().unwrap().clone();
     let started = Instant::now();
     let (parts, body) = req.into_parts();
     let url = parts.uri.to_string();
@@ -363,7 +437,7 @@ async fn forward(
         });
         text(StatusCode::BAD_GATEWAY, &e)
     };
-    let (mut target, mut local, mut pace) = (url.clone(), None, (0, 0));
+    let (mut target, mut local, mut pace, mut hold) = (url.clone(), None, (0, 0), (false, false));
     let (mut asked, mut answered, mut applied) = (Vec::new(), Vec::new(), Vec::new());
     for rule in rules.iter().filter(|r| r.on && matches(&r.url, &url)) {
         let act = match &rule.act {
@@ -395,6 +469,10 @@ async fn forward(
                 pace = (*delay_ms, *kib_per_s);
                 rule.act.clone()
             }
+            Act::Breakpoint { request, response } => {
+                hold = (hold.0 || *request, hold.1 || *response);
+                rule.act.clone()
+            }
         };
         applied.push(act);
     }
@@ -424,19 +502,37 @@ async fn forward(
         let body = futures_util::stream::iter([Ok(Bytes::from(body))]);
         return ok(id).send(StatusCode::OK, headers, body);
     }
-    let client = match clients.forward_for(&target) {
-        Ok(client) => client,
-        Err(e) => return fail(e),
-    };
-    let mut headers = parts.headers;
+    let (mut method, mut headers) = (parts.method, parts.headers);
     for name in HOP_BY_HOP.iter().chain(&["host"]) {
         headers.remove(*name);
     }
-    headers.append(hyper::header::VIA, HeaderValue::from_static(VIA));
     set_headers(&mut headers, &asked);
-    let mut send = client.request(parts.method, &target).headers(headers);
     // A GET's empty body stays absent: streamed, it would go out chunked.
-    if !body.is_end_stream() {
+    let sent = if hold.0 {
+        let body = match body.collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(e) => return fail(e.to_string()),
+        };
+        flows.update(id, |f| f.request.take(&body));
+        // Counted again for what's typed.
+        headers.remove(hyper::header::CONTENT_LENGTH);
+        let first = format!("{method} {target}");
+        let edited = controls
+            .pause(flows, id, first, &headers, &body, false)
+            .await;
+        let Some((first, edited, body)) = edited else {
+            return fail(ABORTED.to_owned());
+        };
+        let (verb, url) = first.split_once(' ').unwrap_or((first.as_str(), ""));
+        method = match Method::from_bytes(verb.as_bytes()) {
+            Ok(method) => method,
+            Err(e) => return fail(format!("{verb}: {e}")),
+        };
+        (target, headers) = (url.trim().to_owned(), edited);
+        Some(reqwest::Body::from(body))
+    } else if body.is_end_stream() {
+        None
+    } else {
         let tee = Tee {
             flows: flows.clone(),
             id,
@@ -452,7 +548,16 @@ async fn forward(
             }
             std::future::ready(chunk)
         });
-        send = send.body(reqwest::Body::wrap_stream(chunks));
+        Some(reqwest::Body::wrap_stream(chunks))
+    };
+    headers.append(hyper::header::VIA, HeaderValue::from_static(VIA));
+    let client = match clients.forward_for(&target) {
+        Ok(client) => client,
+        Err(e) => return fail(e),
+    };
+    let mut send = client.request(method, &target).headers(headers);
+    if let Some(sent) = sent {
+        send = send.body(sent);
     }
     let res = match send.send().await {
         Ok(res) => res,
@@ -465,7 +570,29 @@ async fn forward(
         }
     }
     set_headers(&mut headers, &answered);
-    ok(id).send(res.status(), headers, res.bytes_stream())
+    let status = res.status();
+    if !hold.1 {
+        return ok(id).send(status, headers, res.bytes_stream());
+    }
+    let body = match res.bytes().await {
+        Ok(body) => body,
+        Err(e) => return fail(error_chain(&e)),
+    };
+    headers.remove(hyper::header::CONTENT_LENGTH);
+    let reason = status.canonical_reason().unwrap_or_default();
+    let first = format!("{} {reason}", status.as_u16());
+    let edited = controls
+        .pause(flows, id, first, &headers, &body, true)
+        .await;
+    let Some((first, mut headers, body)) = edited else {
+        return fail(ABORTED.to_owned());
+    };
+    let code = first.split_whitespace().next().unwrap_or_default();
+    let Ok(status) = StatusCode::from_bytes(code.as_bytes()) else {
+        return fail(format!("{code}: not a status"));
+    };
+    headers.insert(hyper::header::CONTENT_LENGTH, body.len().into());
+    ok(id).send(status, headers, futures_util::stream::iter([Ok(body)]))
 }
 
 /// The answer as the app gets it, kept in its flow as it goes.
@@ -902,12 +1029,12 @@ mod tests {
     fn proxy_with(
         rt: &tokio::runtime::Runtime,
         net: Network,
-        controls: Controls,
+        controls: impl Into<Arc<Controls>>,
     ) -> (SocketAddr, Flows) {
         let clients = rt.block_on(crate::net::build_client(net)).unwrap();
         let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let (addr, flows) = (listener.local_addr().unwrap(), Flows::new(|| {}));
-        rt.spawn(serve(listener, clients, flows.clone(), Arc::new(controls)));
+        rt.spawn(serve(listener, clients, flows.clone(), controls.into()));
         (addr, flows)
     }
 
@@ -1046,6 +1173,103 @@ mod tests {
             took >= Duration::from_millis(780),
             "{took:?} ({quick:?} unthrottled)"
         );
+    }
+
+    /// A breakpoint holds the request until it's let go as edited, so the server gets
+    /// what was typed; then the answer, edited too, is what the app gets. A binary body
+    /// goes on as it was, not as text. Dropped instead, the app gets a 502 and the flow
+    /// says why.
+    #[test]
+    fn a_breakpoint_holds_both_ways_for_an_edit_or_an_abort() {
+        let rt = runtime();
+        let server = crate::http::tests::serve(|req| ("200 OK".into(), req.to_owned()));
+        let controls = Arc::new(Controls {
+            rules: Mutex::new(vec![Rule {
+                on: true,
+                url: "/held".into(),
+                act: Act::Breakpoint {
+                    request: true,
+                    response: true,
+                },
+            }]),
+            ..Default::default()
+        });
+        let (addr, flows) = proxy_with(&rt, direct(), controls.clone());
+        let app = through(addr);
+        // Long enough for the firewall here, which holds a new binary's first connections.
+        let held = |response: bool| {
+            for _ in 0..3000 {
+                let mut paused = controls.paused.lock().unwrap();
+                if paused.first().is_some_and(|p| p.response == response) {
+                    return paused.remove(0);
+                }
+                drop(paused);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("nothing held");
+        };
+        let send = |sent: reqwest::RequestBuilder| {
+            rt.spawn(async move {
+                let res = sent.send().await.unwrap();
+                (res.status().as_u16(), res.text().await.unwrap())
+            })
+        };
+
+        let url = format!("http://{server}/held");
+        let answer = send(app.post(&url).header("x-app", "1").body("from the app"));
+        let mut p = held(false);
+        assert!(p.text.starts_with(&format!("POST {url}\n")), "{}", p.text);
+        assert!(p.text.contains("x-app: 1\n"), "{}", p.text);
+        assert!(p.text.ends_with("\n\nfrom the app"), "{}", p.text);
+        p.text = (p.text.replacen("/held", "/edited", 1))
+            .replace("x-app: 1", "x-pane: 2")
+            .replace("from the app", "from the pane");
+        p.resume();
+        let mut p = held(true);
+        let seen = p.text.clone();
+        assert!(seen.starts_with("200 OK\n"), "{seen}");
+        let (head, _) = seen.split_once("\n\n").unwrap();
+        assert!(!head.contains("content-length"), "counted again: {head}");
+        assert!(seen.contains("POST /edited HTTP/1.1"), "{seen}");
+        assert!(
+            seen.contains("x-pane: 2") && !seen.contains("x-app"),
+            "{seen}"
+        );
+        assert!(seen.ends_with("from the pane"), "{seen}");
+        p.text = "201 Created\nx-answer: pane\n\nfrom the breakpoint".into();
+        p.resume();
+        let answer = rt.block_on(answer).unwrap();
+        assert_eq!(answer, (201, "from the breakpoint".to_owned()));
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!(f.status, Some(201));
+        assert_eq!(f.request.body, b"from the app", "as the app sent it");
+        assert_eq!(f.response.body, b"from the breakpoint", "as the app got it");
+        let length = ("content-length".to_owned(), "19".to_owned());
+        assert!(
+            f.response.headers.contains(&length),
+            "{:?}",
+            f.response.headers
+        );
+        assert!(matches!(f.applied[..], [Act::Breakpoint { .. }]));
+
+        let answer = send(app.post(&url).body(vec![0xff, 0, 1]));
+        let p = held(false);
+        assert!(
+            p.text
+                .ends_with("\n\n(3 bytes of binary data, sent as they were)")
+        );
+        p.resume();
+        let p = held(true);
+        assert!(p.text.contains("content-length: 3"), "{}", p.text);
+        p.resume();
+        assert_eq!(rt.block_on(answer).unwrap().0, 200);
+
+        let answer = send(app.get(&url));
+        drop(held(false));
+        let answer = rt.block_on(answer).unwrap();
+        assert_eq!(answer, (502, ABORTED.to_owned()));
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!(f.error.as_deref(), Some(ABORTED));
     }
 
     fn direct() -> Network {

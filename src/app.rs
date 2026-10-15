@@ -4449,6 +4449,49 @@ impl App {
                 self.fail(e);
             }
         }
+        if let Some(view) = &self.capture {
+            let mut paused = view.controls.paused.lock().unwrap();
+            let waiting = paused.len().saturating_sub(1);
+            let (mut go, mut abort) = (false, false);
+            if let Some(held) = paused.first_mut() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        dot(ui, ORANGE);
+                        ui.strong(match held.response {
+                            false => t("Held at a breakpoint: the request"),
+                            true => t("Held at a breakpoint: the answer"),
+                        });
+                        if waiting > 0 {
+                            ui.weak(tf("{} more waiting", &[&waiting]));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            go = ui.add(primary(t("Continue"))).clicked();
+                            abort = (ui.button(t("Abort")))
+                                .on_hover_text(t("The app gets a 502 instead"))
+                                .clicked();
+                        });
+                    });
+                    ui.weak(t(
+                        "Edit it, then Continue: the first line, a header a line, a blank line, the body.",
+                    ));
+                    egui::ScrollArea::vertical()
+                        .id_salt("capture-paused")
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            let edit = egui::TextEdit::multiline(&mut held.text)
+                                .id_salt(("capture-paused", held.id, held.response))
+                                .code_editor()
+                                .desired_width(f32::INFINITY);
+                            ui.add(edit);
+                        });
+                });
+            }
+            if go {
+                paused.remove(0).resume();
+            } else if abort {
+                paused.remove(0);
+            }
+        }
         if let Some(CaptureView {
             flows,
             filter,
@@ -4517,6 +4560,8 @@ impl App {
         if stop {
             if let Some(view) = &mut self.capture {
                 view.server = None;
+                // Their exchanges went with the server.
+                view.controls.paused.lock().unwrap().clear();
             }
             self.status = t("Capture stopped").into();
             // After: a failure to put it back is the message that stays.
@@ -12123,6 +12168,13 @@ fn rules_ui(ui: &mut egui::Ui, rules: &mut Vec<crate::capture::Rule>) -> bool {
                 kib_per_s: 0,
             },
         ),
+        (
+            t("Breakpoint"),
+            Act::Breakpoint {
+                request: true,
+                response: true,
+            },
+        ),
     ];
     let kind = |act: &Act| std::mem::discriminant(act);
     let (mut changed, mut gone) = (false, None);
@@ -12171,6 +12223,10 @@ fn rules_ui(ui: &mut egui::Ui, rules: &mut Vec<crate::capture::Rule>) -> bool {
                     let rate = (ui.add(rate.range(0..=1_000_000)))
                         .on_hover_text(t("The answer at most this fast; 0, as fast as it comes"));
                     delay.changed() | rate.changed()
+                }
+                Act::Breakpoint { request, response } => {
+                    ui.checkbox(request, t("Request")).changed()
+                        | ui.checkbox(response, t("Response")).changed()
                 }
             };
             if icon_button(ui, icon::TRASH, t("Delete"), None)
@@ -12221,6 +12277,7 @@ fn applied_text(act: &crate::capture::Act) -> String {
             "Throttled: held {} ms, at most {} KiB/s",
             &[delay_ms, kib_per_s],
         ),
+        Act::Breakpoint { .. } => t("Held at a breakpoint").into(),
     }
 }
 
@@ -21170,6 +21227,82 @@ mod ui_tests {
         h.get_by_label("Close the capture").click();
         h.run();
         assert_eq!(kept(&h), "", "put back on closing the capture");
+    }
+
+    /// An exchange held at a breakpoint shows atop the capture pane as text to edit:
+    /// Continue sends what the text says, Abort answers the app with a 502.
+    #[test]
+    fn a_held_exchange_goes_on_as_edited_or_is_aborted_from_the_pane() {
+        use std::io::{Read, Write};
+        let server = crate::http::tests::serve(|req| ("200 OK".into(), req.to_owned()));
+        let ws = workspace("capture-breakpoint");
+        let rule =
+            r#"[{"on":true,"url":"/held","act":{"Breakpoint":{"request":true,"response":false}}}]"#;
+        ws.save_capture_rules(rule).unwrap();
+        let mut h = harness(ws);
+        h.run();
+        h.state_mut().act(Action::Capture);
+        h.run();
+        h.get_by_label("Start capturing").click();
+        h.run();
+        let proxy = h.state_mut().capturing().expect("listening");
+        let send = || {
+            std::thread::spawn(move || {
+                let mut app = std::net::TcpStream::connect(proxy).unwrap();
+                let url = format!("http://{server}/held");
+                let head = format!("Host: {server}\r\nConnection: close");
+                write!(app, "GET {url} HTTP/1.1\r\n{head}\r\n\r\n").unwrap();
+                let mut answer = String::new();
+                app.read_to_string(&mut answer).unwrap();
+                answer
+            })
+        };
+        // Long enough for the firewall here, which holds a new binary's first connections.
+        let shown = |h: &mut Harness<'_, App>| {
+            for _ in 0..3000 {
+                h.run();
+                if h.query_by_label("Continue").is_some() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("nothing held");
+        };
+
+        let app = send();
+        shown(&mut h);
+        shot(&mut h, "t-capture-paused");
+        {
+            let view = h.state().capture.as_ref().unwrap();
+            let held = &mut view.controls.paused.lock().unwrap()[0];
+            held.text = held.text.replacen("/held", "/edited", 1);
+        }
+        h.get_by_label("Continue").click();
+        h.run();
+        assert!(h.query_by_label("Continue").is_none(), "let go");
+        let answer = app.join().unwrap().to_lowercase();
+        assert!(answer.contains("\r\n\r\nget /edited http/1.1"), "{answer}");
+        // A GET goes on without a body, as the app sent it.
+        assert!(!answer.contains("content-length: 0"), "{answer}");
+
+        let app = send();
+        shown(&mut h);
+        h.get_by_label("Abort").click();
+        h.run();
+        assert!(h.query_by_label("Continue").is_none(), "dropped");
+        let answer = app.join().unwrap();
+        assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+
+        // Stopped, what was held goes with the server.
+        let app = send();
+        shown(&mut h);
+        h.get_by_label("Stop").click();
+        h.run();
+        assert!(
+            h.query_by_label("Continue").is_none(),
+            "gone with the server"
+        );
+        let _ = app.join();
     }
 
     /// A rule added in the pane applies to the next exchange and is kept in the workspace:

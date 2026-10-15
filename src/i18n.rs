@@ -1885,6 +1885,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Request header", "請求標頭"),
     ("Response header", "回應標頭"),
     ("Throttle", "限速"),
+    ("Breakpoint", "中斷點"),
+    ("Request", "請求"),
     ("File to answer with", "用來回應的檔案"),
     ("Value (empty: removed)", "值（留空即移除）"),
     ("Held before going on", "送出前先等待"),
@@ -1902,6 +1904,17 @@ const ZH_TW: &[(&str, &str)] = &[
     (
         "Throttled: held {} ms, at most {} KiB/s",
         "已限速：等待 {} 毫秒，最快 {} KiB/s",
+    ),
+    ("Held at a breakpoint", "曾在中斷點暫停"),
+    ("Held at a breakpoint: the request", "在中斷點暫停：請求"),
+    ("Held at a breakpoint: the answer", "在中斷點暫停：回應"),
+    ("{} more waiting", "還有 {} 個在等待"),
+    ("Continue", "繼續"),
+    ("Abort", "中止"),
+    ("The app gets a 502 instead", "應用程式改收到 502"),
+    (
+        "Edit it, then Continue: the first line, a header a line, a blank line, the body.",
+        "編輯後按「繼續」：第一行、每行一個標頭、一個空行、內文。",
     ),
     (
         "Add it to the trusted roots of the system (Keychain Access, certmgr) or of the app",
