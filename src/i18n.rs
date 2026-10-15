@@ -1893,6 +1893,80 @@ const ZH_TW: &[(&str, &str)] = &[
         "連 HTTPS 也讀取：每個主機改用 apitool CA 簽發的憑證，應用程式必須信任這個 CA",
     ),
     ("Export CA certificate…", "匯出 CA 憑證…"),
+    ("Trusting apitool's CA", "信任 apitool 的 CA"),
+    ("Command line", "命令列工具"),
+    ("Phones", "手機"),
+    (
+        "Save it with Export CA certificate… first: the commands then name the file.",
+        "先用「匯出 CA 憑證…」存檔，下面的指令就會帶入那個檔案。",
+    ),
+    (
+        "apitool's own requests trust it once the system does, or as the Extra CA bundle in Settings › Network.",
+        "系統信任之後，apitool 自己的請求也會信任；或在 設定 › 網路 把它填進「額外的 CA 憑證」。",
+    ),
+    ("Copied the command", "已複製指令"),
+    (
+        "For this user, in Safari, Chrome, Edge, apitool and most apps; macOS asks for your password:",
+        "對目前使用者生效，Safari、Chrome、Edge、apitool 與大多數應用程式都會信任；macOS 會要求輸入密碼：",
+    ),
+    (
+        "Or by hand: open the file in Keychain Access, double-click apitool capture CA, and under Trust set When using this certificate to Always Trust.",
+        "或手動：用「鑰匙圈存取」打開檔案，雙擊 apitool capture CA，在「信任」把「使用此憑證時」設為「永遠信任」。",
+    ),
+    ("To take it back:", "日後要移除："),
+    (
+        "For this user, in Edge, Chrome, apitool and most apps, no administrator needed; Windows asks to confirm:",
+        "對目前使用者生效，Edge、Chrome、apitool 與大多數應用程式都會信任，不需要系統管理員；Windows 會請你確認：",
+    ),
+    (
+        "Or by hand: double-click the .crt file, Install Certificate…, Current User, then place it in Trusted Root Certification Authorities.",
+        "或手動：雙擊 .crt 檔，「安裝憑證…」，選「目前使用者」，再放到「受信任的根憑證授權單位」。",
+    ),
+    (
+        "Debian, Ubuntu, and Ubuntu in WSL:",
+        "Debian、Ubuntu，以及 WSL 裡的 Ubuntu：",
+    ),
+    ("Fedora, RHEL, Arch:", "Fedora、RHEL、Arch："),
+    (
+        "Chrome and Chromium keep their own list on Linux (certutil is in libnss3-tools):",
+        "Linux 上的 Chrome 與 Chromium 用自己的清單（certutil 在 libnss3-tools 套件）：",
+    ),
+    (
+        "Firefox keeps its own list: Settings › Privacy & Security › Certificates › View Certificates… › Authorities › Import…, pick the file and tick Trust this CA to identify websites.",
+        "Firefox 用自己的清單：設定 › 隱私權與安全性 › 憑證 › 檢視憑證… › 憑證機構 › 匯入…，選這個檔案並勾選「信任由此憑證機構來識別網站」。",
+    ),
+    (
+        "On Windows and macOS it can use the system's instead: set this to true in about:config.",
+        "在 Windows 與 macOS 上也可以改用系統的清單：在 about:config 把這項設為 true。",
+    ),
+    (
+        "Many tools bring their own roots and don't read the system's proxy. In the shell to capture from:",
+        "很多工具自帶根憑證，也不讀系統代理。在要擷取的那個 shell 裡：",
+    ),
+    (
+        "NODE_EXTRA_CA_CERTS adds to Node's roots. REQUESTS_CA_BUNDLE (Python requests, pip) and SSL_CERT_FILE (OpenSSL: Python, Ruby, PHP) replace theirs, which is fine while everything goes through the capture.",
+        "NODE_EXTRA_CA_CERTS 是加進 Node 的根憑證；REQUESTS_CA_BUNDLE（Python requests、pip）與 SSL_CERT_FILE（OpenSSL：Python、Ruby、PHP）則會取代原本的，所有流量都經過擷取時沒有問題。",
+    ),
+    (
+        "Java, into the JDK's own list (its password is changeit):",
+        "Java，加進 JDK 自己的清單（密碼是 changeit）：",
+    ),
+    (
+        "Tick Other devices too before Start, then set the phone's Wi-Fi proxy to Manual: server {}, port {}.",
+        "開始前勾選「也接受其他裝置」，再把手機 Wi-Fi 的代理設為手動：伺服器 {}，連接埠 {}。",
+    ),
+    (
+        "Get the file onto the phone: AirDrop, mail or a chat to yourself.",
+        "把檔案傳到手機：AirDrop、郵件，或傳訊息給自己。",
+    ),
+    (
+        "iPhone and iPad: open it, install it in Settings › Profile Downloaded, then turn it on in Settings › General › About › Certificate Trust Settings.",
+        "iPhone 與 iPad：打開檔案，到 設定 › 已下載描述檔 安裝，再到 設定 › 一般 › 關於本機 › 憑證信任設定 開啟。",
+    ),
+    (
+        "Android: Settings › Security › Encryption & credentials › Install a certificate › CA certificate (names vary by maker). Chrome trusts it; since Android 7, other apps only if they opt in.",
+        "Android：設定 › 安全性 › 加密與憑證 › 安裝憑證 › CA 憑證（名稱依廠牌而異）。Chrome 會信任；Android 7 起，其他 App 要自己選擇信任使用者憑證才會生效。",
+    ),
     ("Use as the system proxy", "設為系統代理"),
     (
         "Points the system's HTTP and HTTPS proxy here; Stop or quitting puts back what was set",

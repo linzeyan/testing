@@ -535,6 +535,10 @@ struct CaptureView {
     /// The OS's connection table shows instead of the flows.
     conns_shown: bool,
     conns: crate::conns::Table,
+    /// The trust guide's tab, of `trust_ui`'s.
+    trust: usize,
+    /// Where the CA was last exported to, for the guide's commands to name.
+    ca_file: Option<String>,
 }
 
 /// Stops the capture proxy when dropped.
@@ -4475,6 +4479,20 @@ impl App {
                 &[&lan, &port, &port],
             ));
         }
+        if decrypting && let Some(view) = &mut self.capture {
+            let lan = (view.server.as_ref()).and_then(|s| s.lan);
+            let lan = lan.map_or(t("this machine's address").to_owned(), |ip| ip.to_string());
+            let port = listening.map_or(9090, |a| a.port());
+            let copied = egui::CollapsingHeader::new(t("Trusting apitool's CA"))
+                .id_salt("capture-trust")
+                .show(ui, |ui| {
+                    trust_ui(ui, &mut view.trust, view.ca_file.as_deref(), port, &lan)
+                })
+                .body_returned;
+            if copied == Some(true) {
+                self.status = t("Copied the command").into();
+            }
+        }
         if let Some(on) = let_in
             && let Some(view) = &mut self.capture
         {
@@ -4610,10 +4628,17 @@ impl App {
         }
         if export_ca
             && let Some(ca) = ca
-            && let Some(to) = pick_file("apitool-capture-ca.pem", &[("PEM", &["pem", "crt"])], true)
+            // .crt: what Windows opens by double-click, and Debian's update-ca-certificates
+            // and Android's installer take; PEM inside, as all of them read.
+            && let Some(to) = pick_file("apitool-capture-ca.crt", &[("PEM", &["crt", "pem"])], true)
         {
             match std::fs::write(&to, ca.pem()) {
-                Ok(()) => self.status = tf("Saved {}", &[&to]),
+                Ok(()) => {
+                    self.status = tf("Saved {}", &[&to]);
+                    if let Some(view) = &mut self.capture {
+                        view.ca_file = Some(to);
+                    }
+                }
                 Err(e) => self.fail(format!("{to}: {e}")),
             }
         }
@@ -7803,27 +7828,7 @@ impl App {
                         }
                         if let Ok(cli) = &cli {
                             let setup = mcp_setup(*mcp_client, cli, &root, *mcp_window);
-                            // A code block as docs show one, its copy icon in the corner.
-                            let copy = egui::Frame::new()
-                                .fill(ui.visuals().code_bg_color)
-                                .corner_radius(4.0)
-                                .inner_margin(egui::Margin::symmetric(8, 6))
-                                .show(ui, |ui| {
-                                    ui.horizontal_top(|ui| {
-                                        let gap = ui.spacing().item_spacing.x;
-                                        let width = ui.available_width() - button_height(ui) - gap;
-                                        ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
-                                            ui.set_width(width);
-                                            let code = RichText::new(&setup).monospace();
-                                            ui.add(egui::Label::new(code).wrap());
-                                        });
-                                        icon_button(ui, icon::COPY, t("Copy"), None)
-                                            .on_hover_text(t("Copy"))
-                                            .clicked()
-                                    })
-                                    .inner
-                                });
-                            if copy.inner {
+                            if code_block(ui, &setup) {
                                 ui.ctx().copy_text(setup.clone());
                                 let client = MCP_CLIENTS[*mcp_client];
                                 copied = Some(tf("Copied the setup for {}", &[&client]));
@@ -12225,6 +12230,193 @@ fn capture_view(ctx: &egui::Context, ws: &Workspace) -> CaptureView {
         open: ws.load_capture_open(),
         conns_shown: false,
         conns: Default::default(),
+        // This system's tab first.
+        trust: if cfg!(windows) {
+            1
+        } else if cfg!(target_os = "macos") {
+            0
+        } else {
+            2
+        },
+        ca_file: None,
+    }
+}
+
+/// A code block as docs show one, its copy icon in the corner: true when that was clicked.
+fn code_block(ui: &mut egui::Ui, code: &str) -> bool {
+    let copy = egui::Frame::new()
+        .fill(ui.visuals().code_bg_color)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                let gap = ui.spacing().item_spacing.x;
+                let width = ui.available_width() - button_height(ui) - gap;
+                ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
+                    ui.set_width(width);
+                    ui.add(egui::Label::new(RichText::new(code).monospace()).wrap());
+                });
+                icon_button(ui, icon::COPY, t("Copy"), None)
+                    .on_hover_text(t("Copy"))
+                    .clicked()
+            })
+            .inner
+        });
+    copy.inner
+}
+
+/// How to have apps trust the capture's CA, a tab per system or kind of app; true when a
+/// command was copied.
+fn trust_ui(ui: &mut egui::Ui, tab: &mut usize, file: Option<&str>, port: u16, lan: &str) -> bool {
+    let tabs = [
+        "macOS",
+        "Windows",
+        "Linux, WSL",
+        "Firefox",
+        t("Command line"),
+        t("Phones"),
+    ];
+    ui.horizontal(|ui| {
+        for (i, name) in tabs.into_iter().enumerate() {
+            ui.selectable_value(tab, i, name);
+        }
+    });
+    if file.is_none() {
+        ui.weak(t(
+            "Save it with Export CA certificate… first: the commands then name the file.",
+        ));
+    }
+    let file = file.unwrap_or("apitool-capture-ca.crt");
+    let mut copied = false;
+    for (text, code) in trust_steps(*tab, file, port, lan, cfg!(windows)) {
+        ui.label(text);
+        if let Some(code) = code
+            && code_block(ui, &code)
+        {
+            ui.ctx().copy_text(code);
+            copied = true;
+        }
+    }
+    ui.weak(t(
+        "apitool's own requests trust it once the system does, or as the Extra CA bundle in Settings › Network.",
+    ));
+    copied
+}
+
+/// `trust_ui`'s steps on `tab`: a line of text each, and the command it gives, naming `file`
+/// as the shell it runs in reads it and the capture at `port`, or `lan` from another device.
+fn trust_steps(
+    tab: usize,
+    file: &str,
+    port: u16,
+    lan: &str,
+    windows: bool,
+) -> Vec<(String, Option<String>)> {
+    let say = |text: &str| (text.to_owned(), None);
+    let run = |text: &str, code: String| (text.to_owned(), Some(code));
+    let proxy = format!("http://127.0.0.1:{port}");
+    match tab {
+        0 => vec![
+            run(
+                t("For this user, in Safari, Chrome, Edge, apitool and most apps; macOS asks for your password:"),
+                format!("security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db \"{file}\""),
+            ),
+            say(t(
+                "Or by hand: open the file in Keychain Access, double-click apitool capture CA, and under Trust set When using this certificate to Always Trust.",
+            )),
+            run(
+                t("To take it back:"),
+                "security delete-certificate -c \"apitool capture CA\" ~/Library/Keychains/login.keychain-db".into(),
+            ),
+        ],
+        1 => vec![
+            run(
+                t("For this user, in Edge, Chrome, apitool and most apps, no administrator needed; Windows asks to confirm:"),
+                format!("certutil -user -addstore Root \"{file}\""),
+            ),
+            say(t(
+                "Or by hand: double-click the .crt file, Install Certificate…, Current User, then place it in Trusted Root Certification Authorities.",
+            )),
+            run(
+                t("To take it back:"),
+                "certutil -user -delstore Root \"apitool capture CA\"".into(),
+            ),
+        ],
+        2 => {
+            // WSL reads a Windows path under /mnt, so the commands run there as they are.
+            let file = wsl_path(file);
+            vec![
+                run(
+                    t("Debian, Ubuntu, and Ubuntu in WSL:"),
+                    format!("sudo cp \"{file}\" /usr/local/share/ca-certificates/apitool-capture-ca.crt && sudo update-ca-certificates"),
+                ),
+                run(t("Fedora, RHEL, Arch:"), format!("sudo trust anchor --store \"{file}\"")),
+                run(
+                    t("Chrome and Chromium keep their own list on Linux (certutil is in libnss3-tools):"),
+                    format!("certutil -d sql:$HOME/.pki/nssdb -A -t \"C,,\" -n \"apitool capture CA\" -i \"{file}\""),
+                ),
+            ]
+        }
+        3 => vec![
+            say(t(
+                "Firefox keeps its own list: Settings › Privacy & Security › Certificates › View Certificates… › Authorities › Import…, pick the file and tick Trust this CA to identify websites.",
+            )),
+            run(
+                t("On Windows and macOS it can use the system's instead: set this to true in about:config."),
+                "security.enterprise_roots.enabled".into(),
+            ),
+        ],
+        4 => {
+            let shell = match windows {
+                true => format!(
+                    "$env:HTTPS_PROXY = \"{proxy}\"; $env:HTTP_PROXY = \"{proxy}\"\n$env:NODE_EXTRA_CA_CERTS = \"{file}\"\n$env:REQUESTS_CA_BUNDLE = \"{file}\"; $env:SSL_CERT_FILE = \"{file}\""
+                ),
+                false => format!(
+                    "export HTTPS_PROXY={proxy} HTTP_PROXY={proxy}\nexport NODE_EXTRA_CA_CERTS=\"{file}\"\nexport REQUESTS_CA_BUNDLE=\"{file}\" SSL_CERT_FILE=\"{file}\""
+                ),
+            };
+            vec![
+                run(
+                    t("Many tools bring their own roots and don't read the system's proxy. In the shell to capture from:"),
+                    shell,
+                ),
+                say(t(
+                    "NODE_EXTRA_CA_CERTS adds to Node's roots. REQUESTS_CA_BUNDLE (Python requests, pip) and SSL_CERT_FILE (OpenSSL: Python, Ruby, PHP) replace theirs, which is fine while everything goes through the capture.",
+                )),
+                run("curl:", format!("curl --proxy {proxy} --cacert \"{file}\" https://example.com")),
+                run(
+                    t("Java, into the JDK's own list (its password is changeit):"),
+                    format!("keytool -importcert -cacerts -alias apitool-capture -file \"{file}\""),
+                ),
+            ]
+        }
+        _ => vec![
+            (
+                tf(
+                    "Tick Other devices too before Start, then set the phone's Wi-Fi proxy to Manual: server {}, port {}.",
+                    &[&lan, &port],
+                ),
+                None,
+            ),
+            say(t("Get the file onto the phone: AirDrop, mail or a chat to yourself.")),
+            say(t(
+                "iPhone and iPad: open it, install it in Settings › Profile Downloaded, then turn it on in Settings › General › About › Certificate Trust Settings.",
+            )),
+            say(t(
+                "Android: Settings › Security › Encryption & credentials › Install a certificate › CA certificate (names vary by maker). Chrome trusts it; since Android 7, other apps only if they opt in.",
+            )),
+        ],
+    }
+}
+
+/// A Windows path as WSL reads it, under /mnt; any other as it is.
+fn wsl_path(path: &str) -> String {
+    match path.as_bytes() {
+        [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic() => {
+            let rest = path[3..].replace('\\', "/");
+            format!("/mnt/{}/{rest}", d.to_ascii_lowercase() as char)
+        }
+        _ => path.to_owned(),
     }
 }
 
@@ -21348,6 +21540,111 @@ mod ui_tests {
         let kept = h.state().ws.load_capture_ca();
         let sealed = cfg!(any(windows, target_os = "macos"));
         assert_eq!(kept.contains("PRIVATE KEY"), !sealed, "{kept}");
+    }
+
+    /// Every command the guide gives is pasted as is, so it names the exported file as its
+    /// shell reads it: quoted for a space, a Windows path under /mnt for WSL's Linux, and
+    /// PowerShell's syntax on Windows; tools and phones are pointed at the capture's port.
+    #[test]
+    fn the_trust_commands_name_the_file_as_their_shell_reads_it() {
+        let file = r"C:\Users\Jo Lee\apitool-capture-ca.crt";
+        let codes = |tab, file, windows| -> Vec<String> {
+            (trust_steps(tab, file, 9091, "192.168.1.5", windows).into_iter())
+                .filter_map(|(_, code)| code)
+                .collect()
+        };
+        assert_eq!(
+            codes(0, "/Users/jo/ca.crt", false)[0],
+            r#"security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db "/Users/jo/ca.crt""#
+        );
+        assert_eq!(
+            codes(1, file, true)[0],
+            r#"certutil -user -addstore Root "C:\Users\Jo Lee\apitool-capture-ca.crt""#
+        );
+        let linux = codes(2, file, true);
+        assert_eq!(linux.len(), 3);
+        for code in &linux {
+            assert!(
+                code.contains("\"/mnt/c/Users/Jo Lee/apitool-capture-ca.crt\""),
+                "{code}"
+            );
+        }
+        assert_eq!(wsl_path("/home/jo/ca.crt"), "/home/jo/ca.crt");
+        let shell = &codes(4, file, true)[0];
+        assert!(
+            shell.contains(r#"$env:HTTPS_PROXY = "http://127.0.0.1:9091""#),
+            "{shell}"
+        );
+        assert!(
+            shell.contains(&format!("$env:NODE_EXTRA_CA_CERTS = \"{file}\"")),
+            "{shell}"
+        );
+        let shell = &codes(4, "/Users/jo/ca.crt", false)[0];
+        assert!(
+            shell.contains("export HTTPS_PROXY=http://127.0.0.1:9091"),
+            "{shell}"
+        );
+        assert!(
+            shell.contains(r#"export NODE_EXTRA_CA_CERTS="/Users/jo/ca.crt""#),
+            "{shell}"
+        );
+        let phone = &trust_steps(5, file, 9091, "192.168.1.5", false)[0].0;
+        assert!(phone.contains("server 192.168.1.5, port 9091"), "{phone}");
+    }
+
+    /// The guide shows only while decrypting, opens on this system's tab, names the file the
+    /// CA was exported to, and copies a command with a click.
+    #[test]
+    fn the_trust_guide_shows_while_decrypting_with_the_exported_file() {
+        let mut h = harness(workspace("capture-trust"));
+        h.run();
+        h.state_mut().act(Action::Capture);
+        h.run();
+        assert!(h.query_by_label("Trusting apitool's CA").is_none());
+        h.get_by_label("Decrypt HTTPS").click();
+        h.run();
+        let file = std::env::temp_dir()
+            .join("exported-ca.crt")
+            .display()
+            .to_string();
+        h.state_mut().capture.as_mut().unwrap().ca_file = Some(file.clone());
+        h.get_by_label("Trusting apitool's CA").click();
+        h.run();
+        shot(&mut h, "t-capture-trust");
+        let ours = match () {
+            _ if cfg!(windows) => "certutil -user -addstore Root",
+            _ if cfg!(target_os = "macos") => "security add-trusted-cert",
+            _ => "update-ca-certificates",
+        };
+        assert!(
+            h.query_by_label_contains(ours).is_some(),
+            "this system's tab"
+        );
+        assert!(h.query_by_label_contains(&format!("\"{file}\"")).is_some());
+        h.get_by_label("Firefox").click();
+        h.run();
+        assert!(
+            h.query_by_label_contains("security.enterprise_roots.enabled")
+                .is_some()
+        );
+        assert!(h.query_by_label_contains(ours).is_none());
+        h.query_all_by_label("Copy").next().unwrap().click();
+        // The frame that handles the click is the one whose output carries the copy.
+        let copied = (0..4).find_map(|_| {
+            h.step();
+            (h.output().platform_output.commands.iter()).find_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+        });
+        assert_eq!(copied.as_deref(), Some("security.enterprise_roots.enabled"));
+        assert_eq!(h.state().status, "Copied the command");
+        h.get_by_label("Decrypt HTTPS").click();
+        h.run();
+        assert!(
+            h.query_by_label("Trusting apitool's CA").is_none(),
+            "gone with decrypting"
+        );
     }
 
     /// The system proxy pointed at the capture goes back as it was at the next start after

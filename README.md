@@ -395,8 +395,11 @@ request, its answer as an example. The export icon writes every flow as HAR. HTT
 through as a tunnel, shown with its host and the bytes each way, unless "Decrypt HTTPS" is
 on: then each host gets a certificate from apitool's own CA, made once and kept in the
 workspace (its key sealed as secrets are), and its requests show as any other. "Export CA
-certificate…" saves the CA for the system's trusted roots (Keychain Access, certmgr) or an
-app's; an app that doesn't trust it fails to connect, and its tunnel says so. Decrypted
+certificate…" saves the CA as a .crt file for the system's trusted roots or an app's; an app
+that doesn't trust it fails to connect, and its tunnel says so. "Trusting apitool's CA",
+shown while decrypting, has the steps for macOS, Windows, Linux and WSL, Firefox, command-line
+tools (Node, Python, curl, Java) and phones, its commands naming the exported file, a click
+to copy each. Decrypted
 connections speak HTTP/1.1, so an app that only speaks HTTP/2 (gRPC) can't go through. The
 latest 1000 flows are kept, each body's first 256 KiB. WebSocket upgrades through the proxy
 aren't relayed.
