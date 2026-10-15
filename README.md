@@ -408,6 +408,14 @@ it says, or **Abort** answers the app with a 502. A binary body goes on as it wa
 note is typed over; Stop drops whatever is held. A row a rule changed has an orange dot, and
 its detail says what changed. HTTPS needs "Decrypt HTTPS" on for rules to see inside.
 
+**Connections**, beside Flows, lists every TCP and UDP connection the OS has open, as
+Sniffnet does, without the proxy: each process (name and PID), its local and remote
+address, and the state, listed again every 2 seconds and filtered by process, address or
+state. Listeners are dimmed. It reads the OS's own tables (`lsof` on macOS and Linux,
+`netstat` and `tasklist` on Windows) rather than capturing packets, which would need a
+driver installed (Npcap), so there are no byte counts. On macOS and Linux only your own
+processes show; the others' need root.
+
 ## Command line
 
 ```

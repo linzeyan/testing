@@ -530,6 +530,9 @@ struct CaptureView {
     controls: Arc<crate::capture::Controls>,
     /// The system's proxy points here (what it was is in the workspace).
     system: bool,
+    /// The OS's connection table shows instead of the flows.
+    conns_shown: bool,
+    conns: crate::conns::Table,
 }
 
 /// Stops the capture proxy when dropped.
@@ -4496,30 +4499,53 @@ impl App {
             flows,
             filter,
             picked,
+            conns_shown,
+            conns,
             ..
         }) = &mut self.capture
         {
             ui.horizontal(|ui| {
-                ui.weak(tf("{} flows", &[&flows.with(<[_]>::len)]));
-                if icon_button(ui, icon::ERASER, t("Clear"), None)
-                    .on_hover_text(t("Clear"))
-                    .clicked()
-                {
-                    flows.clear();
+                ui.selectable_value(conns_shown, false, t("Flows"));
+                ui.selectable_value(conns_shown, true, t("Connections"))
+                    .on_hover_text(t(
+                        "Every TCP and UDP connection the OS lists, by process: no proxy needed, no byte counts",
+                    ));
+                ui.separator();
+                if *conns_shown {
+                    let listed = conns.list.as_ref().and_then(|l| l.as_ref().ok());
+                    ui.weak(tf("{} connections", &[&listed.map_or(0, Vec::len)]));
+                } else {
+                    ui.weak(tf("{} flows", &[&flows.with(<[_]>::len)]));
+                    if icon_button(ui, icon::ERASER, t("Clear"), None)
+                        .on_hover_text(t("Clear"))
+                        .clicked()
+                    {
+                        flows.clear();
+                    }
+                    export = icon_button(ui, icon::EXPORT, t("Export as HAR…"), None)
+                        .on_hover_text(t("Export as HAR…"))
+                        .clicked();
                 }
-                export = icon_button(ui, icon::EXPORT, t("Export as HAR…"), None)
-                    .on_hover_text(t("Export as HAR…"))
-                    .clicked();
+                let hint = match *conns_shown {
+                    true => t("Filter by process, address or state"),
+                    false => t("Filter by URL or method"),
+                };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add(
                         egui::TextEdit::singleline(filter)
-                            .hint_text(t("Filter by URL or method"))
+                            .hint_text(hint)
                             .desired_width(200.0),
                     );
                 });
             });
             ui.separator();
-            open_as = flows.with(|list| flow_list(ui, list, filter, picked));
+            if *conns_shown {
+                let ctx = ui.ctx().clone();
+                conns.refresh(move || ctx.request_repaint());
+                conns_list(ui, conns, filter);
+            } else {
+                open_as = flows.with(|list| flow_list(ui, list, filter, picked));
+            }
         }
         if start {
             self.start_capture(&ui.ctx().clone());
@@ -12144,6 +12170,8 @@ fn capture_view(ctx: &egui::Context, ws: &Workspace) -> CaptureView {
         picked: None,
         controls: Arc::new(controls),
         system: false,
+        conns_shown: false,
+        conns: Default::default(),
     }
 }
 
@@ -12279,6 +12307,55 @@ fn applied_text(act: &crate::capture::Act) -> String {
         ),
         Act::Breakpoint { .. } => t("Held at a breakpoint").into(),
     }
+}
+
+/// The OS's connections, a row each, by process, as Sniffnet lists them. A listener, with no
+/// other end, is dimmed so the live ones stand out.
+fn conns_list(ui: &mut egui::Ui, table: &crate::conns::Table, filter: &str) {
+    let list = match &table.list {
+        None => {
+            ui.spinner();
+            return;
+        }
+        Some(Err(e)) => {
+            ui.colored_label(RED, e.as_str());
+            return;
+        }
+        Some(Ok(list)) => list,
+    };
+    #[cfg(unix)]
+    ui.weak(t("Only your own processes show: the others' need root."));
+    let needle = filter.trim().to_lowercase();
+    let hits: Vec<_> = (list.iter())
+        .filter(|c| {
+            let fields = [&c.process, &c.proto, &c.local, &c.remote, &c.state];
+            needle.is_empty()
+                || c.pid.to_string() == needle
+                || fields.iter().any(|f| f.to_lowercase().contains(&needle))
+        })
+        .collect();
+    let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .show_rows(ui, row_h, hits.len(), |ui, rows| {
+            for c in &hits[rows] {
+                let arrow = if c.remote.is_empty() { " " } else { "→" };
+                let line = format!(
+                    "{:<24.24} {:>6}  {:<3}  {:<28} {arrow} {:<28} {}",
+                    c.process, c.pid, c.proto, c.local, c.remote, c.state
+                );
+                let text = RichText::new(line).monospace();
+                let text = if c.remote.is_empty() {
+                    text.weak()
+                } else {
+                    text
+                };
+                ui.horizontal(|ui| {
+                    ui.set_height(row_h);
+                    ui.add(egui::Label::new(text).truncate());
+                });
+            }
+        });
 }
 
 /// The capture's flows, newest at the bottom as they come, and the one picked under them,
@@ -21227,6 +21304,41 @@ mod ui_tests {
         h.get_by_label("Close the capture").click();
         h.run();
         assert_eq!(kept(&h), "", "put back on closing the capture");
+    }
+
+    /// The Connections view lists what the OS has open, by process, this one's listener
+    /// among them; the filter narrows it to an address.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn the_connections_view_lists_this_process_sockets() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut h = harness(workspace("conns"));
+        h.run();
+        h.state_mut().act(Action::Capture);
+        h.run();
+        h.get_by_label("Connections").click();
+        h.state_mut().capture.as_mut().unwrap().filter = addr.clone();
+        // Stepped: the spinner redraws until the listing is in.
+        for _ in 0..1500 {
+            h.step();
+            if h.state().capture.as_ref().unwrap().conns.list.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        h.run();
+        shot(&mut h, "t-capture-conns");
+        let row = h.get_by_label_contains(&addr);
+        let row = row.value().unwrap_or_default();
+        let pid = std::process::id().to_string();
+        assert!(row.starts_with("apitool") && row.contains(&pid), "{row}");
+        assert!(row.contains("LISTEN"), "{row}");
+        assert_eq!(
+            h.query_all_by_label_contains("  TCP  ").count(),
+            1,
+            "filtered"
+        );
     }
 
     /// An exchange held at a breakpoint shows atop the capture pane as text to edit:

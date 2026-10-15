@@ -1847,6 +1847,21 @@ const ZH_TW: &[(&str, &str)] = &[
     ("{} flows", "{} 筆流量"),
     ("Export as HAR…", "匯出為 HAR…"),
     ("Filter by URL or method", "依 URL 或方法篩選"),
+    ("Flows", "流量"),
+    ("Connections", "連線"),
+    (
+        "Every TCP and UDP connection the OS lists, by process: no proxy needed, no byte counts",
+        "作業系統列出的每個 TCP 與 UDP 連線，依程序排列：不必經過代理，但沒有位元組數",
+    ),
+    ("{} connections", "{} 個連線"),
+    (
+        "Filter by process, address or state",
+        "依程序、位址或狀態篩選",
+    ),
+    (
+        "Only your own processes show: the others' need root.",
+        "只顯示你自己的程序：其他程序的連線需要 root 權限。",
+    ),
     ("Nothing captured yet.", "尚未擷取到任何內容。"),
     ("Open as request", "開成請求"),
     (
