@@ -334,8 +334,9 @@ empty tree): paste it, give its path or drop the file (or folder).
 | Insomnia v4 JSON / v5 YAML | Folders, auth and scripts; `{{ _.x }}` as `{{x}}`; the base environment as collection variables and each sub-environment as an environment |
 | HAR from browser devtools | A folder per host, each response kept as the request's example |
 
-Copy a folder or the whole collection as a Postman collection, and an environment (from its
-editor) as a Postman environment, its secrets as Postman's secret type.
+Copy a folder or the whole collection as a Postman collection, or export it as one (right-click
+> "Copy as" or "Export"), and an environment (from its editor) as a Postman environment, its
+secrets as Postman's secret type.
 
 "</> Code" writes the request as curl, wget, HTTPie, PowerShell, raw HTTP, Python, fetch,
 axios, Go, Java, C#, PHP, Ruby, Rust, Swift or Kotlin. A Binary body reads its file, and
@@ -351,8 +352,8 @@ last carries over between kinds. Long lines scroll sideways rather than wrap.
 | gRPC | grpcurl, grpc-js, grpcio, by the method's streaming shape |
 
 API docs come from request and folder descriptions and saved examples: right-click a
-folder (or More above the collections) > "Copy docs as Markdown", "Export docs as
-Markdown…" or "Export as OpenAPI…", or `apitool-cli docs`. The OpenAPI 3.1 document (YAML,
+folder (or More above the collections) > "Copy as" or "Export" > Markdown or OpenAPI, or
+`apitool-cli docs`. The OpenAPI 3.1 document (YAML,
 or JSON for a .json file) imports back as the same requests: the server from `{{baseUrl}}`
 with the folder's value, `:id` and `{{var}}` path segments as path parameters, query
 parameters that are off as optional, a tag per subfolder, bodies and saved examples with a

@@ -866,10 +866,10 @@ enum TreeAction {
     Duplicate(PathBuf),
     Run(PathBuf),
     FolderSettings(PathBuf),
-    CopyDocs(PathBuf),
-    /// To a file: OpenAPI when true, else Markdown.
-    ExportDocs(PathBuf, bool),
-    CopyPostman(PathBuf),
+    /// A folder's requests onto the clipboard as this format.
+    Copy(PathBuf, Format),
+    /// A folder's requests to a file in this format.
+    Export(PathBuf, Format),
     Mock(PathBuf),
     /// A folder clicked: where the tree is now.
     Folder(PathBuf),
@@ -883,6 +883,65 @@ enum TreeAction {
     Move(Vec<PathBuf>, PathBuf),
     /// What, next to which, after it (else before).
     Place(Vec<PathBuf>, PathBuf, bool),
+}
+
+/// What a folder's requests can be copied or exported as, under Copy as and Export.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Format {
+    Markdown,
+    OpenApi,
+    Postman,
+}
+
+impl Format {
+    const ALL: [Format; 3] = [Format::Markdown, Format::OpenApi, Format::Postman];
+
+    fn name(self) -> &'static str {
+        match self {
+            Format::Markdown => "Markdown",
+            Format::OpenApi => "OpenAPI",
+            Format::Postman => t("Postman collection"),
+        }
+    }
+
+    /// The file it's saved as for `name`, and the save dialog's filter.
+    fn file(self, name: &str) -> (String, (&'static str, &'static [&'static str])) {
+        match self {
+            Format::Markdown => (format!("{name}.md"), ("Markdown", &["md"])),
+            Format::OpenApi => (
+                format!("{name}.yaml"),
+                ("OpenAPI", &["yaml", "yml", "json"]),
+            ),
+            Format::Postman => (
+                format!("{name}.postman_collection.json"),
+                ("Postman", &["json"]),
+            ),
+        }
+    }
+
+    /// The requests under `dir` as the file `file` holds them (OpenAPI's extension picks
+    /// YAML or JSON), and what was left out, said after what was done; empty if nothing.
+    fn text(self, ws: &Workspace, dir: &Path, file: &Path) -> Result<(String, String), String> {
+        let (text, left, why) = match self {
+            Format::Markdown | Format::OpenApi => {
+                let (text, left) = crate::docs::for_file(ws, dir, file)?;
+                let why = t(
+                    "; left out {} it can't describe: streams, gRPC, or a second request to the same method and path",
+                );
+                (text, left, why)
+            }
+            Format::Postman => {
+                let (text, _, left) = crate::postman::collection(ws, dir)?;
+                let why = t("; left out {} WebSocket/SSE/gRPC, which collections can't hold");
+                (text, left, why)
+            }
+        };
+        let left = match left {
+            0 => String::new(),
+            n => fill(why, &[&n]),
+        };
+        Ok((text, left))
+    }
 }
 
 /// Collection runner pane. Settings persist while the pane is open; results are summaries only.
@@ -3900,22 +3959,10 @@ impl App {
             let more =
                 icon_button(ui, icon::MORE, t("More"), None).on_hover_text(t("All collections"));
             egui::Popup::menu(&more).show(|ui| {
-                if ui.button(t("Copy docs as Markdown")).clicked() {
-                    self.copy_docs(&root, ui.ctx());
-                    ui.close();
-                }
-                for (label, openapi) in [
-                    (t("Export docs as Markdown…"), false),
-                    (t("Export as OpenAPI…"), true),
-                ] {
-                    if ui.button(label).clicked() {
-                        ui.close();
-                        self.export_dialog(&root, openapi);
-                    }
-                }
-                if ui.button(t("Copy as Postman collection")).clicked() {
-                    self.copy_postman(&root, ui.ctx());
-                    ui.close();
+                match copy_export_menus(ui) {
+                    Some((format, false)) => self.copy_as(&root, format, ui.ctx()),
+                    Some((format, true)) => self.export_dialog(&root, format),
+                    None => {}
                 }
                 if ui.button(t("Start mock server")).clicked() {
                     self.start_mock(root.clone(), ui.ctx());
@@ -4106,9 +4153,8 @@ impl App {
                 TreeAction::Duplicate(path) => self.duplicate(&path),
                 TreeAction::Run(path) => self.open_runner(path),
                 TreeAction::FolderSettings(dir) => self.open_folder_editor(dir),
-                TreeAction::CopyDocs(dir) => self.copy_docs(&dir, ui.ctx()),
-                TreeAction::ExportDocs(dir, openapi) => self.export_dialog(&dir, openapi),
-                TreeAction::CopyPostman(dir) => self.copy_postman(&dir, ui.ctx()),
+                TreeAction::Copy(dir, format) => self.copy_as(&dir, format, ui.ctx()),
+                TreeAction::Export(dir, format) => self.export_dialog(&dir, format),
                 TreeAction::Mock(dir) => self.start_mock(dir, ui.ctx()),
                 TreeAction::Move(paths, folder) => {
                     let moves = (paths.into_iter())
@@ -4180,21 +4226,12 @@ impl App {
     }
 
     /// For Postman's Import > Raw text.
-    fn copy_postman(&mut self, dir: &Path, ctx: &egui::Context) {
-        self.status = match crate::postman::collection(&self.ws, dir) {
-            Ok((json, count, skipped)) => {
-                ctx.copy_text(json);
-                let left = match skipped {
-                    0 => String::new(),
-                    n => tf(
-                        "; left out {} WebSocket/SSE/gRPC, which collections can't hold",
-                        &[&n],
-                    ),
-                };
-                tf(
-                    "Copied {} requests as a Postman collection{}",
-                    &[&count, &left],
-                )
+    fn copy_as(&mut self, dir: &Path, format: Format, ctx: &egui::Context) {
+        let (file, _) = format.file("API");
+        self.status = match format.text(&self.ws, dir, Path::new(&file)) {
+            Ok((text, left)) => {
+                ctx.copy_text(text);
+                tf("Copied as {}{}", &[&format.name(), &left])
             }
             Err(e) => e,
         };
@@ -4234,47 +4271,27 @@ impl App {
         Ok(i.warnings)
     }
 
-    fn copy_docs(&mut self, dir: &Path, ctx: &egui::Context) {
-        match crate::docs::markdown(&self.ws, dir) {
-            Ok(md) => {
-                ctx.copy_text(md);
-                self.status = t("Copied the docs as Markdown").into();
-            }
-            Err(e) => self.fail(e),
-        }
-    }
-
-    fn export_dialog(&mut self, dir: &Path, openapi: bool) {
+    fn export_dialog(&mut self, dir: &Path, format: Format) {
         let name = match dir == self.ws.collections() {
             true => "API".to_owned(),
             false => {
                 crate::store::unescape_name(&dir.file_name().unwrap_or_default().to_string_lossy())
             }
         };
-        let (file, filters): (_, &[(&str, &[&str])]) = match openapi {
-            true => (
-                format!("{name}.yaml"),
-                &[("OpenAPI", &["yaml", "yml", "json"])],
-            ),
-            false => (format!("{name}.md"), &[("Markdown", &["md"])]),
-        };
-        if let Some(to) = pick_file(&file, filters, true) {
-            self.export_docs(dir, Path::new(&to));
+        let (file, filter) = format.file(&name);
+        if let Some(to) = pick_file(&file, &[filter], true) {
+            self.export(dir, format, Path::new(&to));
         }
     }
 
-    fn export_docs(&mut self, dir: &Path, to: &Path) {
+    fn export(&mut self, dir: &Path, format: Format, to: &Path) {
         let shown = to.display();
-        let written = crate::docs::for_file(&self.ws, dir, to).and_then(|(text, left)| {
+        let written = format.text(&self.ws, dir, to).and_then(|(text, left)| {
             std::fs::write(to, text).map_err(|e| format!("{shown}: {e}"))?;
             Ok(left)
         });
         self.status = match written {
-            Ok(0) => tf("Saved {}", &[&shown]),
-            Ok(n) => tf(
-                "Saved {}; left out {} it can't describe: streams, gRPC, or a second request to the same method and path",
-                &[&shown, &n],
-            ),
+            Ok(left) => tf("Saved {}{}", &[&shown, &left]),
             Err(e) => e,
         };
     }
@@ -9070,20 +9087,33 @@ fn folder_menu(
         false => t("Folder settings…"),
     };
     item(ui, settings, TreeAction::FolderSettings(path.clone()));
-    item(
-        ui,
-        t("Copy docs as Markdown"),
-        TreeAction::CopyDocs(path.clone()),
-    );
-    let docs = |openapi| TreeAction::ExportDocs(path.clone(), openapi);
-    item(ui, t("Export docs as Markdown…"), docs(false));
-    item(ui, t("Export as OpenAPI…"), docs(true));
-    item(
-        ui,
-        t("Copy as Postman collection"),
-        TreeAction::CopyPostman(path.clone()),
-    );
-    item(ui, t("Start mock server"), TreeAction::Mock(path));
+    let picked = copy_export_menus(ui);
+    item(ui, t("Start mock server"), TreeAction::Mock(path.clone()));
+    actions.extend(picked.map(|(format, export)| match export {
+        true => TreeAction::Export(path, format),
+        false => TreeAction::Copy(path, format),
+    }));
+}
+
+/// Copy as and Export, a submenu of every format each, in a folder's menu and the
+/// collections' More menu alike: the format picked, and whether to a file.
+fn copy_export_menus(ui: &mut egui::Ui) -> Option<(Format, bool)> {
+    let mut picked = None;
+    ui.menu_button(t("Copy as"), |ui| {
+        for format in Format::ALL {
+            if ui.button(format.name()).clicked() {
+                picked = Some((format, false));
+            }
+        }
+    });
+    ui.menu_button(t("Export"), |ui| {
+        for format in Format::ALL {
+            if ui.button(format!("{}…", format.name())).clicked() {
+                picked = Some((format, true));
+            }
+        }
+    });
+    picked
 }
 
 fn request_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<TreeAction>) {
@@ -16632,11 +16662,13 @@ mod ui_tests {
         assert!(h.query_by_label("Accept").is_none());
     }
 
-    /// A folder's menu exports its docs to a file in the format the file's name asks for:
-    /// Markdown, or OpenAPI as YAML or JSON. What OpenAPI can't hold is counted, not lost
+    /// A folder's menu groups its formats under Copy as and Export, each a submenu, so the
+    /// menu stays short as formats are added; a format from Copy as is on the clipboard
+    /// and the menu closes. Exported, OpenAPI is YAML or JSON as the file's name asks, a
+    /// Postman collection is a file too, and what a format can't hold is counted, not lost
     /// unsaid.
     #[test]
-    fn a_folder_exports_its_docs_as_markdown_or_openapi() {
+    fn a_folder_copies_or_exports_itself_in_each_format() {
         let ws = workspace("export-docs");
         let api = ws.create_folder(&ws.collections(), "api").unwrap();
         let get = Request {
@@ -16654,12 +16686,40 @@ mod ui_tests {
         h.run();
         h.get_all_by_label("api").next().unwrap().click_secondary();
         h.run();
-        assert!(h.query_by_label("Export docs as Markdown…").is_some());
-        assert!(h.query_by_label("Export as OpenAPI…").is_some());
+        assert!(h.query_by_label("OpenAPI").is_none(), "inside Copy as");
+        // A submenu's button is labelled with its arrow.
+        h.get_by_label("Export ⏵").click();
+        h.run();
+        shot(&mut h, "t-folder-export-menu");
+        for format in ["Markdown…", "OpenAPI…", "Postman collection…"] {
+            assert!(h.query_by_label(format).is_some(), "{format}");
+        }
+        h.get_by_label("Copy as ⏵").click();
+        h.run();
+        assert!(
+            h.query_by_label("OpenAPI…").is_none(),
+            "one submenu at a time"
+        );
+        h.get_by_label("OpenAPI").click();
+        let copied = (0..4).find_map(|_| {
+            h.step();
+            (h.output().platform_output.commands.iter()).find_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+        });
+        assert!(copied.is_some_and(|c| c.starts_with("openapi: 3.1.0\n")));
+        h.run();
+        assert!(h.query_by_label("Copy as ⏵").is_none(), "the menu closed");
+        assert_eq!(
+            h.state().status,
+            "Copied as OpenAPI; left out 1 it can't describe: streams, gRPC, or a second request to the same method and path"
+        );
 
         let dir = std::env::temp_dir().join(format!("apitool-export-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        h.state_mut().export_docs(&api, &dir.join("api.yaml"));
+        h.state_mut()
+            .export(&api, Format::OpenApi, &dir.join("api.yaml"));
         assert!(
             h.state().status.contains("left out 1"),
             "{}",
@@ -16667,17 +16727,30 @@ mod ui_tests {
         );
         let yaml = std::fs::read_to_string(dir.join("api.yaml")).unwrap();
         assert!(yaml.starts_with("openapi: 3.1.0\n") && yaml.contains("/users/{id}:"));
-        h.state_mut().export_docs(&api, &dir.join("api.json"));
+        h.state_mut()
+            .export(&api, Format::OpenApi, &dir.join("api.json"));
         let json = std::fs::read_to_string(dir.join("api.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(doc["servers"][0]["url"], "https://api.test");
-        h.state_mut().export_docs(&api, &dir.join("api.md"));
+        h.state_mut()
+            .export(&api, Format::Markdown, &dir.join("api.md"));
         let md = std::fs::read_to_string(dir.join("api.md")).unwrap();
         assert!(md.starts_with("# api\n"), "{md}");
         assert!(
             h.state().status.starts_with("Saved "),
             "{}",
             h.state().status
+        );
+        let to = dir.join("api.postman_collection.json");
+        h.state_mut().export(&api, Format::Postman, &to);
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&to).unwrap()).unwrap();
+        assert!(doc["info"]["schema"].as_str().unwrap().contains("v2.1.0"));
+        assert_eq!(doc["item"].as_array().map(Vec::len), Some(1), "{doc}");
+        assert!(
+            h.state()
+                .status
+                .ends_with("left out 1 WebSocket/SSE/gRPC, which collections can't hold")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -21620,7 +21693,9 @@ mod ui_tests {
             h.query_by_label_contains(ours).is_some(),
             "this system's tab"
         );
-        assert!(h.query_by_label_contains(&format!("\"{file}\"")).is_some());
+        // Linux's tab names it in each of its three commands.
+        let quoted = format!("\"{file}\"");
+        assert!(h.query_all_by_label_contains(&quoted).next().is_some());
         h.get_by_label("Firefox").click();
         h.run();
         assert!(

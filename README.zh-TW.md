@@ -292,7 +292,7 @@ Ctrl+K 可依資料夾與名稱（依序打出其中幾個字母即可）或 URL
 | Insomnia v4 JSON / v5 YAML | 資料夾、驗證與指令碼；`{{ _.x }}` 轉為 `{{x}}`；base environment 成為集合變數，每個 sub-environment 成為一個環境 |
 | 瀏覽器開發者工具的 HAR | 每個主機一個資料夾，每筆回應保留為該請求的範例 |
 
-資料夾或整個集合可以「複製為 Postman 集合」；環境可在其編輯視窗「複製為 Postman 環境」，秘密變數會成為 Postman 的 secret 類型。
+資料夾或整個集合可以複製或匯出為 Postman 集合（右鍵 >「複製為」或「匯出」）；環境可在其編輯視窗「複製為 Postman 環境」，秘密變數會成為 Postman 的 secret 類型。
 
 「</> 程式碼」可將請求轉成 curl、wget、HTTPie、PowerShell、原始 HTTP、Python、fetch、axios、Go、
 Java、C#、PHP、Ruby、Rust、Swift 或 Kotlin。二進位內容會讀入對應的檔案，而 `--data-binary @file`
@@ -308,7 +308,7 @@ Java、C#、PHP、Ruby、Rust、Swift 或 Kotlin。二進位內容會讀入對�
 | gRPC | grpcurl、grpc-js、grpcio，依方法的串流形式產生 |
 
 API 文件由請求與資料夾的說明及已儲存的範例產生：在資料夾上按右鍵（或集合上方的「更多」）>
-「複製文件為 Markdown」、「匯出文件為 Markdown…」或「匯出為 OpenAPI…」，或執行
+「複製為」或「匯出」> Markdown 或 OpenAPI，或執行
 `apitool-cli docs`。OpenAPI 3.1 文件（YAML；檔名為 .json 時輸出 JSON）匯入後會還原成同樣的
 請求：server 取自 `{{baseUrl}}` 與資料夾裡的值，`:id` 與 `{{變數}}` 路徑段落成為 path 參數，
 停用的 query 參數標為選填，每個子資料夾一個 tag，內容與已儲存的範例附上依內容推得的 schema，
