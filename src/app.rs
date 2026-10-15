@@ -530,6 +530,8 @@ struct CaptureView {
     controls: Arc<crate::capture::Controls>,
     /// The system's proxy points here (what it was is in the workspace).
     system: bool,
+    /// Listening on every interface, not 127.0.0.1 only: WSL, a VM or a phone can use it.
+    open: bool,
     /// The OS's connection table shows instead of the flows.
     conns_shown: bool,
     conns: crate::conns::Table,
@@ -537,7 +539,10 @@ struct CaptureView {
 
 /// Stops the capture proxy when dropped.
 struct Listening {
+    /// Where apps on this machine reach it: 127.0.0.1, whichever it listens on.
     addr: std::net::SocketAddr,
+    /// This machine's address on its network, while other devices are let in.
+    lan: Option<std::net::IpAddr>,
     abort: tokio::task::AbortHandle,
 }
 
@@ -4271,18 +4276,24 @@ impl App {
     }
 
     /// Port 9090 when free, as Proxyman's, so an app's proxy setting holds across restarts.
-    /// On 127.0.0.1 only: what reaches it goes out with this machine's network settings.
+    /// On 127.0.0.1 only unless other devices are let in: what reaches it goes out with this
+    /// machine's network settings.
     fn start_capture(&mut self, ctx: &egui::Context) {
+        let open = (self.capture)
+            .get_or_insert_with(|| capture_view(ctx, &self.ws))
+            .open;
+        let host = if open { "0.0.0.0" } else { "127.0.0.1" };
         let bound = self.rt.block_on(async {
-            match tokio::net::TcpListener::bind("127.0.0.1:9090").await {
+            match tokio::net::TcpListener::bind((host, 9090)).await {
                 Ok(l) => Ok(l),
-                Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0").await,
+                Err(_) => tokio::net::TcpListener::bind((host, 0)).await,
             }
         });
-        let (addr, listener) = match bound.and_then(|l| Ok((l.local_addr()?, l))) {
+        let (port, listener) = match bound.and_then(|l| Ok((l.local_addr()?.port(), l))) {
             Ok(l) => l,
             Err(e) => return self.fail(tf("Capture: {}", &[&e])),
         };
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let view = (self.capture).get_or_insert_with(|| capture_view(ctx, &self.ws));
         let (cell, net, tx, ctx) = (
             self.client.clone(),
@@ -4310,6 +4321,7 @@ impl App {
         });
         view.server = Some(Listening {
             addr,
+            lan: open.then(crate::capture::lan_ip).flatten(),
             abort: task.abort_handle(),
         });
     }
@@ -4375,7 +4387,8 @@ impl App {
         let listening = self.capturing();
         let view = (self.capture).get_or_insert_with(|| capture_view(ui.ctx(), &self.ws));
         let decrypting = view.controls.decrypt.lock().unwrap().is_some();
-        let pointing = view.system;
+        let (pointing, open) = (view.system, view.open);
+        let mut let_in = None;
         let (mut start, mut stop, mut export, mut open_as) = (false, false, false, None);
         let (mut decrypt, mut export_ca, mut system) = (None, false, None);
         ui.horizontal(|ui| {
@@ -4384,7 +4397,11 @@ impl App {
             match listening {
                 Some(addr) => {
                     dot(ui, GREEN);
-                    ui.label(tf("Listening on {}", &[&addr]));
+                    let on = match open {
+                        true => format!("0.0.0.0:{}", addr.port()),
+                        false => addr.to_string(),
+                    };
+                    ui.label(tf("Listening on {}", &[&on]));
                     if icon_button(ui, icon::COPY, t("Copy the address"), None)
                         .on_hover_text(t("Copy the address"))
                         .clicked()
@@ -4394,6 +4411,19 @@ impl App {
                     stop = ui.button(t("Stop")).clicked();
                 }
                 None => start = ui.add(primary(t("Start capturing"))).clicked(),
+            }
+            let mut on = open;
+            let tick = ui.add_enabled_ui(listening.is_none(), |ui| {
+                ui.checkbox(&mut on, t("Other devices too"))
+            });
+            if (tick.inner)
+                .on_hover_text(t(
+                    "Listens on every network interface, not only 127.0.0.1, so WSL, a VM or a phone can use it. Anyone who can reach this machine can then send through it; Windows may ask to let apitool accept connections.",
+                ))
+                .on_disabled_hover_text(t("Stop first: it applies when capturing starts"))
+                .changed()
+            {
+                let_in = Some(on);
             }
             let mut on = pointing;
             let tick = ui.add_enabled_ui(listening.is_some(), |ui| {
@@ -4436,6 +4466,23 @@ impl App {
             ),
         };
         ui.weak(fill(hint, &[&addr]));
+        if let (true, Some(addr)) = (open, listening) {
+            let lan = self.capture.as_ref().and_then(|v| v.server.as_ref()?.lan);
+            let lan = lan.map_or(t("this machine's address").to_owned(), |ip| ip.to_string());
+            let port = addr.port();
+            ui.weak(tf(
+                "From another device or a VM: {}:{}. From WSL 2: the Windows host's address, which `ip route show default | cut -d' ' -f3` prints in WSL, port {}; with mirrored networking, 127.0.0.1 works as is.",
+                &[&lan, &port, &port],
+            ));
+        }
+        if let Some(on) = let_in
+            && let Some(view) = &mut self.capture
+        {
+            view.open = on;
+            if let Err(e) = self.ws.save_capture_open(on) {
+                self.fail(e);
+            }
+        }
         if let Some(view) = &self.capture {
             let mut rules = view.controls.rules.lock().unwrap();
             let on = rules.iter().filter(|r| r.on).count();
@@ -9464,6 +9511,11 @@ fn json_editor(ui: &mut egui::Ui, text: &mut String, vars: &HashMap<String, Stri
         {
             *text = pretty;
         }
+        if ui.small_button(t("Minify")).clicked()
+            && let Some(one) = http::minify_json(text)
+        {
+            *text = one;
+        }
         // Parsing it each frame is what an uneditable body can do without.
         if !text.trim().is_empty()
             && text.len() <= crate::varedit::MAX_EDIT
@@ -12170,6 +12222,7 @@ fn capture_view(ctx: &egui::Context, ws: &Workspace) -> CaptureView {
         picked: None,
         controls: Arc::new(controls),
         system: false,
+        open: ws.load_capture_open(),
         conns_shown: false,
         conns: Default::default(),
     }
@@ -12754,17 +12807,26 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
             _ => t("Message"),
         };
         if crate::varedit::too_big(ui, id, &mut c.text).is_none() {
-            let edit = ui.add(
-                egui::TextEdit::multiline(&mut c.text)
-                    .id(id)
-                    .desired_rows(4)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text(hint)
-                    .desired_width(ui.available_width() - send_w - 8.0),
-            );
-            if edit.changed() {
-                c.error.clear();
-            }
+            let width = ui.available_width() - send_w - 8.0;
+            // Some 10 lines at most, then it scrolls: grown with a pasted payload, it pushed
+            // the log under it out of sight.
+            egui::ScrollArea::vertical()
+                .id_salt("compose-scroll")
+                .max_height(160.0)
+                .max_width(width)
+                .show(ui, |ui| {
+                    let edit = ui.add(
+                        egui::TextEdit::multiline(&mut c.text)
+                            .id(id)
+                            .desired_rows(4)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text(hint)
+                            .desired_width(width),
+                    );
+                    if edit.changed() {
+                        c.error.clear();
+                    }
+                });
         }
         ui.vertical(|ui| {
             let button = (ui.add_enabled_ui(can_send, |ui| {
@@ -12796,6 +12858,21 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
             });
         });
     });
+    // Only for what looks like JSON: parsing a big message every frame to know costs.
+    if c.text.trim_start().starts_with(['{', '[']) {
+        ui.horizontal(|ui| {
+            if ui.small_button(t("Beautify")).clicked()
+                && let Some(pretty) = http::pretty_json(&c.text)
+            {
+                c.text = pretty;
+            }
+            if ui.small_button(t("Minify")).clicked()
+                && let Some(one) = http::minify_json(&c.text)
+            {
+                c.text = one;
+            }
+        });
+    }
     if !c.error.is_empty() {
         ui.colored_label(RED, c.error.as_str());
     }
@@ -21304,6 +21381,95 @@ mod ui_tests {
         h.get_by_label("Close the capture").click();
         h.run();
         assert_eq!(kept(&h), "", "put back on closing the capture");
+    }
+
+    /// A long message scrolls inside the compose box instead of pushing the log out of
+    /// sight, and JSON there is laid out or put on one line with a click.
+    #[test]
+    fn a_long_message_scrolls_in_its_box_and_json_is_minified() {
+        let ws = workspace("compose-long");
+        let path = ws.create_request(&ws.collections(), "socket").unwrap();
+        let req = Request {
+            method: "WS".into(),
+            url: "ws://127.0.0.1:9/".into(),
+            ..Default::default()
+        };
+        ws.save_request(&path, &req).unwrap();
+        let mut h = harness(ws);
+        h.run();
+        h.state_mut().activate(path, true);
+        h.run();
+        let items: Vec<_> = (0..200).map(|i| format!("{{\"n\": {i}}}")).collect();
+        let pretty = http::pretty_json(&format!("[{}]", items.join(","))).unwrap();
+        h.state_mut().compose.text = pretty.clone();
+        h.run();
+        let under = h.get_by_label("Minify").rect();
+        assert!(
+            under.bottom() < 800.0,
+            "pushed out of the window: {under:?}"
+        );
+        h.get_by_label("Minify").click();
+        h.run();
+        let one = format!("[{}]", items.join(",")).replace(": ", ":");
+        assert_eq!(h.state().compose.text, one);
+        h.get_by_label("Beautify").click();
+        h.run();
+        assert_eq!(h.state().compose.text, pretty);
+    }
+
+    /// A JSON body is put on one line with a click, as Beautify lays it out.
+    #[test]
+    fn a_json_body_is_minified() {
+        let mut h = with_request("json-minify");
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        d.method = "POST".into();
+        d.body = Body::Json {
+            text: "{\n  \"a\": [1, 2]\n}".into(),
+        };
+        h.state_mut().req_tab = ReqTab::Body;
+        h.run();
+        h.get_by_label("Minify").click();
+        h.run();
+        let Body::Json { text } = &draft(&h).body else {
+            panic!("not JSON")
+        };
+        assert_eq!(text, r#"{"a":[1,2]}"#);
+    }
+
+    /// Other devices let in, the capture listens on every interface: it answers at this
+    /// machine's network address too, while apps here still set 127.0.0.1. The choice is
+    /// kept in the workspace.
+    #[test]
+    fn other_devices_reach_the_capture_once_let_in() {
+        use std::io::{Read, Write};
+        let mut h = harness(workspace("capture-open"));
+        h.run();
+        h.state_mut().act(Action::Capture);
+        h.run();
+        h.get_by_label("Other devices too").click();
+        h.run();
+        assert!(h.state().ws.load_capture_open());
+        h.get_by_label("Start capturing").click();
+        h.run();
+        let here = h.state_mut().capturing().expect("listening");
+        assert!(here.ip().is_loopback(), "{here}");
+        shot(&mut h, "t-capture-open");
+        let lan = crate::capture::lan_ip().expect("a network address");
+        assert!(!lan.is_loopback() && !lan.is_unspecified(), "{lan}");
+        let mut device = std::net::TcpStream::connect((lan, here.port())).unwrap();
+        write!(
+            device,
+            "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut answer = String::new();
+        device.read_to_string(&mut answer).unwrap();
+        assert!(answer.contains("apitool's capture proxy"), "{answer}");
+        h.get_by_label("Stop").click();
+        h.run();
+        h.state_mut().capture = None;
+        h.run();
+        assert!(h.state().capture.as_ref().unwrap().open, "kept");
     }
 
     /// The Connections view lists what the OS has open, by process, this one's listener

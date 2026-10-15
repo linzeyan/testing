@@ -1848,6 +1848,21 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Export as HAR…", "匯出為 HAR…"),
     ("Filter by URL or method", "依 URL 或方法篩選"),
     ("Flows", "流量"),
+    ("Minify", "壓縮"),
+    ("Other devices too", "也接受其他裝置"),
+    (
+        "Listens on every network interface, not only 127.0.0.1, so WSL, a VM or a phone can use it. Anyone who can reach this machine can then send through it; Windows may ask to let apitool accept connections.",
+        "監聽所有網路介面而不只 127.0.0.1，讓 WSL、虛擬機或手機也能使用。任何連得到這台電腦的人都能透過它送出請求；Windows 可能會詢問是否允許 apitool 接受連線。",
+    ),
+    (
+        "Stop first: it applies when capturing starts",
+        "請先停止：這個設定在開始擷取時生效",
+    ),
+    ("this machine's address", "這台電腦的位址"),
+    (
+        "From another device or a VM: {}:{}. From WSL 2: the Windows host's address, which `ip route show default | cut -d' ' -f3` prints in WSL, port {}; with mirrored networking, 127.0.0.1 works as is.",
+        "其他裝置或虛擬機：{}:{}。WSL 2：用 Windows 主機的位址（在 WSL 執行 `ip route show default | cut -d' ' -f3` 可得），埠 {}；若使用 mirrored 網路模式，直接用 127.0.0.1 即可。",
+    ),
     ("Connections", "連線"),
     (
         "Every TCP and UDP connection the OS lists, by process: no proxy needed, no byte counts",

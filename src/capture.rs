@@ -714,6 +714,15 @@ async fn tunnel(
     )
 }
 
+/// This machine's address on its network, for other devices to reach the capture at: the
+/// one it would send from to the internet. The socket is only pointed, nothing is sent.
+pub fn lan_ip() -> Option<std::net::IpAddr> {
+    let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // TEST-NET-1: never answered, and any default route covers it.
+    probe.connect("192.0.2.1:9").ok()?;
+    probe.local_addr().ok().map(|a| a.ip())
+}
+
 /// To `target` (`host:port`) the way the network settings send https there: directly, or
 /// through an http:// proxy's own CONNECT.
 async fn connect(
@@ -736,7 +745,17 @@ async fn connect(
     }
     let at = format!("proxy {host}:{port}");
     let mut s = (TcpStream::connect((host, port)).await).map_err(|e| format!("{at}: {e}"))?;
-    if own.is_some_and(|own| s.peer_addr().is_ok_and(|p| p == own)) {
+    // On every interface, it's itself at any of this machine's addresses: then the
+    // connection comes from the address it went to.
+    let itself = |p: SocketAddr| {
+        own.is_some_and(|own| {
+            p == own
+                || (own.ip().is_unspecified()
+                    && p.port() == own.port()
+                    && s.local_addr().is_ok_and(|l| l.ip() == p.ip()))
+        })
+    };
+    if s.peer_addr().is_ok_and(itself) {
         return Err(LOOP.to_owned());
     }
     let auth = match login {
@@ -1437,24 +1456,27 @@ mod tests {
         let (addr, _) = proxy(&rt, behind(format!("http://u:p@{upstream}")));
         assert_eq!(ping_through(addr, &target), "ping");
 
-        // Its own address is only known once bound: ask it for the port it was given.
-        let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
-        let own = listener.local_addr().unwrap();
-        let clients = rt.block_on(crate::net::build_client(behind(format!("http://{own}"))));
-        let flows = Flows::new(|| {});
-        rt.spawn(serve(
-            listener,
-            clients.unwrap(),
-            flows.clone(),
-            Arc::default(),
-        ));
-        let refused = ping_through(own, &target);
-        assert!(refused.starts_with("HTTP/1.1 502"), "{refused}");
-        let f = flow_when(&flows, |f| f.error.is_some());
-        assert!(
-            f.error.as_deref().unwrap().contains("its own upstream"),
-            "{f:?}"
-        );
+        // Its own address is only known once bound: ask it for the port it was given. On
+        // every interface (other devices let in), 127.0.0.1 is itself too.
+        for host in ["127.0.0.1", "0.0.0.0"] {
+            let listener = rt.block_on(TcpListener::bind((host, 0))).unwrap();
+            let own = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+            let clients = rt.block_on(crate::net::build_client(behind(format!("http://{own}"))));
+            let flows = Flows::new(|| {});
+            rt.spawn(serve(
+                listener,
+                clients.unwrap(),
+                flows.clone(),
+                Arc::default(),
+            ));
+            let refused = ping_through(own, &target);
+            assert!(refused.starts_with("HTTP/1.1 502"), "{host}: {refused}");
+            let f = flow_when(&flows, |f| f.error.is_some());
+            assert!(
+                f.error.as_deref().unwrap().contains("its own upstream"),
+                "{host}: {f:?}"
+            );
+        }
     }
 
     /// An HTTPS server with a certificate of its own, answering with the request line.

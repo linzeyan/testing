@@ -958,6 +958,32 @@ pub fn pretty_xml(xml: &str) -> Option<String> {
     Some(out)
 }
 
+/// On one line, the whitespace between tokens dropped; strings, numbers and escapes as
+/// they were, as `pretty_json` keeps them.
+pub fn minify_json(body: &str) -> Option<String> {
+    serde_json::from_str::<serde::de::IgnoredAny>(body).ok()?;
+    let bytes = body.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        i += 1;
+        match b {
+            b'"' => {
+                let start = i - 1;
+                while bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+                out.extend_from_slice(&bytes[start..i]);
+            }
+            b if b.is_ascii_whitespace() => {}
+            b => out.push(b),
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Indented like `serde_json::to_string_pretty`, but without building a value tree: a
 /// tree costs several times the text (a 100 MB body went past 1 GB). Numbers and escapes
 /// stay exactly as the server wrote them.
@@ -2096,6 +2122,15 @@ pub(crate) mod tests {
         assert_eq!(ours.replace("-3e2", "-300.0"), theirs);
         assert_eq!(pretty_json("[1,"), None, "not JSON: shown as it came");
         assert_eq!(pretty_json("\"x\"").unwrap(), "\"x\"");
+    }
+
+    /// One line, the spaces inside strings kept and numbers as they came.
+    #[test]
+    fn minify_json_keeps_strings_and_numbers() {
+        let doc = "{\n  \"a\": [1, 2.50, -3e2],\n  \"s\": \"two  spaces, \\\"q\\\" {}\"\n}";
+        let one = r#"{"a":[1,2.50,-3e2],"s":"two  spaces, \"q\" {}"}"#;
+        assert_eq!(minify_json(doc).as_deref(), Some(one));
+        assert_eq!(minify_json("[1,"), None, "not JSON: left as it is");
     }
 
     /// The clients Send picks from: a request's settings choose (and cache) its client.

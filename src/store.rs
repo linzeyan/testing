@@ -696,6 +696,15 @@ impl Workspace {
         self.put("capture-rules", json)
     }
 
+    /// Whether the capture lets other devices in (listens on every interface).
+    pub fn load_capture_open(&self) -> bool {
+        self.get("capture-open").is_some_and(|v| v == "1")
+    }
+
+    pub fn save_capture_open(&self, open: bool) -> Result<(), String> {
+        self.put("capture-open", if open { "1" } else { "0" })
+    }
+
     /// The system's proxy settings from before the capture pointed it at itself; empty
     /// when it doesn't.
     pub fn load_system_proxy(&self) -> String {
