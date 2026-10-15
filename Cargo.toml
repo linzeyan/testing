@@ -80,7 +80,7 @@ rfd = { version = "0.17", default-features = false }
 h2 = "0.4.19"
 # Already in the tree via reqwest, as a client: the capture proxy serves with it too, its
 # upgrades carrying CONNECT tunnels.
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
 # Decrypting HTTPS: the CA and a certificate per host, made with ring (aws-lc doesn't
 # cross-build for Windows); tokio-rustls, already in the tree via reqwest, ends the app's TLS.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

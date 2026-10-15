@@ -396,11 +396,16 @@ impl Tee {
         self.flows.update(self.id, |f| f.request.take(chunk));
     }
 
-    fn response(&self, chunk: reqwest::Result<Bytes>) -> Result<Frame<Bytes>, std::io::Error> {
-        match chunk {
-            Ok(chunk) => {
-                self.flows.update(self.id, |f| f.response.take(&chunk));
-                Ok(Frame::data(chunk))
+    fn response(
+        &self,
+        frame: reqwest::Result<Frame<Bytes>>,
+    ) -> Result<Frame<Bytes>, std::io::Error> {
+        match frame {
+            Ok(frame) => {
+                if let Some(chunk) = frame.data_ref() {
+                    self.flows.update(self.id, |f| f.response.take(chunk));
+                }
+                Ok(frame)
             }
             Err(e) => {
                 let e = error_chain(&e);
@@ -499,12 +504,23 @@ async fn forward(
         // Its length known, as a file server tells it: streamed, it went out chunked.
         headers.insert(hyper::header::CONTENT_LENGTH, body.len().into());
         set_headers(&mut headers, &answered);
-        let body = futures_util::stream::iter([Ok(Bytes::from(body))]);
-        return ok(id).send(StatusCode::OK, headers, body);
+        let (status, headers, body) = match hold.1 {
+            true => match held(controls, flows, id, StatusCode::OK, headers, body.into()).await {
+                Ok(answer) => answer,
+                Err(e) => return fail(e),
+            },
+            false => (StatusCode::OK, headers, Bytes::from(body)),
+        };
+        return ok(id).send(status, headers, body.into());
     }
     let (mut method, mut headers) = (parts.method, parts.headers);
+    // The one hop-by-hop header HTTP/2 lets through, which gRPC's servers ask for.
+    let trailers = (headers.get(hyper::header::TE)).is_some_and(|te| te == "trailers");
     for name in HOP_BY_HOP.iter().chain(&["host"]) {
         headers.remove(*name);
+    }
+    if trailers {
+        headers.insert(hyper::header::TE, HeaderValue::from_static("trailers"));
     }
     set_headers(&mut headers, &asked);
     // A GET's empty body stays absent: streamed, it would go out chunked.
@@ -572,27 +588,41 @@ async fn forward(
     set_headers(&mut headers, &answered);
     let status = res.status();
     if !hold.1 {
-        return ok(id).send(status, headers, res.bytes_stream());
+        let body = Response::<reqwest::Body>::from(res).into_body();
+        return ok(id).send(status, headers, body);
     }
     let body = match res.bytes().await {
         Ok(body) => body,
         Err(e) => return fail(error_chain(&e)),
     };
+    match held(controls, flows, id, status, headers, body).await {
+        Ok((status, headers, body)) => ok(id).send(status, headers, body.into()),
+        Err(e) => fail(e),
+    }
+}
+
+/// An answer held at a breakpoint, a server's or a mapped file's: as the pane lets it go,
+/// or why the app gets none.
+async fn held(
+    controls: &Controls,
+    flows: &Flows,
+    id: u64,
+    status: StatusCode,
+    mut headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, Bytes), String> {
+    // Counted again for what's typed.
     headers.remove(hyper::header::CONTENT_LENGTH);
     let reason = status.canonical_reason().unwrap_or_default();
     let first = format!("{} {reason}", status.as_u16());
-    let edited = controls
-        .pause(flows, id, first, &headers, &body, true)
-        .await;
-    let Some((first, mut headers, body)) = edited else {
-        return fail(ABORTED.to_owned());
-    };
+    let edited = (controls.pause(flows, id, first, &headers, &body, true)).await;
+    let (first, mut headers, body) = edited.ok_or(ABORTED)?;
     let code = first.split_whitespace().next().unwrap_or_default();
     let Ok(status) = StatusCode::from_bytes(code.as_bytes()) else {
-        return fail(format!("{code}: not a status"));
+        return Err(format!("{code}: not a status"));
     };
     headers.insert(hyper::header::CONTENT_LENGTH, body.len().into());
-    ok(id).send(status, headers, futures_util::stream::iter([Ok(body)]))
+    Ok((status, headers, body))
 }
 
 /// The answer as the app gets it, kept in its flow as it goes.
@@ -605,12 +635,7 @@ struct Answer<'a> {
 }
 
 impl Answer<'_> {
-    fn send(
-        self,
-        status: StatusCode,
-        headers: HeaderMap,
-        body: impl futures_util::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
-    ) -> Response<Body> {
+    fn send(self, status: StatusCode, headers: HeaderMap, body: reqwest::Body) -> Response<Body> {
         let shown = pairs(&headers);
         self.flows.update(self.id, |f| {
             (f.status, f.response.headers) = (Some(status.as_u16()), shown);
@@ -621,14 +646,14 @@ impl Answer<'_> {
             started: self.started,
         };
         let rate = self.rate;
-        let paced = body.then(move |chunk| async move {
-            if let (1.., Ok(chunk)) = (rate, &chunk) {
+        let paced = BodyStream::new(body).then(move |frame| async move {
+            if let (1.., Ok(Some(chunk))) = (rate, frame.as_ref().map(Frame::data_ref)) {
                 let took = chunk.len() as f64 / (rate as f64 * 1024.0);
                 tokio::time::sleep(Duration::from_secs_f64(took)).await;
             }
-            chunk
+            frame
         });
-        let body = StreamBody::new(paced.map(move |chunk| tee.response(chunk)));
+        let body = StreamBody::new(paced.map(move |frame| tee.response(frame)));
         let mut res = Response::new(body.boxed_unsync());
         (*res.status_mut(), *res.headers_mut()) = (status, headers);
         res
@@ -852,12 +877,12 @@ impl Ca {
         let chain = vec![cert.der().clone(), self.cert.clone()];
         let key = PrivateKeyDer::try_from(key.serialize_der()).map_err(|e| fail(&e))?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        // No ALPN: an app offering h2 hears nothing of it and speaks HTTP/1.1, all this
-        // serves.
-        let config = (rustls::ServerConfig::builder_with_provider(provider))
+        let mut config = (rustls::ServerConfig::builder_with_provider(provider))
             .with_safe_default_protocol_versions()
             .and_then(|b| b.with_no_client_auth().with_single_cert(chain, key))
             .map_err(|e| fail(&e))?;
+        // HTTP/2 when the app offers it, as gRPC must; else HTTP/1.1.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let config = Arc::new(config);
         hosts.insert(host.to_owned(), config.clone());
         Ok(config)
@@ -940,8 +965,16 @@ fn intercept(
                 Ok::<_, Infallible>(res)
             }
         });
-        let conn =
-            hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tls), service);
+        let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+        let io = TokioIo::new(tls);
+        let conn = async {
+            if h2 {
+                let exec = hyper_util::rt::TokioExecutor::new();
+                (hyper::server::conn::http2::Builder::new(exec).serve_connection(io, service)).await
+            } else {
+                (hyper::server::conn::http1::Builder::new().serve_connection(io, service)).await
+            }
+        };
         tokio::select! {
             served = conn => if let Err(e) = served {
                 log::debug!("capture: {e}");
@@ -1215,18 +1248,7 @@ mod tests {
         });
         let (addr, flows) = proxy_with(&rt, direct(), controls.clone());
         let app = through(addr);
-        // Long enough for the firewall here, which holds a new binary's first connections.
-        let held = |response: bool| {
-            for _ in 0..3000 {
-                let mut paused = controls.paused.lock().unwrap();
-                if paused.first().is_some_and(|p| p.response == response) {
-                    return paused.remove(0);
-                }
-                drop(paused);
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            panic!("nothing held");
-        };
+        let held = |response: bool| held_one(&controls, response);
         let send = |sent: reqwest::RequestBuilder| {
             rt.spawn(async move {
                 let res = sent.send().await.unwrap();
@@ -1289,6 +1311,70 @@ mod tests {
         assert_eq!(answer, (502, ABORTED.to_owned()));
         let f = flow_when(&flows, |f| f.elapsed.is_some());
         assert_eq!(f.error.as_deref(), Some(ABORTED));
+    }
+
+    /// The oldest exchange held, once it's the request or the answer as asked; long enough
+    /// for the firewall here, which holds a new binary's first connections.
+    fn held_one(controls: &Controls, response: bool) -> Paused {
+        for _ in 0..3000 {
+            let mut paused = controls.paused.lock().unwrap();
+            if paused.first().is_some_and(|p| p.response == response) {
+                return paused.remove(0);
+            }
+            drop(paused);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("nothing held");
+    }
+
+    /// A file answered by Map Local stops at a response breakpoint as a server's answer
+    /// does: what the app gets is what the pane let go. Nothing is sent anywhere, so the
+    /// host needn't exist.
+    #[test]
+    fn a_mapped_file_stops_at_a_response_breakpoint() {
+        let rt = runtime();
+        let file = std::env::temp_dir().join(format!("apitool-mapped-{}.json", std::process::id()));
+        std::fs::write(&file, "{\"from\":\"file\"}").unwrap();
+        let rule = |act| Rule {
+            on: true,
+            url: "/mapped".into(),
+            act,
+        };
+        let controls = Arc::new(Controls {
+            rules: Mutex::new(vec![
+                rule(Act::MapLocal(file.display().to_string())),
+                rule(Act::Breakpoint {
+                    request: false,
+                    response: true,
+                }),
+            ]),
+            ..Default::default()
+        });
+        let (addr, flows) = proxy_with(&rt, direct(), controls.clone());
+        let app = through(addr);
+        let answer = rt.spawn(async move {
+            let res = app
+                .get("http://mapped.invalid/mapped")
+                .send()
+                .await
+                .unwrap();
+            (res.status().as_u16(), res.text().await.unwrap())
+        });
+        let mut p = held_one(&controls, true);
+        assert!(
+            p.text
+                .starts_with("200 OK\ncontent-type: application/json\n"),
+            "{}",
+            p.text
+        );
+        assert!(p.text.ends_with("\n\n{\"from\":\"file\"}"), "{}", p.text);
+        p.text = p.text.replace("file", "pane");
+        p.resume();
+        let pane = "{\"from\":\"pane\"}";
+        assert_eq!(rt.block_on(answer).unwrap(), (200, pane.to_owned()));
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!(f.response.body, pane.as_bytes());
+        let _ = std::fs::remove_file(&file);
     }
 
     fn direct() -> Network {
@@ -1507,6 +1593,105 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// An HTTPS server speaking only HTTP/2, as gRPC's do: "pong" and a grpc-status
+    /// trailer to each request, noting its version and te.
+    fn h2_server(rt: &tokio::runtime::Runtime) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = PrivateKeyDer::try_from(own.signing_key.serialize_der()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = (rustls::ServerConfig::builder_with_provider(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![own.cert.der().clone()], key)
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        rt.spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                let (acceptor, log) = (acceptor.clone(), log.clone());
+                tokio::spawn(async move {
+                    let tls = acceptor.accept(s).await.unwrap();
+                    let mut conn = h2::server::handshake(tls).await.unwrap();
+                    while let Some(Ok((req, mut respond))) = conn.accept().await {
+                        let te = req.headers().get("te").map_or("", |v| v.to_str().unwrap());
+                        log.lock()
+                            .unwrap()
+                            .push(format!("{:?} te={te}", req.version()));
+                        let head = Response::builder().header("content-type", "application/grpc");
+                        let mut send = respond
+                            .send_response(head.body(()).unwrap(), false)
+                            .unwrap();
+                        send.send_data(Bytes::from_static(b"pong"), false).unwrap();
+                        let mut trailers = HeaderMap::new();
+                        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+                        send.send_trailers(trailers).unwrap();
+                    }
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// Decrypting, an app speaking HTTP/2 goes on in it, as gRPC must: its te: trailers
+    /// reaches the server, and the server's trailers, the call's status, reach the app.
+    #[test]
+    fn grpc_goes_through_decrypted_over_http2() {
+        let rt = runtime();
+        let (cert, key) = Ca::generate().unwrap();
+        let ca = Arc::new(Ca::load(&cert, &key).unwrap());
+        // The server's own certificate is self-signed: only apitool's side checks it.
+        let net = Network {
+            insecure: true,
+            ..direct()
+        };
+        let clients = rt.block_on(crate::net::build_client(net)).unwrap();
+        let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let (addr, flows) = (listener.local_addr().unwrap(), Flows::new(|| {}));
+        let controls = Controls {
+            decrypt: Mutex::new(Some(ca)),
+            ..Default::default()
+        };
+        rt.spawn(serve(listener, clients, flows.clone(), Arc::new(controls)));
+        let (server, seen) = h2_server(&rt);
+        let app = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::https(format!("http://{addr}")).unwrap())
+            .add_root_certificate(reqwest::Certificate::from_pem(cert.as_bytes()).unwrap())
+            .build()
+            .unwrap();
+        let url = format!("https://localhost:{}/echo.Echo/Ping", server.port());
+        let (version, trailers, body) = rt.block_on(async {
+            let call = app.post(&url).header("content-type", "application/grpc");
+            let res = call
+                .header("te", "trailers")
+                .body("ping")
+                .send()
+                .await
+                .unwrap();
+            let version = res.version();
+            let all = Response::<reqwest::Body>::from(res)
+                .into_body()
+                .collect()
+                .await
+                .unwrap();
+            (
+                version,
+                all.trailers().cloned().unwrap_or_default(),
+                all.to_bytes(),
+            )
+        });
+        assert_eq!(version, reqwest::Version::HTTP_2);
+        assert_eq!(body, "pong");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+        assert_eq!(*seen.lock().unwrap(), ["HTTP/2.0 te=trailers"]);
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!((f.url, f.response.body), (url, b"pong".to_vec()));
     }
 
     /// Decrypting, an app that trusts the CA reads its HTTPS answer through the proxy, and

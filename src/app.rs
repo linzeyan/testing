@@ -13073,11 +13073,11 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
         };
         if crate::varedit::too_big(ui, id, &mut c.text).is_none() {
             let width = ui.available_width() - send_w - 8.0;
-            // Some 10 lines at most, then it scrolls: grown with a pasted payload, it pushed
-            // the log under it out of sight.
+            // Four lines, then it scrolls: grown with a pasted payload, it pushed the log
+            // under it out of sight. In a row there's no height to fill, so a scroll area
+            // keeps to its least, 64px.
             egui::ScrollArea::vertical()
                 .id_salt("compose-scroll")
-                .max_height(160.0)
                 .max_width(width)
                 .show(ui, |ui| {
                     let edit = ui.add(
@@ -21825,11 +21825,9 @@ mod ui_tests {
         let pretty = http::pretty_json(&format!("[{}]", items.join(","))).unwrap();
         h.state_mut().compose.text = pretty.clone();
         h.run();
-        let under = h.get_by_label("Minify").rect();
-        assert!(
-            under.bottom() < 800.0,
-            "pushed out of the window: {under:?}"
-        );
+        // A few lines, not all the room there is: below it, once connected, is the log.
+        let grown = h.get_by_label("Minify").rect().top() - h.get_by_label("Send").rect().top();
+        assert!(grown < 100.0, "the box grew {grown}px");
         h.get_by_label("Minify").click();
         h.run();
         let one = format!("[{}]", items.join(",")).replace(": ", ":");

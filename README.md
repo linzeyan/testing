@@ -411,7 +411,7 @@ that doesn't trust it fails to connect, and its tunnel says so. "Trusting apitoo
 shown while decrypting, has the steps for macOS, Windows, Linux and WSL, Firefox, command-line
 tools (Node, Python, curl, Java) and phones, its commands naming the exported file, a click
 to copy each. Decrypted
-connections speak HTTP/1.1, so an app that only speaks HTTP/2 (gRPC) can't go through. The
+connections speak HTTP/2 when the app offers it, so gRPC goes through, its trailers too. The
 latest 1000 flows are kept, each body's first 256 KiB. WebSocket upgrades through the proxy
 aren't relayed.
 
@@ -421,7 +421,7 @@ file and never reaches the server; **Map Remote** sends to another server (its s
 and port; the path and query stay); **Request header** and **Response header** set one, or
 remove it when the value is empty; **Throttle** holds the request, then lets the answer
 through at most so many KiB/s; **Breakpoint** holds the request before it goes on, the
-answer before the app gets it, or both. A held exchange shows atop the pane as text (its
+answer before the app gets it (a Map Local file's too), or both. A held exchange shows atop the pane as text (its
 first line, a header a line, a blank line, the body): edit it, then **Continue** sends what
 it says, or **Abort** answers the app with a 502. A binary body goes on as it was unless its
 note is typed over; Stop drops whatever is held. A row a rule changed has an orange dot, and
