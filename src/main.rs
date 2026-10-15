@@ -85,6 +85,7 @@ fn main() -> eframe::Result {
             let font = appearance::cjk().map_or("none: CJK text will not render", |(p, _)| p);
             let renderer = format!("{}\nCJK font: {font}", renderer_info(cc));
             log::info!("{}", renderer.replace('\n', ", "));
+            cc.egui_ctx.add_plugin(app::OpenLinks);
             let mut app = app::App::new(ws, renderer);
             app.auto_update();
             app.restore_window(cc.storage);

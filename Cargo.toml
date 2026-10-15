@@ -89,6 +89,9 @@ bytes = "1"
 # Already in the tree via reqwest-websocket, whose handshake takes its config: the
 # largest message a WebSocket takes in.
 tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+# The Docs tab's preview: egui draws no Markdown of its own. No images or syntax
+# highlighting, so it brings only pulldown-cmark and two small crates of its own.
+egui_commonmark = { version = "0.25", default-features = false, features = ["pulldown_cmark"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux has no dialog of its own: ask the desktop portal.

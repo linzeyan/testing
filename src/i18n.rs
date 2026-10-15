@@ -1073,6 +1073,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Saved example \"{}\"", "已儲存範例「{}」"),
     ("Saved {}", "已儲存 {}"),
     ("Saved {}{}", "已儲存 {}{}"),
+    ("Nothing written yet.", "尚未撰寫內容。"),
+    ("Write", "撰寫"),
     (
         "; left out {} SSE, gRPC, MQTT or Socket.IO requests, which Insomnia can't hold",
         "；略過 {} 個 Insomnia 無法容納的 SSE、gRPC、MQTT 或 Socket.IO 請求",

@@ -11133,8 +11133,46 @@ fn auth_editor(
     follow
 }
 
+/// Opens the links clicked in the window, in the browser as sign-in does: eframe opens
+/// them only with its "links" feature, a crate more. Added by main, not the tests, whose
+/// clicks mustn't open a browser.
+pub struct OpenLinks;
+
+impl egui::Plugin for OpenLinks {
+    fn debug_name(&self) -> &'static str {
+        "OpenLinks"
+    }
+
+    fn output_hook(&mut self, _: &egui::Context, output: &mut egui::FullOutput) {
+        output.platform_output.commands.retain(|c| match c {
+            egui::OutputCommand::OpenUrl(open) => {
+                if let Err(e) = crate::auth::open_browser(&open.url) {
+                    log::warn!("{e}");
+                }
+                false
+            }
+            _ => true,
+        });
+    }
+}
+
 fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
+    // One for every Docs tab, so reading through requests' docs stays reading.
+    let key = egui::Id::new("docs-preview");
+    let mut preview = ui.data(|d| d.get_temp(key)).unwrap_or(false);
     ui.horizontal_wrapped(|ui| {
+        if ui
+            .add(egui::Button::new(t("Write")).selected(!preview))
+            .clicked()
+        {
+            preview = false;
+        }
+        if ui
+            .add(egui::Button::new(t("Preview")).selected(preview))
+            .clicked()
+        {
+            preview = true;
+        }
         ui.weak(t(
             "Markdown. A folder's right-click menu exports these docs as Markdown or OpenAPI.",
         ));
@@ -11149,6 +11187,21 @@ fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
             description.push_str(template);
         }
     });
+    ui.data_mut(|d| d.insert_temp(key, preview));
+    if preview {
+        if description.trim().is_empty() {
+            ui.weak(t("Nothing written yet."));
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("docs-preview")
+            .show(ui, |ui| {
+                // ponytail: a cache made each frame, as there are no images to keep; a link to a
+                // #heading doesn't scroll there. Keep one on the App if that's wanted.
+                let cache = &mut egui_commonmark::CommonMarkCache::default();
+                egui_commonmark::CommonMarkViewer::new().show(ui, cache, description);
+            });
+        return;
+    }
     ui.add(
         egui::TextEdit::multiline(description)
             .desired_rows(fill_rows(ui, egui::TextStyle::Body))
@@ -21162,6 +21215,42 @@ mod ui_tests {
             assert!(text.starts_with(written), "{text}");
             assert!(!offered(&h), "only while empty");
         }
+    }
+
+    /// Docs read as written: Preview lays the Markdown out (a heading, a link) in place of
+    /// its source, Write brings the source back, and empty docs say so rather than show a
+    /// blank pane.
+    #[test]
+    fn docs_preview_lays_out_the_markdown() {
+        let mut h = with_request("docs-preview");
+        h.state_mut().req_tab = ReqTab::Docs;
+        h.run();
+        let editor = || egui_kittest::kittest::By::new().role(Role::MultilineTextInput);
+        assert!(h.query(editor()).is_some());
+        h.get_by_label("Preview").click();
+        h.run();
+        h.get_by_label("Nothing written yet.");
+        let source = "# Orders\n\nSee [the guide](https://example.com/guide).";
+        h.state_mut().open.as_mut().unwrap().draft.description = source.into();
+        h.run();
+        shot(&mut h, "72-docs-preview");
+        assert!(h.query_by_label("Nothing written yet.").is_none());
+        assert!(h.query(editor()).is_none(), "the source isn't shown");
+        h.get_by_label("Orders");
+        // Asked of the window, which main hands to the browser (`OpenLinks`).
+        h.get_by_label("the guide").click();
+        let opened = (0..3).any(|_| {
+            h.step();
+            let commands = &h.output().platform_output.commands;
+            commands.iter().any(|c| {
+                matches!(c, egui::OutputCommand::OpenUrl(o) if o.url == "https://example.com/guide")
+            })
+        });
+        assert!(opened, "the link opens its page");
+        h.get_by_label("Write").click();
+        h.run();
+        assert!(h.query(editor()).is_some());
+        assert_eq!(draft(&h).description, source);
     }
 
     /// Not a check: prints what one frame costs in the states that look heavy, with the

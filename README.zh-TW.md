@@ -317,6 +317,8 @@ Java、C#、PHP、Ruby、Rust、Swift 或 Kotlin。二進位內容會讀入對�
 | MQTT | mosquitto、paho-mqtt、mqtt.js、paho Go |
 | gRPC | grpcurl、grpc-js、grpcio，依方法的串流形式產生 |
 
+說明以 Markdown 撰寫在請求或資料夾的「文件」分頁；按「預覽」可看到排版後的樣子，其中的連結會在瀏覽器開啟。
+
 API 文件由請求與資料夾的說明及已儲存的範例產生：在資料夾上按右鍵（或集合上方的「更多」）>
 「複製為」或「匯出」> Markdown 或 OpenAPI，或執行
 `apitool-cli docs`。OpenAPI 3.1 文件（YAML；檔名為 .json 時輸出 JSON）匯入後會還原成同樣的

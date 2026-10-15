@@ -361,6 +361,9 @@ last carries over between kinds. Long lines scroll sideways rather than wrap.
 | MQTT | mosquitto, paho-mqtt, mqtt.js, paho Go |
 | gRPC | grpcurl, grpc-js, grpcio, by the method's streaming shape |
 
+Descriptions are Markdown, written in a request's or folder's Docs tab; Preview there shows
+them laid out, and a link in them opens in the browser.
+
 API docs come from request and folder descriptions and saved examples: right-click a
 folder (or More above the collections) > "Copy as" or "Export" > Markdown or OpenAPI, or
 `apitool-cli docs`. The OpenAPI 3.1 document (YAML,
