@@ -687,6 +687,15 @@ impl Workspace {
         self.put("capture-ca", json)
     }
 
+    /// The capture's rules, as JSON; empty before the first.
+    pub fn load_capture_rules(&self) -> String {
+        self.get("capture-rules").unwrap_or_default()
+    }
+
+    pub fn save_capture_rules(&self, json: &str) -> Result<(), String> {
+        self.put("capture-rules", json)
+    }
+
     /// The system's proxy settings from before the capture pointed it at itself; empty
     /// when it doesn't.
     pub fn load_system_proxy(&self) -> String {

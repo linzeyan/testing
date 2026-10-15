@@ -396,6 +396,14 @@ connections speak HTTP/1.1, so an app that only speaks HTTP/2 (gRPC) can't go th
 latest 1000 flows are kept, each body's first 256 KiB. WebSocket upgrades through the proxy
 aren't relayed.
 
+Rules, as Proxyman's tools, apply to every exchange whose URL matches (anywhere in the URL,
+`*` for any part), top to bottom, and are kept in the workspace: **Map Local** answers from a
+file and never reaches the server; **Map Remote** sends to another server (its scheme, host
+and port; the path and query stay); **Request header** and **Response header** set one, or
+remove it when the value is empty; **Throttle** holds the request, then lets the answer
+through at most so many KiB/s. A row a rule changed has an orange dot, and its detail says
+what changed. HTTPS needs "Decrypt HTTPS" on for rules to see inside.
+
 ## Command line
 
 ```

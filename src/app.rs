@@ -526,8 +526,8 @@ struct CaptureView {
     filter: String,
     /// The flow shown under the list.
     picked: Option<u64>,
-    /// The CA while Decrypt HTTPS is on, shared with the proxy, which reads it per tunnel.
-    decrypt: crate::capture::Decrypt,
+    /// Decrypt HTTPS and the rules, shared with the proxy, which reads them per exchange.
+    controls: Arc<crate::capture::Controls>,
     /// The system's proxy points here (what it was is in the workspace).
     system: bool,
 }
@@ -4280,14 +4280,14 @@ impl App {
             Ok(l) => l,
             Err(e) => return self.fail(tf("Capture: {}", &[&e])),
         };
-        let view = self.capture.get_or_insert_with(|| capture_view(ctx));
+        let view = (self.capture).get_or_insert_with(|| capture_view(ctx, &self.ws));
         let (cell, net, tx, ctx) = (
             self.client.clone(),
             (self.network.clone(), self.cookies.clone()),
             self.tx.clone(),
             ctx.clone(),
         );
-        let (flows, decrypt) = (view.flows.clone(), view.decrypt.clone());
+        let (flows, controls) = (view.flows.clone(), view.controls.clone());
         let failed = t("Capture: {}");
         let task = self.rt.spawn(async move {
             // Through the proxy chosen for requests: a VDI may have no other way out.
@@ -4296,7 +4296,7 @@ impl App {
                 .await
             {
                 Ok(clients) => {
-                    crate::capture::serve(listener, clients.clone(), flows, decrypt).await;
+                    crate::capture::serve(listener, clients.clone(), flows, controls).await;
                 }
                 // The pane sees the task ended and offers Start again.
                 Err(e) => {
@@ -4370,8 +4370,9 @@ impl App {
 
     fn capture_ui(&mut self, ui: &mut egui::Ui) {
         let listening = self.capturing();
-        let view = self.capture.get_or_insert_with(|| capture_view(ui.ctx()));
-        let (decrypting, pointing) = (view.decrypt.lock().unwrap().is_some(), view.system);
+        let view = (self.capture).get_or_insert_with(|| capture_view(ui.ctx(), &self.ws));
+        let decrypting = view.controls.decrypt.lock().unwrap().is_some();
+        let pointing = view.system;
         let (mut start, mut stop, mut export, mut open_as) = (false, false, false, None);
         let (mut decrypt, mut export_ca, mut system) = (None, false, None);
         ui.horizontal(|ui| {
@@ -4432,6 +4433,22 @@ impl App {
             ),
         };
         ui.weak(fill(hint, &[&addr]));
+        if let Some(view) = &self.capture {
+            let mut rules = view.controls.rules.lock().unwrap();
+            let on = rules.iter().filter(|r| r.on).count();
+            let edited = egui::CollapsingHeader::new(tf("Rules ({} on)", &[&on]))
+                .id_salt("capture-rules")
+                .show(ui, |ui| rules_ui(ui, &mut rules))
+                .body_returned
+                .unwrap_or(false);
+            let json = edited.then(|| serde_json::to_string(&*rules).unwrap_or_default());
+            drop(rules);
+            if let Some(json) = json
+                && let Err(e) = self.ws.save_capture_rules(&json)
+            {
+                self.fail(e);
+            }
+        }
         if let Some(CaptureView {
             flows,
             filter,
@@ -4473,7 +4490,7 @@ impl App {
         };
         // Ticked, `ca` is the CA; unticked, None.
         if let (Some(_), Some(view)) = (decrypt, &self.capture) {
-            *view.decrypt.lock().unwrap() = ca.clone();
+            *view.controls.decrypt.lock().unwrap() = ca.clone();
         }
         if export_ca
             && let Some(ca) = ca
@@ -12066,17 +12083,144 @@ impl StreamSession {
 }
 
 /// The capture pane's state, from when it first shows: Decrypt HTTPS can be set before
-/// the first Start.
-fn capture_view(ctx: &egui::Context) -> CaptureView {
+/// the first Start. The rules are the workspace's.
+fn capture_view(ctx: &egui::Context, ws: &Workspace) -> CaptureView {
     let repaint = ctx.clone();
+    let rules = serde_json::from_str(&ws.load_capture_rules()).unwrap_or_default();
+    let controls = crate::capture::Controls {
+        rules: std::sync::Mutex::new(rules),
+        ..Default::default()
+    };
     CaptureView {
         // Flows come in bursts: one frame for a burst.
         flows: crate::capture::Flows::new(move || repaint.request_repaint_after(BATCHED)),
         server: None,
         filter: String::new(),
         picked: None,
-        decrypt: Default::default(),
+        controls: Arc::new(controls),
         system: false,
+    }
+}
+
+/// The capture's rules, edited in place, a row each; true when one changed.
+fn rules_ui(ui: &mut egui::Ui, rules: &mut Vec<crate::capture::Rule>) -> bool {
+    use crate::capture::Act;
+    let kinds = [
+        (t("Map Local"), Act::MapLocal(String::new())),
+        (t("Map Remote"), Act::MapRemote(String::new())),
+        (
+            t("Request header"),
+            Act::RequestHeader(String::new(), String::new()),
+        ),
+        (
+            t("Response header"),
+            Act::ResponseHeader(String::new(), String::new()),
+        ),
+        (
+            t("Throttle"),
+            Act::Throttle {
+                delay_ms: 500,
+                kib_per_s: 0,
+            },
+        ),
+    ];
+    let kind = |act: &Act| std::mem::discriminant(act);
+    let (mut changed, mut gone) = (false, None);
+    // A row each, the URL and the kind at fixed widths so the rows line up: a Grid
+    // re-measured itself every frame here and never stopped repainting.
+    for (i, rule) in rules.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            let on = ui.checkbox(&mut rule.on, "").on_hover_text(t("On"));
+            let url = egui::TextEdit::singleline(&mut rule.url)
+                .hint_text(t("URL, * for any part"))
+                .desired_width(220.0);
+            changed |= on.changed() | ui.add(url).changed();
+            let shown = (kinds.iter()).find(|(_, a)| kind(a) == kind(&rule.act));
+            egui::ComboBox::from_id_salt(("capture-rule-kind", i))
+                .selected_text(shown.map_or("", |(label, _)| *label))
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    for (label, act) in &kinds {
+                        let current = kind(act) == kind(&rule.act);
+                        if ui.selectable_label(current, *label).clicked() && !current {
+                            (rule.act, changed) = (act.clone(), true);
+                        }
+                    }
+                });
+            let text = |ui: &mut egui::Ui, value: &mut String, hint: &str, width| {
+                let edit = egui::TextEdit::singleline(value).hint_text(hint);
+                ui.add(edit.desired_width(width)).changed()
+            };
+            changed |= match &mut rule.act {
+                Act::MapLocal(path) => {
+                    text(ui, path, t("File to answer with"), 220.0) | browse(ui, path, &[], false)
+                }
+                Act::MapRemote(to) => text(ui, to, "http://localhost:3000", 220.0),
+                Act::RequestHeader(name, value) | Act::ResponseHeader(name, value) => {
+                    text(ui, name, t("Name"), 120.0)
+                        | text(ui, value, t("Value (empty: removed)"), 160.0)
+                }
+                Act::Throttle {
+                    delay_ms,
+                    kib_per_s,
+                } => {
+                    let delay = egui::DragValue::new(delay_ms).suffix(" ms");
+                    let rate = egui::DragValue::new(kib_per_s).suffix(" KiB/s");
+                    let delay =
+                        (ui.add(delay.range(0..=60_000))).on_hover_text(t("Held before going on"));
+                    let rate = (ui.add(rate.range(0..=1_000_000)))
+                        .on_hover_text(t("The answer at most this fast; 0, as fast as it comes"));
+                    delay.changed() | rate.changed()
+                }
+            };
+            if icon_button(ui, icon::TRASH, t("Delete"), None)
+                .on_hover_text(t("Delete"))
+                .clicked()
+            {
+                gone = Some(i);
+            }
+        });
+    }
+    if let Some(i) = gone {
+        rules.remove(i);
+        changed = true;
+    }
+    if ui.button(t("Add rule")).clicked() {
+        rules.push(crate::capture::Rule {
+            on: true,
+            url: String::new(),
+            act: Act::MapLocal(String::new()),
+        });
+        changed = true;
+    }
+    changed
+}
+
+/// What a rule did to a flow, as its detail tells it.
+fn applied_text(act: &crate::capture::Act) -> String {
+    use crate::capture::Act;
+    match act {
+        Act::MapLocal(path) => tf("Map Local: answered from {}", &[path]),
+        Act::MapRemote(url) => tf("Map Remote: sent to {}", &[url]),
+        Act::RequestHeader(name, value) if value.is_empty() => {
+            tf("Request header {} removed", &[name])
+        }
+        Act::RequestHeader(name, value) => tf("Request header set: {}: {}", &[name, value]),
+        Act::ResponseHeader(name, value) if value.is_empty() => {
+            tf("Response header {} removed", &[name])
+        }
+        Act::ResponseHeader(name, value) => tf("Response header set: {}: {}", &[name, value]),
+        Act::Throttle {
+            delay_ms,
+            kib_per_s: 0,
+        } => tf("Throttled: held {} ms", &[delay_ms]),
+        Act::Throttle {
+            delay_ms,
+            kib_per_s,
+        } => tf(
+            "Throttled: held {} ms, at most {} KiB/s",
+            &[delay_ms, kib_per_s],
+        ),
     }
 }
 
@@ -12164,6 +12308,20 @@ fn flow_list(
                             .monospace()
                             .color(color),
                     );
+                    // Room for it on every row, so the columns line up.
+                    let changed = !f.applied.is_empty();
+                    let mark = dot(
+                        ui,
+                        if changed {
+                            ORANGE
+                        } else {
+                            Color32::TRANSPARENT
+                        },
+                    );
+                    if changed {
+                        let text: Vec<_> = f.applied.iter().map(applied_text).collect();
+                        mark.on_hover_text(text.join("\n"));
+                    }
                     let took = f
                         .elapsed
                         .map_or("…".to_owned(), |e| format!("{} ms", e.as_millis()));
@@ -12208,6 +12366,9 @@ fn flow_text(f: &crate::capture::Flow) -> String {
         out.push('\n');
     };
     let mut out = format!("{} {}\n", f.method, f.url);
+    for act in &f.applied {
+        let _ = writeln!(out, "# {}", applied_text(act));
+    }
     message(&mut out, &f.request);
     if let Some(status) = f.status {
         let _ = writeln!(out, "\n{status}");
@@ -20957,7 +21118,7 @@ mod ui_tests {
         h.run();
         let ca = |h: &Harness<'_, App>| {
             let view = h.state().capture.as_ref().unwrap();
-            let ca = view.decrypt.lock().unwrap().clone();
+            let ca = view.controls.decrypt.lock().unwrap().clone();
             ca.map(|ca| ca.pem().to_owned())
         };
         let tick = |h: &mut Harness<'_, App>| {
@@ -21009,6 +21170,72 @@ mod ui_tests {
         h.get_by_label("Close the capture").click();
         h.run();
         assert_eq!(kept(&h), "", "put back on closing the capture");
+    }
+
+    /// A rule added in the pane applies to the next exchange and is kept in the workspace:
+    /// closed and opened again, the pane has it.
+    #[test]
+    fn a_rule_from_the_pane_applies_and_is_kept() {
+        use std::io::{Read, Write};
+        let server = crate::http::tests::serve(|_| ("200 OK".into(), "real".into()));
+        let file = std::env::temp_dir().join(format!("apitool-rule-{}.txt", std::process::id()));
+        std::fs::write(&file, "mapped").unwrap();
+        let mut h = harness(workspace("capture-rule"));
+        h.run();
+        h.state_mut().act(Action::Capture);
+        h.run();
+        h.get_by_label("Rules (0 on)").click();
+        h.run();
+        h.get_by_label("Add rule").click();
+        h.run();
+        // Told by its placeholder, which shows while it's empty: clicked, then typed in.
+        fn by_hint<'h>(h: &'h Harness<'_, App>, hint: &str) -> egui_kittest::Node<'h> {
+            let mut all = h.get_all_by_role(Role::TextInput);
+            all.find(|n| n.accesskit_node().placeholder() == Some(hint))
+                .unwrap()
+        }
+        let fill = |h: &mut Harness<'_, App>, hint: &str, text: &str| {
+            by_hint(h, hint).click();
+            h.run();
+            by_hint(h, hint).type_text(text);
+            h.run();
+        };
+        fill(&mut h, "URL, * for any part", "/items");
+        fill(&mut h, "File to answer with", &file.display().to_string());
+        shot(&mut h, "t-capture-rules");
+        h.get_by_label("Start capturing").click();
+        h.run();
+        let proxy = h.state_mut().capturing().expect("listening");
+        let mut app = std::net::TcpStream::connect(proxy).unwrap();
+        let url = format!("http://{server}/items/1");
+        write!(
+            app,
+            "GET {url} HTTP/1.1\r\nHost: {server}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut answer = String::new();
+        app.read_to_string(&mut answer).unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(answer.ends_with("\r\n\r\nmapped"), "{answer}");
+        // Picked, the flow says which rule answered it.
+        wait_live(&mut h, |app| {
+            let flows = &app.capture.as_ref().unwrap().flows;
+            flows.with(|l| l.iter().any(|f| f.elapsed.is_some()))
+        });
+        h.get_by_label(&url).click();
+        h.run();
+        let note = tf("Map Local: answered from {}", &[&file.display()]);
+        let told = (h.get_all_by_role(Role::Label))
+            .filter_map(|n| n.value())
+            .any(|v| v.contains(&format!("# {note}")));
+        assert!(told, "{note}");
+
+        h.state_mut().capture = None;
+        h.run();
+        h.get_by_label("Rules (1 on)");
+        let kept: Vec<crate::capture::Rule> =
+            serde_json::from_str(&h.state().ws.load_capture_rules()).unwrap();
+        assert_eq!(kept[0].url, "/items");
     }
 
     fn wait_live(h: &mut Harness<'_, App>, done: impl Fn(&App) -> bool) {

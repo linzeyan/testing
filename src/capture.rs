@@ -21,6 +21,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -86,6 +87,8 @@ pub struct Flow {
     /// None while it goes on.
     pub elapsed: Option<Duration>,
     pub error: Option<String>,
+    /// The rules that changed it, a Map Remote's as the URL it went to.
+    pub applied: Vec<Act>,
 }
 
 impl Flow {
@@ -139,6 +142,7 @@ impl Flows {
             response: Message::default(),
             elapsed: None,
             error: None,
+            applied: Vec::new(),
         });
         drop(list);
         (self.changed)();
@@ -177,9 +181,54 @@ fn text(status: StatusCode, message: &str) -> Response<Body> {
     res
 }
 
+/// What the pane sets and the proxy reads for each exchange, so a change applies at once.
+#[derive(Default)]
+pub struct Controls {
+    /// Decrypting's CA while it's on; tunnels pass untouched while it's None.
+    pub decrypt: Mutex<Option<Arc<Ca>>>,
+    pub rules: Mutex<Vec<Rule>>,
+}
+
+/// Proxyman's tools, as a rule: what to do to an exchange whose URL `matches` it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Rule {
+    pub on: bool,
+    pub url: String,
+    pub act: Act,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Act {
+    /// Answered from this file, never sent on.
+    MapLocal(String),
+    /// Sent to this server instead (scheme, host, port), the path and query kept.
+    MapRemote(String),
+    /// Set on the request; an empty value removes it.
+    RequestHeader(String, String),
+    /// Set on the answer the app gets; an empty value removes it.
+    ResponseHeader(String, String),
+    /// Held this long before going on, and the answer at most this fast (0: as fast as
+    /// it comes).
+    Throttle { delay_ms: u64, kib_per_s: u64 },
+}
+
+/// A rule's URL: found anywhere in the URL, `*` for any run of characters, case aside.
+/// An empty one matches nothing, so a rule just added changes nothing yet.
+pub fn matches(pattern: &str, url: &str) -> bool {
+    let (pattern, url) = (pattern.trim().to_lowercase(), url.to_lowercase());
+    let mut at = 0;
+    for part in pattern.split('*').filter(|p| !p.is_empty()) {
+        match url[at..].find(part) {
+            Some(i) => at += i + part.len(),
+            None => return false,
+        }
+    }
+    !pattern.is_empty()
+}
+
 /// Serves until dropped, its tunnels with it. `clients` forwards: its proxy, CA file and
 /// client certificates.
-pub async fn serve(listener: TcpListener, clients: Clients, flows: Flows, decrypt: Decrypt) {
+pub async fn serve(listener: TcpListener, clients: Clients, flows: Flows, controls: Arc<Controls>) {
     let own = listener.local_addr().ok();
     // Tunnels watch it: the sender goes when this does.
     let (_running, stopped) = tokio::sync::watch::channel(());
@@ -196,17 +245,18 @@ pub async fn serve(listener: TcpListener, clients: Clients, flows: Flows, decryp
             }
         };
         let (clients, flows) = (clients.clone(), flows.clone());
-        let (stopped, decrypt) = (stopped.clone(), decrypt.clone());
+        let (stopped, controls) = (stopped.clone(), controls.clone());
         connections.spawn(async move {
             let service = hyper::service::service_fn(move |req| {
                 let (clients, flows) = (clients.clone(), flows.clone());
-                let (stopped, ca) = (stopped.clone(), decrypt.lock().unwrap().clone());
+                let (stopped, controls) = (stopped.clone(), controls.clone());
                 async move {
+                    let ca = controls.decrypt.lock().unwrap().clone();
                     let res = match ca {
                         Some(ca) if req.method() == Method::CONNECT => {
-                            intercept(req, ca, &clients, &flows, stopped)
+                            intercept(req, ca, &clients, &flows, controls, stopped)
                         }
-                        _ => handle(req, &clients, &flows, own, stopped).await,
+                        _ => handle(req, &clients, &flows, &controls, own, stopped).await,
                     };
                     Ok::<_, Infallible>(res)
                 }
@@ -225,6 +275,7 @@ async fn handle(
     req: Request<Incoming>,
     clients: &Clients,
     flows: &Flows,
+    controls: &Controls,
     own: Option<SocketAddr>,
     stopped: tokio::sync::watch::Receiver<()>,
 ) -> Response<Body> {
@@ -235,11 +286,16 @@ async fn handle(
         let hint = "This is apitool's capture proxy: set it as the HTTP proxy, not as the server.";
         return text(StatusCode::BAD_REQUEST, hint);
     }
-    exchange(req, clients, flows).await
+    exchange(req, clients, flows, controls).await
 }
 
 /// A request with its absolute URL: forwarded, unless it came back around.
-async fn exchange(req: Request<Incoming>, clients: &Clients, flows: &Flows) -> Response<Body> {
+async fn exchange(
+    req: Request<Incoming>,
+    clients: &Clients,
+    flows: &Flows,
+    controls: &Controls,
+) -> Response<Body> {
     let vias = req.headers().get_all(hyper::header::VIA);
     if vias
         .iter()
@@ -247,7 +303,8 @@ async fn exchange(req: Request<Incoming>, clients: &Clients, flows: &Flows) -> R
     {
         return text(StatusCode::LOOP_DETECTED, LOOP);
     }
-    forward(req, clients, flows).await
+    let rules = controls.rules.lock().unwrap().clone();
+    forward(req, clients, flows, &rules).await
 }
 
 const LOOP: &str = "apitool's capture proxy would be its own upstream: in apitool's network \
@@ -290,7 +347,12 @@ impl Drop for Tee {
     }
 }
 
-async fn forward(req: Request<Incoming>, clients: &Clients, flows: &Flows) -> Response<Body> {
+async fn forward(
+    req: Request<Incoming>,
+    clients: &Clients,
+    flows: &Flows,
+    rules: &[Rule],
+) -> Response<Body> {
     let started = Instant::now();
     let (parts, body) = req.into_parts();
     let url = parts.uri.to_string();
@@ -301,7 +363,68 @@ async fn forward(req: Request<Incoming>, clients: &Clients, flows: &Flows) -> Re
         });
         text(StatusCode::BAD_GATEWAY, &e)
     };
-    let client = match clients.forward_for(&url) {
+    let (mut target, mut local, mut pace) = (url.clone(), None, (0, 0));
+    let (mut asked, mut answered, mut applied) = (Vec::new(), Vec::new(), Vec::new());
+    for rule in rules.iter().filter(|r| r.on && matches(&r.url, &url)) {
+        let act = match &rule.act {
+            // The first one answers.
+            Act::MapLocal(_) if local.is_some() => continue,
+            Act::MapLocal(path) => {
+                local = Some(path.clone());
+                rule.act.clone()
+            }
+            Act::MapRemote(to) => match remap(&url, to) {
+                Ok(to) => {
+                    target = to;
+                    Act::MapRemote(target.clone())
+                }
+                Err(e) => return fail(e),
+            },
+            Act::RequestHeader(name, value) => {
+                asked.push((name.clone(), value.clone()));
+                rule.act.clone()
+            }
+            Act::ResponseHeader(name, value) => {
+                answered.push((name.clone(), value.clone()));
+                rule.act.clone()
+            }
+            Act::Throttle {
+                delay_ms,
+                kib_per_s,
+            } => {
+                pace = (*delay_ms, *kib_per_s);
+                rule.act.clone()
+            }
+        };
+        applied.push(act);
+    }
+    if !applied.is_empty() {
+        flows.update(id, |f| f.applied = applied);
+    }
+    tokio::time::sleep(Duration::from_millis(pace.0)).await;
+    let ok = |id| Answer {
+        flows,
+        id,
+        started,
+        rate: pace.1,
+    };
+    if let Some(path) = local {
+        let body = match tokio::fs::read(&path).await {
+            Ok(body) => body,
+            Err(e) => return fail(format!("{path}: {e}")),
+        };
+        let mime = mime_guess::from_path(&path).first_or_octet_stream();
+        let mut headers = HeaderMap::new();
+        if let Ok(mime) = HeaderValue::from_str(mime.as_ref()) {
+            headers.insert(hyper::header::CONTENT_TYPE, mime);
+        }
+        // Its length known, as a file server tells it: streamed, it went out chunked.
+        headers.insert(hyper::header::CONTENT_LENGTH, body.len().into());
+        set_headers(&mut headers, &answered);
+        let body = futures_util::stream::iter([Ok(Bytes::from(body))]);
+        return ok(id).send(StatusCode::OK, headers, body);
+    }
+    let client = match clients.forward_for(&target) {
         Ok(client) => client,
         Err(e) => return fail(e),
     };
@@ -310,7 +433,8 @@ async fn forward(req: Request<Incoming>, clients: &Clients, flows: &Flows) -> Re
         headers.remove(*name);
     }
     headers.append(hyper::header::VIA, HeaderValue::from_static(VIA));
-    let mut send = client.request(parts.method, &url).headers(headers);
+    set_headers(&mut headers, &asked);
+    let mut send = client.request(parts.method, &target).headers(headers);
     // A GET's empty body stays absent: streamed, it would go out chunked.
     if !body.is_end_stream() {
         let tee = Tee {
@@ -334,27 +458,81 @@ async fn forward(req: Request<Incoming>, clients: &Clients, flows: &Flows) -> Re
         Ok(res) => res,
         Err(e) => return fail(error_chain(&e)),
     };
-    let status = res.status();
-    let mut back = Response::builder().status(status);
+    let mut headers = HeaderMap::new();
     for (name, value) in res.headers() {
         if !HOP_BY_HOP.contains(&name.as_str()) {
-            back = back.header(name, value);
+            headers.append(name, value.clone());
         }
     }
-    let shown = pairs(res.headers());
-    flows.update(id, |f| {
-        (f.status, f.response.headers) = (Some(status.as_u16()), shown);
-    });
-    let tee = Tee {
-        flows: flows.clone(),
-        id,
-        started,
-    };
-    let body = StreamBody::new(res.bytes_stream().map(move |chunk| tee.response(chunk)));
-    match back.body(body.boxed_unsync()) {
-        Ok(res) => res,
-        Err(e) => fail(e.to_string()),
+    set_headers(&mut headers, &answered);
+    ok(id).send(res.status(), headers, res.bytes_stream())
+}
+
+/// The answer as the app gets it, kept in its flow as it goes.
+struct Answer<'a> {
+    flows: &'a Flows,
+    id: u64,
+    started: Instant,
+    /// KiB/s at most; 0, as fast as it comes.
+    rate: u64,
+}
+
+impl Answer<'_> {
+    fn send(
+        self,
+        status: StatusCode,
+        headers: HeaderMap,
+        body: impl futures_util::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    ) -> Response<Body> {
+        let shown = pairs(&headers);
+        self.flows.update(self.id, |f| {
+            (f.status, f.response.headers) = (Some(status.as_u16()), shown);
+        });
+        let tee = Tee {
+            flows: self.flows.clone(),
+            id: self.id,
+            started: self.started,
+        };
+        let rate = self.rate;
+        let paced = body.then(move |chunk| async move {
+            if let (1.., Ok(chunk)) = (rate, &chunk) {
+                let took = chunk.len() as f64 / (rate as f64 * 1024.0);
+                tokio::time::sleep(Duration::from_secs_f64(took)).await;
+            }
+            chunk
+        });
+        let body = StreamBody::new(paced.map(move |chunk| tee.response(chunk)));
+        let mut res = Response::new(body.boxed_unsync());
+        (*res.status_mut(), *res.headers_mut()) = (status, headers);
+        res
     }
+}
+
+/// Header rules in order: set, or removed when the value is empty. What can't be a header
+/// is left out.
+fn set_headers(headers: &mut HeaderMap, rules: &[(String, String)]) {
+    for (name, value) in rules {
+        let Ok(name) = hyper::header::HeaderName::from_bytes(name.trim().as_bytes()) else {
+            continue;
+        };
+        if value.is_empty() {
+            headers.remove(&name);
+        } else if let Ok(value) = HeaderValue::from_str(value) {
+            headers.insert(name, value);
+        }
+    }
+}
+
+/// `url` sent to `to`'s server: its scheme, host and port, the path and query kept.
+fn remap(url: &str, to: &str) -> Result<String, String> {
+    let to = reqwest::Url::parse(to.trim()).map_err(|e| format!("Map Remote {to}: {e}"))?;
+    let url = reqwest::Url::parse(url).map_err(|e| format!("{url}: {e}"))?;
+    let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Ok(format!(
+        "{}{}{query}",
+        to.origin().ascii_serialization(),
+        url.path()
+    ))
 }
 
 /// CONNECT: the bytes go both ways untouched, counted when the tunnel closes.
@@ -465,9 +643,6 @@ async fn connect(
     }
 }
 
-/// Decrypting's CA while it's on; tunnels pass untouched while it's None.
-pub type Decrypt = Arc<Mutex<Option<Arc<Ca>>>>;
-
 /// The CA that signs a certificate for each host an app opens HTTPS to. The app must trust
 /// it, so it is made once and kept (see `generate` and `load`).
 pub struct Ca {
@@ -572,6 +747,7 @@ fn intercept(
     ca: Arc<Ca>,
     clients: &Clients,
     flows: &Flows,
+    controls: Arc<Controls>,
     mut stopped: tokio::sync::watch::Receiver<()>,
 ) -> Response<Body> {
     let Some(authority) = req.uri().authority().cloned() else {
@@ -603,7 +779,7 @@ fn intercept(
             Some(_) => format!("https://{authority}"),
         };
         let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
-            let (clients, flows) = (clients.clone(), flows.clone());
+            let (clients, flows, controls) = (clients.clone(), flows.clone(), controls.clone());
             // Inside the tunnel a request names only its path.
             let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
             let uri = format!("{origin}{path}").parse::<hyper::Uri>();
@@ -611,7 +787,7 @@ fn intercept(
                 let res = match uri {
                     Ok(uri) => {
                         *req.uri_mut() = uri;
-                        exchange(req, &clients, &flows).await
+                        exchange(req, &clients, &flows, &controls).await
                     }
                     Err(e) => text(StatusCode::BAD_REQUEST, &e.to_string()),
                 };
@@ -720,11 +896,156 @@ mod tests {
 
     /// A capture proxy forwarding by `net`, and where it listens.
     fn proxy(rt: &tokio::runtime::Runtime, net: Network) -> (SocketAddr, Flows) {
+        proxy_with(rt, net, Controls::default())
+    }
+
+    fn proxy_with(
+        rt: &tokio::runtime::Runtime,
+        net: Network,
+        controls: Controls,
+    ) -> (SocketAddr, Flows) {
         let clients = rt.block_on(crate::net::build_client(net)).unwrap();
         let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let (addr, flows) = (listener.local_addr().unwrap(), Flows::new(|| {}));
-        rt.spawn(serve(listener, clients, flows.clone(), Decrypt::default()));
+        rt.spawn(serve(listener, clients, flows.clone(), Arc::new(controls)));
         (addr, flows)
+    }
+
+    fn through(addr: SocketAddr) -> reqwest::Client {
+        let proxy = reqwest::Proxy::http(format!("http://{addr}")).unwrap();
+        reqwest::Client::builder().proxy(proxy).build().unwrap()
+    }
+
+    /// A rule's URL is found anywhere, `*` stands for any run, and case doesn't matter; an
+    /// empty one, a rule just added, matches nothing.
+    #[test]
+    fn a_rule_url_matches_anywhere_with_wildcards() {
+        let url = "https://API.test/v1/users/7?full=1";
+        for hit in ["api.test", "*/users/*", "https://*/v1/*full", "*"] {
+            assert!(matches(hit, url), "{hit}");
+        }
+        for miss in ["", "  ", "/v2/", "*/users/*/posts", "full*v1"] {
+            assert!(!matches(miss, url), "{miss}");
+        }
+    }
+
+    /// Proxyman's tools as rules: a Map Local answers from its file and never reaches the
+    /// server; a Map Remote goes to another server, the path and query kept; header rules
+    /// set and remove on either side; a rule that's off does nothing. A flow says which
+    /// changed it.
+    #[test]
+    fn rules_answer_locally_send_elsewhere_and_rewrite_headers() {
+        let rt = runtime();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        let real = crate::http::tests::serve(move |req| {
+            kept.lock().unwrap().push(req.to_lowercase());
+            ("200 OK\r\nx-server: real".into(), "real".into())
+        });
+        let other = crate::http::tests::serve(|req| {
+            let line = req.lines().next().unwrap_or_default();
+            ("200 OK".into(), format!("other {line}"))
+        });
+        let file = std::env::temp_dir().join(format!("apitool-map-{}.json", std::process::id()));
+        std::fs::write(&file, r#"{"mapped":true}"#).unwrap();
+        let rule = |url: &str, act| Rule {
+            on: true,
+            url: url.into(),
+            act,
+        };
+        let rules = vec![
+            Rule {
+                on: false,
+                ..rule("*", Act::MapLocal("/nowhere".into()))
+            },
+            rule("*/local*", Act::MapLocal(file.display().to_string())),
+            // The first that matches answers.
+            rule("/local/", Act::MapLocal("/nowhere".into())),
+            rule("/remote", Act::MapRemote(format!("http://{other}/ignored"))),
+            rule("*", Act::RequestHeader("x-added".into(), "1".into())),
+            rule("*", Act::RequestHeader("x-app".into(), String::new())),
+            rule("*", Act::ResponseHeader("x-server".into(), String::new())),
+            rule(
+                "*",
+                Act::ResponseHeader("access-control-allow-origin".into(), "*".into()),
+            ),
+        ];
+        let controls = Controls {
+            rules: Mutex::new(rules),
+            ..Default::default()
+        };
+        let (addr, flows) = proxy_with(&rt, direct(), controls);
+        let app = through(addr);
+        let get = |path: &str| {
+            let sent = app.get(format!("http://{real}{path}")).header("x-app", "1");
+            rt.block_on(async {
+                let res = sent.send().await.unwrap();
+                let headers = res.headers().clone();
+                (headers, res.text().await.unwrap())
+            })
+        };
+
+        let (headers, body) = get("/local/a");
+        assert_eq!(body, r#"{"mapped":true}"#);
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers["access-control-allow-origin"], "*");
+        assert!(seen.lock().unwrap().is_empty(), "never reached the server");
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!(f.applied[0], Act::MapLocal(file.display().to_string()));
+
+        let (_, body) = get("/remote?q=1");
+        assert_eq!(body, "other GET /remote?q=1 HTTP/1.1");
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        let went = Act::MapRemote(format!("http://{other}/remote?q=1"));
+        assert!(f.applied.contains(&went), "{:?}", f.applied);
+
+        let (headers, body) = get("/plain");
+        assert_eq!(body, "real");
+        assert!(!headers.contains_key("x-server"));
+        let asked = seen.lock().unwrap()[0].clone();
+        assert!(
+            asked.contains("x-added: 1") && !asked.contains("x-app"),
+            "{asked}"
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A throttle holds the request, then lets the answer through no faster than its rate:
+    /// what a slow network does to an app.
+    #[test]
+    fn a_throttle_holds_the_request_and_slows_the_answer() {
+        let rt = runtime();
+        let server = crate::http::tests::serve(|_| ("200 OK".into(), "x".repeat(8 * 1024)));
+        let throttle = Act::Throttle {
+            delay_ms: 300,
+            kib_per_s: 16,
+        };
+        let controls = Controls {
+            rules: Mutex::new(vec![Rule {
+                on: true,
+                url: "/slow".into(),
+                act: throttle,
+            }]),
+            ..Default::default()
+        };
+        let (addr, _) = proxy_with(&rt, direct(), controls);
+        let app = through(addr);
+        let get = |path: &str| {
+            let sent = app.get(format!("http://{server}{path}"));
+            let started = Instant::now();
+            let body = rt.block_on(async { sent.send().await.unwrap().bytes().await.unwrap() });
+            assert_eq!(body.len(), 8 * 1024);
+            started.elapsed()
+        };
+        // Unthrottled first: a new binary's first connections are held by the firewall here,
+        // which would pass for the throttle's doing.
+        let quick = get("/warm");
+        // 300 ms held, then 8 KiB at 16 KiB/s: half a second more.
+        let took = get("/slow");
+        assert!(
+            took >= Duration::from_millis(780),
+            "{took:?} ({quick:?} unthrottled)"
+        );
     }
 
     fn direct() -> Network {
@@ -901,7 +1222,7 @@ mod tests {
             listener,
             clients.unwrap(),
             flows.clone(),
-            Decrypt::default(),
+            Arc::default(),
         ));
         let refused = ping_through(own, &target);
         assert!(refused.starts_with("HTTP/1.1 502"), "{refused}");
@@ -959,8 +1280,11 @@ mod tests {
         let clients = rt.block_on(crate::net::build_client(net)).unwrap();
         let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let (addr, flows) = (listener.local_addr().unwrap(), Flows::new(|| {}));
-        let decrypt = Arc::new(Mutex::new(Some(ca)));
-        rt.spawn(serve(listener, clients, flows.clone(), decrypt));
+        let controls = Controls {
+            decrypt: Mutex::new(Some(ca)),
+            ..Default::default()
+        };
+        rt.spawn(serve(listener, clients, flows.clone(), Arc::new(controls)));
         let server = tls_server();
         let app = |trusted: bool| {
             let mut b = reqwest::Client::builder()
@@ -1035,6 +1359,7 @@ mod tests {
             response,
             elapsed: Some(Duration::from_millis(12)),
             error: None,
+            applied: Vec::new(),
         };
         let json = [("content-type", "application/json")];
         let post = flow(
