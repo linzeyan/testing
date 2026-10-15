@@ -292,7 +292,17 @@ Ctrl+K 可依資料夾與名稱（依序打出其中幾個字母即可）或 URL
 | Insomnia v4 JSON / v5 YAML | 資料夾、驗證與指令碼；`{{ _.x }}` 轉為 `{{x}}`；base environment 成為集合變數，每個 sub-environment 成為一個環境 |
 | 瀏覽器開發者工具的 HAR | 每個主機一個資料夾，每筆回應保留為該請求的範例 |
 
-資料夾或整個集合可以複製或匯出為 Postman 集合（右鍵 >「複製為」或「匯出」）；環境可在其編輯視窗「複製為 Postman 環境」，秘密變數會成為 Postman 的 secret 類型。
+在資料夾或集合上按右鍵 >「複製為」或「匯出」，可以轉成其他工具能匯入的各種格式：
+
+| 格式 | 內容 | 可匯入的工具 |
+|---|---|---|
+| Postman 集合 v2.1 | 資料夾、驗證、指令碼、變數、範例；不含 WebSocket、SSE、gRPC | Postman、Hoppscotch、Insomnia、Bruno、Yaak、Restfox、Yaade |
+| Insomnia v4 | 資料夾及其變數、驗證、指令碼，含 WebSocket；集合的變數成為基礎環境，驗證與指令碼放在直屬項目上 | Insomnia、Hoppscotch、Bruno、Yaak、Restfox |
+| OpenAPI 3.1、Markdown | API 文件，見下方 | |
+| HAR 1.2 | 每個請求實際送出的樣子，變數已代入，第一個已儲存範例當作回應 | Hoppscotch、Insomnia、瀏覽器開發者工具 |
+| cURL | 每個請求實際送出的樣子，一個指令配一行註解標明名稱 | 各工具的 cURL 匯入、shell |
+
+環境可在其編輯視窗「複製為 Postman 環境」，秘密變數會成為 Postman 的 secret 類型。
 
 「</> 程式碼」可將請求轉成 curl、wget、HTTPie、PowerShell、原始 HTTP、Python、fetch、axios、Go、
 Java、C#、PHP、Ruby、Rust、Swift 或 Kotlin。二進位內容會讀入對應的檔案，而 `--data-binary @file`

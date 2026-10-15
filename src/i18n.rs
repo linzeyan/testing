@@ -1074,6 +1074,14 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Saved {}", "已儲存 {}"),
     ("Saved {}{}", "已儲存 {}{}"),
     (
+        "; left out {} SSE, gRPC, MQTT or Socket.IO requests, which Insomnia can't hold",
+        "；略過 {} 個 Insomnia 無法容納的 SSE、gRPC、MQTT 或 Socket.IO 請求",
+    ),
+    (
+        "; left out {} streams and gRPC requests, which it can't hold",
+        "；略過 {} 個無法容納的串流與 gRPC 請求",
+    ),
+    (
         "; left out {} it can't describe: streams, gRPC, or a second request to the same method and path",
         "；略過 {} 個無法描述的請求：串流、gRPC，或同一方法與路徑的第二個請求",
     ),

@@ -334,9 +334,19 @@ empty tree): paste it, give its path or drop the file (or folder).
 | Insomnia v4 JSON / v5 YAML | Folders, auth and scripts; `{{ _.x }}` as `{{x}}`; the base environment as collection variables and each sub-environment as an environment |
 | HAR from browser devtools | A folder per host, each response kept as the request's example |
 
-Copy a folder or the whole collection as a Postman collection, or export it as one (right-click
-> "Copy as" or "Export"), and an environment (from its editor) as a Postman environment, its
-secrets as Postman's secret type.
+Right-click a folder or collection > "Copy as" or "Export" for every format the other clients
+import:
+
+| Format | What it holds | Imported by |
+|---|---|---|
+| Postman collection v2.1 | Folders, auth, scripts, variables, examples; not WebSocket, SSE or gRPC | Postman, Hoppscotch, Insomnia, Bruno, Yaak, Restfox, Yaade |
+| Insomnia v4 | Folders with their variables, auth and scripts, WebSocket too; the collection's variables as the base environment, its auth and scripts on what's directly in it | Insomnia, Hoppscotch, Bruno, Yaak, Restfox |
+| OpenAPI 3.1, Markdown | API docs, see below | |
+| HAR 1.2 | Each request as sent, variables filled in, with its first saved example as the answer | Hoppscotch, Insomnia, browser devtools |
+| cURL | Each request as sent, a command under a comment naming it | Every client's cURL import, a shell |
+
+An environment (from its editor) copies as a Postman environment, its secrets as Postman's
+secret type.
 
 "</> Code" writes the request as curl, wget, HTTPie, PowerShell, raw HTTP, Python, fetch,
 axios, Go, Java, C#, PHP, Ruby, Rust, Swift or Kotlin. A Binary body reads its file, and

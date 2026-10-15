@@ -891,16 +891,29 @@ enum Format {
     Markdown,
     OpenApi,
     Postman,
+    Insomnia,
+    Har,
+    Curl,
 }
 
 impl Format {
-    const ALL: [Format; 3] = [Format::Markdown, Format::OpenApi, Format::Postman];
+    const ALL: [Format; 6] = [
+        Format::Markdown,
+        Format::OpenApi,
+        Format::Postman,
+        Format::Insomnia,
+        Format::Har,
+        Format::Curl,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             Format::Markdown => "Markdown",
             Format::OpenApi => "OpenAPI",
             Format::Postman => t("Postman collection"),
+            Format::Insomnia => "Insomnia",
+            Format::Har => "HAR",
+            Format::Curl => "cURL",
         }
     }
 
@@ -916,12 +929,22 @@ impl Format {
                 format!("{name}.postman_collection.json"),
                 ("Postman", &["json"]),
             ),
+            Format::Insomnia => (format!("{name}.insomnia.json"), ("Insomnia", &["json"])),
+            Format::Har => (format!("{name}.har"), ("HAR", &["har", "json"])),
+            Format::Curl => (format!("{name}.sh"), ("cURL", &["sh", "txt"])),
         }
     }
 
     /// The requests under `dir` as the file `file` holds them (OpenAPI's extension picks
     /// YAML or JSON), and what was left out, said after what was done; empty if nothing.
-    fn text(self, ws: &Workspace, dir: &Path, file: &Path) -> Result<(String, String), String> {
+    /// HAR and cURL are requests as sent: `vars` are the globals and the environment's.
+    fn text(
+        self,
+        ws: &Workspace,
+        dir: &Path,
+        file: &Path,
+        vars: (&HashMap<String, String>, &HashMap<String, String>),
+    ) -> Result<(String, String), String> {
         let (text, left, why) = match self {
             Format::Markdown | Format::OpenApi => {
                 let (text, left) = crate::docs::for_file(ws, dir, file)?;
@@ -933,6 +956,22 @@ impl Format {
             Format::Postman => {
                 let (text, _, left) = crate::postman::collection(ws, dir)?;
                 let why = t("; left out {} WebSocket/SSE/gRPC, which collections can't hold");
+                (text, left, why)
+            }
+            Format::Insomnia => {
+                let (text, left) = crate::insomnia::export(ws, dir)?;
+                let why = t(
+                    "; left out {} SSE, gRPC, MQTT or Socket.IO requests, which Insomnia can't hold",
+                );
+                (text, left, why)
+            }
+            Format::Har | Format::Curl => {
+                let (globals, env) = vars;
+                let (text, left) = match self {
+                    Format::Har => crate::codegen::har(ws, dir, globals, env)?,
+                    _ => crate::codegen::curl_script(ws, dir, globals, env)?,
+                };
+                let why = t("; left out {} streams and gRPC requests, which it can't hold");
                 (text, left, why)
             }
         };
@@ -4228,7 +4267,8 @@ impl App {
     /// For Postman's Import > Raw text.
     fn copy_as(&mut self, dir: &Path, format: Format, ctx: &egui::Context) {
         let (file, _) = format.file("API");
-        self.status = match format.text(&self.ws, dir, Path::new(&file)) {
+        let vars = (&self.globals, &self.vars);
+        self.status = match format.text(&self.ws, dir, Path::new(&file), vars) {
             Ok((text, left)) => {
                 ctx.copy_text(text);
                 tf("Copied as {}{}", &[&format.name(), &left])
@@ -4286,10 +4326,13 @@ impl App {
 
     fn export(&mut self, dir: &Path, format: Format, to: &Path) {
         let shown = to.display();
-        let written = format.text(&self.ws, dir, to).and_then(|(text, left)| {
-            std::fs::write(to, text).map_err(|e| format!("{shown}: {e}"))?;
-            Ok(left)
-        });
+        let vars = (&self.globals, &self.vars);
+        let written = format
+            .text(&self.ws, dir, to, vars)
+            .and_then(|(text, left)| {
+                std::fs::write(to, text).map_err(|e| format!("{shown}: {e}"))?;
+                Ok(left)
+            });
         self.status = match written {
             Ok(left) => tf("Saved {}{}", &[&shown, &left]),
             Err(e) => e,
@@ -16691,7 +16734,14 @@ mod ui_tests {
         h.get_by_label("Export ⏵").click();
         h.run();
         shot(&mut h, "t-folder-export-menu");
-        for format in ["Markdown…", "OpenAPI…", "Postman collection…"] {
+        for format in [
+            "Markdown…",
+            "OpenAPI…",
+            "Postman collection…",
+            "Insomnia…",
+            "HAR…",
+            "cURL…",
+        ] {
             assert!(h.query_by_label(format).is_some(), "{format}");
         }
         h.get_by_label("Copy as ⏵").click();

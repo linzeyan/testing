@@ -3,9 +3,13 @@
 //! `http::build`, so every snippet carries the headers, auth and body that Send would.
 
 use std::fmt::Write as _;
+use std::path::Path;
+
+use serde_json::{Value, json};
 
 use crate::http::{OFFLINE, build, error_chain};
-use crate::model::{Auth, Body, HttpVersion, KeyValue, Request, Settings};
+use crate::model::{Auth, Body, HttpVersion, KeyValue, Request, Settings, is_streaming};
+use crate::store::{Workspace, unescape_name};
 
 type Generator = fn(&Wire) -> String;
 
@@ -2774,10 +2778,311 @@ fn grpc_python(s: &Stream) -> String {
     out
 }
 
+type Vars = std::collections::HashMap<String, String>;
+
+/// A request under a folder as Send makes it: named, resolved, its first saved example.
+struct Made {
+    name: String,
+    req: Request,
+    example: Option<crate::model::Example>,
+}
+
+/// The requests under `dir`, resolved with `globals`, their folders' variables and `env`
+/// in that precedence, as Send resolves them; and how many were left out: streams and
+/// gRPC, which neither curl nor HAR speaks.
+fn made_under(
+    ws: &Workspace,
+    dir: &Path,
+    globals: &Vars,
+    env: &Vars,
+) -> Result<(Vec<Made>, usize), String> {
+    let mut paths = Vec::new();
+    crate::store::requests_in(&ws.tree(), dir, &mut paths);
+    let (mut made, mut left) = (Vec::new(), 0);
+    for path in paths {
+        let req = ws.load_request(&path)?;
+        if is_streaming(&req.method) || req.method == "GRPC" {
+            left += 1;
+            continue;
+        }
+        let mut vars = globals.clone();
+        vars.extend(req.inherited.vars.clone());
+        vars.extend(env.clone());
+        made.push(Made {
+            name: unescape_name(&path.file_stem().unwrap_or_default().to_string_lossy()),
+            example: req.examples.first().cloned(),
+            req: req.resolved(&vars).0,
+        });
+    }
+    Ok((made, left))
+}
+
+/// The requests under `dir` as a shell script: a cURL command each, under a comment naming
+/// it, which every API client's cURL import takes one at a time.
+pub fn curl_script(
+    ws: &Workspace,
+    dir: &Path,
+    globals: &Vars,
+    env: &Vars,
+) -> Result<(String, usize), String> {
+    let (made, left) = made_under(ws, dir, globals, env)?;
+    let mut out = String::new();
+    for Made { name, req, .. } in made {
+        // One that can't be made says why where it would be, not failing the rest.
+        let command = Wire::new(req).map_or_else(|e| format!("# {e}"), |w| curl(&w));
+        let _ = write!(out, "# {name}\n{command}\n\n");
+    }
+    Ok((out, left))
+}
+
+/// The requests under `dir` as a HAR 1.2 log, which Hoppscotch and Insomnia import: an
+/// entry each, named in its comment as Insomnia reads it, answered by its first saved
+/// example, else status 0 as a request never answered.
+pub fn har(
+    ws: &Workspace,
+    dir: &Path,
+    globals: &Vars,
+    env: &Vars,
+) -> Result<(String, usize), String> {
+    let (made, mut left) = made_under(ws, dir, globals, env)?;
+    let started = crate::fake::value("$isoTimestamp").unwrap_or_default();
+    let pairs = |list: Vec<(String, String)>| -> Vec<Value> {
+        (list.into_iter())
+            .map(|(name, value)| json!({ "name": name, "value": value }))
+            .collect()
+    };
+    let mut entries = Vec::new();
+    for Made { name, req, example } in made {
+        let form = match &req.body {
+            Body::Form { fields } => Some(fields.clone()),
+            _ => None,
+        };
+        let Ok(w) = Wire::new(req) else {
+            left += 1;
+            continue;
+        };
+        let typed = w.header("content-type").unwrap_or_default().to_owned();
+        let query = pairs(
+            w.url
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect(),
+        );
+        let mut request = json!({
+            "method": w.method, "url": w.url.as_str(), "httpVersion": "HTTP/1.1",
+            "cookies": [], "headers": pairs(w.headers.clone()), "queryString": query,
+            "headersSize": -1, "bodySize": w.body.as_ref().map_or(0, String::len),
+            "comment": name,
+        });
+        if let Some(text) = &w.body {
+            request["postData"] = json!({ "mimeType": typed, "text": text });
+            // A form's fields as well, as browsers write them.
+            if let Some(fields) = form {
+                let fields = fields.into_iter().map(|f| (f.key, f.value)).collect();
+                request["postData"]["params"] = pairs(fields).into();
+            }
+        } else if !w.parts.is_empty() {
+            let params: Vec<Value> = (w.parts.iter())
+                .map(|(name, part)| match part {
+                    Part::Text(value) => json!({ "name": name, "value": value }),
+                    Part::File(path) => json!({ "name": name, "fileName": path }),
+                })
+                .collect();
+            request["postData"] = json!({ "mimeType": "multipart/form-data", "params": params });
+        }
+        let response = match example {
+            Some(e) => {
+                let reason = e
+                    .name
+                    .strip_prefix(&e.status.to_string())
+                    .unwrap_or(&e.name);
+                json!({
+                    "status": e.status, "statusText": reason.trim(), "httpVersion": "HTTP/1.1",
+                    "cookies": [], "headers": [], "redirectURL": "",
+                    "content": { "size": e.body.len(), "mimeType": e.content_type, "text": e.body },
+                    "headersSize": -1, "bodySize": e.body.len(),
+                })
+            }
+            None => json!({
+                "status": 0, "statusText": "", "httpVersion": "HTTP/1.1", "cookies": [],
+                "headers": [], "redirectURL": "", "content": { "size": 0, "mimeType": "" },
+                "headersSize": -1, "bodySize": -1,
+            }),
+        };
+        entries.push(json!({
+            "startedDateTime": started, "time": 0, "request": request, "response": response,
+            "cache": {}, "timings": { "send": 0, "wait": 0, "receive": 0 },
+        }));
+    }
+    let log = json!({ "log": {
+        "version": "1.2",
+        "creator": { "name": "apitool", "version": env!("CARGO_PKG_VERSION") },
+        "entries": entries,
+    }});
+    let text = serde_json::to_string_pretty(&log).map_err(|e| e.to_string())?;
+    Ok((text, left))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::KeyValue;
+
+    /// A folder as HAR or cURL holds each request as Send makes it: the environment's
+    /// variables over its folders' over the globals, inherited auth as its header, a form's
+    /// fields too; in the shape Hoppscotch's HAR import checks (it rejects one without
+    /// httpVersion, cookies, queryString or the sizes); and back through apitool's own
+    /// imports as the same requests. Streams are counted, not made.
+    #[test]
+    fn a_folder_goes_out_as_har_and_curl_as_sent() {
+        use crate::model::{Example, Folder};
+        use std::collections::HashMap;
+        let root = std::env::temp_dir().join(format!("apitool-har-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::open(root.clone()).unwrap();
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let folder = Folder {
+            vars: vec![
+                KeyValue::new("base", "https://folder.test"),
+                KeyValue::new("page", "2"),
+            ],
+            auth: Auth::Bearer {
+                token: "{{token}}".into(),
+            },
+            ..Default::default()
+        };
+        ws.save_folder(&api, &folder).unwrap();
+        let items = Request {
+            method: "POST".into(),
+            url: "{{base}}/items?page={{page}}".into(),
+            body: Body::Json {
+                text: "{\"a\":1}".into(),
+            },
+            examples: vec![Example {
+                name: "201 Created".into(),
+                status: 201,
+                content_type: "application/json".into(),
+                body: "{\"id\":9}".into(),
+            }],
+            ..Default::default()
+        };
+        let login = Request {
+            method: "POST".into(),
+            url: "{{base}}/login".into(),
+            body: Body::Form {
+                fields: vec![KeyValue::new("user", "{{user}}")],
+            },
+            auth: Auth::None,
+            ..Default::default()
+        };
+        let live = Request {
+            method: "WS".into(),
+            url: "wss://x.test".into(),
+            ..Default::default()
+        };
+        // Bytes that aren't text: no command can hold them, which the export says instead
+        // of failing.
+        let raw = Request {
+            method: "PUT".into(),
+            url: "{{base}}/raw".into(),
+            body: Body::Base64 {
+                text: "/w==".into(),
+            },
+            ..Default::default()
+        };
+        for (name, req) in [
+            ("api/items", items),
+            ("api/live", live),
+            ("api/login", login),
+            ("api/raw", raw),
+        ] {
+            ws.save_request(&ws.request_path(name).unwrap(), &req)
+                .unwrap();
+        }
+        let vars = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            (pairs.iter())
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let globals = vars(&[("user", "me"), ("base", "https://global.test")]);
+        let env = vars(&[("token", "t"), ("base", "https://env.test")]);
+
+        let (text, left) = har(&ws, &api, &globals, &env).unwrap();
+        assert_eq!(left, 2, "the WebSocket, and the bytes");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let entries = v["log"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let r = &entry["request"];
+            for key in [
+                "httpVersion",
+                "cookies",
+                "headers",
+                "queryString",
+                "headersSize",
+                "bodySize",
+            ] {
+                assert!(!r[key].is_null(), "{key}");
+            }
+        }
+        assert_eq!(entries[0]["request"]["comment"], "items");
+        let crate::postman::Import::Collection { requests, .. } = crate::har::import(&v) else {
+            panic!("a collection")
+        };
+        let (_, first) = &requests[0];
+        assert_eq!(first.url, "https://env.test/items?page=2");
+        let bearer = KeyValue::new("authorization", "Bearer t");
+        assert!(first.headers.contains(&bearer), "{:?}", first.headers);
+        assert_eq!(
+            first.body,
+            Body::Json {
+                text: "{\"a\":1}".into()
+            }
+        );
+        let answer = &first.examples[0];
+        assert_eq!(
+            (answer.name.as_str(), answer.body.as_str()),
+            ("201 Created", "{\"id\":9}")
+        );
+        let (_, second) = &requests[1];
+        assert_eq!(
+            second.body,
+            Body::Form {
+                fields: vec![KeyValue::new("user", "me")]
+            }
+        );
+        assert!(
+            !second.headers.iter().any(|h| h.key == "authorization"),
+            "its own: none"
+        );
+
+        let (script, left) = curl_script(&ws, &api, &globals, &env).unwrap();
+        assert_eq!(left, 1);
+        let commands: Vec<_> = script
+            .split("\n\n")
+            .filter(|c| !c.trim().is_empty())
+            .collect();
+        assert_eq!(commands.len(), 3, "{script}");
+        assert!(commands[0].starts_with("# items\ncurl "), "{script}");
+        assert!(
+            commands[2].starts_with("# raw\n# This body's bytes aren't text"),
+            "{script}"
+        );
+        let (comment, command) = commands[1].split_once('\n').unwrap();
+        assert_eq!(comment, "# login");
+        let back = crate::curl::from_curl(command).unwrap();
+        assert_eq!(
+            (back.method.as_str(), back.url.as_str()),
+            ("POST", "https://env.test/login")
+        );
+        assert_eq!(
+            back.body,
+            Body::Form {
+                fields: vec![KeyValue::new("user", "me")]
+            }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn string_literals_keep_quotes_escapes_and_interpolation_markers_literal() {

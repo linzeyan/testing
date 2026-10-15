@@ -3,6 +3,7 @@
 //! environment becomes the collection's variables, each sub-environment an environment.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
@@ -12,7 +13,7 @@ use crate::model::{
     Auth, AwsV4, Body, Folder, Grant, Hawk, KeyValue, Ntlm, OAuth1, OAuth2, Request,
 };
 use crate::postman::Import;
-use crate::store::{escape_name, safe_name};
+use crate::store::{Node, Workspace, escape_name, folder_name, safe_name, unescape_name};
 
 pub fn is_insomnia(v: &Value) -> bool {
     (v["__export_format"] == 4 && v["resources"].is_array())
@@ -22,10 +23,11 @@ pub fn is_insomnia(v: &Value) -> bool {
 pub fn import(root: &Value) -> Import {
     let mut r = Reader::default();
     let root = templates(root, &mut r.tags);
-    let (name, children, envs) = match root["resources"].as_array() {
+    let (name, description, children, envs) = match root["resources"].as_array() {
         Some(resources) => v4(resources),
         None => (
             str_of(&root["name"]).to_owned(),
+            description_of(&root),
             root["collection"].clone(),
             {
                 let base = &root["environments"];
@@ -43,7 +45,7 @@ pub fn import(root: &Value) -> Import {
         &json!({
             "children": children,
             "environment": base["data"],
-            "description": description_of(&root),
+            "description": description,
             "authentication": root["authentication"],
             "headers": root["headers"],
         }),
@@ -76,11 +78,17 @@ pub fn import(root: &Value) -> Import {
     }
 }
 
-/// v4's flat list as v5's tree, children in the order Insomnia shows them.
-fn v4(resources: &[Value]) -> (String, Value, (Value, Vec<Value>)) {
+/// v4's flat list as v5's tree, children in the order Insomnia shows them; the workspace's
+/// name and description.
+fn v4(resources: &[Value]) -> (String, String, Value, (Value, Vec<Value>)) {
     let of_type = |t: &'static str| resources.iter().filter(move |r| r["_type"] == t);
     let Some(ws) = of_type("workspace").next() else {
-        return (String::new(), json!([]), (Value::Null, Vec::new()));
+        return (
+            String::new(),
+            String::new(),
+            json!([]),
+            (Value::Null, Vec::new()),
+        );
     };
     let base = of_type("environment")
         .find(|e| e["parentId"] == ws["_id"])
@@ -108,7 +116,12 @@ fn v4(resources: &[Value]) -> (String, Value, (Value, Vec<Value>)) {
         Value::Array(children)
     }
     let name = str_of(&ws["name"]).to_owned();
-    (name, tree(resources, &ws["_id"]), (base, subs))
+    (
+        name,
+        description_of(ws),
+        tree(resources, &ws["_id"]),
+        (base, subs),
+    )
 }
 
 #[derive(Default)]
@@ -484,6 +497,312 @@ fn template(s: &str, unknown: &mut HashSet<String>) -> String {
     .into_owned()
 }
 
+/// The requests under `dir` (a folder, or the collections root) as an Insomnia v4 export,
+/// which Insomnia, Hoppscotch, Bruno, Yaak and Restfox all import; and how many were left
+/// out: SSE, MQTT and Socket.IO have no Insomnia counterpart, and gRPC's proto files stay
+/// here. The folder's variables are the base environment. A v4 workspace holds no auth or
+/// scripts, so the folder's go on each item directly in it, which Insomnia runs the same.
+pub fn export(ws: &Workspace, dir: &Path) -> Result<(String, usize), String> {
+    let root = ws.collections();
+    let tree = ws.tree();
+    let (name, nodes) = match dir == root {
+        true => ("API".to_owned(), &tree[..]),
+        false => {
+            let nodes = crate::docs::find(&tree, dir)
+                .ok_or_else(|| format!("no folder at {}", folder_name(&root, dir)))?;
+            let name = dir.file_name().unwrap_or_default().to_string_lossy();
+            (unescape_name(&name), nodes)
+        }
+    };
+    let top = ws.load_folder(dir)?;
+    let mut out = Out {
+        resources: vec![
+            json!({ "_id": "wrk_1", "_type": "workspace", "parentId": null, "name": name,
+                    "description": top.description, "scope": "collection" }),
+            json!({ "_id": "env_1", "_type": "environment", "parentId": "wrk_1",
+                    "name": "Base Environment", "data": data(&top.vars) }),
+        ],
+        left: 0,
+    };
+    out.walk(ws, nodes, "wrk_1", Some(&top))?;
+    let export = json!({ "_type": "export", "__export_format": 4, "__export_source": "apitool",
+                         "resources": out.resources });
+    let text = serde_json::to_string_pretty(&export).map_err(|e| e.to_string())?;
+    Ok((text, out.left))
+}
+
+struct Out {
+    resources: Vec<Value>,
+    left: usize,
+}
+
+impl Out {
+    /// `top` is the exported folder, for the items directly in it.
+    fn walk(
+        &mut self,
+        ws: &Workspace,
+        nodes: &[Node],
+        parent: &str,
+        top: Option<&Folder>,
+    ) -> Result<(), String> {
+        for (order, node) in nodes.iter().enumerate() {
+            match node {
+                Node::Folder {
+                    name,
+                    path,
+                    children,
+                } => {
+                    let mut f = ws.load_folder(path)?;
+                    if let Some(top) = top {
+                        adopt(top, &mut f.auth, &mut f.pre_request, &mut f.tests);
+                    }
+                    let id = format!("fld_{}", self.resources.len());
+                    self.resources.push(json!({
+                        "_id": id, "_type": "request_group", "parentId": parent, "name": name,
+                        "description": f.description, "environment": data(&f.vars),
+                        "authentication": auth_out(&f.auth),
+                        "preRequestScript": script_out(&f.pre_request),
+                        "afterResponseScript": script_out(&f.tests), "metaSortKey": order,
+                    }));
+                    self.walk(ws, children, &id, None)?;
+                }
+                Node::Request { method, .. }
+                    if matches!(method.as_str(), "SSE" | "GRPC" | "MQTT" | "SOCKETIO") =>
+                {
+                    self.left += 1
+                }
+                Node::Request { name, path, .. } => {
+                    let mut req = ws.load_request(path)?;
+                    if let Some(top) = top {
+                        adopt(top, &mut req.auth, &mut req.pre_request, &mut req.tests);
+                    }
+                    let id = format!("req_{}", self.resources.len());
+                    self.resources
+                        .push(request_out(&id, parent, name, &req, order));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What an item directly in the exported folder has of it: its auth where the item's is
+/// inherited, and its scripts, run before the item's own as a folder's are.
+fn adopt(top: &Folder, auth: &mut Auth, pre_request: &mut String, tests: &mut String) {
+    if *auth == Auth::Inherit {
+        *auth = top.auth.clone();
+    }
+    for (outer, own) in [(&top.pre_request, pre_request), (&top.tests, tests)] {
+        if outer.trim().is_empty() {
+            continue;
+        }
+        *own = match own.trim().is_empty() {
+            true => outer.clone(),
+            false => format!("{outer}\n{own}"),
+        };
+    }
+}
+
+fn request_out(id: &str, parent: &str, name: &str, req: &Request, order: usize) -> Value {
+    let mut r = json!({
+        "_id": id, "parentId": parent, "name": name, "description": req.description,
+        "metaSortKey": order, "headers": rows_out(&req.headers),
+        "authentication": auth_out(&req.auth),
+    });
+    match req.method.as_str() {
+        // Its query stays in the URL: Insomnia's own exports have it there.
+        "WS" => {
+            r["_type"] = json!("websocket_request");
+            r["url"] = json!(nunjucks(&req.url));
+        }
+        method => {
+            r["_type"] = json!("request");
+            r["method"] = json!(if method == "GRAPHQL" { "POST" } else { method });
+            // The query is in `parameters`, off ones too.
+            r["url"] = json!(nunjucks(req.url.split('?').next().unwrap_or_default()));
+            r["parameters"] = rows_out(&req.params);
+            r["pathParameters"] = rows_out(&req.path_vars);
+            r["body"] = body_out(&req.body, &req.headers);
+            r["preRequestScript"] = json!(script_out(&req.pre_request));
+            r["afterResponseScript"] = json!(script_out(&req.tests));
+        }
+    }
+    r
+}
+
+fn rows_out(rows: &[KeyValue]) -> Value {
+    let row = |kv: &KeyValue| {
+        let mut r = json!({ "name": nunjucks(&kv.key), "value": nunjucks(&kv.value) });
+        if !kv.enabled {
+            r["disabled"] = json!(true);
+        }
+        if !kv.description.is_empty() {
+            r["description"] = json!(kv.description);
+        }
+        r
+    };
+    rows.iter().map(row).collect()
+}
+
+/// An environment's data has no off switch: off variables stay here.
+fn data(vars: &[KeyValue]) -> Value {
+    let on = vars.iter().filter(|v| v.enabled && !v.key.is_empty());
+    Value::Object(
+        on.map(|v| (v.key.clone(), json!(nunjucks(&v.value))))
+            .collect(),
+    )
+}
+
+fn body_out(body: &Body, headers: &[KeyValue]) -> Value {
+    let typed = |mime: &str, text: &str| json!({ "mimeType": mime, "text": nunjucks(text) });
+    // Insomnia types a text body by its own field, and sends that as the Content-Type.
+    let declared = (headers.iter())
+        .find(|h| h.enabled && h.key.eq_ignore_ascii_case("content-type"))
+        .map_or("text/plain", |h| h.value.as_str());
+    match body {
+        Body::None => json!({}),
+        Body::Json { text } => typed("application/json", text),
+        Body::Text { text } => typed(declared, text),
+        Body::Form { fields } => {
+            json!({ "mimeType": "application/x-www-form-urlencoded", "params": rows_out(fields) })
+        }
+        Body::Multipart { parts } => {
+            let mut params = rows_out(parts);
+            for (row, part) in params.as_array_mut().into_iter().flatten().zip(parts) {
+                if let Some(file) = part.value.strip_prefix('@') {
+                    row["type"] = json!("file");
+                    row["fileName"] = json!(file);
+                    row["value"] = json!("");
+                }
+            }
+            json!({ "mimeType": "multipart/form-data", "params": params })
+        }
+        Body::File { path } => json!({ "mimeType": "application/octet-stream", "fileName": path }),
+        Body::GraphQL { query, variables } => {
+            // An object as Insomnia writes it; as typed when it isn't JSON yet ({{vars}}).
+            let variables = match variables.trim() {
+                "" => json!({}),
+                v => serde_json::from_str(v).unwrap_or_else(|_| json!(v)),
+            };
+            let envelope = json!({ "query": query, "variables": variables });
+            typed("application/graphql", &envelope.to_string())
+        }
+        // ponytail: Insomnia has no body of typed bytes; text ones go as text, the rest is
+        // left out, as for Postman.
+        typed_bytes @ (Body::Base64 { .. } | Body::Hex { .. }) => {
+            match typed_bytes.typed_bytes().and_then(|b| b.ok()) {
+                Some(bytes) => match String::from_utf8(bytes) {
+                    Ok(text) => typed(declared, &text),
+                    Err(_) => json!({}),
+                },
+                None => json!({}),
+            }
+        }
+    }
+}
+
+/// `auth` backwards; `{}` inherits.
+fn auth_out(a: &Auth) -> Value {
+    let n = |s: &str| json!(nunjucks(s));
+    match a {
+        Auth::Inherit => json!({}),
+        Auth::None => json!({ "type": "none" }),
+        Auth::Basic { username, password } => {
+            json!({ "type": "basic", "username": n(username), "password": n(password) })
+        }
+        Auth::Digest { username, password } => {
+            json!({ "type": "digest", "username": n(username), "password": n(password) })
+        }
+        Auth::Bearer { token } => json!({ "type": "bearer", "token": n(token) }),
+        Auth::ApiKey {
+            key,
+            value,
+            in_query,
+        } => json!({
+            "type": "apikey", "key": n(key), "value": n(value),
+            "addTo": if *in_query { "queryParams" } else { "header" },
+        }),
+        Auth::OAuth2(o) => json!({
+            "type": "oauth2",
+            "grantType": match o.grant {
+                Grant::ClientCredentials => "client_credentials",
+                Grant::Password => "password",
+                Grant::AuthorizationCode => "authorization_code",
+                Grant::Implicit => "implicit",
+            },
+            "accessTokenUrl": n(&o.token_url), "authorizationUrl": n(&o.auth_url),
+            "clientId": n(&o.client_id), "clientSecret": n(&o.client_secret),
+            "scope": n(&o.scope), "username": n(&o.username), "password": n(&o.password),
+            "redirectUrl": n(&o.redirect_uri), "credentialsInBody": !o.basic_auth,
+        }),
+        Auth::AwsV4(a) => json!({
+            "type": "iam", "accessKeyId": n(&a.access_key), "secretAccessKey": n(&a.secret_key),
+            "region": n(&a.region), "service": n(&a.service), "sessionToken": n(&a.session_token),
+        }),
+        Auth::OAuth1(o) => {
+            let secret = match o.signature_method.starts_with("RSA") {
+                true => "privateKey",
+                false => "consumerSecret",
+            };
+            let mut v = json!({
+                "type": "oauth1", "signatureMethod": o.signature_method,
+                "consumerKey": n(&o.consumer_key), "tokenKey": n(&o.token),
+                "tokenSecret": n(&o.token_secret), "realm": n(&o.realm),
+            });
+            v[secret] = n(&o.consumer_secret);
+            v
+        }
+        Auth::Hawk(h) => json!({
+            "type": "hawk", "id": n(&h.id), "key": n(&h.key), "algorithm": h.algorithm,
+            "ext": n(&h.ext), "validatePayload": h.payload_hash,
+        }),
+        // Insomnia has no domain field: it reads `DOMAIN\user` in the name.
+        Auth::Ntlm(x) => {
+            let user = match x.domain.as_str() {
+                "" => x.username.clone(),
+                domain => format!("{domain}\\{}", x.username),
+            };
+            json!({ "type": "ntlm", "username": n(&user), "password": n(&x.password) })
+        }
+        // ponytail: Insomnia has no JWT or EdgeGrid auth; such a request goes without.
+        Auth::Jwt(_) | Auth::EdgeGrid(_) => json!({ "type": "none" }),
+    }
+}
+
+static API_VARIABLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{\s*([^{}]+?)\s*\}\}").expect("valid"));
+static PM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bpm\.").expect("valid"));
+
+fn script_out(s: &str) -> String {
+    PM.replace_all(s, "insomnia.").into_owned()
+}
+
+/// `template` backwards: `{{name}}` as `{{ _.name }}` (bracketed unless it's a plain name,
+/// which Nunjucks would read as an expression), dynamic variables as their tags.
+fn nunjucks(s: &str) -> String {
+    if !s.contains("{{") {
+        return s.to_owned();
+    }
+    API_VARIABLE
+        .replace_all(s, |c: &Captures| {
+            let name = &c[1];
+            let plain = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            match name {
+                "$guid" | "$randomUUID" => "{% uuid 'v4' %}".to_owned(),
+                "$timestamp" => "{% now 'unix' %}".to_owned(),
+                "$isoTimestamp" => "{% now 'iso-8601' %}".to_owned(),
+                n if n.starts_with('$') && crate::fake::value(n).is_some() => {
+                    format!("{{% faker '{}' %}}", &n[1..])
+                }
+                n if n.starts_with('?') => format!("{{% prompt '{}' %}}", &n[1..]),
+                n if plain => format!("{{{{ _.{n} }}}}"),
+                n => format!("{{{{ _['{n}'] }}}}"),
+            }
+        })
+        .into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +1052,199 @@ environments:
             ("WS", "wss://echo.websocket.org")
         );
         assert_eq!(envs[0].0, "Staging");
+    }
+
+    /// What goes to Insomnia must come back the same, in the shape the other apps check:
+    /// Bruno wants the export marker and a workspace, Hoppscotch roots at parentId null.
+    /// The folder's auth and scripts land on the items directly in it (a v4 workspace holds
+    /// none), so each still runs with them; Nunjucks names a variable with a space by
+    /// brackets, a dotted one would read as a path.
+    #[test]
+    fn a_folder_goes_to_insomnia_and_back() {
+        use std::collections::HashMap;
+        let root = std::env::temp_dir().join(format!("apitool-insomnia-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::open(root.clone()).unwrap();
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let admin = ws.create_folder(&api, "admin").unwrap();
+        let top = Folder {
+            description: "The API".into(),
+            vars: vec![
+                KeyValue::new("base", "https://x.test"),
+                KeyValue::new("user id", "7"),
+            ],
+            auth: Auth::Bearer {
+                token: "{{token}}".into(),
+            },
+            pre_request: "pm.environment.set('a', 1);".into(),
+            ..Default::default()
+        };
+        ws.save_folder(&api, &top).unwrap();
+        let sub = Folder {
+            vars: vec![KeyValue::new("role", "admin")],
+            auth: Auth::Basic {
+                username: "u".into(),
+                password: "{{pw}}".into(),
+            },
+            ..Default::default()
+        };
+        ws.save_folder(&admin, &sub).unwrap();
+        let off = KeyValue {
+            enabled: false,
+            ..KeyValue::new("debug", "1")
+        };
+        let requests = [
+            (
+                "api/list",
+                Request {
+                    url: "{{base}}/items/:id?page=2".into(),
+                    params: vec![KeyValue::new("page", "2"), off.clone()],
+                    path_vars: vec![KeyValue::new("id", "{{user id}}")],
+                    headers: vec![
+                        KeyValue {
+                            description: "who".into(),
+                            ..KeyValue::new("X-Id", "{{$guid}}")
+                        },
+                        off.clone(),
+                    ],
+                    description: "Lists **items**.".into(),
+                    tests: "pm.test('ok', () => {});".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "api/note",
+                Request {
+                    method: "POST".into(),
+                    url: "{{base}}/notes".into(),
+                    headers: vec![KeyValue::new("Content-Type", "application/xml")],
+                    body: Body::Text {
+                        text: "<n code=\"{{?Code}}\"/>".into(),
+                    },
+                    auth: Auth::ApiKey {
+                        key: "k".into(),
+                        value: "{{key}}".into(),
+                        in_query: true,
+                    },
+                    pre_request: "console.log(2);".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "api/query",
+                Request {
+                    method: "GRAPHQL".into(),
+                    url: "{{base}}/graphql".into(),
+                    body: Body::GraphQL {
+                        query: "{ me }".into(),
+                        variables: "{\n  \"a\": 1\n}".into(),
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "api/live",
+                Request {
+                    method: "WS".into(),
+                    url: "wss://x.test/live".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "api/feed",
+                Request {
+                    method: "SSE".into(),
+                    url: "{{base}}/feed".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "api/admin/upload",
+                Request {
+                    method: "POST".into(),
+                    url: "{{base}}/files".into(),
+                    body: Body::Multipart {
+                        parts: vec![
+                            KeyValue::new("file", "@/tmp/a.png"),
+                            KeyValue::new("title", "{{role}}"),
+                        ],
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "api/admin/login",
+                Request {
+                    method: "POST".into(),
+                    url: "{{base}}/login".into(),
+                    body: Body::Form {
+                        fields: vec![KeyValue::new("user", "me"), off.clone()],
+                    },
+                    auth: Auth::None,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (name, req) in &requests {
+            ws.save_request(&ws.request_path(name).unwrap(), req)
+                .unwrap();
+        }
+        let (json, left) = export(&ws, &api).unwrap();
+        assert_eq!(left, 1, "SSE has no Insomnia counterpart");
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            (v["_type"].as_str(), v["__export_format"].as_u64()),
+            (Some("export"), Some(4))
+        );
+        let workspace = &v["resources"][0];
+        assert_eq!(workspace["_type"], "workspace");
+        assert_eq!(workspace["parentId"], Value::Null);
+        assert!(json.contains("{{ _['user id'] }}"), "{json}");
+        // The query only in `parameters`: Insomnia adds those to the URL, so it would go twice.
+        assert!(
+            json.contains(r#""url": "{{ _.base }}/items/:id","#),
+            "{json}"
+        );
+        assert!(json.contains("insomnia.test('ok'"), "{json}");
+        // Insomnia's own tags and a variables object, which apitool reads back either way.
+        assert!(json.contains("{% uuid 'v4' %}") && json.contains("{% prompt 'Code' %}"));
+        assert!(json.contains(r#"\"variables\":{\"a\":1}"#), "{json}");
+
+        let (folders, back, warnings, _) = collection(&json);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let folders: HashMap<_, _> = folders.into_iter().collect();
+        assert_eq!(folders[""].description, "The API");
+        assert_eq!(folders[""].vars, top.vars);
+        let mut sub_out = sub.clone();
+        adopt(
+            &top,
+            &mut sub_out.auth,
+            &mut sub_out.pre_request,
+            &mut sub_out.tests,
+        );
+        assert_eq!(folders["admin"], sub_out);
+        let back: HashMap<_, _> = back.into_iter().collect();
+        assert_eq!(back.len(), 6);
+        // As the folder's, not through `adopt` alone: inherited auth, its script before theirs.
+        assert_eq!(back["list"].auth, top.auth);
+        assert_eq!(
+            back["note"].pre_request,
+            "pm.environment.set('a', 1);\nconsole.log(2);"
+        );
+        assert_eq!(folders["admin"].pre_request, top.pre_request);
+        for (name, _) in requests.iter().filter(|(n, _)| *n != "api/feed") {
+            let mut want = ws.load_request(&ws.request_path(name).unwrap()).unwrap();
+            want.inherited = Default::default();
+            if !name.starts_with("api/admin/") {
+                adopt(&top, &mut want.auth, &mut want.pre_request, &mut want.tests);
+            }
+            // Insomnia's WebSocket requests have no scripts.
+            if want.method == "WS" {
+                (want.pre_request, want.tests) = Default::default();
+            }
+            assert_eq!(back[name.strip_prefix("api/").unwrap()], want, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
