@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use eframe::egui::gui_zoom::kb_shortcuts::{ZOOM_IN, ZOOM_IN_SECONDARY, ZOOM_OUT, ZOOM_RESET};
@@ -539,6 +539,10 @@ struct CaptureView {
     trust: usize,
     /// Where the CA was last exported to, for the guide's commands to name.
     ca_file: Option<String>,
+    /// Make a new CA was clicked once; the next click replaces it.
+    renew_armed: bool,
+    /// A new CA was made while this view was open: the guide says to take the old one back.
+    renewed: bool,
 }
 
 /// Stops the capture proxy when dropped.
@@ -4434,16 +4438,21 @@ impl App {
     /// secrets are, so an app that trusts it once goes on doing so.
     fn capture_ca(&self) -> Result<Arc<crate::capture::Ca>, String> {
         let kept = serde_json::from_str::<(String, String)>(&self.ws.load_capture_ca());
-        let (cert, key) = match kept {
-            Ok((cert, sealed)) => (cert, crate::vault::open(&sealed)?),
-            Err(_) => {
-                let (cert, key) = crate::capture::Ca::generate()?;
-                let sealed = crate::vault::seal(&key)?;
-                let json = serde_json::to_string(&(&cert, sealed)).map_err(|e| e.to_string())?;
-                self.ws.save_capture_ca(&json)?;
-                (cert, key)
+        match kept {
+            Ok((cert, sealed)) => {
+                crate::capture::Ca::load(&cert, &crate::vault::open(&sealed)?).map(Arc::new)
             }
-        };
+            Err(_) => self.new_capture_ca(),
+        }
+    }
+
+    /// A new CA in place of the kept one: for a key that may have got out, as apps that
+    /// trusted the old one stop trusting what the capture shows them.
+    fn new_capture_ca(&self) -> Result<Arc<crate::capture::Ca>, String> {
+        let (cert, key) = crate::capture::Ca::generate()?;
+        let sealed = crate::vault::seal(&key)?;
+        let json = serde_json::to_string(&(&cert, sealed)).map_err(|e| e.to_string())?;
+        self.ws.save_capture_ca(&json)?;
         crate::capture::Ca::load(&cert, &key).map(Arc::new)
     }
 
@@ -4543,14 +4552,47 @@ impl App {
             let lan = (view.server.as_ref()).and_then(|s| s.lan);
             let lan = lan.map_or(t("this machine's address").to_owned(), |ip| ip.to_string());
             let port = listening.map_or(9090, |a| a.port());
-            let copied = egui::CollapsingHeader::new(t("Trusting apitool's CA"))
+            let shown = egui::CollapsingHeader::new(t("Trusting apitool's CA"))
                 .id_salt("capture-trust")
                 .show(ui, |ui| {
-                    trust_ui(ui, &mut view.trust, view.ca_file.as_deref(), port, &lan)
+                    if view.renewed {
+                        ui.colored_label(ORANGE, t(
+                            "This is a new CA. Take the old one back first (the macOS and Windows tabs show how), then export and trust this one: both have the same name, so taking one back by name removes both.",
+                        ));
+                    }
+                    let copied =
+                        trust_ui(ui, &mut view.trust, view.ca_file.as_deref(), port, &lan);
+                    ui.separator();
+                    let label = match view.renew_armed {
+                        true => RichText::new(t("Click again to replace the CA")).color(RED),
+                        false => RichText::new(t("Make a new CA")),
+                    };
+                    let renew = (ui.button(label))
+                        .on_hover_text(t(
+                            "If its key may have got out. Every app that trusts the old one stops connecting until it trusts the new one.",
+                        ))
+                        .clicked()
+                        && std::mem::replace(&mut view.renew_armed, true);
+                    (copied, renew)
                 })
                 .body_returned;
-            if copied == Some(true) {
-                self.status = t("Copied the command").into();
+            match shown {
+                Some((_, true)) => match self.new_capture_ca() {
+                    Ok(ca) => {
+                        if let Some(view) = &mut self.capture {
+                            *view.controls.decrypt.lock().unwrap() = Some(ca);
+                            // The exported file holds the old one: the guide asks for a new
+                            // export before naming a file again.
+                            view.ca_file = None;
+                            view.renew_armed = false;
+                            view.renewed = true;
+                        }
+                        self.status = t("Made a new CA").into();
+                    }
+                    Err(e) => self.fail(e),
+                },
+                Some((true, _)) => self.status = t("Copied the command").into(),
+                _ => {}
             }
         }
         if let Some(on) = let_in
@@ -11195,9 +11237,15 @@ fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
         egui::ScrollArea::vertical()
             .id_salt("docs-preview")
             .show(ui, |ui| {
-                // ponytail: a cache made each frame, as there are no images to keep; a link to a
-                // #heading doesn't scroll there. Keep one on the App if that's wanted.
-                let cache = &mut egui_commonmark::CommonMarkCache::default();
+                // One cache kept across frames: a fresh one installs egui's image loaders
+                // again, each time logging a warning that none are enabled.
+                // ponytail: a link to a #heading doesn't scroll there.
+                let id = egui::Id::new("docs-preview-cache");
+                let cache = ui.data_mut(|d| {
+                    d.get_temp_mut_or_default::<Arc<Mutex<egui_commonmark::CommonMarkCache>>>(id)
+                        .clone()
+                });
+                let cache = &mut cache.lock().unwrap();
                 egui_commonmark::CommonMarkViewer::new().show(ui, cache, description);
             });
         return;
@@ -12365,6 +12413,8 @@ fn capture_view(ctx: &egui::Context, ws: &Workspace) -> CaptureView {
             2
         },
         ca_file: None,
+        renew_armed: false,
+        renewed: false,
     }
 }
 
@@ -21752,6 +21802,42 @@ mod ui_tests {
         let kept = h.state().ws.load_capture_ca();
         let sealed = cfg!(any(windows, target_os = "macos"));
         assert_eq!(kept.contains("PRIVATE KEY"), !sealed, "{kept}");
+    }
+
+    /// A key that may have got out is retired with two clicks, not one: the new CA is kept
+    /// in the workspace and decrypts from then on, and the guide stops naming the file the
+    /// old one was exported to.
+    #[test]
+    fn making_a_new_ca_replaces_the_kept_one_after_a_second_click() {
+        let mut h = harness(workspace("capture-renew"));
+        h.run();
+        h.state_mut().act(Action::Capture);
+        h.run();
+        h.get_by_label("Decrypt HTTPS").click();
+        h.run();
+        let ca = |h: &Harness<'_, App>| {
+            let view = h.state().capture.as_ref().unwrap();
+            let ca = view.controls.decrypt.lock().unwrap().clone();
+            ca.unwrap().pem().to_owned()
+        };
+        let old = ca(&h);
+        h.state_mut().capture.as_mut().unwrap().ca_file = Some("old.crt".into());
+        h.get_by_label("Trusting apitool's CA").click();
+        h.run();
+        h.get_by_label("Make a new CA").click();
+        h.run();
+        assert_eq!(ca(&h), old, "one click only arms it");
+        h.get_by_label("Click again to replace the CA").click();
+        h.run();
+        let new = ca(&h);
+        assert_ne!(new, old);
+        assert_eq!(h.state().capture.as_ref().unwrap().ca_file, None);
+        assert!(h.query_by_label_contains("This is a new CA").is_some());
+        assert_eq!(
+            h.state().capture_ca().unwrap().pem(),
+            new,
+            "kept in the workspace"
+        );
     }
 
     /// Every command the guide gives is pasted as is, so it names the exported file as its

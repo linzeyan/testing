@@ -1911,6 +1911,17 @@ const ZH_TW: &[(&str, &str)] = &[
         "系統信任之後，apitool 自己的請求也會信任；或在 設定 › 網路 把它填進「額外的 CA 憑證」。",
     ),
     ("Copied the command", "已複製指令"),
+    ("Make a new CA", "產生新的 CA"),
+    ("Click again to replace the CA", "再點一次即換掉 CA"),
+    (
+        "If its key may have got out. Every app that trusts the old one stops connecting until it trusts the new one.",
+        "私鑰可能外流時使用。信任舊 CA 的應用程式都會連不上，直到改信任新的為止。",
+    ),
+    ("Made a new CA", "已產生新的 CA"),
+    (
+        "This is a new CA. Take the old one back first (the macOS and Windows tabs show how), then export and trust this one: both have the same name, so taking one back by name removes both.",
+        "這是新的 CA。請先移除舊的（macOS、Windows 分頁有指令），再匯出並信任這一張：兩張同名，按名稱移除會兩張一起刪掉。",
+    ),
     (
         "For this user, in Safari, Chrome, Edge, apitool and most apps; macOS asks for your password:",
         "對目前使用者生效，Safari、Chrome、Edge、apitool 與大多數應用程式都會信任；macOS 會要求輸入密碼：",
