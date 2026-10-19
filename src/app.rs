@@ -22077,13 +22077,14 @@ mod ui_tests {
         let ours = match () {
             _ if cfg!(windows) => "certutil -user -addstore Root",
             _ if cfg!(target_os = "macos") => "security add-trusted-cert",
-            _ => "update-ca-certificates",
+            // Not the way back, which runs update-ca-certificates too.
+            _ => "sudo cp ",
         };
         assert!(
             h.query_by_label_contains(ours).is_some(),
             "this system's tab"
         );
-        // Linux's tab names it in each of its three commands.
+        // Linux's tab names it in each command that adds it.
         let quoted = format!("\"{file}\"");
         assert!(h.query_all_by_label_contains(&quoted).next().is_some());
         h.get_by_label("Firefox").click();
