@@ -394,10 +394,16 @@ and a second request to a method and path already taken are left out, and counte
 
 "Capture" in the status bar (or "Capture traffic" from Ctrl+K) opens a pane
 like Proxyman's or Charles's. Start capturing, then set the address shown, `127.0.0.1:9090`
-(another free port when that one is taken), as the HTTP proxy of an app, or tick "Use as the
-system proxy" to point the system's HTTP and HTTPS proxy there (Windows' Internet Options,
-macOS's network services; a proxy script or auto-detection is turned off meanwhile). Stop,
+(the port is set next to Start and kept for the workspace; when it's taken, another free one,
+and the status bar says so), as the HTTP or SOCKS (4, 4a, 5, without a login) proxy of an
+app, both on the one port, or tick "Use as the system proxy" to point the system's HTTP and
+HTTPS proxy there (Windows' Internet Options, macOS's network services; a proxy script or
+auto-detection is turned off meanwhile); the status bar then reads "Capturing on …, as the
+system proxy". apitool's own requests go through it then too, when its proxy setting is
+System; the capture itself keeps forwarding the way the system's proxy was before. Stop,
 closing the capture or quitting puts back what was set; after a crash, the next start does.
+An app that read the system's proxy when it started (Telegram, a shell's `HTTPS_PROXY`) may
+need a restart to see it; curl doesn't read it at all.
 It listens on 127.0.0.1 only unless "Other devices too" is ticked before Start: then on
 every interface, so WSL, a VM or a phone can use it at this machine's network address
 (shown; from WSL 2, the Windows host's address, the default gateway, or 127.0.0.1 with
@@ -408,12 +414,16 @@ underneath with both sides' headers and bodies; "Open as request" saves it as a 
 request, its answer as an example. The export icon writes every flow as HAR. HTTPS passes
 through as a tunnel, shown with its host and the bytes each way, unless "Decrypt HTTPS" is
 on: then each host gets a certificate from apitool's own CA, made once and kept in the
-workspace (its key sealed as secrets are), and its requests show as any other. "Export CA
+workspace (its key sealed as secrets are), and its requests show as any other. Each
+certificate names a CRL the capture itself serves (signed by the CA, revoking nothing), as
+Windows' TLS in curl, git and .NET refuses a certificate whose revocation it can't check
+(`CRYPT_E_NO_REVOCATION_CHECK`). Inside a SOCKS tunnel, plain HTTP is read as flows too; what's
+neither HTTP nor TLS (Telegram's own protocol, say) goes through as a tunnel. "Export CA
 certificate…" saves the CA as a .crt file for the system's trusted roots or an app's; an app
 that doesn't trust it fails to connect, and its tunnel says so. "Trusting apitool's CA",
 shown while decrypting, has the steps for macOS, Windows, Linux and WSL, Firefox, command-line
-tools (Node, Python, curl, Java) and phones, its commands naming the exported file, a click
-to copy each. Decrypted
+tools (Node, Python, curl, Java) and phones, each with how to take it back, its commands
+naming the exported file, a click to copy each. Decrypted
 connections speak HTTP/2 when the app offers it, so gRPC goes through, its trailers too. The
 latest 1000 flows are kept, each body's first 256 KiB. WebSocket upgrades through the proxy
 aren't relayed.

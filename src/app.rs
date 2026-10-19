@@ -532,6 +532,8 @@ struct CaptureView {
     system: bool,
     /// Listening on every interface, not 127.0.0.1 only: WSL, a VM or a phone can use it.
     open: bool,
+    /// The port to listen on; another when it's taken.
+    port: u16,
     /// The OS's connection table shows instead of the flows.
     conns_shown: bool,
     conns: crate::conns::Table,
@@ -3843,6 +3845,11 @@ impl App {
                 }
                 // Always here: the pane has no other way in but the command palette.
                 let label = match self.capturing() {
+                    // The system's traffic, not only what apps were set to send here.
+                    Some(addr) if self.capture.as_ref().is_some_and(|c| c.system) => {
+                        dot(ui, GREEN);
+                        tf("Capturing on {}, as the system proxy", &[&addr])
+                    }
                     Some(addr) => {
                         dot(ui, GREEN);
                         tf("Capturing on {}", &[&addr])
@@ -3851,7 +3858,7 @@ impl App {
                 };
                 if ui
                     .button(label)
-                    .on_hover_text(t("Capture what apps send through a local HTTP proxy"))
+                    .on_hover_text(t("Capture what apps send through a local HTTP or SOCKS proxy"))
                     .clicked()
                 {
                     (self.capture_shown, self.runner_shown) = (true, false);
@@ -4343,16 +4350,15 @@ impl App {
         };
     }
 
-    /// Port 9090 when free, as Proxyman's, so an app's proxy setting holds across restarts.
-    /// On 127.0.0.1 only unless other devices are let in: what reaches it goes out with this
-    /// machine's network settings.
+    /// The port set (9090 at first, as Proxyman's) when free, so an app's proxy setting
+    /// holds across restarts. On 127.0.0.1 only unless other devices are let in: what
+    /// reaches it goes out with this machine's network settings.
     fn start_capture(&mut self, ctx: &egui::Context) {
-        let open = (self.capture)
-            .get_or_insert_with(|| capture_view(ctx, &self.ws))
-            .open;
+        let view = (self.capture).get_or_insert_with(|| capture_view(ctx, &self.ws));
+        let (open, wanted) = (view.open, view.port);
         let host = if open { "0.0.0.0" } else { "127.0.0.1" };
         let bound = self.rt.block_on(async {
-            match tokio::net::TcpListener::bind((host, 9090)).await {
+            match tokio::net::TcpListener::bind((host, wanted)).await {
                 Ok(l) => Ok(l),
                 Err(_) => tokio::net::TcpListener::bind((host, 0)).await,
             }
@@ -4361,6 +4367,13 @@ impl App {
             Ok(l) => l,
             Err(e) => return self.fail(tf("Capture: {}", &[&e])),
         };
+        if port != wanted {
+            // An app set to the port it asked for would miss everything: told, not quiet.
+            self.status = tf(
+                "Port {} is taken: capturing on {} instead",
+                &[&wanted, &port],
+            );
+        }
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let view = (self.capture).get_or_insert_with(|| capture_view(ctx, &self.ws));
         let (cell, net, tx, ctx) = (
@@ -4407,12 +4420,36 @@ impl App {
     /// The system's proxy at the capture, what it was kept in the workspace first: killed
     /// meanwhile, apitool puts it back at its next start.
     fn point_system_proxy(&mut self, addr: std::net::SocketAddr) -> Result<(), String> {
+        // The capture's clients, which it may still be building, read the system's proxy
+        // before it points here: after, they would forward into the capture itself.
+        let (cell, net) = (self.client.clone(), self.network.clone());
+        let built = self.rt.block_on(async {
+            let build = || net::build_client_with_jar(net, self.cookies.clone());
+            cell.get_or_init(build)
+                .await
+                .as_ref()
+                .map(|_| ())
+                .map_err(Clone::clone)
+        });
+        built?;
         let saved = crate::sysproxy::current()?;
         let json = serde_json::to_string(&saved).map_err(|e| e.to_string())?;
+        log::info!("system proxy: was {json}, now {addr}");
         self.ws.save_system_proxy(&json)?;
         crate::sysproxy::point(&saved, addr).inspect_err(|_| {
             let _ = self.ws.save_system_proxy("");
-        })
+        })?;
+        self.follow_system_proxy();
+        Ok(())
+    }
+
+    /// apitool's own requests go where the system's proxy now points, as other apps' do:
+    /// through the capture while it's the system's proxy. The capture keeps forwarding
+    /// with the clients it started with, so it doesn't go into itself.
+    fn follow_system_proxy(&mut self) {
+        if self.network.proxy == net::ProxyMode::System {
+            self.client = SharedClient::default();
+        }
     }
 
     /// The system's proxy as it was before the capture pointed it at itself, if it did.
@@ -4426,7 +4463,9 @@ impl App {
         };
         match crate::sysproxy::restore(&saved) {
             Ok(()) => {
+                log::info!("system proxy: back to {kept}");
                 let _ = self.ws.save_system_proxy("");
+                self.follow_system_proxy();
                 self.status = t("The system proxy is back as it was").into();
             }
             // Kept in the workspace: the next start tries again.
@@ -4461,12 +4500,27 @@ impl App {
         let view = (self.capture).get_or_insert_with(|| capture_view(ui.ctx(), &self.ws));
         let decrypting = view.controls.decrypt.lock().unwrap().is_some();
         let (pointing, open) = (view.system, view.open);
-        let mut let_in = None;
+        let (mut let_in, mut port_set) = (None, None);
         let (mut start, mut stop, mut export, mut open_as) = (false, false, false, None);
         let (mut decrypt, mut export_ca, mut system) = (None, false, None);
         ui.horizontal(|ui| {
             ui.heading(t("Capture"));
             ui.add_space(8.0);
+            // While listening, the address shows the port.
+            if listening.is_none() {
+                ui.label(t("Port"));
+                // Typed, not dragged: a port is a number to pick, not a slider.
+                let mut port = view.port;
+                let typed = ui
+                    .add(egui::DragValue::new(&mut port).speed(0.0).range(1..=65535))
+                    .on_hover_text(t(
+                        "Apps set to this port find the capture there after every start",
+                    ));
+                if typed.changed() {
+                    view.port = port;
+                    port_set = Some(port);
+                }
+            }
             match listening {
                 Some(addr) => {
                     dot(ui, GREEN);
@@ -4529,13 +4583,14 @@ impl App {
                 ))
                 .clicked();
         });
-        let addr = listening.map_or("127.0.0.1:9090".to_owned(), |a| a.to_string());
+        let port = self.capture.as_ref().map_or(9090, |v| v.port);
+        let addr = listening.map_or(format!("127.0.0.1:{port}"), |a| a.to_string());
         let hint = match decrypting {
             false => t(
-                "Set {} as the HTTP proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS shows as tunnels, their host and size only.",
+                "Set {} as the HTTP or SOCKS proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS shows as tunnels, their host and size only.",
             ),
             true => t(
-                "Set {} as the HTTP proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS is decrypted: an app that doesn't trust apitool's CA fails to connect.",
+                "Set {} as the HTTP or SOCKS proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS is decrypted: an app that doesn't trust apitool's CA fails to connect.",
             ),
         };
         ui.weak(fill(hint, &[&addr]));
@@ -4551,13 +4606,13 @@ impl App {
         if decrypting && let Some(view) = &mut self.capture {
             let lan = (view.server.as_ref()).and_then(|s| s.lan);
             let lan = lan.map_or(t("this machine's address").to_owned(), |ip| ip.to_string());
-            let port = listening.map_or(9090, |a| a.port());
+            let port = listening.map_or(view.port, |a| a.port());
             let shown = egui::CollapsingHeader::new(t("Trusting apitool's CA"))
                 .id_salt("capture-trust")
                 .show(ui, |ui| {
                     if view.renewed {
                         ui.colored_label(ORANGE, t(
-                            "This is a new CA. Take the old one back first (the macOS and Windows tabs show how), then export and trust this one: both have the same name, so taking one back by name removes both.",
+                            "This is a new CA. Take the old one back first (each tab shows how), then export and trust this one: both have the same name, so taking one back by name removes both.",
                         ));
                     }
                     let copied =
@@ -4602,6 +4657,11 @@ impl App {
             if let Err(e) = self.ws.save_capture_open(on) {
                 self.fail(e);
             }
+        }
+        if let Some(port) = port_set
+            && let Err(e) = self.ws.save_capture_port(port)
+        {
+            self.fail(e);
         }
         if let Some(view) = &self.capture {
             let mut rules = view.controls.rules.lock().unwrap();
@@ -8595,7 +8655,7 @@ const ACTIONS: [(&str, Action); 14] = [
     (n_("New environment"), Action::NewEnv),
     (n_("Edit globals"), Action::Globals),
     (n_("Run all collections"), Action::RunCollection),
-    (n_("Capture traffic (HTTP proxy)"), Action::Capture),
+    (n_("Capture traffic (HTTP or SOCKS proxy)"), Action::Capture),
     (n_("Import (Postman, OpenAPI, Swagger)"), Action::ImportAny),
     (
         n_("Network settings (proxy, certificates)"),
@@ -12402,6 +12462,7 @@ fn capture_view(ctx: &egui::Context, ws: &Workspace) -> CaptureView {
         controls: Arc::new(controls),
         system: false,
         open: ws.load_capture_open(),
+        port: ws.load_capture_port(),
         conns_shown: false,
         conns: Default::default(),
         // This system's tab first.
@@ -12474,7 +12535,7 @@ fn trust_ui(ui: &mut egui::Ui, tab: &mut usize, file: Option<&str>, port: u16, l
         }
     }
     ui.weak(t(
-        "apitool's own requests trust it once the system does, or as the Extra CA bundle in Settings › Network.",
+        "apitool's own requests trust it once the system does, or as the Extra CA bundle in Settings › Network (empty that field to take it back).",
     ));
     copied
 }
@@ -12504,6 +12565,9 @@ fn trust_steps(
                 t("To take it back:"),
                 "security delete-certificate -c \"apitool capture CA\" ~/Library/Keychains/login.keychain-db".into(),
             ),
+            say(t(
+                "Or by hand: in Keychain Access, under login › Certificates, delete apitool capture CA.",
+            )),
         ],
         1 => vec![
             run(
@@ -12511,12 +12575,19 @@ fn trust_steps(
                 format!("certutil -user -addstore Root \"{file}\""),
             ),
             say(t(
-                "Or by hand: double-click the .crt file, Install Certificate…, Current User, then place it in Trusted Root Certification Authorities.",
+                "Or by hand: double-click the .crt file, Install Certificate…, Current User, then Place all certificates in the following store, Browse…, Trusted Root Certification Authorities. Left to pick the store, Windows puts it under Intermediate Certification Authorities, where it isn't trusted.",
             )),
             run(
                 t("To take it back:"),
                 "certutil -user -delstore Root \"apitool capture CA\"".into(),
             ),
+            run(
+                t("If it went under Intermediate Certification Authorities, from there too:"),
+                "certutil -user -delstore CA \"apitool capture CA\"".into(),
+            ),
+            say(t(
+                "Or by hand: run certmgr.msc, and under Trusted Root Certification Authorities › Certificates (and Intermediate Certification Authorities › Certificates) delete apitool capture CA.",
+            )),
         ],
         2 => {
             // WSL reads a Windows path under /mnt, so the commands run there as they are.
@@ -12526,10 +12597,19 @@ fn trust_steps(
                     t("Debian, Ubuntu, and Ubuntu in WSL:"),
                     format!("sudo cp \"{file}\" /usr/local/share/ca-certificates/apitool-capture-ca.crt && sudo update-ca-certificates"),
                 ),
+                run(
+                    t("To take it back:"),
+                    "sudo rm /usr/local/share/ca-certificates/apitool-capture-ca.crt && sudo update-ca-certificates --fresh".into(),
+                ),
                 run(t("Fedora, RHEL, Arch:"), format!("sudo trust anchor --store \"{file}\"")),
+                run(t("To take it back:"), format!("sudo trust anchor --remove \"{file}\"")),
                 run(
                     t("Chrome and Chromium keep their own list on Linux (certutil is in libnss3-tools):"),
                     format!("certutil -d sql:$HOME/.pki/nssdb -A -t \"C,,\" -n \"apitool capture CA\" -i \"{file}\""),
+                ),
+                run(
+                    t("To take it back:"),
+                    "certutil -d sql:$HOME/.pki/nssdb -D -n \"apitool capture CA\"".into(),
                 ),
             ]
         }
@@ -12541,8 +12621,15 @@ fn trust_steps(
                 t("On Windows and macOS it can use the system's instead: set this to true in about:config."),
                 "security.enterprise_roots.enabled".into(),
             ),
+            say(t(
+                "To take it back: in the same Authorities list, pick apitool capture CA under apitool and Delete or Distrust…; set security.enterprise_roots.enabled back to false if you changed it.",
+            )),
         ],
         4 => {
+            let unset = match windows {
+                true => "Remove-Item Env:HTTPS_PROXY, Env:HTTP_PROXY, Env:NODE_EXTRA_CA_CERTS, Env:REQUESTS_CA_BUNDLE, Env:SSL_CERT_FILE",
+                false => "unset HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE SSL_CERT_FILE",
+            };
             let shell = match windows {
                 true => format!(
                     "$env:HTTPS_PROXY = \"{proxy}\"; $env:HTTP_PROXY = \"{proxy}\"\n$env:NODE_EXTRA_CA_CERTS = \"{file}\"\n$env:REQUESTS_CA_BUNDLE = \"{file}\"; $env:SSL_CERT_FILE = \"{file}\""
@@ -12559,10 +12646,18 @@ fn trust_steps(
                 say(t(
                     "NODE_EXTRA_CA_CERTS adds to Node's roots. REQUESTS_CA_BUNDLE (Python requests, pip) and SSL_CERT_FILE (OpenSSL: Python, Ruby, PHP) replace theirs, which is fine while everything goes through the capture.",
                 )),
+                run(
+                    t("To take them back in that shell (a new shell starts without them):"),
+                    unset.into(),
+                ),
                 run("curl:", format!("curl --proxy {proxy} --cacert \"{file}\" https://example.com")),
                 run(
                     t("Java, into the JDK's own list (its password is changeit):"),
                     format!("keytool -importcert -cacerts -alias apitool-capture -file \"{file}\""),
+                ),
+                run(
+                    t("To take it back:"),
+                    "keytool -delete -cacerts -alias apitool-capture".into(),
                 ),
             ]
         }
@@ -12580,6 +12675,9 @@ fn trust_steps(
             )),
             say(t(
                 "Android: Settings › Security › Encryption & credentials › Install a certificate › CA certificate (names vary by maker). Chrome trusts it; since Android 7, other apps only if they opt in.",
+            )),
+            say(t(
+                "To take it back: on iPhone and iPad, Settings › General › VPN & Device Management › apitool capture CA › Remove Profile; on Android, Settings › Security › Encryption & credentials › User credentials › apitool capture CA › Remove. Then set the Wi-Fi proxy back to Off.",
             )),
         ],
     }
@@ -21703,6 +21801,49 @@ mod ui_tests {
         );
     }
 
+    /// The port set is where the next start listens, kept for the workspace, so an app's
+    /// proxy setting holds; taken, the capture listens on another and says so.
+    #[test]
+    fn the_capture_listens_on_the_port_set_or_says_it_could_not() {
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let mut h = harness(workspace("capture-port"));
+        h.run();
+        // Kept for the workspace: the pane opens with it.
+        h.state().ws.save_capture_port(port).unwrap();
+        h.state_mut().act(Action::Capture);
+        h.run();
+        h.get_by_label("Start capturing").click();
+        h.run();
+        let at = h.state_mut().capturing().expect("listening");
+        assert_eq!(at.port(), port);
+        // Told apart in the footer: the system's traffic comes here, not only the apps set to.
+        let footer = format!("Capturing on {at}");
+        assert!(h.query_by_label(&footer).is_some());
+        h.state_mut().capture.as_mut().unwrap().system = true;
+        h.run();
+        assert!(
+            h.query_by_label(&format!("{footer}, as the system proxy"))
+                .is_some()
+        );
+        h.state_mut().capture.as_mut().unwrap().system = false;
+        h.get_by_label("Stop").click();
+        h.run();
+
+        // Taken by another app: an app set to it would miss everything, so it's said.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        h.state_mut().capture.as_mut().unwrap().port = port;
+        h.get_by_label("Start capturing").click();
+        h.run();
+        let at = h.state_mut().capturing().expect("listening elsewhere");
+        assert_ne!(at.port(), port);
+        let said = format!("Port {port} is taken: capturing on {} instead", at.port());
+        assert_eq!(h.state().status, said);
+        drop(taken);
+    }
+
     /// Without settling: a live stream's spinner keeps repainting, which `run` rejects.
     /// What an app sends through the capture proxy shows as a row; picked, it shows whole,
     /// and opens as a request that resends it, the answer kept as its example. The
@@ -21860,8 +22001,9 @@ mod ui_tests {
             r#"certutil -user -addstore Root "C:\Users\Jo Lee\apitool-capture-ca.crt""#
         );
         let linux = codes(2, file, true);
-        assert_eq!(linux.len(), 3);
-        for code in &linux {
+        // Each way in, then its way out.
+        assert_eq!(linux.len(), 6);
+        for code in linux.iter().step_by(2) {
             assert!(
                 code.contains("\"/mnt/c/Users/Jo Lee/apitool-capture-ca.crt\""),
                 "{code}"
@@ -21888,6 +22030,29 @@ mod ui_tests {
         );
         let phone = &trust_steps(5, file, 9091, "192.168.1.5", false)[0].0;
         assert!(phone.contains("server 192.168.1.5, port 9091"), "{phone}");
+    }
+
+    /// A CA left trusted after the capture is done lets whoever has its key read that
+    /// machine's HTTPS: every tab that puts it somewhere says how to take it out again.
+    #[test]
+    fn every_trust_tab_says_how_to_take_it_back() {
+        for windows in [false, true] {
+            for tab in 0..6 {
+                let steps = trust_steps(tab, "ca.crt", 9090, "192.168.1.5", windows);
+                assert!(
+                    steps.iter().any(|(text, _)| text.starts_with("To take")),
+                    "tab {tab}: {steps:#?}"
+                );
+            }
+        }
+        let windows: Vec<_> = (trust_steps(1, "ca.crt", 9090, "", true).into_iter())
+            .filter_map(|(_, code)| code)
+            .collect();
+        // Double-clicked and left to Windows, it lands under Intermediate.
+        assert!(
+            windows.iter().any(|c| c.contains("-delstore CA ")),
+            "{windows:?}"
+        );
     }
 
     /// The guide shows only while decrypting, opens on this system's tab, names the file the
@@ -21923,8 +22088,9 @@ mod ui_tests {
         assert!(h.query_all_by_label_contains(&quoted).next().is_some());
         h.get_by_label("Firefox").click();
         h.run();
+        // The setting's own block; the way back names it too.
         assert!(
-            h.query_by_label_contains("security.enterprise_roots.enabled")
+            h.query_by_label("security.enterprise_roots.enabled")
                 .is_some()
         );
         assert!(h.query_by_label_contains(ours).is_none());

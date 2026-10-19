@@ -23,7 +23,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::http::error_chain;
@@ -154,7 +154,12 @@ impl Flows {
         let mut list = self.list.lock().unwrap();
         // Still going on: near the end.
         if let Some(flow) = list.iter_mut().rev().find(|flow| flow.id == id) {
+            let failed = flow.error.is_some();
             f(flow);
+            // Into the log too, which is what a user sends when an app can't connect.
+            if let (false, Some(e)) = (failed, &flow.error) {
+                log::debug!("capture: {} {}: {e}", flow.method, flow.url);
+            }
         }
         drop(list);
         (self.changed)();
@@ -300,12 +305,45 @@ pub fn matches(pattern: &str, url: &str) -> bool {
     !pattern.is_empty()
 }
 
-/// Serves until dropped, its tunnels with it. `clients` forwards: its proxy, CA file and
-/// client certificates.
+/// What every connection to the proxy works with.
+#[derive(Clone)]
+struct Proxy {
+    /// Forwards: its proxy, CA file and client certificates.
+    clients: Clients,
+    flows: Flows,
+    controls: Arc<Controls>,
+    /// Where it listens, to tell it's its own upstream.
+    own: Option<SocketAddr>,
+    /// `host:port` apps reach it at, for the CRL its certificates point them to.
+    reach: String,
+    /// Changes when the proxy stops: tunnels end with it.
+    stopped: tokio::sync::watch::Receiver<()>,
+}
+
+/// Serves until dropped, its tunnels with it, HTTP and SOCKS on the one port. `clients`
+/// forwards: its proxy, CA file and client certificates.
 pub async fn serve(listener: TcpListener, clients: Clients, flows: Flows, controls: Arc<Controls>) {
     let own = listener.local_addr().ok();
-    // Tunnels watch it: the sender goes when this does.
+    // On every interface, apps elsewhere reach it at this machine's address, and so does
+    // this machine.
+    let reach = match own {
+        Some(a) if a.ip().is_unspecified() => {
+            let ip = lan_ip().unwrap_or(std::net::Ipv4Addr::LOCALHOST.into());
+            SocketAddr::new(ip, a.port()).to_string()
+        }
+        Some(a) => a.to_string(),
+        None => String::new(),
+    };
+    log::info!("capture: listening on {own:?}, its CRL at {reach}");
     let (_running, stopped) = tokio::sync::watch::channel(());
+    let proxy = Proxy {
+        clients,
+        flows,
+        controls,
+        own,
+        reach,
+        stopped,
+    };
     let mut connections = tokio::task::JoinSet::new();
     loop {
         while connections.try_join_next().is_some() {}
@@ -318,19 +356,24 @@ pub async fn serve(listener: TcpListener, clients: Clients, flows: Flows, contro
                 continue;
             }
         };
-        let (clients, flows) = (clients.clone(), flows.clone());
-        let (stopped, controls) = (stopped.clone(), controls.clone());
+        let p = proxy.clone();
         connections.spawn(async move {
-            let service = hyper::service::service_fn(move |req| {
-                let (clients, flows) = (clients.clone(), flows.clone());
-                let (stopped, controls) = (stopped.clone(), controls.clone());
+            // A SOCKS greeting starts with its version; an HTTP request, with a letter.
+            let mut first = [0u8];
+            if matches!(stream.peek(&mut first).await, Ok(1)) && matches!(first[0], 4 | 5) {
+                if let Err(e) = socks(stream, p).await {
+                    log::debug!("capture: SOCKS: {e}");
+                }
+                return;
+            }
+            let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                let p = p.clone();
                 async move {
-                    let ca = controls.decrypt.lock().unwrap().clone();
+                    let ca = p.controls.decrypt.lock().unwrap().clone();
                     let res = match ca {
-                        Some(ca) if req.method() == Method::CONNECT => {
-                            intercept(req, ca, &clients, &flows, controls, stopped)
-                        }
-                        _ => handle(req, &clients, &flows, &controls, own, stopped).await,
+                        Some(ca) if req.uri().path() == ca.crl_path() => crl(&ca),
+                        Some(ca) if req.method() == Method::CONNECT => intercept(req, ca, p),
+                        _ => handle(req, &p).await,
                     };
                     Ok::<_, Infallible>(res)
                 }
@@ -345,22 +388,87 @@ pub async fn serve(listener: TcpListener, clients: Clients, flows: Flows, contro
     }
 }
 
-async fn handle(
-    req: Request<Incoming>,
-    clients: &Clients,
-    flows: &Flows,
-    controls: &Controls,
-    own: Option<SocketAddr>,
-    stopped: tokio::sync::watch::Receiver<()>,
-) -> Response<Body> {
+async fn handle(req: Request<Incoming>, p: &Proxy) -> Response<Body> {
     if req.method() == Method::CONNECT {
-        return tunnel(req, &clients.route, flows, own, stopped).await;
+        return tunnel(req, p).await;
     }
     if req.uri().scheme().is_none() {
         let hint = "This is apitool's capture proxy: set it as the HTTP proxy, not as the server.";
         return text(StatusCode::BAD_REQUEST, hint);
     }
-    exchange(req, clients, flows, controls).await
+    exchange(req, &p.clients, &p.flows, &p.controls).await
+}
+
+/// SOCKS 4, 4a and 5 without a login, CONNECT only (what Telegram and browsers ask for):
+/// the tunnel then carries what any other does.
+async fn socks(mut s: TcpStream, p: Proxy) -> std::io::Result<()> {
+    let refused = |why: &str| std::io::Error::other(why.to_owned());
+    let target = match s.read_u8().await? {
+        5 => {
+            let mut methods = vec![0; s.read_u8().await? as usize];
+            s.read_exact(&mut methods).await?;
+            if !methods.contains(&0) {
+                s.write_all(&[5, 0xff]).await?;
+                return Err(refused("only without a login"));
+            }
+            s.write_all(&[5, 0]).await?;
+            // Its version, command, a reserved byte and the kind of address.
+            let mut head = [0; 4];
+            s.read_exact(&mut head).await?;
+            let host = match head[3] {
+                1 => std::net::Ipv4Addr::from(s.read_u32().await?).to_string(),
+                3 => {
+                    let mut name = vec![0; s.read_u8().await? as usize];
+                    s.read_exact(&mut name).await?;
+                    String::from_utf8_lossy(&name).into_owned()
+                }
+                4 => format!("[{}]", std::net::Ipv6Addr::from(s.read_u128().await?)),
+                _ => return Err(refused("an address of an unknown kind")),
+            };
+            let port = s.read_u16().await?;
+            // Bound to 0.0.0.0:0: the app has no use for where the proxy connects from.
+            let answer = |code| [5, code, 0, 1, 0, 0, 0, 0, 0, 0];
+            if head[1] != 1 {
+                s.write_all(&answer(7)).await?;
+                return Err(refused("only CONNECT"));
+            }
+            s.write_all(&answer(0)).await?;
+            format!("{host}:{port}")
+        }
+        _ => {
+            let command = s.read_u8().await?;
+            let port = s.read_u16().await?;
+            let ip = s.read_u32().await?;
+            nul_ended(&mut s).await?;
+            // 4a: an address of 0.0.0.x, x not 0, means a host name follows.
+            let host = match ip {
+                1..=255 => nul_ended(&mut s).await?,
+                ip => std::net::Ipv4Addr::from(ip).to_string(),
+            };
+            let granted = command == 1;
+            s.write_all(&[0, if granted { 0x5a } else { 0x5b }, 0, 0, 0, 0, 0, 0])
+                .await?;
+            if !granted {
+                return Err(refused("only CONNECT"));
+            }
+            format!("{host}:{port}")
+        }
+    };
+    let ca = p.controls.decrypt.lock().unwrap().clone();
+    inside(s, target, ca, p).await;
+    Ok(())
+}
+
+/// SOCKS 4's user id and 4a's host name.
+async fn nul_ended(s: &mut TcpStream) -> std::io::Result<String> {
+    let mut text = Vec::new();
+    loop {
+        match s.read_u8().await? {
+            0 => return Ok(String::from_utf8_lossy(&text).into_owned()),
+            _ if text.len() >= 255 => return Err(std::io::Error::other("no end to a name")),
+            b => text.push(b),
+        }
+    }
 }
 
 /// A request with its absolute URL: forwarded, unless it came back around.
@@ -688,19 +796,14 @@ fn remap(url: &str, to: &str) -> Result<String, String> {
 }
 
 /// CONNECT: the bytes go both ways untouched, counted when the tunnel closes.
-async fn tunnel(
-    req: Request<Incoming>,
-    route: &Route,
-    flows: &Flows,
-    own: Option<SocketAddr>,
-    mut stopped: tokio::sync::watch::Receiver<()>,
-) -> Response<Body> {
+async fn tunnel(req: Request<Incoming>, p: &Proxy) -> Response<Body> {
     let started = Instant::now();
     let Some(target) = req.uri().authority().map(|a| a.to_string()) else {
         return text(StatusCode::BAD_REQUEST, "CONNECT takes host:port");
     };
+    let flows = &p.flows;
     let id = flows.start("CONNECT", &target, req.headers());
-    let mut upstream = match connect(route, &target, own).await {
+    let upstream = match connect(&p.clients.route, &target, p.own).await {
         Ok(stream) => stream,
         Err(e) => {
             flows.update(id, |f| {
@@ -710,33 +813,44 @@ async fn tunnel(
         }
     };
     flows.update(id, |f| f.status = Some(200));
-    let flows = flows.clone();
+    let p = p.clone();
     tokio::spawn(async move {
-        let result = match hyper::upgrade::on(req).await {
-            Ok(upgraded) => {
-                let mut app = TokioIo::new(upgraded);
-                tokio::select! {
-                    copied = tokio::io::copy_bidirectional(&mut app, &mut upstream) => {
-                        copied.map_err(|e| e.to_string())
-                    }
-                    _ = stopped.changed() => Err("capture stopped".to_owned()),
-                }
-            }
-            Err(e) => Err(e.to_string()),
-        };
-        flows.update(id, |f| {
-            match result {
-                Ok((up, down)) => (f.request.size, f.response.size) = (up, down),
-                Err(e) => f.error = Some(e),
-            }
-            f.elapsed = Some(started.elapsed());
-        });
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => pipe(TokioIo::new(upgraded), upstream, id, started, &p).await,
+            Err(e) => p.flows.update(id, |f| {
+                (f.error, f.elapsed) = (Some(e.to_string()), Some(started.elapsed()));
+            }),
+        }
     });
     Response::new(
         http_body_util::Empty::new()
             .map_err(|e| match e {})
             .boxed_unsync(),
     )
+}
+
+/// The tunnel flow `id`'s bytes, both ways until either side closes, counted then.
+async fn pipe(
+    mut app: impl AsyncRead + AsyncWrite + Unpin,
+    mut upstream: TcpStream,
+    id: u64,
+    started: Instant,
+    p: &Proxy,
+) {
+    let mut stopped = p.stopped.clone();
+    let result = tokio::select! {
+        copied = tokio::io::copy_bidirectional(&mut app, &mut upstream) => {
+            copied.map_err(|e| e.to_string())
+        }
+        _ = stopped.changed() => Err("capture stopped".to_owned()),
+    };
+    p.flows.update(id, |f| {
+        match result {
+            Ok((up, down)) => (f.request.size, f.response.size) = (up, down),
+            Err(e) => f.error = Some(e),
+        }
+        f.elapsed = Some(started.elapsed());
+    });
 }
 
 /// This machine's address on its network, for other devices to reach the capture at: the
@@ -820,8 +934,11 @@ pub struct Ca {
     issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
     cert: CertificateDer<'static>,
     pem: String,
-    /// One certificate per host, made on its first tunnel.
-    hosts: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
+    /// One certificate per host and where its CRL is, made on its first tunnel.
+    hosts: Mutex<HashMap<(String, String), Arc<rustls::ServerConfig>>>,
+    /// Where the proxy answers with this CA's CRL, named after the CA: Windows keeps a
+    /// CRL by its URL, and a new CA's must not be checked against the old one's.
+    crl_path: String,
 }
 
 impl Ca {
@@ -839,6 +956,10 @@ impl Ca {
         let bad = |e: &dyn std::fmt::Display| format!("apitool's capture CA: {e}");
         let key = rcgen::KeyPair::from_pem(key).map_err(|e| bad(&e))?;
         let der = CertificateDer::from_pem_slice(cert.as_bytes()).map_err(|e| bad(&e))?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, &der);
+        let name: String = (digest.as_ref()[..8].iter())
+            .map(|b| format!("{b:02x}"))
+            .collect();
         Ok(Self {
             // Its name, key usages and key are all a signature needs of it: the same
             // params as `generate` made it with.
@@ -846,6 +967,7 @@ impl Ca {
             cert: der,
             pem: cert.to_owned(),
             hosts: Mutex::default(),
+            crl_path: format!("/apitool-capture-ca/{name}.crl"),
         })
     }
 
@@ -854,9 +976,34 @@ impl Ca {
         &self.pem
     }
 
-    fn config_for(&self, host: &str) -> Result<Arc<rustls::ServerConfig>, String> {
+    fn crl_path(&self) -> &str {
+        &self.crl_path
+    }
+
+    /// A CRL revoking nothing, freshly signed.
+    fn crl(&self) -> Result<Vec<u8>, String> {
+        let since = (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)).unwrap_or_default();
+        let now = rcgen::date_time_ymd(1970, 1, 1) + since;
+        let params = rcgen::CertificateRevocationListParams {
+            this_update: now - Duration::from_secs(86_400),
+            // Windows keeps it until then.
+            next_update: now + Duration::from_secs(7 * 86_400),
+            // Increasing from one to the next, as the CRL number must.
+            crl_number: rcgen::SerialNumber::from(now.unix_timestamp().to_be_bytes().to_vec()),
+            issuing_distribution_point: None,
+            revoked_certs: Vec::new(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl = params.signed_by(&self.issuer).map_err(|e| e.to_string())?;
+        Ok(crl.der().to_vec())
+    }
+
+    /// `host`'s certificate, pointing to the CRL at `reach` (`host:port`): Windows' TLS,
+    /// in curl, git and .NET, refuses a certificate whose revocation it can't check.
+    fn config_for(&self, host: &str, reach: &str) -> Result<Arc<rustls::ServerConfig>, String> {
         let mut hosts = self.hosts.lock().unwrap();
-        if let Some(config) = hosts.get(host) {
+        let kept = (host.to_owned(), reach.to_owned());
+        if let Some(config) = hosts.get(&kept) {
             return Ok(config.clone());
         }
         let fail = |e: &dyn std::fmt::Display| format!("a certificate for {host}: {e}");
@@ -872,6 +1019,9 @@ impl Ca {
         params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
         params.use_authority_key_identifier_extension = true;
+        params.crl_distribution_points = vec![rcgen::CrlDistributionPoint {
+            uris: vec![format!("http://{reach}{}", self.crl_path)],
+        }];
         valid_for(&mut params, 365);
         let cert = params.signed_by(&key, &self.issuer).map_err(|e| fail(&e))?;
         let chain = vec![cert.der().clone(), self.cert.clone()];
@@ -884,8 +1034,22 @@ impl Ca {
         // HTTP/2 when the app offers it, as gRPC must; else HTTP/1.1.
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let config = Arc::new(config);
-        hosts.insert(host.to_owned(), config.clone());
+        hosts.insert(kept, config.clone());
         Ok(config)
+    }
+}
+
+/// The CRL, as Windows fetches it before trusting a certificate of the CA's.
+fn crl(ca: &Ca) -> Response<Body> {
+    match ca.crl() {
+        Ok(der) => {
+            let body = Full::new(Bytes::from(der)).map_err(|e| match e {});
+            let mut res = Response::new(body.boxed_unsync());
+            let kind = HeaderValue::from_static("application/pkix-crl");
+            res.headers_mut().insert(hyper::header::CONTENT_TYPE, kind);
+            res
+        }
+        Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
 
@@ -911,75 +1075,15 @@ fn valid_for(params: &mut rcgen::CertificateParams, days: u64) {
     params.not_after = now + Duration::from_secs(days * 86_400);
 }
 
-/// CONNECT while decrypting: the app's TLS ends here and each request inside goes on as
-/// any other, its URL https://. A handshake the app broke off is a flow with why.
-fn intercept(
-    req: Request<Incoming>,
-    ca: Arc<Ca>,
-    clients: &Clients,
-    flows: &Flows,
-    controls: Arc<Controls>,
-    mut stopped: tokio::sync::watch::Receiver<()>,
-) -> Response<Body> {
-    let Some(authority) = req.uri().authority().cloned() else {
+/// CONNECT while decrypting: answered at once, then what the app sends decides (`inside`).
+fn intercept(req: Request<Incoming>, ca: Arc<Ca>, p: Proxy) -> Response<Body> {
+    let Some(authority) = req.uri().authority().map(|a| a.to_string()) else {
         return text(StatusCode::BAD_REQUEST, "CONNECT takes host:port");
     };
-    let (clients, flows) = (clients.clone(), flows.clone());
     tokio::spawn(async move {
-        let started = Instant::now();
-        let host = authority.host().trim_matches(['[', ']']);
-        let accepted = async {
-            let config = ca.config_for(host)?;
-            let upgraded = (hyper::upgrade::on(req).await).map_err(|e| e.to_string())?;
-            let acceptor = tokio_rustls::TlsAcceptor::from(config);
-            (acceptor.accept(TokioIo::new(upgraded)).await)
-                .map_err(|e| format!("{e} (does the app trust apitool's CA?)"))
-        };
-        let tls = match accepted.await {
-            Ok(tls) => tls,
-            Err(e) => {
-                let id = flows.start("CONNECT", authority.as_str(), &HeaderMap::new());
-                flows.update(id, |f| {
-                    (f.error, f.elapsed) = (Some(e), Some(started.elapsed()));
-                });
-                return;
-            }
-        };
-        let origin = match authority.port_u16() {
-            Some(443) | None => format!("https://{}", authority.host()),
-            Some(_) => format!("https://{authority}"),
-        };
-        let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
-            let (clients, flows, controls) = (clients.clone(), flows.clone(), controls.clone());
-            // Inside the tunnel a request names only its path.
-            let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
-            let uri = format!("{origin}{path}").parse::<hyper::Uri>();
-            async move {
-                let res = match uri {
-                    Ok(uri) => {
-                        *req.uri_mut() = uri;
-                        exchange(req, &clients, &flows, &controls).await
-                    }
-                    Err(e) => text(StatusCode::BAD_REQUEST, &e.to_string()),
-                };
-                Ok::<_, Infallible>(res)
-            }
-        });
-        let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
-        let io = TokioIo::new(tls);
-        let conn = async {
-            if h2 {
-                let exec = hyper_util::rt::TokioExecutor::new();
-                (hyper::server::conn::http2::Builder::new(exec).serve_connection(io, service)).await
-            } else {
-                (hyper::server::conn::http1::Builder::new().serve_connection(io, service)).await
-            }
-        };
-        tokio::select! {
-            served = conn => if let Err(e) = served {
-                log::debug!("capture: {e}");
-            },
-            _ = stopped.changed() => {}
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => inside(TokioIo::new(upgraded), authority, Some(ca), p).await,
+            Err(e) => log::debug!("capture: {e}"),
         }
     });
     Response::new(
@@ -987,6 +1091,197 @@ fn intercept(
             .map_err(|e| match e {})
             .boxed_unsync(),
     )
+}
+
+/// How long a tunnel waits for the app to speak first: a server that does (SMTP, MySQL)
+/// is relayed to after that.
+const FIRST_WORD: Duration = Duration::from_millis(500);
+
+/// What an app sends into the tunnel it opened to `target` (`host:port`): TLS ends here
+/// with a certificate from `ca`, if decrypting; plain HTTP is read as flows; anything
+/// else, Telegram's own protocol say, is relayed as it is.
+async fn inside(
+    mut app: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    target: String,
+    ca: Option<Arc<Ca>>,
+    p: Proxy,
+) {
+    let started = Instant::now();
+    let mut first = [0u8];
+    let front = match tokio::time::timeout(FIRST_WORD, app.read(&mut first)).await {
+        // Gone without a word.
+        Ok(Ok(0) | Err(_)) => return,
+        Ok(Ok(_)) => Some(first[0]),
+        Err(_) => None,
+    };
+    let app = Rewound {
+        front: front.map(|b| vec![b]).unwrap_or_default(),
+        inner: app,
+    };
+    let (host, port) = split_target(&target);
+    match (front, ca) {
+        // A TLS handshake's first record.
+        (Some(0x16), Some(ca)) => decrypt(app, &target, ca, started, p).await,
+        (Some(b), _) if b.is_ascii_uppercase() => {
+            let origin = match port {
+                80 => format!("http://{host}"),
+                _ => format!("http://{target}"),
+            };
+            requests(TokioIo::new(app), origin, false, &p).await;
+        }
+        _ => {
+            let id = p.flows.start("CONNECT", &target, &HeaderMap::new());
+            match connect(&p.clients.route, &target, p.own).await {
+                Ok(upstream) => {
+                    p.flows.update(id, |f| f.status = Some(200));
+                    pipe(app, upstream, id, started, &p).await;
+                }
+                Err(e) => p.flows.update(id, |f| {
+                    (f.error, f.elapsed) = (Some(e), Some(started.elapsed()));
+                }),
+            }
+        }
+    }
+}
+
+/// `host:port` as its host (brackets kept on IPv6) and port, 443 if it has none.
+fn split_target(target: &str) -> (&str, u16) {
+    match target.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.contains(']') => {
+            (host, port.parse().unwrap_or(443))
+        }
+        _ => (target, 443),
+    }
+}
+
+/// The app's TLS ends here, with a certificate for the host it named (its SNI, else the
+/// tunnel's), and each request inside goes on as any other, its URL https://. A handshake
+/// the app broke off is a flow with why.
+async fn decrypt(
+    app: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    target: &str,
+    ca: Arc<Ca>,
+    started: Instant,
+    p: Proxy,
+) {
+    let (host, port) = split_target(target);
+    let accepted = async {
+        let acceptor = rustls::server::Acceptor::default();
+        let start = (tokio_rustls::LazyConfigAcceptor::new(acceptor, app).await)
+            .map_err(|e| e.to_string())?;
+        // An app that tunnels to an address (SOCKS 4, Telegram) still names the host here.
+        let named = start.client_hello().server_name().map(str::to_owned);
+        let name = named.unwrap_or_else(|| host.trim_matches(['[', ']']).to_owned());
+        let config = ca.config_for(&name, &p.reach)?;
+        let tls = (start.into_stream(config).await)
+            .map_err(|e| format!("{e} (does the app trust apitool's CA?)"))?;
+        Ok::<_, String>((tls, name))
+    };
+    let (tls, name) = match accepted.await {
+        Ok(accepted) => accepted,
+        Err(e) => {
+            let id = p.flows.start("CONNECT", target, &HeaderMap::new());
+            p.flows.update(id, |f| {
+                (f.error, f.elapsed) = (Some(e), Some(started.elapsed()));
+            });
+            return;
+        }
+    };
+    let name = match name.parse::<std::net::Ipv6Addr>() {
+        Ok(_) => format!("[{name}]"),
+        Err(_) => name,
+    };
+    let origin = match port {
+        443 => format!("https://{name}"),
+        _ => format!("https://{name}:{port}"),
+    };
+    let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+    requests(TokioIo::new(tls), origin, h2, &p).await;
+}
+
+/// The requests an app sends inside a tunnel, each a flow: they name only their path, and
+/// `origin` is where to.
+async fn requests<S>(io: TokioIo<S>, origin: String, h2: bool, p: &Proxy)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (clients, flows, controls) = (p.clients.clone(), p.flows.clone(), p.controls.clone());
+    let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+        let (clients, flows, controls) = (clients.clone(), flows.clone(), controls.clone());
+        let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
+        let uri = format!("{origin}{path}").parse::<hyper::Uri>();
+        async move {
+            let res = match uri {
+                Ok(uri) => {
+                    *req.uri_mut() = uri;
+                    exchange(req, &clients, &flows, &controls).await
+                }
+                Err(e) => text(StatusCode::BAD_REQUEST, &e.to_string()),
+            };
+            Ok::<_, Infallible>(res)
+        }
+    });
+    let conn = async {
+        if h2 {
+            let exec = hyper_util::rt::TokioExecutor::new();
+            (hyper::server::conn::http2::Builder::new(exec).serve_connection(io, service)).await
+        } else {
+            (hyper::server::conn::http1::Builder::new().serve_connection(io, service)).await
+        }
+    };
+    let mut stopped = p.stopped.clone();
+    tokio::select! {
+        served = conn => if let Err(e) = served {
+            log::debug!("capture: {e}");
+        },
+        _ = stopped.changed() => {}
+    }
+}
+
+/// A stream with what was read off it to decide what it carries put back in front.
+struct Rewound<S> {
+    front: Vec<u8>,
+    inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Rewound<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.front.is_empty() {
+            return std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        }
+        let n = self.front.len().min(buf.remaining());
+        buf.put_slice(&self.front[..n]);
+        self.front.drain(..n);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Rewound<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// HAR 1.2, as browsers' devtools save it, of the flows that were HTTP exchanges.
@@ -1457,6 +1752,47 @@ mod tests {
         assert!(flows.with(<[Flow]>::is_empty));
     }
 
+    /// Pointed at as the system's proxy, the capture still forwards the way the system's
+    /// proxy was when it started, even with a client it builds only then (its first
+    /// request through): not into itself, a 508 to every app. Run in a process of its own,
+    /// as it changes the environment, which the system's proxy is read from first.
+    #[test]
+    fn as_the_system_proxy_the_capture_forwards_as_the_system_did_before() {
+        let me = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(me)
+            .args(["--exact", "capture::tests::system_proxy_child", "--ignored"])
+            .env("APITOOL_SYSTEM_PROXY_CHILD", "1")
+            .env_remove("HTTP_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&child.stdout);
+        assert!(child.status.success(), "{out}");
+        assert!(out.contains("1 passed"), "the child ran: {out}");
+    }
+
+    #[test]
+    #[ignore = "run by as_the_system_proxy_the_capture_forwards_as_the_system_did_before"]
+    fn system_proxy_child() {
+        assert!(std::env::var_os("APITOOL_SYSTEM_PROXY_CHILD").is_some());
+        let rt = runtime();
+        let server = crate::http::tests::serve(|_| ("200 OK".into(), "from the server".into()));
+        let (addr, flows) = proxy(&rt, Network::default());
+        // SAFETY: this process runs this one test, on this thread; the runtime's threads
+        // read the environment only when a client is built, which is what's under test.
+        unsafe { std::env::set_var("HTTP_PROXY", format!("http://{addr}")) };
+        let app = through(addr);
+        let res = rt.block_on(async {
+            let res = app.get(format!("http://{server}/")).send().await.unwrap();
+            (res.status(), res.text().await.unwrap())
+        });
+        assert_eq!(res, (StatusCode::OK, "from the server".to_owned()));
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!(f.status, Some(200));
+    }
+
     /// An echo server: what it reads, it writes back, until the other side closes.
     fn echo() -> SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1744,6 +2080,224 @@ mod tests {
         let f = flow_when(&flows, |f| f.tunnel() && f.error.is_some());
         assert_eq!(f.url, format!("localhost:{}", server.port()));
         assert!(f.error.unwrap().contains("trust apitool's CA"));
+    }
+
+    /// Windows' TLS (curl, git, .NET) refuses a certificate whose revocation it can't
+    /// check, as rustls does told to deny an unknown status: so each certificate names a
+    /// CRL at the proxy, which answers with one the CA signed, revoking nothing. Another
+    /// CA's CRL says nothing about these certificates, and is refused.
+    #[test]
+    fn certificates_point_to_a_crl_the_proxy_serves() {
+        let rt = runtime();
+        let (cert, key) = Ca::generate().unwrap();
+        let ca = Arc::new(Ca::load(&cert, &key).unwrap());
+        let net = Network {
+            insecure: true,
+            ..direct()
+        };
+        let controls = Controls {
+            decrypt: Mutex::new(Some(ca.clone())),
+            ..Default::default()
+        };
+        let (addr, _) = proxy_with(&rt, net, controls);
+        let crl_url = format!("http://{addr}{}", ca.crl_path());
+        // Straight from the proxy, and through it while it's the system's proxy.
+        for app in [
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            through(addr),
+        ] {
+            let res = rt.block_on(app.get(&crl_url).send()).unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(res.headers()["content-type"], "application/pkix-crl");
+        }
+        let pem = |der: Vec<u8>| {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+            let pem = format!("-----BEGIN X509 CRL-----\n{b64}\n-----END X509 CRL-----\n");
+            reqwest::tls::CertificateRevocationList::from_pem(pem.as_bytes()).unwrap()
+        };
+        let checking = |crl| {
+            reqwest::Client::builder()
+                .proxy(reqwest::Proxy::https(format!("http://{addr}")).unwrap())
+                .tls_certs_only([reqwest::Certificate::from_pem(cert.as_bytes()).unwrap()])
+                .tls_crls_only([crl])
+                .tls_info(true)
+                .build()
+                .unwrap()
+        };
+        let server = tls_server();
+        let url = format!("https://localhost:{}/", server.port());
+        let served =
+            rt.block_on(async { reqwest::get(&crl_url).await.unwrap().bytes().await.unwrap() });
+        let res = rt.block_on(checking(pem(served.to_vec())).get(&url).send());
+        assert_eq!(res.unwrap().status(), StatusCode::OK);
+
+        // The certificate itself, which reqwest only shows of a connection it made directly.
+        let config = ca.config_for("localhost", &addr.to_string()).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        rt.spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(s).await.unwrap();
+            let _ = tls.read(&mut [0; 1024]).await;
+            let answer = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            let _ = tls.write_all(answer).await;
+            let _ = tls.shutdown().await;
+        });
+        let direct = reqwest::Client::builder()
+            .no_proxy()
+            .http1_only()
+            .add_root_certificate(reqwest::Certificate::from_pem(cert.as_bytes()).unwrap())
+            .tls_info(true)
+            .build()
+            .unwrap();
+        let res = rt.block_on(direct.get(format!("https://localhost:{port}/")).send());
+        let res = res.unwrap();
+        let info = res.extensions().get::<reqwest::tls::TlsInfo>().unwrap();
+        let leaf = info.peer_certificate().unwrap();
+        assert!(
+            leaf.windows(crl_url.len()).any(|w| w == crl_url.as_bytes()),
+            "the certificate names {crl_url}"
+        );
+
+        let (other, key) = Ca::generate().unwrap();
+        let other = Ca::load(&other, &key).unwrap().crl().unwrap();
+        let refused = rt.block_on(checking(pem(other)).get(&url).send());
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
+    /// What a user hit: Windows' own curl (Schannel) checks a certificate's revocation and
+    /// refuses one it can't check (CRYPT_E_NO_REVOCATION_CHECK), even from a CA it trusts.
+    /// Through the decrypting capture, it fetches the CRL the certificate names and reads
+    /// the answer.
+    #[cfg(windows)]
+    #[test]
+    fn windows_curl_trusts_a_decrypted_connection() {
+        let rt = runtime();
+        let (cert, key) = Ca::generate().unwrap();
+        let ca = Arc::new(Ca::load(&cert, &key).unwrap());
+        let net = Network {
+            insecure: true,
+            ..direct()
+        };
+        let controls = Controls {
+            decrypt: Mutex::new(Some(ca)),
+            ..Default::default()
+        };
+        let (addr, _) = proxy_with(&rt, net, controls);
+        let server = tls_server();
+        let file = std::env::temp_dir().join(format!("apitool-ca-{}.crt", std::process::id()));
+        std::fs::write(&file, &cert).unwrap();
+        // Not Git's curl, which may come first on PATH and checks with OpenSSL.
+        let root = std::env::var("SystemRoot").unwrap();
+        let out =
+            std::process::Command::new(std::path::Path::new(&root).join(r"System32\curl.exe"))
+                .args([
+                    "--silent",
+                    "--show-error",
+                    "--proxy",
+                    &format!("http://{addr}"),
+                ])
+                .arg("--cacert")
+                .arg(&file)
+                .arg(format!("https://localhost:{}/curl", server.port()))
+                .output()
+                .unwrap();
+        let _ = std::fs::remove_file(&file);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{said}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "GET /curl HTTP/1.1");
+    }
+
+    /// Through SOCKS `hello` (its greeting and CONNECT at once), the proxy's `answer`
+    /// bytes, then "ping" and its echo.
+    fn ping_socks(proxy: SocketAddr, hello: &[u8], answer: usize) -> (Vec<u8>, String) {
+        let mut s = std::net::TcpStream::connect(proxy).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(hello).unwrap();
+        let mut got = vec![0; answer];
+        s.read_exact(&mut got).unwrap();
+        s.write_all(b"ping").unwrap();
+        let mut back = [0; 4];
+        s.read_exact(&mut back).unwrap();
+        (got, String::from_utf8_lossy(&back).into_owned())
+    }
+
+    /// SOCKS 5, to a name or an address, and 4a, as Telegram and browsers set it, on the
+    /// HTTP port: what isn't HTTP goes through as it is, its flow counting the bytes.
+    #[test]
+    fn socks_tunnels_carry_bytes_both_ways_and_count_them() {
+        let rt = runtime();
+        let (addr, flows) = proxy(&rt, direct());
+        let target = echo();
+        let port = target.port().to_be_bytes();
+        let ok5 = vec![5, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        let ok4 = vec![0, 0x5a, 0, 0, 0, 0, 0, 0];
+        let cases = [
+            (
+                [&[5, 1, 0, 5, 1, 0, 3, 9][..], b"localhost", &port].concat(),
+                ok5.clone(),
+                "localhost",
+            ),
+            (
+                [&[5, 1, 0, 5, 1, 0, 1, 127, 0, 0, 1][..], &port].concat(),
+                ok5,
+                "127.0.0.1",
+            ),
+            (
+                [&[4, 1][..], &port, &[0, 0, 0, 1, 0], b"localhost\0"].concat(),
+                ok4,
+                "localhost",
+            ),
+        ];
+        for (hello, ok, host) in cases {
+            let (answer, echoed) = ping_socks(addr, &hello, ok.len());
+            assert_eq!((answer, echoed.as_str()), (ok, "ping"), "{host}");
+            let f = flow_when(&flows, |f| f.elapsed.is_some());
+            assert!(f.tunnel());
+            assert_eq!(f.url, format!("{host}:{}", target.port()));
+            assert_eq!((f.request.size, f.response.size), (4, 4));
+        }
+    }
+
+    /// Inside a SOCKS tunnel, plain HTTP is read as any request is, and while decrypting,
+    /// so is HTTPS, its certificate for the name the app gave its TLS: an app that
+    /// resolved it itself tunnels to an address.
+    #[test]
+    fn requests_through_socks_are_flows_https_too() {
+        let rt = runtime();
+        let (cert, key) = Ca::generate().unwrap();
+        let ca = Arc::new(Ca::load(&cert, &key).unwrap());
+        let net = Network {
+            insecure: true,
+            ..direct()
+        };
+        let controls = Controls {
+            decrypt: Mutex::new(Some(ca)),
+            ..Default::default()
+        };
+        let (addr, flows) = proxy_with(&rt, net, controls);
+        let app = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("socks5://{addr}")).unwrap())
+            .add_root_certificate(reqwest::Certificate::from_pem(cert.as_bytes()).unwrap())
+            .build()
+            .unwrap();
+        let line = |req: &str| req.lines().next().unwrap_or_default().to_owned();
+        let plain = crate::http::tests::serve(move |req| ("200 OK".into(), line(req)));
+        let tls = tls_server();
+        for url in [
+            format!("http://{plain}/plain?x=1"),
+            format!("https://localhost:{}/tls?x=1", tls.port()),
+        ] {
+            let body = rt.block_on(async { app.get(&url).send().await?.text().await });
+            let path = &url[url.find("/p").or(url.find("/t")).unwrap()..];
+            assert_eq!(body.unwrap(), format!("GET {path} HTTP/1.1"));
+            let f = flow_when(&flows, |f| f.elapsed.is_some());
+            assert_eq!(
+                (f.method.as_str(), f.url.as_str(), f.status),
+                ("GET", &*url, Some(200))
+            );
+        }
     }
 
     /// Past the cap the oldest flows go, the newest stay: a busy app left capturing

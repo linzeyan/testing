@@ -705,6 +705,17 @@ impl Workspace {
         self.put("capture-open", if open { "1" } else { "0" })
     }
 
+    /// 9090, as Proxyman's, unless another was set.
+    pub fn load_capture_port(&self) -> u16 {
+        (self.get("capture-port"))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(9090)
+    }
+
+    pub fn save_capture_port(&self, port: u16) -> Result<(), String> {
+        self.put("capture-port", &port.to_string())
+    }
+
     /// The system's proxy settings from before the capture pointed it at itself; empty
     /// when it doesn't.
     pub fn load_system_proxy(&self) -> String {

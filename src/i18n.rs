@@ -1830,14 +1830,29 @@ const ZH_TW: &[(&str, &str)] = &[
         "顯示 proto3 因值為 0、\"\" 或 false 而省略的欄位",
     ),
     ("Capture", "擷取"),
-    ("Capture traffic (HTTP proxy)", "擷取流量（HTTP 代理）"),
     (
-        "Capture what apps send through a local HTTP proxy",
-        "透過本機 HTTP 代理擷取應用程式送出的請求",
+        "Capture traffic (HTTP or SOCKS proxy)",
+        "擷取流量（HTTP 或 SOCKS 代理）",
+    ),
+    (
+        "Capture what apps send through a local HTTP or SOCKS proxy",
+        "透過本機 HTTP 或 SOCKS 代理擷取應用程式送出的請求",
     ),
     ("Capture: {}", "擷取：{}"),
     ("Capture stopped", "已停止擷取"),
     ("Capturing on {}", "擷取中：{}"),
+    (
+        "Capturing on {}, as the system proxy",
+        "擷取中：{}，已設為系統代理",
+    ),
+    (
+        "Port {} is taken: capturing on {} instead",
+        "連接埠 {} 已被占用：改在 {} 擷取",
+    ),
+    (
+        "Apps set to this port find the capture there after every start",
+        "設定成這個連接埠的應用程式，每次開始擷取後都能在這裡找到它",
+    ),
     ("Close the capture", "關閉擷取"),
     (
         "Stops capturing and drops what it captured",
@@ -1847,8 +1862,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Copy the address", "複製位址"),
     ("Start capturing", "開始擷取"),
     (
-        "Set {} as the HTTP proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS shows as tunnels, their host and size only.",
-        "把 {} 設為應用程式或系統的 HTTP 代理：送出的請求會顯示在這裡，並以 apitool 的網路設定轉送。HTTPS 顯示為通道，只有主機與大小。",
+        "Set {} as the HTTP or SOCKS proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS shows as tunnels, their host and size only.",
+        "把 {} 設為應用程式或系統的 HTTP 或 SOCKS 代理：送出的請求會顯示在這裡，並以 apitool 的網路設定轉送。HTTPS 顯示為通道，只有主機與大小。",
     ),
     ("{} flows", "{} 筆流量"),
     ("Export as HAR…", "匯出為 HAR…"),
@@ -1907,8 +1922,8 @@ const ZH_TW: &[(&str, &str)] = &[
         "先用「匯出 CA 憑證…」存檔，下面的指令就會帶入那個檔案。",
     ),
     (
-        "apitool's own requests trust it once the system does, or as the Extra CA bundle in Settings › Network.",
-        "系統信任之後，apitool 自己的請求也會信任；或在 設定 › 網路 把它填進「額外的 CA 憑證」。",
+        "apitool's own requests trust it once the system does, or as the Extra CA bundle in Settings › Network (empty that field to take it back).",
+        "系統信任之後，apitool 自己的請求也會信任；或在 設定 › 網路 把它填進「額外的 CA 憑證」（清空該欄即移除）。",
     ),
     ("Copied the command", "已複製指令"),
     ("Make a new CA", "產生新的 CA"),
@@ -1919,8 +1934,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Made a new CA", "已產生新的 CA"),
     (
-        "This is a new CA. Take the old one back first (the macOS and Windows tabs show how), then export and trust this one: both have the same name, so taking one back by name removes both.",
-        "這是新的 CA。請先移除舊的（macOS、Windows 分頁有指令），再匯出並信任這一張：兩張同名，按名稱移除會兩張一起刪掉。",
+        "This is a new CA. Take the old one back first (each tab shows how), then export and trust this one: both have the same name, so taking one back by name removes both.",
+        "這是新的 CA。請先移除舊的（每個分頁都有移除方式），再匯出並信任這一張：兩張同名，按名稱移除會兩張一起刪掉。",
     ),
     (
         "For this user, in Safari, Chrome, Edge, apitool and most apps; macOS asks for your password:",
@@ -1932,12 +1947,36 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("To take it back:", "日後要移除："),
     (
+        "Or by hand: in Keychain Access, under login › Certificates, delete apitool capture CA.",
+        "或手動：在「鑰匙圈存取」的 登入 › 憑證 中刪除 apitool capture CA。",
+    ),
+    (
+        "To take it back: in the same Authorities list, pick apitool capture CA under apitool and Delete or Distrust…; set security.enterprise_roots.enabled back to false if you changed it.",
+        "日後要移除：在同一個「憑證機構」清單中，選 apitool 底下的 apitool capture CA，按「刪除或不信任…」；若改過 security.enterprise_roots.enabled，把它設回 false。",
+    ),
+    (
+        "To take them back in that shell (a new shell starts without them):",
+        "要在同一個 shell 移除（新開的 shell 本來就沒有）：",
+    ),
+    (
+        "To take it back: on iPhone and iPad, Settings › General › VPN & Device Management › apitool capture CA › Remove Profile; on Android, Settings › Security › Encryption & credentials › User credentials › apitool capture CA › Remove. Then set the Wi-Fi proxy back to Off.",
+        "日後要移除：iPhone 與 iPad 到 設定 › 一般 › VPN 與裝置管理 › apitool capture CA › 移除描述檔；Android 到 設定 › 安全性 › 加密與憑證 › 使用者憑證 › apitool capture CA › 移除。最後把 Wi-Fi 代理設回「關閉」。",
+    ),
+    (
         "For this user, in Edge, Chrome, apitool and most apps, no administrator needed; Windows asks to confirm:",
         "對目前使用者生效，Edge、Chrome、apitool 與大多數應用程式都會信任，不需要系統管理員；Windows 會請你確認：",
     ),
     (
-        "Or by hand: double-click the .crt file, Install Certificate…, Current User, then place it in Trusted Root Certification Authorities.",
-        "或手動：雙擊 .crt 檔，「安裝憑證…」，選「目前使用者」，再放到「受信任的根憑證授權單位」。",
+        "Or by hand: double-click the .crt file, Install Certificate…, Current User, then Place all certificates in the following store, Browse…, Trusted Root Certification Authorities. Left to pick the store, Windows puts it under Intermediate Certification Authorities, where it isn't trusted.",
+        "或手動：雙擊 .crt 檔，「安裝憑證…」，選「目前使用者」，再選「將所有憑證放入以下的存放區」，「瀏覽…」，選「受信任的根憑證授權單位」。若讓 Windows 自動選擇存放區，它會放進「中繼憑證授權單位」，那裡的憑證不被信任。",
+    ),
+    (
+        "If it went under Intermediate Certification Authorities, from there too:",
+        "若它被放進了「中繼憑證授權單位」，也要從那裡移除：",
+    ),
+    (
+        "Or by hand: run certmgr.msc, and under Trusted Root Certification Authorities › Certificates (and Intermediate Certification Authorities › Certificates) delete apitool capture CA.",
+        "或手動：執行 certmgr.msc，在「受信任的根憑證授權單位 › 憑證」（以及「中繼憑證授權單位 › 憑證」）刪除 apitool capture CA。",
     ),
     (
         "Debian, Ubuntu, and Ubuntu in WSL:",
@@ -2042,8 +2081,8 @@ const ZH_TW: &[(&str, &str)] = &[
         "把它加到系統（鑰匙圈存取、certmgr）或應用程式的受信任根憑證",
     ),
     (
-        "Set {} as the HTTP proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS is decrypted: an app that doesn't trust apitool's CA fails to connect.",
-        "把 {} 設為應用程式或系統的 HTTP 代理：送出的請求會顯示在這裡，並以 apitool 的網路設定轉送。HTTPS 會被解密：不信任 apitool CA 的應用程式將無法連線。",
+        "Set {} as the HTTP or SOCKS proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS is decrypted: an app that doesn't trust apitool's CA fails to connect.",
+        "把 {} 設為應用程式或系統的 HTTP 或 SOCKS 代理：送出的請求會顯示在這裡，並以 apitool 的網路設定轉送。HTTPS 會被解密：不信任 apitool CA 的應用程式將無法連線。",
     ),
 ];
 

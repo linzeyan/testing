@@ -389,8 +389,13 @@ pub async fn build_client_with_jar(
             note = skipped;
             match pac {
                 Some(pac) => (Some(pac_proxy(&pac)), Route::Pac(pac)),
-                // reqwest reads the same system settings itself.
-                None => (None, Route::Rules(Arc::new(Matcher::from_system()))),
+                // Read once, here, for every client these settings build: reqwest reads
+                // them again for each client it builds, and one built while the capture
+                // is the system's proxy would forward the capture's requests into itself.
+                None => {
+                    let route = Route::Rules(Arc::new(Matcher::from_system()));
+                    (Some(route_proxy(&route)), route)
+                }
             }
         }
         ProxyMode::None => (None, Route::Direct),
@@ -798,6 +803,19 @@ async fn load_pac(location: &str) -> Result<Arc<Pac>, String> {
 fn pac_proxy(pac: &Arc<Pac>) -> reqwest::Proxy {
     let pac = pac.clone();
     reqwest::Proxy::custom(move |url| pac.proxy_for(url))
+}
+
+/// The login goes back into the URL, where reqwest takes it from.
+fn route_proxy(route: &Route) -> reqwest::Proxy {
+    let route = route.clone();
+    reqwest::Proxy::custom(move |url| {
+        let (mut proxy, login) = route.proxy_for(url)?;
+        if let Some((user, password)) = login {
+            let _ = proxy.set_username(&user);
+            let _ = proxy.set_password(Some(&password));
+        }
+        Some(proxy)
+    })
 }
 
 async fn fetch_pac(location: &str) -> Result<String, String> {
