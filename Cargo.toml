@@ -67,8 +67,9 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider", "websocket", "proxy"] }
 # Already in the tree via reqwest, which reads the system proxy with it: MQTT asks it the
 # same question for the broker. Its HttpInfo tells a response's connection from one that
-# opened beside it.
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy", "client-proxy-system", "tokio"] }
+# opened beside it. The capture proxy serves with its auto builder: an app's HTTP/1.1 and
+# h2c (gRPC without TLS) reach the one port.
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "client-proxy", "client-proxy-system", "server-auto", "tokio"] }
 http = "1.5.0"
 # Already in the tree via reqwest: the OS trust store (policy-installed roots on Windows)
 # for mqtts://, as reqwest uses it for https.
@@ -89,6 +90,10 @@ bytes = "1"
 # Already in the tree via reqwest-websocket, whose handshake takes its config: the
 # largest message a WebSocket takes in.
 tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+# Already in the tree (reqwest's gzip, hayro's PDF fonts): the capture shows a compressed
+# answer as the text it unpacks to.
+flate2 = "1"
+brotli-decompressor = "5"
 # The Docs tab's preview: egui draws no Markdown of its own. No images or syntax
 # highlighting, so it brings only pulldown-cmark and two small crates of its own.
 egui_commonmark = { version = "0.25", default-features = false, features = ["pulldown_cmark"] }
@@ -107,3 +112,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
 # Already in the tree via eframe: its WindowSettings checks the copy in app.rs.
 egui-winit = { version = "0.36.2", default-features = false, features = ["serde"] }
+# Already in the tree via hayro: compresses the br answer the capture's test unpacks.
+brotli = "8"

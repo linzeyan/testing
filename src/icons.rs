@@ -31,6 +31,7 @@ icons! {
     ARROW_UP "arrow-up",
     BOOKMARK "bookmark",
     CHEVRON_DOWN "chevron-down",
+    CHEVRON_LEFT "chevron-left",
     CHEVRON_RIGHT "chevron-right",
     CHEVRON_UP "chevron-up",
     CODE "code-xml",

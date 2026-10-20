@@ -120,7 +120,8 @@ closes it.
   request inside, like Postman's collection and folder settings. A request's inherited auth
   names the folder it comes from and opens that folder's Auth tab.
 
-**Network** (Settings > Network; the status bar shows the proxy in use and opens it)
+**Network** (Settings > Network; the status bar shows the proxy in use and opens it). Changes
+take effect on Apply (or Enter); closing Settings without it drops them.
 
 - Proxies: http, https and SOCKS (`socks5h://host:1080`), PAC (`SOCKS`/`SOCKS5` entries
   included) and WPAD.
@@ -268,16 +269,18 @@ past 16 MiB keep only their start, to spare RAM. Send and download keeps a whole
 - A `folder › request` breadcrumb, whose folders open their settings; a double-click on the
   request's name renames it.
 
-**Tabs**: a click in the tree previews a request; a double-click or an edit keeps its tab. A
+**Tabs**: a click in the tree previews a request; a double-click, an edit or using it (Send,
+Connect, a load test) keeps its tab. A
 middle click closes one. Right-click a tab to duplicate it, or to close others, those to the
 right or all, which leaves tabs with unsaved edits open.
 
 **Layout**: the response sits beside the request; a window too narrow for two columns stacks
-them until it's wider (the "Side by side" toggle greys out meanwhile). "Side by side" in the
-status bar turns that off and "Sidebar" folds
-the tree away. Stacked, the request gets most of the height. The response's ⌄ (or
-"Response" in the status bar, `Ctrl+J`) folds it to a bar under the request that still
-shows the last status, time and size. All three are kept across restarts, as are the
+them until it's wider (the "Side by side" button greys out meanwhile). "Response below" and
+"Side by side" in the status bar pick one place or the other, and "Sidebar" folds
+the tree away; the sidebar can't be dragged narrower than its buttons. Stacked, the request
+gets most of the height. The response's ⌄ (or `Ctrl+J`) folds it to a bar under the request
+that still shows the last status, time and size; side by side, its › folds it to a strip at
+the right with the status code. All three are kept across restarts, as are the
 window's size, place and maximized. A screen too small for the default window gets it maximized.
 With the sidebar folded, the environment picker moves to the right end of the tab strip.
 Messages in the status bar fade after a few seconds; an error stays, in red, until its × dismisses it.
@@ -424,9 +427,10 @@ that doesn't trust it fails to connect, and its tunnel says so. "Trusting apitoo
 shown while decrypting, has the steps for macOS, Windows, Linux and WSL, Firefox, command-line
 tools (Node, Python, curl, Java) and phones, each with how to take it back, its commands
 naming the exported file, a click to copy each. Decrypted
-connections speak HTTP/2 when the app offers it, so gRPC goes through, its trailers too. The
-latest 1000 flows are kept, each body's first 256 KiB. WebSocket upgrades through the proxy
-aren't relayed.
+connections speak HTTP/2 when the app offers it, so gRPC goes through, its trailers too, and
+so does gRPC to an http:// server (h2c). WebSockets (and Socket.IO) go through, a flow each
+with the bytes sent and received. A gzip, deflate or br body shows unpacked. The latest 1000
+flows are kept, each body's first 256 KiB.
 
 Rules, as Proxyman's tools, apply to every exchange whose URL matches (anywhere in the URL,
 `*` for any part), top to bottom, and are kept in the workspace: **Map Local** answers from a

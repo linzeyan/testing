@@ -952,7 +952,11 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Properties", "屬性"),
     ("Proto", "Proto"),
     ("Proxy", "代理伺服器"),
-    ("Closing Settings applies it too", "關閉設定時也會套用"),
+    ("Close drops what isn't applied", "未套用的變更在關閉時捨棄"),
+    (
+        "Network settings not applied: closed without Apply",
+        "網路設定未套用：關閉前沒有按套用",
+    ),
     ("Publish needs a topic", "發布需要指定主題"),
     ("Publish to", "發布到"),
     ("Purple", "紫"),
@@ -1285,10 +1289,9 @@ const ZH_TW: &[(&str, &str)] = &[
         "These variables aren't a JSON object: fix them under JSON.",
         "這些變數不是 JSON 物件：請切到 JSON 修正。",
     ),
-    (
-        "The response beside the request instead of under it",
-        "回應放在請求旁邊，而不是下方",
-    ),
+    ("The response beside the request", "回應放在請求右側"),
+    ("The response under the request", "回應放在請求下方"),
+    ("Response below", "回應在下方"),
     (
         "The response was over {} and wasn't kept while the tab was in the background: send again to see it",
         "回應超過 {}，分頁在背景時沒有保留：請重新傳送以查看",
@@ -1806,7 +1809,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Session", "工作階段"),
     ("Click again to clear all", "再點一次即全部清除"),
-    ("Click again to clear history", "再點一次即清除歷史紀錄"),
+    (
+        "Delete all {} requests in History? This can't be undone.",
+        "刪除歷史紀錄中全部 {} 筆請求？此動作無法復原。",
+    ),
     ("Clear response history", "清除回應歷史紀錄"),
     ("Create", "建立"),
     ("Close the load test", "關閉負載測試"),

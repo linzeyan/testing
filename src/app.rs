@@ -792,6 +792,8 @@ enum Dialog {
     },
     /// Requests and folders, none inside another.
     Delete(Vec<PathBuf>),
+    /// Every request in History, which has no undo.
+    ClearHistory,
     Unsaved(Next),
     /// The workspace files and the database both changed since they were last in step.
     Sync,
@@ -1140,6 +1142,9 @@ pub struct App {
     /// Set each frame: the workbench is too narrow for side by side.
     narrow: bool,
     hide_sidebar: bool,
+    /// Measured each frame: the widest row of the sidebar's buttons, which its separator
+    /// can't be dragged past.
+    sidebar_min: f32,
     hide_response: bool,
     env_colors: HashMap<String, [u8; 3]>,
     recent_filters: Vec<String>,
@@ -1280,6 +1285,7 @@ impl App {
             side_by_side: !state.stacked,
             narrow: false,
             hide_sidebar: state.hide_sidebar,
+            sidebar_min: 0.0,
             hide_response: state.hide_response,
             env_colors: state.env_colors.clone(),
             recent_filters: state.recent_filters.clone(),
@@ -3663,8 +3669,15 @@ impl eframe::App for App {
         varedit::offer(ui.ctx(), scopes);
         self.status_bar(ui);
         if !self.hide_sidebar {
+            // Never narrower than its buttons: dragged to egui's 96 px, the environment's
+            // and the tree's were cut off.
+            let margins = egui::Frame::side_top_panel(ui.style())
+                .total_margin()
+                .sum()
+                .x;
             egui::Panel::left("sidebar")
                 .default_size(260.0)
+                .min_size(self.sidebar_min + margins)
                 .show(ui, |ui| self.sidebar(ui));
         }
         if self.quick_look {
@@ -3708,9 +3721,21 @@ impl eframe::App for App {
         {
             self.edited.push(id);
         }
-        // Editing turns a preview tab into a normal one, as in VS Code.
-        let dirty = self.open.as_ref().filter(|o| o.dirty());
-        if let Some(i) = dirty.and_then(|o| self.tab_index(&o.path)) {
+        // Editing turns a preview tab into a normal one, as in VS Code; so does using it:
+        // the next request clicked in the tree took the place of a live stream's tab (the
+        // stream went on, out of reach), a Send under way or a load test.
+        let busy = |o: &&Open| {
+            o.dirty()
+                || self.stream.as_ref().is_some_and(|s| s.path == o.path)
+                || self.pending.iter().any(|p| p.path == o.path)
+                || self.load.is_some()
+        };
+        if let Some(i) = self
+            .open
+            .as_ref()
+            .filter(busy)
+            .and_then(|o| self.tab_index(&o.path))
+        {
             self.tabs[i].preview = false;
         }
         self.dialog_ui(ui.ctx());
@@ -3793,31 +3818,35 @@ impl App {
                     self.save_state();
                 }
                 ui.separator();
+                // Where the response goes: one place or the other, lit as it is laid out.
+                // A show/hide toggle beside Side by side was lit with it and read as a
+                // second place. Picking one shows a folded response there.
+                let beside = self.side_by_side && !self.narrow;
+                let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[3].0);
+                let mut pick = None;
+                if icon_button(ui, icon::PANEL_BOTTOM, t("Response below"), Some(!beside))
+                    .on_hover_text(format!("{} ({key})", t("The response under the request")))
+                    .clicked()
+                {
+                    pick = Some(false);
+                }
                 let hint = match self.narrow {
                     true => t("The window is too narrow: the response is under the request until it is wider"),
-                    false => t("The response beside the request instead of under it"),
+                    false => t("The response beside the request"),
                 };
-                let on = self.side_by_side;
-                let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[3].0);
                 // Greyed while too narrow: lit, it looked on yet changed nothing.
                 let button = ui.add_enabled_ui(!self.narrow, |ui| {
-                    icon_button(ui, icon::COLUMNS, t("Side by side"), Some(on))
+                    icon_button(ui, icon::COLUMNS, t("Side by side"), Some(beside))
                 });
                 if (button.inner)
                     .on_hover_text(format!("{hint} ({key})"))
                     .on_disabled_hover_text(hint)
                     .clicked()
                 {
-                    self.side_by_side = !on;
-                    self.save_state();
+                    pick = Some(true);
                 }
-                let shown = !self.hide_response;
-                let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[5].0);
-                if icon_button(ui, icon::PANEL_BOTTOM, t("Response"), Some(shown))
-                    .on_hover_text(format!("{} ({key})", t("Show or hide the response")))
-                    .clicked()
-                {
-                    self.hide_response = shown;
+                if let Some(side) = pick {
+                    (self.side_by_side, self.hide_response) = (side, false);
                     self.save_state();
                 }
                 ui.separator();
@@ -3848,11 +3877,13 @@ impl App {
                     // The system's traffic, not only what apps were set to send here.
                     Some(addr) if self.capture.as_ref().is_some_and(|c| c.system) => {
                         dot(ui, GREEN);
-                        tf("Capturing on {}, as the system proxy", &[&addr])
+                        let on = listening_on(self.capture.as_ref(), addr);
+                        tf("Capturing on {}, as the system proxy", &[&on])
                     }
                     Some(addr) => {
                         dot(ui, GREEN);
-                        tf("Capturing on {}", &[&addr])
+                        let on = listening_on(self.capture.as_ref(), addr);
+                        tf("Capturing on {}", &[&on])
                     }
                     None => t("Capture").into(),
                 };
@@ -3915,7 +3946,7 @@ impl App {
                 }
             });
         });
-        ui.horizontal(|ui| {
+        let env_row = ui.horizontal(|ui| {
             self.env_combo(ui);
             if let Some(name) = self.active_env.clone() {
                 let colour = square_button(ui, t("Environment colour"), None)
@@ -3962,6 +3993,8 @@ impl App {
                 self.quick_look = !on;
             }
         });
+        // Rows lay out past a narrow panel's edge, so each is as wide as its buttons.
+        self.sidebar_min = env_row.response.rect.width();
         ui.separator();
         ui.horizontal(|ui| {
             ui.selectable_value(
@@ -3979,7 +4012,7 @@ impl App {
             self.history_ui(ui);
             return;
         }
-        ui.horizontal(|ui| {
+        let tools = ui.horizontal(|ui| {
             let root = self.ws.collections();
             let shortcut = shortcut_label(ui.ctx(), &NEW_REQUEST);
             if icon_button(ui, icon::FILE_PLUS, t("New request"), None)
@@ -4040,6 +4073,7 @@ impl App {
                 self.open_runner(root);
             }
         });
+        self.sidebar_min = self.sidebar_min.max(tools.response.rect.width());
         if !self.tree.is_empty() {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4524,10 +4558,7 @@ impl App {
             match listening {
                 Some(addr) => {
                     dot(ui, GREEN);
-                    let on = match open {
-                        true => format!("0.0.0.0:{}", addr.port()),
-                        false => addr.to_string(),
-                    };
+                    let on = listening_on(Some(&*view), addr);
                     ui.label(tf("Listening on {}", &[&on]));
                     if icon_button(ui, icon::COPY, t("Copy the address"), None)
                         .on_hover_text(t("Copy the address"))
@@ -4901,23 +4932,13 @@ impl App {
         if !self.history.is_empty() {
             ui.horizontal(|ui| {
                 ui.weak(t("Click to load what was sent."));
-                // Up to 200 requests with no undo: a second click, as for environments.
-                let armed = egui::Id::new("clear-history");
-                let confirm = ui.data(|d| d.get_temp(armed)).unwrap_or(false);
-                let clicked = match confirm {
-                    true => ui.button(RichText::new(t("Click again to clear history")).color(RED)),
-                    false => icon_button(ui, icon::TRASH, t("Clear"), None)
-                        .on_hover_text(t("Clear history")),
-                }
-                .clicked();
-                if clicked {
-                    ui.data_mut(|d| d.insert_temp(armed, !confirm));
-                }
-                if clicked && confirm {
-                    match self.ws.clear_history() {
-                        Ok(()) => self.history.clear(),
-                        Err(e) => self.fail(e),
-                    }
+                // Up to 200 requests with no undo: asked first. A second click on a button
+                // that turned red in place was missed, or clicked through.
+                if icon_button(ui, icon::TRASH, t("Clear"), None)
+                    .on_hover_text(t("Clear history"))
+                    .clicked()
+                {
+                    self.dialog = Some(Dialog::ClearHistory);
                 }
             });
             ui.add(
@@ -5294,16 +5315,22 @@ impl App {
         // Too narrow for two columns of URL bar and JSON: stacked whatever the toggle says,
         // like yaak and insomnia; widening the window puts it back.
         self.narrow = ui.available_width() < NARROW;
+        let beside = self.side_by_side && !self.narrow;
+        // Folded where it was: a bar a button tall under the request, a strip a button wide
+        // at its right; the request gets the rest, the central panel's margins around it.
+        let folded = button_height(ui) + 2.0 * 8.0 + 1.0;
         // Separate ids, so each layout keeps its own dragged size.
-        let panel = if self.hide_response {
-            // Folded to its bar under the request, in either layout: the request gets the
-            // rest. The bar is a button tall in the central panel's margins.
-            let bar = button_height(ui) + 2.0 * 8.0 + 1.0;
-            let rest = (ui.available_height() - bar).max(0.0);
+        let panel = if self.hide_response && beside {
+            let rest = (ui.available_width() - folded).max(0.0);
+            egui::Panel::left("request-full-side")
+                .exact_size(rest)
+                .resizable(false)
+        } else if self.hide_response {
+            let rest = (ui.available_height() - folded).max(0.0);
             egui::Panel::top("request-full")
                 .exact_size(rest)
                 .resizable(false)
-        } else if self.side_by_side && !self.narrow {
+        } else if beside {
             egui::Panel::left("request-side")
                 .default_size(ui.available_width() / 2.0)
                 .resizable(true)
@@ -5792,6 +5819,38 @@ impl App {
         let mut fold = None;
         egui::CentralPanel::default().show(ui, |ui| {
             let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[5].0);
+            if self.hide_response && beside {
+                ui.vertical_centered(|ui| {
+                    if icon_button(ui, icon::CHEVRON_LEFT, t("Show the response"), None)
+                        .on_hover_text(format!("{} ({key})", t("Show the response")))
+                        .clicked()
+                    {
+                        fold = Some(false);
+                    }
+                    // The status code alone: the strip has no room for the rest of the line.
+                    match (&pending, &self.response) {
+                        (Some(_), _) => {
+                            icon_label(ui, icon::HOURGLASS, None);
+                        }
+                        (None, Some(shown)) if !streaming && self.load.is_none() => {
+                            match &shown.result {
+                                Ok(view) => {
+                                    let s = view.head.status;
+                                    let code = RichText::new(s.to_string()).strong();
+                                    ui.label(code.color(status_color(s)))
+                                        .on_hover_text(t(status_meaning(s)));
+                                }
+                                Err(e) => {
+                                    icon_label(ui, icon::WARNING, Some(RED))
+                                        .on_hover_text(e.as_str());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                });
+                return;
+            }
             if self.hide_response {
                 ui.horizontal(|ui| {
                     if icon_button(ui, icon::CHEVRON_UP, t("Show the response"), None)
@@ -5861,7 +5920,7 @@ impl App {
                         ui.weak(tf("Press Send or {} to see the response.", &[&shortcut_label(ui.ctx(), &SEND)]));
                         past_menu(ui, &mut past, None);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if fold_button(ui, &key) {
+                            if fold_button(ui, &key, beside) {
                                 fold = Some(true);
                             }
                         });
@@ -5875,7 +5934,7 @@ impl App {
                     let recent = &mut self.recent_filters;
                     let hide = &mut false;
                     let status = &mut self.status;
-                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_external, &mut past, recent, hide, status);
+                    example = response_ui(ui, shown, tab, wrap, &mut save_file, &mut open_external, &mut past, recent, hide, beside, status);
                     if *hide {
                         fold = Some(true);
                     }
@@ -6138,6 +6197,7 @@ impl App {
 
     fn dialog_ui(&mut self, ctx: &egui::Context) {
         let unsaved = self.unsaved().join("\", \"");
+        let history_len = self.history.len();
         let Some(dialog) = &mut self.dialog else {
             return;
         };
@@ -6321,6 +6381,29 @@ impl App {
                                 }
                                 app.save_state();
                                 app.reload();
+                            }));
+                        }
+                        cancel = ui.button(t("Cancel")).clicked();
+                    });
+                }
+                Dialog::ClearHistory => {
+                    ui.heading(t("Clear history"));
+                    ui.label(tf(
+                        "Delete all {} requests in History? This can't be undone.",
+                        &[&history_len],
+                    ));
+                    ui.horizontal(|ui| {
+                        let clear = egui::Button::new(
+                            RichText::new(t("Clear history")).strong().color(Color32::WHITE),
+                        )
+                        .fill(RED);
+                        if ui.add(clear).clicked() || enter_pressed(ui) {
+                            then = Some(Box::new(|app, _| {
+                                app.dialog = None;
+                                match app.ws.clear_history() {
+                                    Ok(()) => app.history.clear(),
+                                    Err(e) => app.fail(e),
+                                }
                             }));
                         }
                         cancel = ui.button(t("Cancel")).clicked();
@@ -7836,7 +7919,8 @@ impl App {
                         });
                 }
                 SettingsTab::Network => {
-                    // A copy until Apply or Close: a proxy URL half typed would be used.
+                    // A copy until Apply: a proxy URL half typed would be used, and a mode
+                    // picked on the way to its URL would cut the network off meanwhile.
                     let net = net_draft.get_or_insert_with(|| net_now.clone());
                     network_settings(ui, net, skipped.as_deref());
                 }
@@ -8135,7 +8219,7 @@ impl App {
                         false => egui::Button::new(t("Apply")),
                     };
                     apply_net = (ui.add_enabled(changed, button))
-                        .on_hover_text(t("Closing Settings applies it too"))
+                        .on_hover_text(t("Close drops what isn't applied"))
                         .clicked()
                         || (changed && enter_pressed(ui));
                 }
@@ -8184,7 +8268,11 @@ impl App {
         }
         if close || modal.should_close() {
             self.settings = false;
-            apply_net = true;
+            // Only Apply applies: a click outside closes too, and took a proxy picked on
+            // the way to typing its URL.
+            if !apply_net && (self.network_editor.as_ref()).is_some_and(|n| *n != self.network) {
+                self.status = t("Network settings not applied: closed without Apply").into();
+            }
         }
         if apply_net
             && let Some(net) = &self.network_editor
@@ -12994,6 +13082,15 @@ fn flow_list(
     open_as
 }
 
+/// Where the capture listens, the same in its pane and the status bar: on every interface
+/// once other devices are let in, though this machine's apps still use 127.0.0.1.
+fn listening_on(view: Option<&CaptureView>, addr: std::net::SocketAddr) -> String {
+    match view.is_some_and(|v| v.open) {
+        true => format!("0.0.0.0:{}", addr.port()),
+        false => addr.to_string(),
+    }
+}
+
 /// A flow as it went: the request, then the answer, each with its headers and the start
 /// of its body.
 fn flow_text(f: &crate::capture::Flow) -> String {
@@ -13008,7 +13105,7 @@ fn flow_text(f: &crate::capture::Flow) -> String {
             return;
         }
         out.push('\n');
-        match std::str::from_utf8(&m.body) {
+        match std::str::from_utf8(&m.content()) {
             Ok(text) => out.push_str(&clip(text, SHOWN)),
             Err(_) => out.push_str(&tf("({} of binary data)", &[&human_size(m.size as usize)])),
         }
@@ -13027,7 +13124,8 @@ fn flow_text(f: &crate::capture::Flow) -> String {
         let _ = writeln!(out, "\n{status}");
         message(&mut out, &f.response);
     }
-    if f.tunnel() && f.elapsed.is_some() {
+    // A WebSocket's 101 carries bytes both ways after, as a tunnel does.
+    if (f.tunnel() || f.status == Some(101)) && f.elapsed.is_some() {
         let (sent, received) = (
             human_size(f.request.size as usize),
             human_size(f.response.size as usize),
@@ -13540,10 +13638,15 @@ fn status_line(ui: &mut egui::Ui, view: &ResponseView) {
 // Each is a separate App field borrowed for the pane; a struct for this one call would
 // only rename them.
 #[allow(clippy::too_many_arguments)]
-/// Folds the response to a bar under the request; `key` is the shortcut that does too.
-fn fold_button(ui: &mut egui::Ui, key: &str) -> bool {
+/// Folds the response where it is: down to a bar under the request, or right to a strip
+/// beside it (`beside`). `key` is the shortcut that does too.
+fn fold_button(ui: &mut egui::Ui, key: &str, beside: bool) -> bool {
     let hint = format!("{} ({key})", t("Hide the response"));
-    icon_button(ui, icon::CHEVRON_DOWN, t("Hide the response"), None)
+    let arrow = match beside {
+        true => icon::CHEVRON_RIGHT,
+        false => icon::CHEVRON_DOWN,
+    };
+    icon_button(ui, arrow, t("Hide the response"), None)
         .on_hover_text(hint)
         .clicked()
 }
@@ -13559,6 +13662,7 @@ fn response_ui(
     past: &mut Past,
     recent: &mut Vec<String>,
     hide: &mut bool,
+    beside: bool,
     status: &mut String,
 ) -> Option<Example> {
     let mut example = None;
@@ -13602,7 +13706,8 @@ fn response_ui(
         }
         let actions = egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true);
         ui.with_layout(actions, |ui| {
-            *hide = fold_button(ui, &shortcut_label(ui.ctx(), &KEYED_ACTIONS[5].0));
+            let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[5].0);
+            *hide = fold_button(ui, &key, beside);
             if let Ok(view) = &mut shown.result {
                 // What the tab shows, said in the status bar: it copied the body from any
                 // tab, without a word. Cookies, Tests and Console copy row by row.
@@ -15251,9 +15356,10 @@ mod ui_tests {
     }
 
     /// The status bar's proxy opens Settings at Network. What's picked there goes out only
-    /// on Apply or when Settings closes, so a proxy URL half typed is never used.
+    /// on Apply: a proxy URL half typed is never used, and closing (Close, Escape, a click
+    /// outside) drops the rest, saying so, instead of switching the network unasked.
     #[test]
-    fn network_is_a_settings_tab_applied_on_apply_or_close() {
+    fn network_is_a_settings_tab_applied_only_on_apply() {
         let mut h = harness(workspace("network-tab"));
         h.run();
         h.get_by_label("System proxy").click();
@@ -15278,10 +15384,18 @@ mod ui_tests {
         h.get_by_label("Close").click();
         h.run();
         assert!(!h.state().settings);
-        assert_eq!(
-            h.state().network.proxy,
-            ProxyMode::Manual,
-            "Close applies it too"
+        assert_eq!(h.state().network.proxy, ProxyMode::None, "Close drops it");
+        assert!(
+            h.state().status.contains("not applied"),
+            "{}",
+            h.state().status
+        );
+        h.state_mut().settings = true;
+        h.run();
+        assert!(
+            h.get_by_label("None").accesskit_node().toggled()
+                == Some(egui::accesskit::Toggled::True),
+            "reopened, it shows what's in use"
         );
     }
 
@@ -15517,6 +15631,75 @@ mod ui_tests {
         assert!(h.state().tabs.is_empty() && h.state().open.is_none());
     }
 
+    /// A preview tab in use is kept as a normal one: the next request clicked took the
+    /// place of a connected stream's tab, the stream going on with no tab to reach it by.
+    #[test]
+    fn a_connected_stream_keeps_its_tab() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let Ok(mut ws) = tungstenite::accept(s) else {
+                        return;
+                    };
+                    while ws.read().is_ok() {}
+                });
+            }
+        });
+        let ws = workspace("stream-tab");
+        let socket = ws.create_request(&ws.collections(), "socket").unwrap();
+        let req = Request {
+            method: "WS".into(),
+            url: format!("ws://{addr}/"),
+            ..Default::default()
+        };
+        ws.save_request(&socket, &req).unwrap();
+        let other = ws.create_request(&ws.collections(), "other").unwrap();
+        let mut h = harness(ws);
+        h.run();
+        h.state_mut().activate(socket.clone(), false);
+        h.run();
+        assert!(h.state().tabs[0].preview, "a plain click previews");
+        h.get_by_label("Connect").click();
+        wait_live(&mut h, |app| app.stream.as_ref().is_some_and(|s| s.live));
+        h.state_mut().activate(other.clone(), false);
+        h.run();
+        let tabs: Vec<_> = h.state().tabs.iter().map(|t| t.path.clone()).collect();
+        assert_eq!(tabs, [socket, other]);
+    }
+
+    /// The sidebar's separator stops where its buttons would be cut off: dragged to egui's
+    /// 96 px, Quick look and Run all were gone, half an environment name with them.
+    #[test]
+    fn the_sidebar_is_never_narrower_than_its_buttons() {
+        let mut h = with_request("sidebar-min");
+        let edge = |h: &Harness<'_, App>| {
+            let id = egui::Id::new("sidebar");
+            egui::PanelState::load(&h.ctx, id)
+                .unwrap()
+                .outer_rect
+                .right()
+        };
+        let from = egui::pos2(edge(&h), 400.0);
+        h.drag_at(from);
+        h.run();
+        h.hover_at(from - egui::vec2(12.0, 0.0));
+        h.run();
+        h.hover_at(egui::pos2(10.0, 400.0));
+        h.run();
+        h.drop_at(egui::pos2(10.0, 400.0));
+        h.run();
+        h.run();
+        let right = edge(&h);
+        assert!(right < 300.0, "dragged narrower: {right}");
+        shot(&mut h, "sidebar-narrowest");
+        for label in ["Quick look", "Environment colour", "Run all collections"] {
+            let button = h.get_by_label(label).rect();
+            assert!(button.right() <= right, "{label} {button:?} past {right}");
+        }
+    }
+
     #[test]
     fn the_tab_menu_closes_in_bulk_but_never_drops_edits() {
         let ws = workspace("tabmenu");
@@ -15625,7 +15808,12 @@ mod ui_tests {
             r.top() < p.top() && r.left() > p.right(),
             "side by side by default: {p:?} {r:?}"
         );
-        button(&h, "Side by side").click();
+        // One place or the other, lit as laid out.
+        let lit = |h: &Harness<'_, App>, label: &str| {
+            button(h, label).accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
+        };
+        assert!(lit(&h, "Side by side") && !lit(&h, "Response below"));
+        button(&h, "Response below").click();
         h.run();
         let (p, r) = rects(&h);
         assert!(
@@ -15633,8 +15821,12 @@ mod ui_tests {
             "stacked: the response is under the request"
         );
         assert!(h.state().ws.load_state().stacked, "kept for the next start");
+        assert!(!lit(&h, "Side by side") && lit(&h, "Response below"));
+        button(&h, "Response below").click();
+        h.run();
+        assert!(lit(&h, "Response below"), "picked again, it stays below");
 
-        // A narrow window stacks them whatever the toggle says.
+        // A narrow window stacks them whatever was picked.
         button(&h, "Side by side").click();
         h.run();
         h.set_size(egui::vec2(1200.0, 800.0));
@@ -16091,12 +16283,19 @@ mod ui_tests {
         h.run();
         assert_eq!(draft(&h).url, sent);
 
-        // Clearing every sent request can't be undone: the first click only asks.
+        // Clearing every sent request can't be undone: it asks first, and Cancel keeps them.
         h.get_by_label("Clear").click();
         h.run();
-        assert_eq!(h.state().history.len(), 1, "one click clears nothing");
-        h.get_by_label("Click again to clear history").click();
+        assert!(matches!(h.state().dialog, Some(Dialog::ClearHistory)));
+        assert!(h.query_by_label_contains("Delete all 1 requests").is_some());
+        h.get_by_label("Cancel").click();
         h.run();
+        assert_eq!(h.state().history.len(), 1, "Cancel clears nothing");
+        h.get_by_label("Clear").click();
+        h.run();
+        button(&h, "Clear history").click();
+        h.run();
+        assert!(h.state().dialog.is_none());
         assert!(h.state().history.is_empty() && h.state().ws.load_history().is_empty());
         assert!(
             h.query_by_label("Click to load what was sent.").is_none(),

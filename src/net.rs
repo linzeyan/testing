@@ -303,9 +303,11 @@ impl Clients {
 
     /// The client the capture proxy forwards a request for `url` with: the same proxy, CA
     /// file and client certificate, no redirects followed and no cookies of the app's.
-    pub fn forward_for(&self, url: &str) -> Result<reqwest::Client, String> {
+    /// `version` as the app asked: h2c stays HTTP/2, a WebSocket's upgrade HTTP/1.1.
+    pub fn forward_for(&self, url: &str, version: HttpVersion) -> Result<reqwest::Client, String> {
         let defaults = Variant::from(&Settings::default());
         self.variant(Variant {
+            version,
             redirects: None,
             referer: false,
             cookies: false,
@@ -401,6 +403,12 @@ pub async fn build_client_with_jar(
         ProxyMode::None => (None, Route::Direct),
         ProxyMode::Manual => {
             let url = net.proxy_url.trim();
+            // reqwest's own word for it is "relative URL without a base".
+            if url.is_empty() {
+                return Err(
+                    "Manual proxy without a URL: type one, such as http://proxy:8080".into(),
+                );
+            }
             let proxy =
                 reqwest::Proxy::all(url).map_err(|e| format!("proxy URL: {}", error_chain(&e)))?;
             let rules = Matcher::builder()

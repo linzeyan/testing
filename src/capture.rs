@@ -3,6 +3,7 @@
 //! only as its host and byte counts, unless decrypting: then its TLS ends here, with a
 //! certificate for its host from apitool's CA, and its requests are flows as any other.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -19,6 +20,7 @@ use hyper::body::{Body as _, Frame, Incoming};
 use hyper::header::{HeaderMap, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use hyper_util::server::conn::auto;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
@@ -27,6 +29,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::http::error_chain;
+use crate::model::HttpVersion;
 use crate::net::{Clients, Route};
 
 /// Past these the oldest flows go and a body is cut: the VDI has little RAM to spare.
@@ -71,7 +74,47 @@ impl Message {
     pub fn cut(&self) -> bool {
         self.size > self.body.len() as u64
     }
+
+    /// The body unpacked from its Content-Encoding, as devtools show it: apps ask for gzip
+    /// or br, and the bytes as they went read as binary. A cut body gives what its start
+    /// unpacks to; one that doesn't unpack stays as it went.
+    pub fn content(&self) -> Cow<'_, [u8]> {
+        use std::io::Read;
+        let coding = (self.headers.iter())
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+            .map(|(_, v)| v.trim().to_ascii_lowercase());
+        let body = self.body.as_slice();
+        let unpack = |mut r: Box<dyn Read + '_>| {
+            let (mut out, mut chunk) = (Vec::new(), [0u8; 16 * 1024]);
+            // Up to an error too: a cut body ends mid-stream. Capped, as a few KiB can
+            // unpack to gigabytes.
+            while out.len() < MAX_UNPACKED {
+                match r.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&chunk[..n]),
+                }
+            }
+            out
+        };
+        let out = match coding.as_deref() {
+            Some("gzip" | "x-gzip") => unpack(Box::new(flate2::read::MultiGzDecoder::new(body))),
+            // zlib-wrapped as the RFC says; some servers send it raw.
+            Some("deflate") => match unpack(Box::new(flate2::read::ZlibDecoder::new(body))) {
+                out if out.is_empty() => unpack(Box::new(flate2::read::DeflateDecoder::new(body))),
+                out => out,
+            },
+            Some("br") => unpack(Box::new(brotli_decompressor::Decompressor::new(body, 4096))),
+            _ => return Cow::Borrowed(body),
+        };
+        match out.is_empty() {
+            true => Cow::Borrowed(body),
+            false => Cow::Owned(out),
+        }
+    }
 }
+
+/// What `Message::content` unpacks at most.
+const MAX_UNPACKED: usize = 4 * MAX_BODY;
 
 #[derive(Clone, Debug)]
 pub struct Flow {
@@ -378,9 +421,10 @@ pub async fn serve(listener: TcpListener, clients: Clients, flows: Flows, contro
                     Ok::<_, Infallible>(res)
                 }
             });
-            let conn = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades();
+            // HTTP/1.1, or HTTP/2 from its first bytes: gRPC over http:// comes as h2c,
+            // with its absolute URL as a proxy's request has.
+            let auto = auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            let conn = auto.serve_connection_with_upgrades(TokioIo::new(stream), service);
             if let Err(e) = conn.await {
                 log::debug!("capture: {e}");
             }
@@ -396,7 +440,7 @@ async fn handle(req: Request<Incoming>, p: &Proxy) -> Response<Body> {
         let hint = "This is apitool's capture proxy: set it as the HTTP proxy, not as the server.";
         return text(StatusCode::BAD_REQUEST, hint);
     }
-    exchange(req, &p.clients, &p.flows, &p.controls).await
+    exchange(req, p).await
 }
 
 /// SOCKS 4, 4a and 5 without a login, CONNECT only (what Telegram and browsers ask for):
@@ -472,12 +516,7 @@ async fn nul_ended(s: &mut TcpStream) -> std::io::Result<String> {
 }
 
 /// A request with its absolute URL: forwarded, unless it came back around.
-async fn exchange(
-    req: Request<Incoming>,
-    clients: &Clients,
-    flows: &Flows,
-    controls: &Controls,
-) -> Response<Body> {
+async fn exchange(req: Request<Incoming>, p: &Proxy) -> Response<Body> {
     let vias = req.headers().get_all(hyper::header::VIA);
     if vias
         .iter()
@@ -485,7 +524,7 @@ async fn exchange(
     {
         return text(StatusCode::LOOP_DETECTED, LOOP);
     }
-    forward(req, clients, flows, controls).await
+    forward(req, p).await
 }
 
 const LOOP: &str = "apitool's capture proxy would be its own upstream: in apitool's network \
@@ -533,15 +572,11 @@ impl Drop for Tee {
     }
 }
 
-async fn forward(
-    req: Request<Incoming>,
-    clients: &Clients,
-    flows: &Flows,
-    controls: &Controls,
-) -> Response<Body> {
+async fn forward(req: Request<Incoming>, p: &Proxy) -> Response<Body> {
+    let (clients, flows, controls) = (&p.clients, &p.flows, &*p.controls);
     let rules = controls.rules.lock().unwrap().clone();
     let started = Instant::now();
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let url = parts.uri.to_string();
     let id = flows.start(parts.method.as_str(), &url, &parts.headers);
     let fail = |e: String| {
@@ -624,11 +659,22 @@ async fn forward(
     let (mut method, mut headers) = (parts.method, parts.headers);
     // The one hop-by-hop header HTTP/2 lets through, which gRPC's servers ask for.
     let trailers = (headers.get(hyper::header::TE)).is_some_and(|te| te == "trailers");
+    // A WebSocket's handshake asks the server to switch, in the headers of the hop it
+    // switches: asked again on the proxy's own.
+    let upgrade = (headers.get(hyper::header::UPGRADE).cloned())
+        .filter(|_| parts.version == hyper::Version::HTTP_11);
     for name in HOP_BY_HOP.iter().chain(&["host"]) {
         headers.remove(*name);
     }
     if trailers {
         headers.insert(hyper::header::TE, HeaderValue::from_static("trailers"));
+    }
+    if let Some(upgrade) = &upgrade {
+        headers.insert(
+            hyper::header::CONNECTION,
+            HeaderValue::from_static("upgrade"),
+        );
+        headers.insert(hyper::header::UPGRADE, upgrade.clone());
     }
     set_headers(&mut headers, &asked);
     // A GET's empty body stays absent: streamed, it would go out chunked.
@@ -675,7 +721,13 @@ async fn forward(
         Some(reqwest::Body::wrap_stream(chunks))
     };
     headers.append(hyper::header::VIA, HeaderValue::from_static(VIA));
-    let client = match clients.forward_for(&target) {
+    let version = match parts.version {
+        _ if upgrade.is_some() => HttpVersion::Http1,
+        // h2c: plain http:// has no TLS to offer HTTP/2 in, and gRPC needs it.
+        hyper::Version::HTTP_2 if target.starts_with("http://") => HttpVersion::Http2,
+        _ => HttpVersion::Auto,
+    };
+    let client = match clients.forward_for(&target, version) {
         Ok(client) => client,
         Err(e) => return fail(e),
     };
@@ -687,6 +739,10 @@ async fn forward(
         Ok(res) => res,
         Err(e) => return fail(error_chain(&e)),
     };
+    let app = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
+    if let (StatusCode::SWITCHING_PROTOCOLS, Some(app)) = (res.status(), app) {
+        return switch(res, app, id, started, p);
+    }
     let mut headers = HeaderMap::new();
     for (name, value) in res.headers() {
         if !HOP_BY_HOP.contains(&name.as_str()) {
@@ -707,6 +763,52 @@ async fn forward(
         Ok((status, headers, body)) => ok(id).send(status, headers, body.into()),
         Err(e) => fail(e),
     }
+}
+
+/// A 101: once both sides have switched, what they send each other (a WebSocket's frames)
+/// goes through untouched and counted, as in a tunnel.
+fn switch(
+    res: reqwest::Response,
+    app: hyper::upgrade::OnUpgrade,
+    id: u64,
+    started: Instant,
+    p: &Proxy,
+) -> Response<Body> {
+    // All of them, Upgrade and Connection too: they say what the app switches to.
+    let headers = res.headers().clone();
+    let shown = pairs(&headers);
+    let status = res.status();
+    p.flows.update(id, |f| {
+        (f.status, f.response.headers) = (Some(status.as_u16()), shown);
+    });
+    let (flows, mut stopped) = (p.flows.clone(), p.stopped.clone());
+    tokio::spawn(async move {
+        let joined = async {
+            let mut server = res.upgrade().await.map_err(|e| error_chain(&e))?;
+            let mut app = TokioIo::new(app.await.map_err(|e| e.to_string())?);
+            tokio::select! {
+                copied = tokio::io::copy_bidirectional(&mut app, &mut server) => {
+                    copied.map_err(|e| e.to_string())
+                }
+                _ = stopped.changed() => Err("capture stopped".to_owned()),
+            }
+        };
+        let result = joined.await;
+        flows.update(id, |f| {
+            match result {
+                Ok((up, down)) => (f.request.size, f.response.size) = (up, down),
+                Err(e) => f.error = Some(e),
+            }
+            f.elapsed = Some(started.elapsed());
+        });
+    });
+    let mut out = Response::new(
+        http_body_util::Empty::new()
+            .map_err(|e| match e {})
+            .boxed_unsync(),
+    );
+    (*out.status_mut(), *out.headers_mut()) = (status, headers);
+    out
 }
 
 /// An answer held at a breakpoint, a server's or a mapped file's: as the pane lets it go,
@@ -1127,7 +1229,7 @@ async fn inside(
                 80 => format!("http://{host}"),
                 _ => format!("http://{target}"),
             };
-            requests(TokioIo::new(app), origin, false, &p).await;
+            requests(TokioIo::new(app), origin, &p).await;
         }
         _ => {
             let id = p.flows.start("CONNECT", &target, &HeaderMap::new());
@@ -1195,40 +1297,35 @@ async fn decrypt(
         443 => format!("https://{name}"),
         _ => format!("https://{name}:{port}"),
     };
-    let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
-    requests(TokioIo::new(tls), origin, h2, &p).await;
+    requests(TokioIo::new(tls), origin, &p).await;
 }
 
 /// The requests an app sends inside a tunnel, each a flow: they name only their path, and
 /// `origin` is where to.
-async fn requests<S>(io: TokioIo<S>, origin: String, h2: bool, p: &Proxy)
+async fn requests<S>(io: TokioIo<S>, origin: String, p: &Proxy)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (clients, flows, controls) = (p.clients.clone(), p.flows.clone(), p.controls.clone());
+    let proxy = p.clone();
     let service = hyper::service::service_fn(move |mut req: Request<Incoming>| {
-        let (clients, flows, controls) = (clients.clone(), flows.clone(), controls.clone());
+        let p = proxy.clone();
         let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
         let uri = format!("{origin}{path}").parse::<hyper::Uri>();
         async move {
             let res = match uri {
                 Ok(uri) => {
                     *req.uri_mut() = uri;
-                    exchange(req, &clients, &flows, &controls).await
+                    exchange(req, &p).await
                 }
                 Err(e) => text(StatusCode::BAD_REQUEST, &e.to_string()),
             };
             Ok::<_, Infallible>(res)
         }
     });
-    let conn = async {
-        if h2 {
-            let exec = hyper_util::rt::TokioExecutor::new();
-            (hyper::server::conn::http2::Builder::new(exec).serve_connection(io, service)).await
-        } else {
-            (hyper::server::conn::http1::Builder::new().serve_connection(io, service)).await
-        }
-    };
+    // HTTP/2 when its first bytes say so (ALPN's h2, or h2c in a plain tunnel); upgrades
+    // carry WebSockets.
+    let auto = auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    let conn = auto.serve_connection_with_upgrades(io, service);
     let mut stopped = p.stopped.clone();
     tokio::select! {
         served = conn => if let Err(e) = served {
@@ -1297,15 +1394,18 @@ pub fn har(flows: &[&Flow]) -> Value {
         .map_or("", |(_, v)| v.as_str())
         .to_owned()
     };
-    // Text as it is; anything else base64, as HAR has it.
-    let content = |m: &Message| match std::str::from_utf8(&m.body) {
-        Ok(text) => json!({"mimeType": mime(&m.headers), "size": m.size, "text": text}),
-        Err(_) => json!({
-            "mimeType": mime(&m.headers),
-            "size": m.size,
-            "text": base64::engine::general_purpose::STANDARD.encode(&m.body),
-            "encoding": "base64",
-        }),
+    // Unpacked, as browsers save it; text as it is, anything else base64, as HAR has it.
+    let content = |m: &Message| {
+        let body = m.content();
+        match std::str::from_utf8(&body) {
+            Ok(text) => json!({"mimeType": mime(&m.headers), "size": m.size, "text": text}),
+            Err(_) => json!({
+                "mimeType": mime(&m.headers),
+                "size": m.size,
+                "text": base64::engine::general_purpose::STANDARD.encode(&body),
+                "encoding": "base64",
+            }),
+        }
     };
     let entries: Vec<Value> = (flows.iter())
         .filter(|f| !f.tunnel())
@@ -1933,7 +2033,9 @@ mod tests {
 
     /// An HTTPS server speaking only HTTP/2, as gRPC's do: "pong" and a grpc-status
     /// trailer to each request, noting its version and te.
-    fn h2_server(rt: &tokio::runtime::Runtime) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    /// A gRPC-like server: "pong" and a grpc-status trailer, each request's version and te
+    /// logged. Over TLS (ALPN h2), or `tls` false, h2c.
+    fn h2_server(rt: &tokio::runtime::Runtime, tls: bool) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
         let own = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = PrivateKeyDer::try_from(own.signing_key.serialize_der()).unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -1953,26 +2055,60 @@ mod tests {
             while let Ok((s, _)) = listener.accept().await {
                 let (acceptor, log) = (acceptor.clone(), log.clone());
                 tokio::spawn(async move {
-                    let tls = acceptor.accept(s).await.unwrap();
-                    let mut conn = h2::server::handshake(tls).await.unwrap();
-                    while let Some(Ok((req, mut respond))) = conn.accept().await {
-                        let te = req.headers().get("te").map_or("", |v| v.to_str().unwrap());
-                        log.lock()
-                            .unwrap()
-                            .push(format!("{:?} te={te}", req.version()));
-                        let head = Response::builder().header("content-type", "application/grpc");
-                        let mut send = respond
-                            .send_response(head.body(()).unwrap(), false)
-                            .unwrap();
-                        send.send_data(Bytes::from_static(b"pong"), false).unwrap();
-                        let mut trailers = HeaderMap::new();
-                        trailers.insert("grpc-status", HeaderValue::from_static("0"));
-                        send.send_trailers(trailers).unwrap();
+                    match tls {
+                        true => pong(acceptor.accept(s).await.unwrap(), log).await,
+                        false => pong(s, log).await,
                     }
                 });
             }
         });
         (addr, seen)
+    }
+
+    async fn pong(io: impl AsyncRead + AsyncWrite + Unpin, log: Arc<Mutex<Vec<String>>>) {
+        let mut conn = h2::server::handshake(io).await.unwrap();
+        while let Some(Ok((req, mut respond))) = conn.accept().await {
+            let te = req.headers().get("te").map_or("", |v| v.to_str().unwrap());
+            log.lock()
+                .unwrap()
+                .push(format!("{:?} te={te}", req.version()));
+            let head = Response::builder().header("content-type", "application/grpc");
+            let mut send = respond
+                .send_response(head.body(()).unwrap(), false)
+                .unwrap();
+            send.send_data(Bytes::from_static(b"pong"), false).unwrap();
+            let mut trailers = HeaderMap::new();
+            trailers.insert("grpc-status", HeaderValue::from_static("0"));
+            send.send_trailers(trailers).unwrap();
+        }
+    }
+
+    /// A unary gRPC-like call: the answer's version, trailers and body.
+    fn call(
+        rt: &tokio::runtime::Runtime,
+        app: &reqwest::Client,
+        url: &str,
+    ) -> (reqwest::Version, HeaderMap, Bytes) {
+        rt.block_on(async {
+            let call = app.post(url).header("content-type", "application/grpc");
+            let res = call
+                .header("te", "trailers")
+                .body("ping")
+                .send()
+                .await
+                .unwrap();
+            let version = res.version();
+            let all = Response::<reqwest::Body>::from(res)
+                .into_body()
+                .collect()
+                .await
+                .unwrap();
+            (
+                version,
+                all.trailers().cloned().unwrap_or_default(),
+                all.to_bytes(),
+            )
+        })
     }
 
     /// Decrypting, an app speaking HTTP/2 goes on in it, as gRPC must: its te: trailers
@@ -1995,39 +2131,92 @@ mod tests {
             ..Default::default()
         };
         rt.spawn(serve(listener, clients, flows.clone(), Arc::new(controls)));
-        let (server, seen) = h2_server(&rt);
+        let (server, seen) = h2_server(&rt, true);
         let app = reqwest::Client::builder()
             .proxy(reqwest::Proxy::https(format!("http://{addr}")).unwrap())
             .add_root_certificate(reqwest::Certificate::from_pem(cert.as_bytes()).unwrap())
             .build()
             .unwrap();
         let url = format!("https://localhost:{}/echo.Echo/Ping", server.port());
-        let (version, trailers, body) = rt.block_on(async {
-            let call = app.post(&url).header("content-type", "application/grpc");
-            let res = call
-                .header("te", "trailers")
-                .body("ping")
-                .send()
-                .await
-                .unwrap();
-            let version = res.version();
-            let all = Response::<reqwest::Body>::from(res)
-                .into_body()
-                .collect()
-                .await
-                .unwrap();
-            (
-                version,
-                all.trailers().cloned().unwrap_or_default(),
-                all.to_bytes(),
-            )
-        });
+        let (version, trailers, body) = call(&rt, &app, &url);
         assert_eq!(version, reqwest::Version::HTTP_2);
         assert_eq!(body, "pong");
         assert_eq!(trailers.get("grpc-status").unwrap(), "0");
         assert_eq!(*seen.lock().unwrap(), ["HTTP/2.0 te=trailers"]);
         let f = flow_when(&flows, |f| f.elapsed.is_some());
         assert_eq!((f.url, f.response.body), (url, b"pong".to_vec()));
+    }
+
+    /// gRPC to an http:// server comes to the proxy as h2c, HTTP/2 from its first bytes
+    /// (it was refused: "found HTTP2 preface"), and goes on as h2c: there's no TLS to pick
+    /// HTTP/2 in. Its te: trailers reaches the server, the call's status the app.
+    #[test]
+    fn grpc_without_tls_goes_through_as_h2c() {
+        let rt = runtime();
+        let (addr, flows) = proxy(&rt, direct());
+        let (server, seen) = h2_server(&rt, false);
+        let app = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{addr}")).unwrap())
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        let url = format!("http://{server}/echo.Echo/Ping");
+        let (version, trailers, body) = call(&rt, &app, &url);
+        assert_eq!(version, reqwest::Version::HTTP_2);
+        assert_eq!(body, "pong");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+        assert_eq!(*seen.lock().unwrap(), ["HTTP/2.0 te=trailers"]);
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!((f.url, f.response.body), (url, b"pong".to_vec()));
+    }
+
+    /// A WebSocket through the proxy: its Upgrade goes on (the server answered 400 without
+    /// it), both sides switch, the frames pass both ways, and the flow is the 101 with the
+    /// bytes counted when it closes.
+    #[test]
+    fn a_websocket_switches_through_the_proxy() {
+        use futures_util::SinkExt;
+        use reqwest_websocket::{Message as Frame, Upgrade};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let Ok(mut ws) = tungstenite::accept(s) else {
+                        return;
+                    };
+                    while let Ok(m) = ws.read() {
+                        if m.is_text() && ws.send(m).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let rt = runtime();
+        let (addr, flows) = proxy(&rt, direct());
+        let app = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{addr}")).unwrap())
+            .http1_only()
+            .build()
+            .unwrap();
+        let url = format!("http://{server}/socket");
+        let echoed = rt.block_on(async {
+            let res = app.get(&url).upgrade().send().await.unwrap();
+            let mut ws = res.into_websocket().await.unwrap();
+            ws.send(Frame::Text("hello".into())).await.unwrap();
+            let echoed = ws.next().await.unwrap().unwrap();
+            ws.close(reqwest_websocket::CloseCode::Normal, None)
+                .await
+                .unwrap();
+            echoed
+        });
+        assert!(matches!(echoed, Frame::Text(t) if t == "hello"));
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!((f.url.as_str(), f.status), (url.as_str(), Some(101)));
+        assert!(f.error.is_none(), "{:?}", f.error);
+        // A masked frame with "hello" and a close each way, at least.
+        assert!(f.request.size > 5 && f.response.size > 5, "{f:?}");
     }
 
     /// Decrypting, an app that trusts the CA reads its HTTPS answer through the proxy, and
@@ -2321,6 +2510,56 @@ mod tests {
         m.take(b"bc");
         assert_eq!((m.body.len(), m.size), (MAX_BODY, MAX_BODY as u64 + 1));
         assert!(m.cut() && m.body.ends_with(b"ab"));
+    }
+
+    /// A compressed answer reads as its text, as devtools show it (a GraphQL answer read as
+    /// "274 B of binary data"): gzip, deflate wrapped or raw, br, and a cut one as far as it
+    /// goes. What isn't compressed, or doesn't unpack, stays as it went.
+    #[test]
+    fn a_compressed_body_reads_as_its_text() {
+        let text: String = (0..3000).map(|n| format!("{n},")).collect();
+        let level = flate2::Compression::default();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), level);
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), level);
+        let mut raw = flate2::write::DeflateEncoder::new(Vec::new(), level);
+        let mut br = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+        for w in [
+            &mut gzip as &mut dyn std::io::Write,
+            &mut zlib,
+            &mut raw,
+            &mut br,
+        ] {
+            w.write_all(text.as_bytes()).unwrap();
+        }
+        let packed = [
+            ("gzip", gzip.finish().unwrap()),
+            ("deflate", zlib.finish().unwrap()),
+            ("deflate", raw.finish().unwrap()),
+            ("br", br.into_inner()),
+        ];
+        let message = |coding: &str, body: &[u8]| Message {
+            headers: vec![("Content-Encoding".into(), coding.into())],
+            body: body.to_vec(),
+            size: body.len() as u64,
+        };
+        for (coding, body) in packed {
+            assert!(body.len() < text.len() / 2, "{coding} packs");
+            let m = message(coding, &body);
+            assert_eq!(&*m.content(), text.as_bytes(), "{coding}");
+            let cut = message(coding, &body[..body.len() / 2]);
+            let start = cut.content();
+            assert!(
+                start.len() > 100 && text.as_bytes().starts_with(&start),
+                "{coding} cut: {} B",
+                start.len()
+            );
+        }
+        let plain = Message {
+            body: b"{}".to_vec(),
+            ..Message::default()
+        };
+        assert!(matches!(plain.content(), Cow::Borrowed(b) if b == b"{}"));
+        assert_eq!(&*message("gzip", b"not gzip").content(), b"not gzip");
     }
 
     /// The HAR imports back as the requests sent, their answers as examples; a tunnel,
