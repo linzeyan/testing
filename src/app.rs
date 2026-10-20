@@ -542,7 +542,6 @@ struct CaptureView {
     /// Where the CA was last exported to, for the guide's commands to name.
     ca_file: Option<String>,
     /// Make a new CA was clicked once; the next click replaces it.
-    renew_armed: bool,
     /// A new CA was made while this view was open: the guide says to take the old one back.
     renewed: bool,
 }
@@ -792,8 +791,8 @@ enum Dialog {
     },
     /// Requests and folders, none inside another.
     Delete(Vec<PathBuf>),
-    /// Every request in History, which has no undo.
-    ClearHistory,
+    /// What has no undo, asked about before it goes.
+    Confirm(Doomed),
     Unsaved(Next),
     /// The workspace files and the database both changed since they were last in step.
     Sync,
@@ -824,6 +823,20 @@ enum Dialog {
     Shortcuts,
 }
 
+/// What a `Dialog::Confirm` does once confirmed. A second click on a button that turned red
+/// in place was missed, or clicked through.
+#[derive(Clone)]
+enum Doomed {
+    /// Every request in History.
+    History,
+    /// An environment, its secret values with it.
+    Env(String),
+    /// Every cookie in the jar, the logins they hold with them.
+    Cookies,
+    /// The capture's CA, for a new one: apps that trust it stop connecting.
+    Ca,
+}
+
 impl Dialog {
     fn name(kind: NameKind, name: impl Into<String>) -> Self {
         Self::Name {
@@ -842,7 +855,6 @@ struct EnvEditor {
     /// What's on disk, so Close can tell whether it would throw edits away.
     saved: (Vec<KeyValue>, Vec<KeyValue>),
     error: String,
-    confirm_delete: bool,
     confirm_discard: bool,
 }
 
@@ -1995,7 +2007,6 @@ impl App {
                     secret,
                     saved,
                     error: String::new(),
-                    confirm_delete: false,
                     confirm_discard: false,
                 });
             }
@@ -4649,34 +4660,16 @@ impl App {
                     let copied =
                         trust_ui(ui, &mut view.trust, view.ca_file.as_deref(), port, &lan);
                     ui.separator();
-                    let label = match view.renew_armed {
-                        true => RichText::new(t("Click again to replace the CA")).color(RED),
-                        false => RichText::new(t("Make a new CA")),
-                    };
-                    let renew = (ui.button(label))
+                    let renew = (ui.button(t("Make a new CA")))
                         .on_hover_text(t(
                             "If its key may have got out. Every app that trusts the old one stops connecting until it trusts the new one.",
                         ))
-                        .clicked()
-                        && std::mem::replace(&mut view.renew_armed, true);
+                        .clicked();
                     (copied, renew)
                 })
                 .body_returned;
             match shown {
-                Some((_, true)) => match self.new_capture_ca() {
-                    Ok(ca) => {
-                        if let Some(view) = &mut self.capture {
-                            *view.controls.decrypt.lock().unwrap() = Some(ca);
-                            // The exported file holds the old one: the guide asks for a new
-                            // export before naming a file again.
-                            view.ca_file = None;
-                            view.renew_armed = false;
-                            view.renewed = true;
-                        }
-                        self.status = t("Made a new CA").into();
-                    }
-                    Err(e) => self.fail(e),
-                },
+                Some((_, true)) => self.dialog = Some(Dialog::Confirm(Doomed::Ca)),
                 Some((true, _)) => self.status = t("Copied the command").into(),
                 _ => {}
             }
@@ -4938,7 +4931,7 @@ impl App {
                     .on_hover_text(t("Clear history"))
                     .clicked()
                 {
-                    self.dialog = Some(Dialog::ClearHistory);
+                    self.dialog = Some(Dialog::Confirm(Doomed::History));
                 }
             });
             ui.add(
@@ -6195,9 +6188,53 @@ impl App {
         }
     }
 
+    /// Does what a `Dialog::Confirm` asked about, now that it's confirmed.
+    fn confirmed(&mut self, doomed: Doomed) {
+        match doomed {
+            Doomed::History => match self.ws.clear_history() {
+                Ok(()) => self.history.clear(),
+                Err(e) => self.fail(e),
+            },
+            Doomed::Env(name) => match self.ws.delete_env(&name) {
+                Ok(()) => {
+                    self.env_editor = None;
+                    if self.active_env.as_ref() == Some(&name) {
+                        self.set_env(None);
+                    }
+                    self.reload();
+                }
+                Err(e) => match &mut self.env_editor {
+                    Some(ed) => ed.error = e,
+                    None => self.fail(e),
+                },
+            },
+            Doomed::Cookies => {
+                self.cookies.clear();
+                self.save_cookies();
+            }
+            Doomed::Ca => match self.new_capture_ca() {
+                Ok(ca) => {
+                    if let Some(view) = &mut self.capture {
+                        *view.controls.decrypt.lock().unwrap() = Some(ca);
+                        // The exported file holds the old one: the guide asks for a new
+                        // export before naming a file again.
+                        view.ca_file = None;
+                        view.renewed = true;
+                    }
+                    self.status = t("Made a new CA").into();
+                }
+                Err(e) => self.fail(e),
+            },
+        }
+    }
+
     fn dialog_ui(&mut self, ctx: &egui::Context) {
         let unsaved = self.unsaved().join("\", \"");
         let history_len = self.history.len();
+        let cookie_count = match &self.dialog {
+            Some(Dialog::Confirm(Doomed::Cookies)) => self.cookies.rows().len(),
+            _ => 0,
+        };
         let Some(dialog) = &mut self.dialog else {
             return;
         };
@@ -6386,24 +6423,52 @@ impl App {
                         cancel = ui.button(t("Cancel")).clicked();
                     });
                 }
-                Dialog::ClearHistory => {
-                    ui.heading(t("Clear history"));
-                    ui.label(tf(
-                        "Delete all {} requests in History? This can't be undone.",
-                        &[&history_len],
-                    ));
+                Dialog::Confirm(doomed) => {
+                    // The button says what it does, apart from the one under the dialog
+                    // that opened it.
+                    let (title, text, go) = match doomed {
+                        Doomed::History => (
+                            t("Clear history"),
+                            tf(
+                                "Delete all {} requests in History? This can't be undone.",
+                                &[&history_len],
+                            ),
+                            t("Clear history").to_owned(),
+                        ),
+                        Doomed::Env(name) => (
+                            t("Delete environment"),
+                            tf(
+                                "Delete the environment \"{}\", its secret values too? This can't be undone.",
+                                &[name],
+                            ),
+                            tf("Delete {}", &[name]),
+                        ),
+                        Doomed::Cookies => (
+                            t("Clear all cookies"),
+                            tf(
+                                "Delete all {} cookies? The logins they hold end; this can't be undone.",
+                                &[&cookie_count],
+                            ),
+                            t("Delete all cookies").to_owned(),
+                        ),
+                        Doomed::Ca => (
+                            t("Make a new CA"),
+                            t("Every app that trusts the current CA stops connecting through the capture until it trusts the new one. Make a new one?").to_owned(),
+                            t("Replace the CA").to_owned(),
+                        ),
+                    };
+                    ui.heading(title);
+                    ui.label(text);
                     ui.horizontal(|ui| {
-                        let clear = egui::Button::new(
-                            RichText::new(t("Clear history")).strong().color(Color32::WHITE),
+                        let go = egui::Button::new(
+                            RichText::new(go).strong().color(Color32::WHITE),
                         )
                         .fill(RED);
-                        if ui.add(clear).clicked() || enter_pressed(ui) {
-                            then = Some(Box::new(|app, _| {
+                        if ui.add(go).clicked() || enter_pressed(ui) {
+                            let doomed = doomed.clone();
+                            then = Some(Box::new(move |app, _| {
                                 app.dialog = None;
-                                match app.ws.clear_history() {
-                                    Ok(()) => app.history.clear(),
-                                    Err(e) => app.fail(e),
-                                }
+                                app.confirmed(doomed);
                             }));
                         }
                         cancel = ui.button(t("Cancel")).clicked();
@@ -6756,6 +6821,8 @@ impl App {
             return;
         };
         let (mut save, mut delete, mut close, mut duplicate) = (false, false, false, false);
+        // Under the delete question: its Escape is that dialog's.
+        let asking = self.dialog.is_some();
         let file =
             (ed.env.as_ref()).map_or("globals.toml".into(), |n| format!("environments/{n}.toml"));
         // Only explicit buttons close this one: a stray click outside must not drop edits.
@@ -6810,18 +6877,11 @@ impl App {
                 } else {
                     RichText::new(t("Close"))
                 };
-                close = ui.button(close_label).clicked() || escape_pressed(ui);
+                close = ui.button(close_label).clicked() || (!asking && escape_pressed(ui));
                 if ed.env.is_some() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = if ed.confirm_delete {
-                            t("Click again to delete")
-                        } else {
-                            t("Delete environment")
-                        };
-                        if ui.button(RichText::new(label).color(RED)).clicked() {
-                            delete = ed.confirm_delete;
-                            ed.confirm_delete = true;
-                        }
+                        let label = RichText::new(t("Delete environment")).color(RED);
+                        delete = ui.button(label).clicked();
                     });
                 }
             });
@@ -6836,16 +6896,7 @@ impl App {
                 self.dialog = Some(Dialog::name(NameKind::DuplicateEnv(from), name));
             }
         } else if delete && let Some(name) = ed.env.clone() {
-            match self.ws.delete_env(&name) {
-                Ok(()) => {
-                    self.env_editor = None;
-                    if self.active_env.as_ref() == Some(&name) {
-                        self.set_env(None);
-                    }
-                    self.reload();
-                }
-                Err(e) => ed.error = e,
-            }
+            self.dialog = Some(Dialog::Confirm(Doomed::Env(name)));
         } else if close {
             if ed.dirty() && !ed.confirm_discard {
                 ed.confirm_discard = true;
@@ -7069,32 +7120,22 @@ impl App {
                 let right = egui::Layout::right_to_left(egui::Align::Center);
                 if !rows.is_empty() {
                     ui.with_layout(right, |ui| {
-                        // Every login at once, with no undo: a second click, as for environments.
-                        let armed = egui::Id::new("clear-cookies");
-                        let confirm = ui.data(|d| d.get_temp(armed)).unwrap_or(false);
-                        let label = match confirm {
-                            true => t("Click again to clear all"),
-                            false => t("Clear all"),
-                        };
-                        if ui.button(RichText::new(label).color(RED)).clicked() {
-                            clear = confirm;
-                            ui.data_mut(|d| d.insert_temp(armed, !confirm));
-                        }
+                        // Every login at once, with no undo: asked first.
+                        clear = ui
+                            .button(RichText::new(t("Clear all")).color(RED))
+                            .clicked();
                     });
                 }
             });
         });
         if let Some(i) = remove {
             self.cookies.remove(&rows[i]);
-        }
-        if clear {
-            self.cookies.clear();
-        }
-        if remove.is_some() || clear {
             self.save_cookies();
         }
+        if clear {
+            self.dialog = Some(Dialog::Confirm(Doomed::Cookies));
+        }
         if close || modal.should_close() {
-            ctx.data_mut(|d| d.remove::<bool>(egui::Id::new("clear-cookies")));
             self.cookie_manager = false;
         }
     }
@@ -12562,7 +12603,6 @@ fn capture_view(ctx: &egui::Context, ws: &Workspace) -> CaptureView {
             2
         },
         ca_file: None,
-        renew_armed: false,
         renewed: false,
     }
 }
@@ -15455,6 +15495,35 @@ mod ui_tests {
     }
 
     #[test]
+    fn deleting_an_environment_asks_first() {
+        let ws = workspace("env-delete");
+        ws.save_env(Some("dev"), &[KeyValue::new("host", "h")], &[])
+            .unwrap();
+        let mut h = harness(ws);
+        h.state_mut().set_env(Some("dev".into()));
+        h.state_mut().open_env_editor(Some("dev".into()), &[]);
+        h.run();
+        h.get_by_label("Delete environment").click();
+        h.run();
+        assert!(
+            h.query_by_label_contains("Delete the environment \"dev\"")
+                .is_some()
+        );
+        // Escape is the question's: the editor under it stays.
+        h.key_press(Key::Escape);
+        h.run();
+        assert!(h.state().dialog.is_none() && h.state().env_editor.is_some());
+        assert!(h.state().envs.contains(&"dev".to_owned()));
+        h.get_by_label("Delete environment").click();
+        h.run();
+        button(&h, "Delete dev").click();
+        h.run();
+        assert!(h.state().env_editor.is_none());
+        assert!(!h.state().envs.contains(&"dev".to_owned()));
+        assert_eq!(h.state().active_env, None, "no longer active");
+    }
+
+    #[test]
     fn an_environment_copies_for_postman_as_the_editor_shows_it() {
         let ws = workspace("env-postman");
         let (host, token) = (KeyValue::new("host", "h"), KeyValue::new("token", "s"));
@@ -16286,7 +16355,10 @@ mod ui_tests {
         // Clearing every sent request can't be undone: it asks first, and Cancel keeps them.
         h.get_by_label("Clear").click();
         h.run();
-        assert!(matches!(h.state().dialog, Some(Dialog::ClearHistory)));
+        assert!(matches!(
+            h.state().dialog,
+            Some(Dialog::Confirm(Doomed::History))
+        ));
         assert!(h.query_by_label_contains("Delete all 1 requests").is_some());
         h.get_by_label("Cancel").click();
         h.run();
@@ -16663,13 +16735,20 @@ mod ui_tests {
         send(&mut h, "/login");
         h.get_by_label("Cookies").click();
         h.run();
-        // Every login at once, with no undo: the first click only asks.
+        // Every login at once, with no undo: asked first, over the jar, and Cancel keeps it.
         h.get_by_label("Clear all").click();
         h.run();
+        assert!(h.query_by_label_contains("Delete all 1 cookies").is_some());
+        h.get_by_label("Cancel").click();
+        h.run();
         assert_eq!(h.state().cookies.rows().len(), 1);
-        h.get_by_label("Click again to clear all").click();
+        assert!(h.state().cookie_manager, "the jar stays open");
+        h.get_by_label("Clear all").click();
+        h.run();
+        button(&h, "Delete all cookies").click();
         h.run();
         assert!(h.state().cookies.rows().is_empty());
+        assert!(h.state().dialog.is_none() && h.state().cookie_manager);
         h.get_by_label("Close").click();
         h.run();
         assert!(!h.state().cookie_manager);
@@ -22148,7 +22227,7 @@ mod ui_tests {
     /// in the workspace and decrypts from then on, and the guide stops naming the file the
     /// old one was exported to.
     #[test]
-    fn making_a_new_ca_replaces_the_kept_one_after_a_second_click() {
+    fn making_a_new_ca_replaces_the_kept_one_once_confirmed() {
         let mut h = harness(workspace("capture-renew"));
         h.run();
         h.state_mut().act(Action::Capture);
@@ -22166,8 +22245,12 @@ mod ui_tests {
         h.run();
         h.get_by_label("Make a new CA").click();
         h.run();
-        assert_eq!(ca(&h), old, "one click only arms it");
-        h.get_by_label("Click again to replace the CA").click();
+        assert_eq!(ca(&h), old, "a click only asks");
+        assert!(matches!(
+            h.state().dialog,
+            Some(Dialog::Confirm(Doomed::Ca))
+        ));
+        button(&h, "Replace the CA").click();
         h.run();
         let new = ca(&h);
         assert_ne!(new, old);

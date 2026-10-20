@@ -271,7 +271,6 @@ const ZH_TW: &[(&str, &str)] = &[
         "Cleared this request's response history",
         "已清除此請求的回應紀錄",
     ),
-    ("Click again to delete", "再點一次即刪除"),
     (
         "Click to add this field to the query.",
         "點一下把這個欄位加進查詢。",
@@ -1808,7 +1807,6 @@ const ZH_TW: &[(&str, &str)] = &[
         "不帶任何憑證送出，不論上層資料夾怎麼設定。",
     ),
     ("Session", "工作階段"),
-    ("Click again to clear all", "再點一次即全部清除"),
     (
         "Delete all {} requests in History? This can't be undone.",
         "刪除歷史紀錄中全部 {} 筆請求？此動作無法復原。",
@@ -1933,7 +1931,22 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Copied the command", "已複製指令"),
     ("Make a new CA", "產生新的 CA"),
-    ("Click again to replace the CA", "再點一次即換掉 CA"),
+    ("Delete {}", "刪除 {}"),
+    ("Clear all cookies", "清除全部 Cookie"),
+    ("Delete all cookies", "刪除全部 Cookie"),
+    ("Replace the CA", "換掉 CA"),
+    (
+        "Delete the environment \"{}\", its secret values too? This can't be undone.",
+        "刪除環境「{}」，連同它的機密值？此動作無法復原。",
+    ),
+    (
+        "Delete all {} cookies? The logins they hold end; this can't be undone.",
+        "刪除全部 {} 個 Cookie？它們保持的登入狀態會結束，此動作無法復原。",
+    ),
+    (
+        "Every app that trusts the current CA stops connecting through the capture until it trusts the new one. Make a new one?",
+        "信任目前 CA 的應用程式，在信任新的 CA 之前都無法再透過擷取連線。要建立新的 CA 嗎？",
+    ),
     (
         "If its key may have got out. Every app that trusts the old one stops connecting until it trusts the new one.",
         "私鑰可能外流時使用。信任舊 CA 的應用程式都會連不上，直到改信任新的為止。",
