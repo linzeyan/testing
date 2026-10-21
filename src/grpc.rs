@@ -1,7 +1,7 @@
 //! gRPC over plain reqwest: the `.proto` is compiled at runtime (protox) and messages
 //! are converted to/from JSON with prost-reflect, so no codegen and no protoc install.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -17,13 +17,26 @@ use crate::http::{self, Response, error_chain, header_list};
 use crate::model::{Body, Request};
 use crate::stream::Event;
 
-/// Where a request's methods come from: its `.proto` file, or with none set, what the
-/// server said over gRPC reflection (`reflection:` and its URL).
-pub fn source(proto: &str, url: &str) -> String {
+/// Where a request's methods come from: its `.proto` file, then the folders its imports
+/// are looked for in, a line each; or with no file set, what the server said over gRPC
+/// reflection (`reflection:` and its URL). One string, so a change to any of it is a
+/// change of source to whoever keeps methods by it.
+pub fn source(proto: &str, url: &str, imports: &[String]) -> String {
     match proto.trim() {
         "" => format!("{REFLECTION}{}", url.trim().trim_end_matches('/')),
-        p => p.to_owned(),
+        p => {
+            let imports = imports.iter().map(|i| i.trim()).filter(|i| !i.is_empty());
+            std::iter::once(p)
+                .chain(imports)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
     }
+}
+
+/// A `source`'s file, the name errors give it.
+fn file(source: &str) -> &str {
+    source.lines().next().unwrap_or_default()
 }
 
 pub const REFLECTION: &str = "reflection:";
@@ -47,8 +60,9 @@ fn pool(proto: &str) -> Result<DescriptorPool, String> {
     }
     // ponytail: single-entry cache; enough for one request or a runner/load test hammering
     // the same RPC. Key includes mtime so edits to the .proto are picked up.
-    static CACHE: Mutex<Option<(PathBuf, SystemTime, DescriptorPool)>> = Mutex::new(None);
-    let proto = proto.trim();
+    static CACHE: Mutex<Option<(String, SystemTime, DescriptorPool)>> = Mutex::new(None);
+    let source = proto.trim();
+    let proto = file(source).trim();
     if proto.is_empty() {
         return Err("No .proto file set".into());
     }
@@ -57,22 +71,23 @@ fn pool(proto: &str) -> Result<DescriptorPool, String> {
         .and_then(|m| m.modified())
         .map_err(|e| format!("{proto}: {e}"))?;
     let mut cache = CACHE.lock().unwrap();
-    if let Some((p, m, pool)) = &*cache
-        && *p == path
+    if let Some((s, m, pool)) = &*cache
+        && s == source
         && *m == modified
     {
         return Ok(pool.clone());
     }
     // The file's own directory and the workspace root cover both `import "b.proto"` and
-    // `import "protos/b.proto"` styles.
+    // `import "protos/b.proto"` styles; the request's import paths, the rest.
     let dir = path.parent().unwrap_or(Path::new("."));
-    let pool = protox::Compiler::new([dir, Path::new(".")])
+    let imports = source.lines().skip(1).map(Path::new);
+    let pool = protox::Compiler::new([dir, Path::new(".")].into_iter().chain(imports))
         .and_then(|mut c| {
             c.include_imports(true).open_file(&path)?;
             Ok(c.descriptor_pool())
         })
         .map_err(|e| format!("{proto}: {e}"))?;
-    *cache = Some((path, modified, pool.clone()));
+    *cache = Some((source.to_owned(), modified, pool.clone()));
     Ok(pool)
 }
 
@@ -114,7 +129,7 @@ fn method(proto: &str, rpc: &str) -> Result<MethodDescriptor, String> {
         .ok_or_else(|| format!("Method \"{rpc}\" should look like package.Service/Method"))?;
     let service = pool
         .get_service_by_name(service)
-        .ok_or_else(|| format!("Service {service} not found in {proto}"))?;
+        .ok_or_else(|| format!("Service {service} not found in {}", file(proto)))?;
     let method = service
         .methods()
         .find(|m| m.name() == name)
@@ -287,13 +302,20 @@ pub fn check(proto: &str, rpc: &str, json: &str) -> Result<(), String> {
     encode(&method(proto, rpc)?, json).map(drop)
 }
 
-/// The HTTP/2 request for `req`: the method's path appended to the URL.
+/// The HTTP/2 request for `req`: the method's path appended to the URL, its host the TLS
+/// server name when one is set, which the client (`Clients::grpc_for`) finds where the
+/// URL's host is.
 fn wire(client: &reqwest::Client, req: Request) -> Result<reqwest::RequestBuilder, String> {
-    let url = format!(
-        "{}/{}",
-        req.url.trim().trim_end_matches('/'),
-        req.rpc.trim()
-    );
+    let base = req.url.trim().trim_end_matches('/');
+    let base = match crate::net::server_alias(&req.settings, base) {
+        Some((name, _)) => {
+            let mut url = reqwest::Url::parse(base).map_err(|e| format!("{base}: {e}"))?;
+            (url.set_host(Some(&name))).map_err(|e| format!("TLS server name {name}: {e}"))?;
+            url.to_string().trim_end_matches('/').to_owned()
+        }
+        None => base.to_owned(),
+    };
+    let url = format!("{base}/{}", req.rpc.trim());
     let deadline = req.settings.timeout_ms;
     let wire = Request {
         url,
@@ -359,7 +381,7 @@ fn take_message(
 /// The request's method, asking the server over reflection first when there's no
 /// `.proto` and it hasn't been asked yet.
 async fn method_for(client: &reqwest::Client, req: &Request) -> Result<MethodDescriptor, String> {
-    let source = source(&req.proto, &req.url);
+    let source = source(&req.proto, &req.url, &req.settings.import_paths);
     if let Some(url) = source.strip_prefix(REFLECTION)
         && reflected(url).is_none()
     {
@@ -1044,7 +1066,7 @@ service Shop { rpc Place(Order) returns (Order); }
             },
             ..Default::default()
         };
-        let source = super::source("", &req.url);
+        let source = super::source("", &req.url, &[]);
         assert!(methods(&source).unwrap_err().contains("press ↻"));
         let resp = rt.block_on(call(client, req)).unwrap();
         assert_eq!(resp.body, r#"{"message":"hi ada x2"}"#);
@@ -1059,6 +1081,151 @@ service Shop { rpc Place(Order) returns (Order); }
                 .unwrap()
                 .contains("\"times\"")
         );
+    }
+
+    /// A .proto whose import lives elsewhere (a shared folder of a monorepo) compiles once
+    /// that folder is an import path, and says what it couldn't find before. The paths
+    /// are part of the source, so methods kept by it are looked up again when they change.
+    #[test]
+    fn imports_are_looked_for_in_the_import_paths() {
+        let root = std::env::temp_dir().join(format!("apitool-imports-{}", std::process::id()));
+        let (api, shared) = (root.join("api"), root.join("shared"));
+        std::fs::create_dir_all(api.clone()).unwrap();
+        std::fs::create_dir_all(shared.join("common")).unwrap();
+        let common = "syntax = \"proto3\"; package common; message Name { string value = 1; }";
+        std::fs::write(shared.join("common/name.proto"), common).unwrap();
+        let main = r#"
+            syntax = "proto3";
+            package hello;
+            import "common/name.proto";
+            service Hi { rpc Say (common.Name) returns (common.Name); }
+        "#;
+        let file = api.join("hi.proto").to_string_lossy().into_owned();
+        std::fs::write(&file, main).unwrap();
+
+        let alone = source(&file, "", &[]);
+        let err = methods(&alone).unwrap_err();
+        assert!(err.contains("common/name.proto"), "{err}");
+        let paths = [shared.to_string_lossy().into_owned(), "  ".into()];
+        let with = source(&file, "", &paths);
+        assert_ne!(with, alone, "another source");
+        let names: Vec<_> = methods(&with)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, ["hello.Hi/Say"]);
+        assert!(
+            template(&with, "hello.Hi/Say")
+                .unwrap()
+                .contains("\"value\"")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A server reached by address whose certificate names another host: with that name as
+    /// the TLS server name the call goes through, the name sent as SNI and :authority (as
+    /// grpcurl's -authority), the certificate still checked against it. Without it the
+    /// certificate doesn't fit the address and the call fails.
+    #[test]
+    fn a_tls_server_name_addresses_the_call_to_that_name() {
+        use tokio::io::{AsyncRead, AsyncWrite};
+        let own = rcgen::generate_simple_self_signed(vec!["grpc.test".into()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(own.signing_key.serialize_der());
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = (rustls::ServerConfig::builder_with_provider(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![own.cert.der().clone()], key.unwrap())
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let ca = std::env::temp_dir().join(format!("apitool-grpc-ca-{}.pem", std::process::id()));
+        std::fs::write(&ca, own.cert.pem()).unwrap();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        crate::net::install_provider();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        async fn answer(
+            io: impl AsyncRead + AsyncWrite + Unpin,
+            log: std::sync::Arc<Mutex<Vec<String>>>,
+        ) {
+            let Ok(mut conn) = h2::server::handshake(io).await else {
+                return;
+            };
+            while let Some(Ok((req, mut respond))) = conn.accept().await {
+                let authority = req.uri().authority().map(|a| a.to_string());
+                log.lock()
+                    .unwrap()
+                    .push(format!("authority {}", authority.unwrap_or_default()));
+                let head = ::http::Response::builder().header("content-type", "application/grpc");
+                let mut stream = respond
+                    .send_response(head.body(()).unwrap(), false)
+                    .unwrap();
+                // HelloReply { message: "hi" }
+                let reply = [0, 0, 0, 0, 4, 0x0a, 2, b'h', b'i'];
+                stream
+                    .send_data(bytes::Bytes::copy_from_slice(&reply), false)
+                    .unwrap();
+                let mut trailers = ::http::HeaderMap::new();
+                trailers.insert("grpc-status", "0".parse().unwrap());
+                stream.send_trailers(trailers).unwrap();
+            }
+        }
+        rt.spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                let (acceptor, log) = (acceptor.clone(), log.clone());
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(s).await else {
+                        return;
+                    };
+                    let sni = tls.get_ref().1.server_name().unwrap_or_default().to_owned();
+                    log.lock().unwrap().push(format!("sni {sni}"));
+                    answer(tls, log).await;
+                });
+            }
+        });
+        let net = crate::net::Network {
+            proxy: crate::net::ProxyMode::None,
+            ca_file: ca.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let clients = rt.block_on(crate::net::build_client(net)).unwrap();
+        let send = |name: &str| {
+            let mut req = Request {
+                method: "GRPC".into(),
+                url: format!("https://127.0.0.1:{port}"),
+                proto: proto_file(),
+                rpc: "greet.v1.Greeter/Hello".into(),
+                ..Default::default()
+            };
+            req.settings.tls_server_name = name.into();
+            let client = clients.grpc_for(&req.settings, &req.url).unwrap();
+            rt.block_on(call(client, req))
+        };
+
+        let refused = send("")
+            .err()
+            .expect("the address isn't the certificate's name");
+        assert!(refused.to_lowercase().contains("certificate"), "{refused}");
+        let resp = send("grpc.test").unwrap();
+        assert_eq!(resp.body, r#"{"message":"hi"}"#);
+        let seen = seen.lock().unwrap().clone();
+        let named = [
+            "sni grpc.test".to_owned(),
+            format!("authority grpc.test:{port}"),
+        ];
+        assert!(seen.ends_with(&named), "{seen:?}");
+        let _ = std::fs::remove_file(&ca);
     }
 
     #[test]

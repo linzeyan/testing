@@ -1722,6 +1722,18 @@ const ZH_TW: &[(&str, &str)] = &[
         "A larger message received is an error",
         "收到更大的訊息即視為錯誤",
     ),
+    ("TLS server name", "TLS 伺服器名稱"),
+    ("The URL's host", "URL 的主機"),
+    (
+        "https only: TLS and :authority use this name, as grpcurl's -authority, while the call still goes to the URL's address",
+        "僅限 https：TLS 與 :authority 改用這個名稱（同 grpcurl 的 -authority），連線仍連到 URL 的位址",
+    ),
+    ("Import paths", "Import 路徑"),
+    ("A folder a line", "一行一個資料夾"),
+    (
+        "Where the .proto's imports are looked for, after its own folder and the workspace",
+        ".proto 的 import 在哪裡找：先找它自己的資料夾與工作區，再找這些",
+    ),
     ("Include default values", "包含預設值欄位"),
     ("Reconnection attempts", "重新連線次數"),
     ("Never", "不重連"),

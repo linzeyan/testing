@@ -121,6 +121,15 @@ pub struct Settings {
     /// gRPC: replies show the fields proto3 leaves out at their defaults (0, "", false).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub include_defaults: bool,
+    /// gRPC over https://: the name the call is to, as grpcurl's -authority has it: TLS's
+    /// SNI, the certificate's check and :authority; it still connects where the URL says
+    /// (see `net::server_alias`). For a server reached by address or another name.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tls_server_name: String,
+    /// gRPC: where the .proto's imports are looked for, after its own folder and the
+    /// workspace; relative ones from the workspace.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub import_paths: Vec<String>,
     /// WebSocket, Socket.IO, SSE, MQTT: how many times in a row a connection that ends
     /// without Disconnect is opened again; 0 never.
     #[serde(skip_serializing_if = "is_zero")]
@@ -148,6 +157,8 @@ impl Default for Settings {
             insecure_parser: false,
             max_message_mb: 0,
             include_defaults: false,
+            tls_server_name: String::new(),
+            import_paths: Vec::new(),
             reconnect_attempts: 0,
             reconnect_interval_ms: 0,
         }

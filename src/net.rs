@@ -213,6 +213,8 @@ struct Variant {
     /// The capture proxy's: what an app sent goes on as it came, nothing added or decoded,
     /// and no timeout to cut a long download or stream.
     forward: bool,
+    /// A name looked up as another host: a gRPC call's TLS server name (`server_alias`).
+    alias: Option<(String, String)>,
 }
 
 impl From<&Settings> for Variant {
@@ -237,6 +239,7 @@ impl From<&Settings> for Variant {
             }),
             lenient: s.insecure_parser,
             forward: false,
+            alias: None,
         }
     }
 }
@@ -317,12 +320,14 @@ impl Clients {
         })
     }
 
-    /// The HTTP/2 client for a gRPC call to `url` with the request's settings.
+    /// The HTTP/2 client for a gRPC call to `url` with the request's settings: given a TLS
+    /// server name, one that finds it where the URL's host is.
     pub fn grpc_for(&self, s: &Settings, url: &str) -> Result<reqwest::Client, String> {
         let cert = self.variants.net.host_cert(url);
         self.variant(Variant {
             version: HttpVersion::Http2,
             cert,
+            alias: server_alias(s, url),
             ..s.into()
         })
     }
@@ -359,6 +364,20 @@ impl Clients {
         self.variants.built.lock().unwrap().insert(v, c.clone());
         Ok(c)
     }
+}
+
+/// A gRPC call's TLS server name for `url`, and the URL's own host, which it's looked up
+/// as: the call is addressed to the name (SNI, the certificate's check, :authority, see
+/// `grpc::wire`) and connects where the URL says. Not over http://, which has no TLS, nor
+/// when it's the URL's host already.
+pub fn server_alias(s: &Settings, url: &str) -> Option<(String, String)> {
+    let name = s.tls_server_name.trim().to_ascii_lowercase();
+    let url = reqwest::Url::parse(url.trim()).ok()?;
+    let host = url
+        .host_str()?
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    (!name.is_empty() && url.scheme() == "https" && name != host).then_some((name, host))
 }
 
 fn grpc_variant() -> Variant {
@@ -520,7 +539,9 @@ pub async fn build_client_with_jar(
                 handshake: h.clone(),
             }));
         }
-        b = b.dns_resolver(TimeDns);
+        b = b.dns_resolver(TimeDns {
+            alias: v.alias.clone(),
+        });
         b = match v.version {
             HttpVersion::Auto => b,
             HttpVersion::Http1 => b.http1_only(),
@@ -1134,11 +1155,17 @@ impl rustls::crypto::SecureRandom for HelloAt {
 
 /// The system resolver (getaddrinfo, as reqwest's own), timed like `TimeConnect`, which it
 /// runs inside.
-struct TimeDns;
+struct TimeDns {
+    /// This name is looked up as that host.
+    alias: Option<(String, String)>,
+}
 
 impl reqwest::dns::Resolve for TimeDns {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_owned();
+        let host = match &self.alias {
+            Some((alias, host)) if name.as_str().eq_ignore_ascii_case(alias) => host.clone(),
+            _ => name.as_str().to_owned(),
+        };
         Box::pin(async move {
             let started = Instant::now();
             let addrs = tokio::net::lookup_host((host, 0)).await;

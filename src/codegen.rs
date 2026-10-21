@@ -1786,7 +1786,10 @@ impl Stream {
             }
         };
         let rpc = (req.method == "GRPC")
-            .then(|| crate::grpc::methods(&crate::grpc::source(&req.proto, &req.url)).ok())
+            .then(|| {
+                let imports = &req.settings.import_paths;
+                crate::grpc::methods(&crate::grpc::source(&req.proto, &req.url, imports)).ok()
+            })
             .flatten()
             .and_then(|list| list.into_iter().find(|r| r.name == req.rpc));
         Ok(Self { req, headers, rpc })
@@ -2609,6 +2612,14 @@ fn grpc_grpcurl(s: &Stream) -> String {
     if !proto.is_empty() {
         let (dir, file) = proto.rsplit_once(['/', '\\']).unwrap_or((".", proto));
         let _ = write!(out, " \\\n  -import-path {} -proto {}", sh(dir), sh(file));
+        let imports = s.req.settings.import_paths.iter().map(|p| p.trim());
+        for path in imports.filter(|p| !p.is_empty()) {
+            let _ = write!(out, " -import-path {}", sh(path));
+        }
+    }
+    let name = s.req.settings.tls_server_name.trim();
+    if tls && !name.is_empty() {
+        let _ = write!(out, " \\\n  -authority {}", sh(name));
     }
     for (k, v) in &s.headers {
         let _ = write!(out, " \\\n  -H {}", sh(&format!("{k}: {v}")));
@@ -3451,6 +3462,22 @@ mod tests {
         );
         let grpcurl = generate("grpcurl", req()).unwrap();
         assert!(grpcurl.contains("-plaintext"), "{grpcurl}");
+        assert!(
+            !grpcurl.contains("-authority"),
+            "no TLS, no name: {grpcurl}"
+        );
+        // The request's import paths and TLS server name, as grpcurl's own flags.
+        let mut tls = req();
+        tls.url = "https://10.0.0.5:443".into();
+        tls.settings.tls_server_name = "chat.internal".into();
+        tls.settings.import_paths = vec!["../shared".into()];
+        let grpcurl = generate("grpcurl", tls).unwrap();
+        assert!(
+            grpcurl.contains(" -import-path '../shared'")
+                && grpcurl.contains("-authority 'chat.internal'")
+                && !grpcurl.contains("-plaintext"),
+            "{grpcurl}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

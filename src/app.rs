@@ -2552,8 +2552,12 @@ impl App {
         let (req, _) = open.draft.resolved(&self.all_vars());
         let socketio = req.method == "SOCKETIO";
         let is_mqtt = req.method == "MQTT";
-        let grpc = (req.method == "GRPC")
-            .then(|| (crate::grpc::source(&req.proto, &req.url), req.rpc.clone()));
+        let grpc = (req.method == "GRPC").then(|| {
+            (
+                crate::grpc::source(&req.proto, &req.url, &req.settings.import_paths),
+                req.rpc.clone(),
+            )
+        });
         let sends = composes(&open.draft, &self.grpc_methods);
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
         let (pub_tx, pub_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5219,7 +5223,8 @@ impl App {
         // Before `streaming`: whether a gRPC method streams comes from its proto.
         let grpc_source = (open.draft.method == "GRPC").then(|| {
             let url = open.draft.resolved(&all_vars).0.url;
-            crate::grpc::source(&open.draft.proto, &url)
+            let imports = &open.draft.settings.import_paths;
+            crate::grpc::source(&open.draft.proto, &url, imports)
         });
         if let Some(source) = &grpc_source
             && (self.grpc_methods.as_ref()).is_none_or(|(p, _)| p != source)
@@ -11955,6 +11960,41 @@ fn connection_rows(
         grid_hint(
             ui,
             t("Show the fields proto3 leaves out at 0, \"\" or false"),
+        );
+        ui.end_row();
+
+        ui.label(t("TLS server name"));
+        ui.add(
+            egui::TextEdit::singleline(&mut s.tls_server_name)
+                .hint_text(t("The URL's host"))
+                .desired_width(220.0),
+        );
+        grid_hint(
+            ui,
+            t(
+                "https only: TLS and :authority use this name, as grpcurl's -authority, while the call still goes to the URL's address",
+            ),
+        );
+        ui.end_row();
+
+        ui.label(t("Import paths"));
+        // Split on every line end, the last one too: a line just begun stays to type in.
+        let mut paths = s.import_paths.join("\n");
+        let typed = ui.add(
+            egui::TextEdit::multiline(&mut paths)
+                .hint_text(t("A folder a line"))
+                .desired_rows(2)
+                .desired_width(220.0),
+        );
+        if typed.changed() {
+            s.import_paths = match paths.is_empty() {
+                true => Vec::new(),
+                false => paths.split('\n').map(str::to_owned).collect(),
+            };
+        }
+        grid_hint(
+            ui,
+            t("Where the .proto's imports are looked for, after its own folder and the workspace"),
         );
         ui.end_row();
     }
@@ -19769,7 +19809,7 @@ mod ui_tests {
     #[test]
     fn every_kind_of_request_has_the_settings_its_client_uses() {
         let mut h = with_request("kinds");
-        const ROWS: [&str; 15] = [
+        const ROWS: [&str; 17] = [
             "HTTP version",
             "Follow original HTTP method",
             "Verify TLS certificate",
@@ -19783,6 +19823,8 @@ mod ui_tests {
             "Disabled TLS versions",
             "Maximum message size",
             "Include default values",
+            "TLS server name",
+            "Import paths",
             "Client ID",
             "Handshake path",
         ];
@@ -19840,6 +19882,8 @@ mod ui_tests {
                     "Disabled TLS versions",
                     "Maximum message size",
                     "Include default values",
+                    "TLS server name",
+                    "Import paths",
                 ],
             ),
             (
@@ -19865,6 +19909,14 @@ mod ui_tests {
         }
         h.state_mut().open.as_mut().unwrap().draft.method = "GRPC".into();
         h.run();
+        // Import paths are typed a folder a line: Enter starts the next one.
+        h.get_by_role(Role::MultilineTextInput).click();
+        h.run();
+        h.get_by_role(Role::MultilineTextInput)
+            .type_text("../shared\nprotos");
+        h.run();
+        let settings = &draft(&h).settings;
+        assert_eq!(settings.import_paths, ["../shared", "protos"]);
         shot(&mut h, "98-grpc-settings");
     }
 
@@ -23926,7 +23978,7 @@ mod ui_tests {
             let mut h = with_request("pub-grpc");
             for url in ["http://grpcb.in:9000", "https://grpcb.in:9001"] {
                 set(&mut h, "GRPC", url, json(r#"{"greeting": "apitool"}"#));
-                let source = crate::grpc::source("", url);
+                let source = crate::grpc::source("", url, &[]);
                 h.get_by_label("Reload").click();
                 let listed = |app: &App| {
                     crate::grpc::methods(&source).is_ok_and(|m| !m.is_empty())

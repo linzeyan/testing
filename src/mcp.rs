@@ -1156,6 +1156,8 @@ fn tools(window: bool) -> Value {
                     "insecure_parser": { "type": "boolean", "default": false, "description": "Accept responses with malformed headers" },
                     "max_message_mb": { "type": "integer", "default": 0, "description": "WebSocket, Socket.IO, gRPC, MQTT: the largest message taken in, in MB; 0 = 64 for WebSocket and Socket.IO, 16 for gRPC, 1 for MQTT" },
                     "include_defaults": { "type": "boolean", "default": false, "description": "gRPC: replies include the fields proto3 leaves out at 0, \"\" or false" },
+                    "tls_server_name": { "type": "string", "description": "gRPC over https: the name TLS (SNI, certificate check) and :authority use, as grpcurl's -authority; it still connects to the URL's host" },
+                    "import_paths": { "type": "array", "items": { "type": "string" }, "description": "gRPC: folders the .proto's imports are looked for in, after its own folder and the workspace; relative to the workspace" },
                     "reconnect_attempts": { "type": "integer", "default": 0, "description": "WebSocket, Socket.IO, SSE, MQTT: times in a row a connection that ends unasked is opened again (SSE sends Last-Event-ID)" },
                     "reconnect_interval_ms": { "type": "integer", "default": 0, "description": "The wait before each reconnection; 0 = 5000" },
                 },
