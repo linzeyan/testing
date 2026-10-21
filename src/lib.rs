@@ -3,6 +3,7 @@
 pub mod app;
 pub mod appearance;
 mod auth;
+mod binary;
 mod capture;
 pub mod cli;
 mod codegen;

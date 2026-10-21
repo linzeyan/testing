@@ -526,6 +526,8 @@ struct CaptureView {
     filter: String,
     /// The flow shown under the list.
     picked: Option<u64>,
+    /// How its bodies and messages show.
+    shown_as: BytesView,
     /// Decrypt HTTPS and the rules, shared with the proxy, which reads them per exchange.
     controls: Arc<crate::capture::Controls>,
     /// The system's proxy points here (what it was is in the workspace).
@@ -4750,6 +4752,7 @@ impl App {
             flows,
             filter,
             picked,
+            shown_as,
             conns_shown,
             conns,
             ..
@@ -4795,7 +4798,7 @@ impl App {
                 conns.refresh(move || ctx.request_repaint());
                 conns_list(ui, conns, filter);
             } else {
-                open_as = flows.with(|list| flow_list(ui, list, filter, picked));
+                open_as = flows.with(|list| flow_list(ui, list, filter, picked, shown_as));
             }
         }
         if start {
@@ -12588,6 +12591,7 @@ fn capture_view(ctx: &egui::Context, ws: &Workspace) -> CaptureView {
         server: None,
         filter: String::new(),
         picked: None,
+        shown_as: BytesView::Auto,
         controls: Arc::new(controls),
         system: false,
         open: ws.load_capture_open(),
@@ -13012,6 +13016,7 @@ fn flow_list(
     list: &[crate::capture::Flow],
     filter: &str,
     picked: &mut Option<u64>,
+    shown_as: &mut BytesView,
 ) -> Option<(String, Request)> {
     let needle = filter.trim().to_lowercase();
     let hits: Vec<_> = (list.iter())
@@ -13031,7 +13036,7 @@ fn flow_list(
             .resizable(true)
             .default_size(220.0)
             .show(ui, |ui| {
-                let text = flow_text(f);
+                let text = flow_text(f, *shown_as);
                 ui.horizontal(|ui| {
                     let open = ui.add_enabled(!f.tunnel(), egui::Button::new(t("Open as request")));
                     let open = (open.on_hover_text(t(
@@ -13046,6 +13051,22 @@ fn flow_list(
                         .clicked()
                     {
                         ui.ctx().copy_text(text.clone());
+                    }
+                    ui.separator();
+                    let views = [
+                        (BytesView::Auto, t("Auto")),
+                        (BytesView::Text, t("Text")),
+                        (BytesView::Hex, "Hex"),
+                        (BytesView::Base64, "Base64"),
+                    ];
+                    for (view, label) in views {
+                        let hint = match view {
+                            BytesView::Auto => t(
+                                "gRPC and protobuf as their fields, text as it is, anything else as a hex dump",
+                            ),
+                            _ => t("How bodies and WebSocket messages show"),
+                        };
+                        ui.selectable_value(shown_as, view, label).on_hover_text(hint);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         close = icon_button(ui, icon::X, t("Close"), None)
@@ -13131,29 +13152,48 @@ fn listening_on(view: Option<&CaptureView>, addr: std::net::SocketAddr) -> Strin
     }
 }
 
-/// A flow as it went: the request, then the answer, each with its headers and the start
-/// of its body.
-fn flow_text(f: &crate::capture::Flow) -> String {
+/// How the capture shows bytes: Auto by what they are, or as picked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BytesView {
+    Auto,
+    Text,
+    Hex,
+    Base64,
+}
+
+/// A flow as it went: the request, then the answer, each with its headers, the start of
+/// its body and its trailers; a WebSocket's messages after its 101.
+fn flow_text(f: &crate::capture::Flow, view: BytesView) -> String {
     use std::fmt::Write;
     // A body this long is a download, not something to read here; Copy has the same.
     const SHOWN: usize = 64 * 1024;
+    // Laid out again with each message that comes: the newest, each to a few lines.
+    const SHOWN_MESSAGES: usize = 200;
+    const MESSAGE_SHOWN: usize = 4 * 1024;
     let message = |out: &mut String, m: &crate::capture::Message| {
         for (name, value) in &m.headers {
             let _ = writeln!(out, "{name}: {value}");
         }
-        if m.body.is_empty() {
-            return;
+        if !m.body.is_empty() {
+            out.push('\n');
+            let header = |name: &str| {
+                (m.headers.iter())
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map_or("", |(_, v)| v.as_str())
+            };
+            let (kind, coding) = (header("content-type"), header("grpc-encoding"));
+            bytes_text(out, &m.content(), kind, coding, view, SHOWN);
+            if m.cut() {
+                let (kept, all) = (human_size(m.body.len()), human_size(m.size as usize));
+                let _ = writeln!(out, "{}", tf("(the first {} of {})", &[&kept, &all]));
+            }
         }
-        out.push('\n');
-        match std::str::from_utf8(&m.content()) {
-            Ok(text) => out.push_str(&clip(text, SHOWN)),
-            Err(_) => out.push_str(&tf("({} of binary data)", &[&human_size(m.size as usize)])),
+        if !m.trailers.is_empty() {
+            let _ = writeln!(out, "\n{}", t("Trailers"));
+            for (name, value) in &m.trailers {
+                let _ = writeln!(out, "{name}: {value}");
+            }
         }
-        if m.cut() {
-            let (kept, all) = (human_size(m.body.len()), human_size(m.size as usize));
-            let _ = write!(out, "\n{}", tf("(the first {} of {})", &[&kept, &all]));
-        }
-        out.push('\n');
     };
     let mut out = format!("{} {}\n", f.method, f.url);
     for act in &f.applied {
@@ -13164,18 +13204,186 @@ fn flow_text(f: &crate::capture::Flow) -> String {
         let _ = writeln!(out, "\n{status}");
         message(&mut out, &f.response);
     }
-    // A WebSocket's 101 carries bytes both ways after, as a tunnel does.
-    if (f.tunnel() || f.status == Some(101)) && f.elapsed.is_some() {
+    let ws = f.status == Some(101);
+    if ws {
+        out.push('\n');
+        let skipped = f.messages.len().saturating_sub(SHOWN_MESSAGES);
+        let earlier = f.dropped + skipped as u64;
+        if earlier > 0 {
+            let _ = writeln!(
+                out,
+                "{}",
+                tf("({} earlier messages not shown)", &[&earlier])
+            );
+        }
+        for m in &f.messages[skipped..] {
+            let kind = match m.opcode {
+                0 => "continuation",
+                1 => "text",
+                2 => "binary",
+                8 => "close",
+                9 => "ping",
+                10 => "pong",
+                _ => "?",
+            };
+            let (arrow, at) = (if m.sent { "↑" } else { "↓" }, clock(m.at, *UTC_OFFSET));
+            let _ = write!(out, "{arrow} {at} {kind} {}", human_size(m.size as usize));
+            match m.close() {
+                Some(close) => _ = writeln!(out, "  {}", close_text(close)),
+                None if m.data.is_empty() => out.push('\n'),
+                None => {
+                    out.push('\n');
+                    // A text message is UTF-8 by the protocol, control characters and all
+                    // (SignalR ends each with 0x1e).
+                    let kind = if m.opcode == 1 { "text/plain" } else { "" };
+                    bytes_text(&mut out, &m.data, kind, "", view, MESSAGE_SHOWN);
+                }
+            }
+        }
+        // Who ended it and why: the first Close, else none came.
+        match f.close().and_then(|c| Some((c.sent, c.close()?))) {
+            Some((true, close)) => {
+                let _ = writeln!(
+                    out,
+                    "\n{}",
+                    tf("Closed by the app: {}", &[&close_text(close)])
+                );
+            }
+            Some((false, close)) => {
+                let _ = writeln!(
+                    out,
+                    "\n{}",
+                    tf("Closed by the server: {}", &[&close_text(close)])
+                );
+            }
+            None if f.elapsed.is_some() => {
+                let ended = close_text((1006, String::new()));
+                let _ = writeln!(out, "\n{ended}");
+            }
+            None => {}
+        }
+    }
+    // Counted as the bytes go, so while it's open too.
+    if f.tunnel() || ws {
         let (sent, received) = (
             human_size(f.request.size as usize),
             human_size(f.response.size as usize),
         );
         let _ = writeln!(out, "\n{}", tf("{} sent, {} received", &[&sent, &received]));
     }
+    if let Some(ended) = &f.ended {
+        let _ = writeln!(out, "\n{}", tf("Ended: {}", &[ended]));
+    }
     if let Some(e) = &f.error {
         let _ = writeln!(out, "\n{e}");
     }
     out
+}
+
+/// A Close's code, what it means, and its reason.
+fn close_text((code, reason): (u16, String)) -> String {
+    let meaning = match code {
+        1000 => n_("normal closure"),
+        1001 => n_("going away"),
+        1002 => n_("protocol error"),
+        1003 => n_("unsupported data"),
+        1005 => n_("no code given"),
+        1006 => n_("ended without a Close"),
+        1007 => n_("invalid data"),
+        1008 => n_("policy violation"),
+        1009 => n_("message too big"),
+        1010 => n_("an extension is missing"),
+        1011 => n_("server error"),
+        1012 => n_("service restart"),
+        1013 => n_("try again later"),
+        1014 => n_("bad gateway"),
+        1015 => n_("TLS handshake failed"),
+        3000..=3999 => n_("a library's or framework's own"),
+        4000..=4999 => n_("the app's own"),
+        _ => "",
+    };
+    let mut text = format!("{code} {}", t(meaning));
+    if !reason.is_empty() {
+        text = format!("{} — {reason}", text.trim_end());
+    }
+    text
+}
+
+/// `bytes` as `view` shows them, about `max` of them, a line end after. Auto: a gRPC body
+/// as its messages, protobuf without its schema, text as it is, anything else as a hex
+/// dump.
+fn bytes_text(
+    out: &mut String,
+    bytes: &[u8],
+    kind: &str,
+    coding: &str,
+    view: BytesView,
+    max: usize,
+) {
+    use crate::binary;
+    use base64::Engine;
+    use std::fmt::Write;
+    let kind = kind.to_ascii_lowercase();
+    // 16 bytes make a line of 78 characters.
+    let cap = match view {
+        BytesView::Hex => max / 4,
+        _ => max,
+    };
+    let shown = &bytes[..bytes.len().min(cap)];
+    let text = match view {
+        BytesView::Text => binary::lossy(shown),
+        BytesView::Hex => binary::hexdump(shown),
+        BytesView::Base64 => base64::engine::general_purpose::STANDARD.encode(shown),
+        BytesView::Auto if kind.starts_with("application/grpc") => {
+            if let Some(list) = binary::grpc_messages(bytes, coding) {
+                for (i, g) in list.iter().enumerate() {
+                    let (n, size) = (i + 1, human_size(g.size));
+                    let title = match (g.trailers, g.compressed) {
+                        (true, _) => t("gRPC-Web trailers").to_owned(),
+                        (false, true) => tf("gRPC message {}, {}, compressed", &[&n, &size]),
+                        (false, false) => tf("gRPC message {}, {}", &[&n, &size]),
+                    };
+                    let _ = writeln!(out, "{title}");
+                    let data = &g.data;
+                    let json = kind.contains("json");
+                    let text = match (g.trailers || json, binary::protobuf(data)) {
+                        (true, _) | (false, None) => auto_text(&data[..data.len().min(max)], true),
+                        (false, Some(fields)) => fields,
+                    };
+                    out.push_str(text.trim_end_matches('\n'));
+                    out.push('\n');
+                }
+                return;
+            }
+            auto_text(shown, false)
+        }
+        BytesView::Auto if kind.contains("protobuf") => match binary::protobuf(bytes) {
+            Some(fields) => fields,
+            None => auto_text(shown, false),
+        },
+        BytesView::Auto => {
+            let texty = ["text/", "json", "xml", "javascript"]
+                .iter()
+                .any(|k| kind.contains(k));
+            auto_text(shown, texty)
+        }
+    };
+    out.push_str(text.trim_end_matches('\n'));
+    out.push('\n');
+    if bytes.len() > shown.len() {
+        let (shown, all) = (human_size(shown.len()), human_size(bytes.len()));
+        let _ = writeln!(out, "{}", tf("({} of {} shown)", &[&shown, &all]));
+    }
+}
+
+/// Text as it is, `texty` text with its control characters too; else a hex dump.
+fn auto_text(bytes: &[u8], texty: bool) -> String {
+    use crate::binary;
+    match binary::printable(bytes) {
+        Some(text) => text.to_owned(),
+        None if texty && binary::utf8(bytes).is_some() => binary::lossy(bytes),
+        None => binary::hexdump(&bytes[..bytes.len().min(4096)]),
+    }
 }
 
 /// What a captured exchange becomes as a request: as importing its HAR would make it,
@@ -22168,6 +22376,12 @@ mod ui_tests {
             .filter_map(|n| n.value())
             .any(|v| v.contains("200") && v.ends_with("{\"id\":7}\n"));
         assert!(whole, "the picked flow, whole");
+        h.get_by_label("Hex").click();
+        h.run();
+        let hex = (h.get_all_by_role(Role::Label))
+            .filter_map(|n| n.value())
+            .any(|v| v.contains("7b 22 69 64 22 3a 37 7d") && v.contains("|{\"id\":7}|"));
+        assert!(hex, "the bodies as a hex dump");
         h.get_by_label("Open as request").click();
         h.run();
         button(&h, "Create").click();
@@ -22189,6 +22403,128 @@ mod ui_tests {
         let har: serde_json::Value = serde_json::from_slice(&std::fs::read(&to).unwrap()).unwrap();
         let _ = std::fs::remove_file(&to);
         assert_eq!(har["log"]["entries"][0]["request"]["url"], *url);
+    }
+
+    /// What the VDI showed: a gRPC body read as text with its NULs (a blank line, cut at the
+    /// first NUL when copied) or as "319 B of binary data", and no call status. Now each
+    /// message's fields and the status from the trailers; a WebSocket's messages each way
+    /// and who closed it with what code. No view puts a NUL in the text.
+    #[test]
+    fn captured_grpc_and_websockets_read_as_what_they_carry() {
+        use crate::capture::{CLOSE, Flow, Message, WsMessage};
+        let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+            p.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let message = |headers: &[(&str, &str)], body: &[u8], trailers: &[(&str, &str)]| Message {
+            headers: pairs(headers),
+            body: body.to_vec(),
+            size: body.len() as u64,
+            trailers: pairs(trailers),
+        };
+        let flow = |method: &str, url: &str, request, status, response| Flow {
+            id: 1,
+            at: std::time::SystemTime::now(),
+            method: method.into(),
+            url: url.into(),
+            request,
+            status,
+            response,
+            elapsed: Some(Duration::from_millis(5)),
+            error: None,
+            applied: Vec::new(),
+            messages: Vec::new(),
+            dropped: 0,
+            ended: None,
+        };
+        let grpc = [("content-type", "application/grpc")];
+        let call = flow(
+            "POST",
+            "http://grpcb.in:9000/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+            message(&grpc, &[0, 0, 0, 0, 2, 0x3a, 0], &[]),
+            Some(200),
+            message(
+                &grpc,
+                &[0, 0, 0, 0, 3, 0x08, 0x96, 0x01],
+                &[("grpc-status", "0")],
+            ),
+        );
+        let text = flow_text(&call, BytesView::Auto);
+        assert!(text.contains("\ngRPC message 1, 2 B\n7: \"\"\n"), "{text}");
+        assert!(text.contains("\ngRPC message 1, 3 B\n1: 150\n"), "{text}");
+        assert!(text.ends_with("\nTrailers\ngrpc-status: 0\n"), "{text}");
+        for view in [
+            BytesView::Auto,
+            BytesView::Text,
+            BytesView::Hex,
+            BytesView::Base64,
+        ] {
+            assert!(!flow_text(&call, view).contains('\0'), "{view:?}");
+        }
+        assert!(flow_text(&call, BytesView::Hex).contains("00 00 00 00 02 3a 00"));
+        assert!(flow_text(&call, BytesView::Base64).contains("\nAAAAAAI6AA==\n"));
+
+        let ws_message = |sent: bool, opcode: u8, data: &[u8]| WsMessage {
+            at: std::time::SystemTime::now(),
+            sent,
+            opcode,
+            data: data.to_vec(),
+            size: data.len() as u64,
+        };
+        let mut ws = flow(
+            "GET",
+            "https://sports-api.polymarket.com/ws",
+            message(&[("upgrade", "websocket")], b"", &[]),
+            Some(101),
+            message(&[("upgrade", "websocket")], b"", &[]),
+        );
+        let bye = [&1000u16.to_be_bytes()[..], b"bye"].concat();
+        ws.messages = vec![
+            ws_message(true, 1, b"{\"subscribe\":\"nba\"}"),
+            ws_message(false, 1, b"{\"score\":\"101-99\"}\x1e"),
+            ws_message(false, 2, &[0, 1, 2]),
+            ws_message(true, CLOSE, &bye),
+            ws_message(false, CLOSE, &bye),
+        ];
+        (ws.request.size, ws.response.size) = (40, 48);
+        let text = flow_text(&ws, BytesView::Auto);
+        let lines: Vec<_> = text.lines().collect();
+        let at = |prefix: &str, kind: &str| {
+            let i = lines
+                .iter()
+                .position(|l| l.starts_with(prefix) && l.contains(kind));
+            i.unwrap_or_else(|| panic!("no {prefix} {kind}: {text}"))
+        };
+        assert_eq!(lines[at("↑", "text") + 1], "{\"subscribe\":\"nba\"}");
+        assert_eq!(lines[at("↓", "text") + 1], "{\"score\":\"101-99\"}\u{fffd}");
+        assert!(
+            lines[at("↓", "binary") + 1].starts_with("00000000  00 01 02 "),
+            "{text}"
+        );
+        assert!(lines[at("↑", "close")].ends_with("close 5 B  1000 normal closure — bye"));
+        assert!(
+            text.contains("\nClosed by the app: 1000 normal closure — bye\n"),
+            "{text}"
+        );
+        assert!(text.contains("\n40 B sent, 48 B received\n"), "{text}");
+
+        ws.messages.truncate(3);
+        let text = flow_text(&ws, BytesView::Auto);
+        assert!(text.contains("\n1006 ended without a Close\n"), "{text}");
+        let mut tunnel = flow(
+            "CONNECT",
+            "broker.emqx.io:1883",
+            message(&[], b"", &[]),
+            Some(200),
+            message(&[], b"", &[]),
+        );
+        tunnel.ended = Some("connection aborted (os error 10053)".into());
+        let text = flow_text(&tunnel, BytesView::Auto);
+        assert!(
+            text.ends_with("\nEnded: connection aborted (os error 10053)\n"),
+            "{text}"
+        );
     }
 
     /// Decrypt HTTPS hands the proxy a CA made once and kept in the workspace, its key

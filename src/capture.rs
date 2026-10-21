@@ -61,6 +61,8 @@ pub struct Message {
     pub body: Vec<u8>,
     /// All of it, as it went through.
     pub size: u64,
+    /// What came after the body: a gRPC call's status is here, not in the headers.
+    pub trailers: Vec<(String, String)>,
 }
 
 impl Message {
@@ -132,11 +134,73 @@ pub struct Flow {
     pub error: Option<String>,
     /// The rules that changed it, a Map Remote's as the URL it went to.
     pub applied: Vec<Act>,
+    /// A WebSocket's messages both ways once it switched, oldest first: the latest
+    /// `MAX_MESSAGES`, `MAX_MESSAGE_BYTES` of them at most.
+    pub messages: Vec<WsMessage>,
+    /// How many older messages went to keep to those caps.
+    pub dropped: u64,
+    /// How a tunnel that worked ended, when not cleanly: a reset once bytes went both ways
+    /// is how many apps hang up, so it's told, not an error (see `pipe`).
+    pub ended: Option<String>,
 }
 
 impl Flow {
     pub fn tunnel(&self) -> bool {
         self.method == "CONNECT"
+    }
+
+    /// The first Close, which says who ended a WebSocket and why.
+    pub fn close(&self) -> Option<&WsMessage> {
+        self.messages.iter().find(|m| m.opcode == CLOSE)
+    }
+
+    fn keep(&mut self, got: Vec<WsMessage>) {
+        if got.is_empty() {
+            return;
+        }
+        self.messages.extend(got);
+        let mut gone = self.messages.len().saturating_sub(MAX_MESSAGES);
+        let mut kept: usize = self.messages[gone..].iter().map(|m| m.data.len()).sum();
+        // The newest always stays: a Close comes last.
+        while kept > MAX_MESSAGE_BYTES && gone + 1 < self.messages.len() {
+            kept -= self.messages[gone].data.len();
+            gone += 1;
+        }
+        self.messages.drain(..gone);
+        self.dropped += gone as u64;
+    }
+}
+
+/// A WebSocket kept open for hours mustn't fill the memory: the newest messages stay.
+pub const MAX_MESSAGES: usize = 1000;
+const MAX_MESSAGE_BYTES: usize = 4 * MAX_BODY;
+
+pub const CLOSE: u8 = 8;
+
+/// One WebSocket message as it went, its frames joined.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WsMessage {
+    pub at: SystemTime,
+    /// The app's to the server; else the server's to the app.
+    pub sent: bool,
+    /// 1 text, 2 binary, 8 close, 9 ping, 10 pong; 0 a continuation whose start was missed.
+    pub opcode: u8,
+    /// Unmasked and, compressed (permessage-deflate), unpacked: the first `MAX_BODY` bytes.
+    pub data: Vec<u8>,
+    /// Its payload as it went, all of it.
+    pub size: u64,
+}
+
+impl WsMessage {
+    /// A Close's code and reason; 1005 when it gave none, as RFC 6455 has it.
+    pub fn close(&self) -> Option<(u16, String)> {
+        (self.opcode == CLOSE).then(|| match self.data.get(..2) {
+            Some(&[a, b]) => {
+                let reason = String::from_utf8_lossy(&self.data[2..]).into_owned();
+                (u16::from_be_bytes([a, b]), reason)
+            }
+            _ => (1005, String::new()),
+        })
     }
 }
 
@@ -186,6 +250,9 @@ impl Flows {
             elapsed: None,
             error: None,
             applied: Vec::new(),
+            messages: Vec::new(),
+            dropped: 0,
+            ended: None,
         });
         drop(list);
         (self.changed)();
@@ -551,6 +618,9 @@ impl Tee {
             Ok(frame) => {
                 if let Some(chunk) = frame.data_ref() {
                     self.flows.update(self.id, |f| f.response.take(chunk));
+                } else if let Some(trailers) = frame.trailers_ref() {
+                    let shown = pairs(trailers);
+                    self.flows.update(self.id, |f| f.response.trailers = shown);
                 }
                 Ok(frame)
             }
@@ -765,8 +835,8 @@ async fn forward(req: Request<Incoming>, p: &Proxy) -> Response<Body> {
     }
 }
 
-/// A 101: once both sides have switched, what they send each other (a WebSocket's frames)
-/// goes through untouched and counted, as in a tunnel.
+/// A 101: once both sides have switched, what they send each other goes through untouched
+/// and counted, as in a tunnel, and read as a WebSocket's messages as it passes.
 fn switch(
     res: reqwest::Response,
     app: hyper::upgrade::OnUpgrade,
@@ -781,23 +851,19 @@ fn switch(
     p.flows.update(id, |f| {
         (f.status, f.response.headers) = (Some(status.as_u16()), shown);
     });
-    let (flows, mut stopped) = (p.flows.clone(), p.stopped.clone());
+    let (flows, stopped) = (p.flows.clone(), p.stopped.clone());
     tokio::spawn(async move {
         let joined = async {
-            let mut server = res.upgrade().await.map_err(|e| error_chain(&e))?;
-            let mut app = TokioIo::new(app.await.map_err(|e| e.to_string())?);
-            tokio::select! {
-                copied = tokio::io::copy_bidirectional(&mut app, &mut server) => {
-                    copied.map_err(|e| e.to_string())
-                }
-                _ = stopped.changed() => Err("capture stopped".to_owned()),
-            }
+            let server = res.upgrade().await.map_err(|e| error_chain(&e))?;
+            let app = TokioIo::new(app.await.map_err(|e| e.to_string())?);
+            both_ways(app, server, true, id, &flows, stopped).await
         };
         let result = joined.await;
         flows.update(id, |f| {
-            match result {
-                Ok((up, down)) => (f.request.size, f.response.size) = (up, down),
-                Err(e) => f.error = Some(e),
+            // After a Close the socket is done with: a side then going without TLS's
+            // close_notify (apitool's own client does) or with a reset is just leaving.
+            if let (Err(e), None) = (result, f.close()) {
+                f.error = Some(e);
             }
             f.elapsed = Some(started.elapsed());
         });
@@ -931,28 +997,242 @@ async fn tunnel(req: Request<Incoming>, p: &Proxy) -> Response<Body> {
     )
 }
 
-/// The tunnel flow `id`'s bytes, both ways until either side closes, counted then.
+/// The tunnel flow `id`'s bytes, both ways until both sides close, counted as they go.
 async fn pipe(
-    mut app: impl AsyncRead + AsyncWrite + Unpin,
-    mut upstream: TcpStream,
+    app: impl AsyncRead + AsyncWrite + Unpin,
+    upstream: TcpStream,
     id: u64,
     started: Instant,
     p: &Proxy,
 ) {
-    let mut stopped = p.stopped.clone();
-    let result = tokio::select! {
-        copied = tokio::io::copy_bidirectional(&mut app, &mut upstream) => {
-            copied.map_err(|e| e.to_string())
-        }
-        _ = stopped.changed() => Err("capture stopped".to_owned()),
-    };
+    let result = both_ways(app, upstream, false, id, &p.flows, p.stopped.clone()).await;
     p.flows.update(id, |f| {
-        match result {
-            Ok((up, down)) => (f.request.size, f.response.size) = (up, down),
-            Err(e) => f.error = Some(e),
+        // The proxy sees bytes, not the protocol's goodbye: once they went both ways the
+        // tunnel worked, and a reset then (an MQTT client's hang-up, Windows' 10053) is
+        // how it ended. One that never carried an answer failed.
+        if let Err(e) = result {
+            match f.request.size > 0 && f.response.size > 0 {
+                true => f.ended = Some(e),
+                false => f.error = Some(e),
+            }
         }
         f.elapsed = Some(started.elapsed());
     });
+}
+
+/// `app` and `server` joined until both are done, or one fails or the capture stops; what
+/// went through counted into flow `id` as it goes, so an end in error keeps it. A
+/// WebSocket's (`ws`) is read as its messages too.
+async fn both_ways(
+    app: impl AsyncRead + AsyncWrite,
+    server: impl AsyncRead + AsyncWrite,
+    ws: bool,
+    id: u64,
+    flows: &Flows,
+    mut stopped: tokio::sync::watch::Receiver<()>,
+) -> Result<(), String> {
+    let (app_in, app_out) = tokio::io::split(app);
+    let (server_in, server_out) = tokio::io::split(server);
+    let reader = |sent| {
+        ws.then(|| Reader {
+            sent,
+            ..Default::default()
+        })
+    };
+    let up = relay(app_in, server_out, true, reader(true), id, flows);
+    let down = relay(server_in, app_out, false, reader(false), id, flows);
+    tokio::select! {
+        done = async { tokio::try_join!(up, down) } => done.map(|_| ()).map_err(|e| e.to_string()),
+        _ = stopped.changed() => Err("capture stopped".to_owned()),
+    }
+}
+
+/// One way, the app's (`sent`) or the server's: what `from` sends goes on to `to`
+/// untouched, counted (and read, given a `reader`) once it has.
+async fn relay(
+    mut from: impl AsyncRead + Unpin,
+    mut to: impl AsyncWrite + Unpin,
+    sent: bool,
+    mut reader: Option<Reader>,
+    id: u64,
+    flows: &Flows,
+) -> std::io::Result<()> {
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = from.read(&mut buf).await?;
+        if n == 0 {
+            // As copy_bidirectional does: the other side learns nothing more comes, and
+            // may still answer. One gone already can't be told, which is no failure.
+            let _ = to.shutdown().await;
+            return Ok(());
+        }
+        to.write_all(&buf[..n]).await?;
+        let got = (reader.as_mut()).map_or_else(Vec::new, |r| r.feed(&buf[..n]));
+        flows.update(id, |f| {
+            match sent {
+                true => f.request.size += n as u64,
+                false => f.response.size += n as u64,
+            }
+            f.keep(got);
+        });
+    }
+}
+
+/// A WebSocket's messages read out of what one side sends as it passes (RFC 6455): frames
+/// come cut anywhere, a message in several, control frames between them.
+#[derive(Default)]
+struct Reader {
+    sent: bool,
+    /// A frame's header so far.
+    head: Vec<u8>,
+    /// The frame whose payload is coming.
+    frame: Option<Part>,
+    /// A message whose last frame hasn't come, and whether it's compressed.
+    message: Option<(WsMessage, bool)>,
+    /// permessage-deflate's window, kept from one message to the next.
+    inflate: Option<flate2::Decompress>,
+    /// A message cut at `MAX_BODY` left the window unknown: later ones stay packed.
+    lost: bool,
+}
+
+struct Part {
+    fin: bool,
+    /// permessage-deflate's mark, on a message's first frame.
+    rsv1: bool,
+    opcode: u8,
+    /// An app's frames are masked; a server's aren't.
+    mask: Option<[u8; 4]>,
+    left: u64,
+    seen: u64,
+    data: Vec<u8>,
+}
+
+impl Reader {
+    fn feed(&mut self, mut bytes: &[u8]) -> Vec<WsMessage> {
+        let mut out = Vec::new();
+        while !bytes.is_empty() {
+            let Some(part) = &mut self.frame else {
+                self.head.push(bytes[0]);
+                bytes = &bytes[1..];
+                if let Some(part) = header(&self.head) {
+                    self.head.clear();
+                    let empty = part.left == 0;
+                    self.frame = Some(part);
+                    if empty {
+                        self.end_frame(&mut out);
+                    }
+                }
+                continue;
+            };
+            let n = part.left.min(bytes.len() as u64) as usize;
+            let room = MAX_BODY.saturating_sub(part.data.len()).min(n);
+            for (i, b) in bytes[..room].iter().enumerate() {
+                let key = part
+                    .mask
+                    .map_or(0, |m| m[((part.seen + i as u64) % 4) as usize]);
+                part.data.push(b ^ key);
+            }
+            (part.seen, part.left) = (part.seen + n as u64, part.left - n as u64);
+            bytes = &bytes[n..];
+            if part.left == 0 {
+                self.end_frame(&mut out);
+            }
+        }
+        out
+    }
+
+    fn end_frame(&mut self, out: &mut Vec<WsMessage>) {
+        let Some(part) = self.frame.take() else {
+            return;
+        };
+        let sent = self.sent;
+        let message = |opcode| WsMessage {
+            at: SystemTime::now(),
+            sent,
+            opcode,
+            data: Vec::new(),
+            size: 0,
+        };
+        // Control frames stand alone, between a message's frames too.
+        let (mut m, packed) = match part.opcode {
+            8.. => (message(part.opcode), false),
+            0 => (self.message.take()).unwrap_or_else(|| (message(0), part.rsv1)),
+            opcode => (message(opcode), part.rsv1),
+        };
+        let room = MAX_BODY.saturating_sub(m.data.len());
+        m.data
+            .extend_from_slice(&part.data[..part.data.len().min(room)]);
+        m.size += part.seen;
+        if !part.fin && part.opcode < 8 {
+            self.message = Some((m, packed));
+            return;
+        }
+        if packed && let Some(data) = self.unpack(&m) {
+            m.data = data;
+        }
+        out.push(m);
+    }
+
+    /// permessage-deflate: raw DEFLATE ending in a sync flush whose last four bytes were
+    /// left off. Read with the window kept, which reads a sender that resets its own
+    /// (no_context_takeover) just as well.
+    fn unpack(&mut self, m: &WsMessage) -> Option<Vec<u8>> {
+        if self.lost || m.size > m.data.len() as u64 {
+            self.lost = true;
+            return None;
+        }
+        let d = (self.inflate).get_or_insert_with(|| flate2::Decompress::new(false));
+        let input = [&m.data[..], &[0, 0, 0xff, 0xff]].concat();
+        let (mut out, mut at) = (Vec::new(), 0);
+        // Until it gives no more: input all taken can still have output to come.
+        loop {
+            out.reserve(16 * 1024);
+            let (read, wrote) = (d.total_in(), d.total_out());
+            let flush = flate2::FlushDecompress::Sync;
+            if d.decompress_vec(&input[at..], &mut out, flush).is_err() {
+                break;
+            }
+            at += (d.total_in() - read) as usize;
+            let stuck = d.total_in() == read && d.total_out() == wrote;
+            if stuck || out.len() >= MAX_BODY {
+                break;
+            }
+        }
+        // Not all of it read: the window from here on is unknown.
+        self.lost = at < input.len();
+        (!self.lost).then_some(out)
+    }
+}
+
+/// A frame's header once `head` holds all of it: two bytes, then its length's 2 or 8 more
+/// past 125, then the mask's 4 if masked.
+fn header(head: &[u8]) -> Option<Part> {
+    let (&b0, &b1) = (head.first()?, head.get(1)?);
+    let ext = match b1 & 0x7f {
+        126 => 2,
+        127 => 8,
+        _ => 0,
+    };
+    let masked = b1 & 0x80 != 0;
+    let at = 2 + ext;
+    let all = at + if masked { 4 } else { 0 };
+    if head.len() < all {
+        return None;
+    }
+    let left = match ext {
+        2 => u16::from_be_bytes([head[2], head[3]]) as u64,
+        8 => u64::from_be_bytes(head[2..10].try_into().ok()?),
+        _ => (b1 & 0x7f) as u64,
+    };
+    Some(Part {
+        fin: b0 & 0x80 != 0,
+        rsv1: b0 & 0x40 != 0,
+        opcode: b0 & 0x0f,
+        mask: masked.then(|| head[at..all].try_into().ok()).flatten(),
+        left,
+        seen: 0,
+        data: Vec::new(),
+    })
 }
 
 /// This machine's address on its network, for other devices to reach the capture at: the
@@ -2219,6 +2499,275 @@ mod tests {
         assert!(f.request.size > 5 && f.response.size > 5, "{f:?}");
     }
 
+    /// What the VDI showed as ERR: a wss:// app (apitool's own) closes with a Close, the
+    /// server answers with its own, and the app's TLS then goes without close_notify. The
+    /// socket ended as it should: the flow stays a 101 with its messages both ways, who
+    /// closed and with what code, and the bytes it counted (0 B before).
+    #[test]
+    fn a_websocket_closed_then_cut_off_keeps_its_messages_and_is_no_error() {
+        use tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+        let rt = runtime();
+        let (cert, key) = Ca::generate().unwrap();
+        let ca = Arc::new(Ca::load(&cert, &key).unwrap());
+        let net = Network {
+            insecure: true,
+            ..direct()
+        };
+        let controls = Controls {
+            decrypt: Mutex::new(Some(ca)),
+            ..Default::default()
+        };
+        let (addr, flows) = proxy_with(&rt, net, controls);
+        let server = wss_echo();
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let target = format!("localhost:{}", server.port());
+        write!(s, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").unwrap();
+        let head = crate::http::tests::read_request(&mut s);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(cert.as_bytes()).unwrap())
+            .unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = (rustls::ClientConfig::builder_with_provider(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tls = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+        let tls = rustls::StreamOwned::new(tls, s);
+        let url = format!("wss://{target}/socket");
+        let (mut ws, _) = tungstenite::client::client(url.as_str(), tls).unwrap();
+        ws.send("hello".into()).unwrap();
+        assert_eq!(ws.read().unwrap(), "hello".into());
+        let bye = CloseFrame {
+            code: CloseCode::Normal,
+            reason: "bye".into(),
+        };
+        ws.close(Some(bye)).unwrap();
+        while ws.read().is_ok() {}
+        // Its TLS goes without close_notify, as a socket dropped does.
+        drop(ws);
+
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!(
+            (f.url.as_str(), f.status),
+            (&*format!("https://{target}/socket"), Some(101))
+        );
+        assert!(f.error.is_none(), "{:?}", f.error);
+        let seen: Vec<_> = (f.messages.iter())
+            .map(|m| (m.sent, m.opcode, m.data.clone()))
+            .collect();
+        let close = |sent| (sent, CLOSE, b"\x03\xe8bye".to_vec());
+        assert_eq!(
+            seen,
+            [
+                (true, 1, b"hello".to_vec()),
+                (false, 1, b"hello".to_vec()),
+                close(true),
+                close(false)
+            ]
+        );
+        let first = f.close().unwrap();
+        assert!(first.sent);
+        assert_eq!(first.close(), Some((1000, "bye".into())));
+        assert!(f.request.size > 10 && f.response.size > 10, "{f:?}");
+    }
+
+    /// A wss:// server with a certificate of its own, echoing text until a Close.
+    fn wss_echo() -> SocketAddr {
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = PrivateKeyDer::try_from(own.signing_key.serialize_der()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = (rustls::ServerConfig::builder_with_provider(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![own.cert.der().clone()], key)
+            .unwrap();
+        let config = Arc::new(config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in listener.incoming().flatten() {
+                let config = config.clone();
+                std::thread::spawn(move || {
+                    let tls = rustls::ServerConnection::new(config).unwrap();
+                    let Ok(mut ws) = tungstenite::accept(rustls::StreamOwned::new(tls, s)) else {
+                        return;
+                    };
+                    while let Ok(m) = ws.read() {
+                        if m.is_text() && ws.send(m).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// A WebSocket frame as a side sends it: an app's masked with `mask`.
+    fn ws_frame(
+        fin: bool,
+        rsv1: bool,
+        opcode: u8,
+        payload: &[u8],
+        mask: Option<[u8; 4]>,
+    ) -> Vec<u8> {
+        let mut out = vec![(fin as u8) << 7 | (rsv1 as u8) << 6 | opcode];
+        let masked = if mask.is_some() { 0x80 } else { 0 };
+        match payload.len() {
+            n @ 0..126 => out.push(masked | n as u8),
+            n @ 126..65536 => {
+                out.push(masked | 126);
+                out.extend((n as u16).to_be_bytes());
+            }
+            n => {
+                out.push(masked | 127);
+                out.extend((n as u64).to_be_bytes());
+            }
+        }
+        match mask {
+            Some(key) => {
+                out.extend(key);
+                out.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+            }
+            None => out.extend(payload),
+        }
+        out
+    }
+
+    /// A WebSocket's messages read out of the bytes as they pass, however they're cut:
+    /// an app's unmasked, a message in two frames joined around a ping between them, a
+    /// long one's 16-bit length, a Close's code and reason.
+    #[test]
+    fn websocket_messages_read_however_the_bytes_come() {
+        let key = Some([1, 2, 3, 4]);
+        let long = "x".repeat(300);
+        let mut close = 1000u16.to_be_bytes().to_vec();
+        close.extend(b"done");
+        let bytes = [
+            ws_frame(true, false, 1, b"hello", key),
+            ws_frame(false, false, 2, &[1, 2, 3], key),
+            ws_frame(true, false, 9, b"", key),
+            ws_frame(true, false, 0, &[4, 5], key),
+            ws_frame(true, false, 1, long.as_bytes(), key),
+            ws_frame(true, false, CLOSE, &close, key),
+        ]
+        .concat();
+        let read = |cuts: usize| {
+            let mut r = Reader {
+                sent: true,
+                ..Default::default()
+            };
+            let got: Vec<_> = (bytes.chunks(cuts)).flat_map(|c| r.feed(c)).collect();
+            (got.iter())
+                .map(|m| (m.sent, m.opcode, m.data.clone(), m.size))
+                .collect::<Vec<_>>()
+        };
+        let want = vec![
+            (true, 1, b"hello".to_vec(), 5),
+            (true, 9, vec![], 0),
+            (true, 2, vec![1, 2, 3, 4, 5], 5),
+            (true, 1, long.clone().into_bytes(), 300),
+            (true, CLOSE, close.clone(), 6),
+        ];
+        assert_eq!(read(bytes.len()), want, "at once");
+        assert_eq!(read(1), want, "a byte at a time");
+        assert_eq!(read(7), want);
+    }
+
+    /// permessage-deflate, as browsers ask for it: each message raw DEFLATE without its
+    /// last four bytes, the window kept, so the second message refers back into the first.
+    #[test]
+    fn compressed_websocket_messages_read_unpacked() {
+        let mut pack = flate2::Compress::new(flate2::Compression::default(), false);
+        let mut packed = |text: &str| {
+            let mut out = Vec::with_capacity(1024);
+            let flush = flate2::FlushCompress::Sync;
+            pack.compress_vec(text.as_bytes(), &mut out, flush).unwrap();
+            assert!(out.ends_with(&[0, 0, 0xff, 0xff]));
+            out.truncate(out.len() - 4);
+            out
+        };
+        let one = "{\"price\":101.25,\"market\":\"sports\"}";
+        let two = "{\"price\":101.50,\"market\":\"sports\"}";
+        let (a, b) = (packed(one), packed(two));
+        assert!(b.len() < two.len() / 2, "the second leans on the first");
+        let mut r = Reader::default();
+        let got = r.feed(
+            &[
+                ws_frame(true, true, 1, &a, None),
+                ws_frame(true, true, 1, &b, None),
+            ]
+            .concat(),
+        );
+        let texts: Vec<_> = got
+            .iter()
+            .map(|m| String::from_utf8_lossy(&m.data))
+            .collect();
+        assert_eq!(texts, [one, two]);
+        assert_eq!(got[1].size, b.len() as u64, "as it went");
+    }
+
+    /// Past the caps the oldest messages go and are counted, the newest (a Close comes
+    /// last) stay: a socket open overnight mustn't fill the memory.
+    #[test]
+    fn the_oldest_messages_go_past_the_caps() {
+        let flows = Flows::new(|| {});
+        let id = flows.start("GET", "http://a.test/ws", &HeaderMap::new());
+        let message = |data: Vec<u8>| WsMessage {
+            at: SystemTime::now(),
+            sent: false,
+            opcode: 1,
+            size: data.len() as u64,
+            data,
+        };
+        flows.update(id, |f| {
+            f.keep((0..MAX_MESSAGES + 5).map(|_| message(vec![b'x'])).collect())
+        });
+        let f = flow_when(&flows, |_| true);
+        assert_eq!((f.messages.len(), f.dropped), (MAX_MESSAGES, 5));
+        let big = || message(vec![b'y'; MAX_BODY]);
+        flows.update(id, |f| f.keep((0..5).map(|_| big()).collect()));
+        let f = flow_when(&flows, |_| true);
+        let kept: usize = f.messages.iter().map(|m| m.data.len()).sum();
+        assert!(kept <= MAX_MESSAGE_BYTES, "{kept}");
+        assert_eq!(f.messages.last().unwrap().data.len(), MAX_BODY);
+    }
+
+    /// The proxy sees a tunnel's bytes, not its protocol's goodbye: an app that resets it
+    /// once bytes went both ways (an MQTT client's hang-up, Windows' 10053) ended it, and
+    /// the flow says so without an error, its bytes counted.
+    #[test]
+    fn a_tunnel_reset_after_it_worked_is_no_error() {
+        let rt = runtime();
+        let (addr, flows) = proxy(&rt, direct());
+        let target = echo().to_string();
+        rt.block_on(async {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            let ask = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+            s.write_all(ask.as_bytes()).await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(s.read_u8().await.unwrap());
+            }
+            s.write_all(b"ping").await.unwrap();
+            let mut back = [0; 4];
+            s.read_exact(&mut back).await.unwrap();
+            assert_eq!(&back, b"ping");
+            // Closed with a reset, not a FIN.
+            s.set_zero_linger().unwrap();
+        });
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert!(f.error.is_none(), "{:?}", f.error);
+        assert!(f.ended.is_some(), "how it ended is told");
+        assert_eq!((f.request.size, f.response.size), (4, 4));
+    }
+
     /// Decrypting, an app that trusts the CA reads its HTTPS answer through the proxy, and
     /// the exchange is a flow as any other, its URL https://. The CA is the one kept: loaded
     /// again, it signs for the same certificate apps were given. An app that doesn't trust
@@ -2541,6 +3090,7 @@ mod tests {
             headers: vec![("Content-Encoding".into(), coding.into())],
             body: body.to_vec(),
             size: body.len() as u64,
+            trailers: Vec::new(),
         };
         for (coding, body) in packed {
             assert!(body.len() < text.len() / 2, "{coding} packs");
@@ -2572,6 +3122,7 @@ mod tests {
                 .collect(),
             body: body.to_vec(),
             size: body.len() as u64,
+            trailers: Vec::new(),
         };
         let flow = |method: &str, url: &str, request, status, response| Flow {
             id: 1,
@@ -2584,6 +3135,9 @@ mod tests {
             elapsed: Some(Duration::from_millis(12)),
             error: None,
             applied: Vec::new(),
+            messages: Vec::new(),
+            dropped: 0,
+            ended: None,
         };
         let json = [("content-type", "application/json")];
         let post = flow(
