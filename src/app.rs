@@ -15627,6 +15627,9 @@ mod ui_tests {
         h.get_by_label("Apply").click();
         h.run();
         assert_eq!(h.state().network.proxy, ProxyMode::None);
+        // Applying builds the clients off the UI thread and says so when done: wait, or its
+        // word lands after Close's below (CI on Linux saw "Network settings applied").
+        wait_live(&mut h, |app| app.status.contains("applied"));
         h.get_by_label("Manual").click();
         h.run();
         h.get_by_label("Close").click();
