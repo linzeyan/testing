@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
@@ -31,6 +31,8 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::http::error_chain;
 use crate::model::HttpVersion;
 use crate::net::{Clients, Route};
+
+pub mod mqtt;
 
 /// Past these the oldest flows go and a body is cut: the VDI has little RAM to spare.
 pub const MAX_FLOWS: usize = 1000;
@@ -134,14 +136,16 @@ pub struct Flow {
     pub error: Option<String>,
     /// The rules that changed it, a Map Remote's as the URL it went to.
     pub applied: Vec<Act>,
-    /// A WebSocket's messages both ways once it switched, oldest first: the latest
-    /// `MAX_MESSAGES`, `MAX_MESSAGE_BYTES` of them at most.
-    pub messages: Vec<WsMessage>,
+    /// A WebSocket's messages both ways once it switched, or an MQTT connection's packets,
+    /// oldest first: the latest `MAX_MESSAGES`, `MAX_MESSAGE_BYTES` of them at most.
+    pub messages: Vec<StreamMessage>,
     /// How many older messages went to keep to those caps.
     pub dropped: u64,
     /// How a tunnel that worked ended, when not cleanly: a reset once bytes went both ways
     /// is how many apps hang up, so it's told, not an error (see `pipe`).
     pub ended: Option<String>,
+    /// The MQTT level its app's CONNECT said, for a tunnel that carries MQTT.
+    pub mqtt: Option<u8>,
 }
 
 impl Flow {
@@ -150,11 +154,11 @@ impl Flow {
     }
 
     /// The first Close, which says who ended a WebSocket and why.
-    pub fn close(&self) -> Option<&WsMessage> {
+    pub fn close(&self) -> Option<&StreamMessage> {
         self.messages.iter().find(|m| m.opcode == CLOSE)
     }
 
-    fn keep(&mut self, got: Vec<WsMessage>) {
+    fn keep(&mut self, got: Vec<StreamMessage>) {
         if got.is_empty() {
             return;
         }
@@ -177,9 +181,9 @@ const MAX_MESSAGE_BYTES: usize = 4 * MAX_BODY;
 
 pub const CLOSE: u8 = 8;
 
-/// One WebSocket message as it went, its frames joined.
+/// One WebSocket message as it went, its frames joined, or one MQTT packet.
 #[derive(Clone, Debug, PartialEq)]
-pub struct WsMessage {
+pub struct StreamMessage {
     pub at: SystemTime,
     /// The app's to the server; else the server's to the app.
     pub sent: bool,
@@ -189,9 +193,11 @@ pub struct WsMessage {
     pub data: Vec<u8>,
     /// Its payload as it went, all of it.
     pub size: u64,
+    /// An MQTT packet's type and header; `data` is its message.
+    pub mqtt: Option<mqtt::Packet>,
 }
 
-impl WsMessage {
+impl StreamMessage {
     /// A Close's code and reason; 1005 when it gave none, as RFC 6455 has it.
     pub fn close(&self) -> Option<(u16, String)> {
         (self.opcode == CLOSE).then(|| match self.data.get(..2) {
@@ -253,6 +259,7 @@ impl Flows {
             messages: Vec::new(),
             dropped: 0,
             ended: None,
+            mqtt: None,
         });
         drop(list);
         (self.changed)();
@@ -856,7 +863,7 @@ fn switch(
         let joined = async {
             let server = res.upgrade().await.map_err(|e| error_chain(&e))?;
             let app = TokioIo::new(app.await.map_err(|e| e.to_string())?);
-            both_ways(app, server, true, id, &flows, stopped).await
+            both_ways(app, server, Carries::WebSocket, id, &flows, stopped).await
         };
         let result = joined.await;
         flows.update(id, |f| {
@@ -997,15 +1004,17 @@ async fn tunnel(req: Request<Incoming>, p: &Proxy) -> Response<Body> {
     )
 }
 
-/// The tunnel flow `id`'s bytes, both ways until both sides close, counted as they go.
+/// The tunnel flow `id`'s bytes, both ways until both sides close, counted as they go, and
+/// read as MQTT's packets if that's what the app speaks.
 async fn pipe(
     app: impl AsyncRead + AsyncWrite + Unpin,
-    upstream: TcpStream,
+    upstream: impl AsyncRead + AsyncWrite + Unpin,
     id: u64,
     started: Instant,
     p: &Proxy,
 ) {
-    let result = both_ways(app, upstream, false, id, &p.flows, p.stopped.clone()).await;
+    let stopped = p.stopped.clone();
+    let result = both_ways(app, upstream, Carries::Unknown, id, &p.flows, stopped).await;
     p.flows.update(id, |f| {
         // The proxy sees bytes, not the protocol's goodbye: once they went both ways the
         // tunnel worked, and a reset then (an MQTT client's hang-up, Windows' 10053) is
@@ -1020,40 +1029,54 @@ async fn pipe(
     });
 }
 
+/// What two joined sides carry, which says how to read their messages as they pass.
+#[derive(Clone, Copy, PartialEq)]
+enum Carries {
+    /// A tunnel's bytes: MQTT should the app's first ones be its CONNECT.
+    Unknown,
+    WebSocket,
+}
+
 /// `app` and `server` joined until both are done, or one fails or the capture stops; what
-/// went through counted into flow `id` as it goes, so an end in error keeps it. A
-/// WebSocket's (`ws`) is read as its messages too.
+/// went through counted into flow `id` as it goes, so an end in error keeps it, and read
+/// as what it `carries`.
 async fn both_ways(
     app: impl AsyncRead + AsyncWrite,
     server: impl AsyncRead + AsyncWrite,
-    ws: bool,
+    carries: Carries,
     id: u64,
     flows: &Flows,
     mut stopped: tokio::sync::watch::Receiver<()>,
 ) -> Result<(), String> {
     let (app_in, app_out) = tokio::io::split(app);
     let (server_in, server_out) = tokio::io::split(server);
-    let reader = |sent| {
-        ws.then(|| Reader {
-            sent,
-            ..Default::default()
-        })
-    };
-    let up = relay(app_in, server_out, true, reader(true), id, flows);
-    let down = relay(server_in, app_out, false, reader(false), id, flows);
+    let level = OnceLock::new();
+    let up = relay(
+        app_in,
+        server_out,
+        Reading::new(true, carries, &level),
+        id,
+        flows,
+    );
+    let down = relay(
+        server_in,
+        app_out,
+        Reading::new(false, carries, &level),
+        id,
+        flows,
+    );
     tokio::select! {
         done = async { tokio::try_join!(up, down) } => done.map(|_| ()).map_err(|e| e.to_string()),
         _ = stopped.changed() => Err("capture stopped".to_owned()),
     }
 }
 
-/// One way, the app's (`sent`) or the server's: what `from` sends goes on to `to`
-/// untouched, counted (and read, given a `reader`) once it has.
+/// One way, the app's or the server's (`reading` says which): what `from` sends goes on to
+/// `to` untouched, read and counted once it has.
 async fn relay(
     mut from: impl AsyncRead + Unpin,
     mut to: impl AsyncWrite + Unpin,
-    sent: bool,
-    mut reader: Option<Reader>,
+    mut reading: Reading<'_>,
     id: u64,
     flows: &Flows,
 ) -> std::io::Result<()> {
@@ -1066,15 +1089,77 @@ async fn relay(
             let _ = to.shutdown().await;
             return Ok(());
         }
+        // Read before it goes on: a broker answers the CONNECT that tells the level its
+        // side is read by only once it has it.
+        let got = reading.feed(&buf[..n]);
         to.write_all(&buf[..n]).await?;
-        let got = (reader.as_mut()).map_or_else(Vec::new, |r| r.feed(&buf[..n]));
         flows.update(id, |f| {
-            match sent {
+            match reading.sent {
                 true => f.request.size += n as u64,
                 false => f.response.size += n as u64,
             }
+            f.mqtt = f.mqtt.or(reading.level.get().copied());
             f.keep(got);
         });
+    }
+}
+
+/// One side's bytes read as they pass: a WebSocket's frames, or MQTT's packets.
+struct Reading<'a> {
+    /// The app's side; else the server's.
+    sent: bool,
+    ws: Option<Reader>,
+    mqtt: Option<mqtt::Packets>,
+    /// The app's first bytes in a tunnel, until they tell whether it speaks MQTT.
+    first: Option<Vec<u8>>,
+    /// MQTT's level, from the app's CONNECT: the broker's side is read by it.
+    level: &'a OnceLock<u8>,
+}
+
+impl<'a> Reading<'a> {
+    fn new(sent: bool, carries: Carries, level: &'a OnceLock<u8>) -> Self {
+        let ws = (carries == Carries::WebSocket).then(|| Reader {
+            sent,
+            ..Default::default()
+        });
+        Self {
+            sent,
+            ws,
+            mqtt: None,
+            first: (sent && carries == Carries::Unknown).then(Vec::new),
+            level,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> Vec<StreamMessage> {
+        if let Some(ws) = &mut self.ws {
+            return ws.feed(bytes);
+        }
+        if self.mqtt.is_none() {
+            let start = match (&mut self.first, self.level.get()) {
+                (Some(first), _) => {
+                    first.extend_from_slice(bytes);
+                    match mqtt::connect_starts(first) {
+                        None => return Vec::new(),
+                        Some(starts) => {
+                            let first = self.first.take().unwrap_or_default();
+                            starts.then(|| (mqtt::Packets::app(), first))
+                        }
+                    }
+                }
+                (None, Some(&level)) if !self.sent => {
+                    Some((mqtt::Packets::broker(level), bytes.to_vec()))
+                }
+                (None, _) => None,
+            };
+            let Some((mut packets, bytes)) = start else {
+                return Vec::new();
+            };
+            let got = packets.feed(&bytes, self.level);
+            self.mqtt = Some(packets);
+            return got;
+        }
+        (self.mqtt.as_mut()).map_or_else(Vec::new, |m| m.feed(bytes, self.level))
     }
 }
 
@@ -1088,7 +1173,7 @@ struct Reader {
     /// The frame whose payload is coming.
     frame: Option<Part>,
     /// A message whose last frame hasn't come, and whether it's compressed.
-    message: Option<(WsMessage, bool)>,
+    message: Option<(StreamMessage, bool)>,
     /// permessage-deflate's window, kept from one message to the next.
     inflate: Option<flate2::Decompress>,
     /// A message cut at `MAX_BODY` left the window unknown: later ones stay packed.
@@ -1108,7 +1193,7 @@ struct Part {
 }
 
 impl Reader {
-    fn feed(&mut self, mut bytes: &[u8]) -> Vec<WsMessage> {
+    fn feed(&mut self, mut bytes: &[u8]) -> Vec<StreamMessage> {
         let mut out = Vec::new();
         while !bytes.is_empty() {
             let Some(part) = &mut self.frame else {
@@ -1141,17 +1226,18 @@ impl Reader {
         out
     }
 
-    fn end_frame(&mut self, out: &mut Vec<WsMessage>) {
+    fn end_frame(&mut self, out: &mut Vec<StreamMessage>) {
         let Some(part) = self.frame.take() else {
             return;
         };
         let sent = self.sent;
-        let message = |opcode| WsMessage {
+        let message = |opcode| StreamMessage {
             at: SystemTime::now(),
             sent,
             opcode,
             data: Vec::new(),
             size: 0,
+            mqtt: None,
         };
         // Control frames stand alone, between a message's frames too.
         let (mut m, packed) = match part.opcode {
@@ -1176,7 +1262,7 @@ impl Reader {
     /// permessage-deflate: raw DEFLATE ending in a sync flush whose last four bytes were
     /// left off. Read with the window kept, which reads a sender that resets its own
     /// (no_context_takeover) just as well.
-    fn unpack(&mut self, m: &WsMessage) -> Option<Vec<u8>> {
+    fn unpack(&mut self, m: &StreamMessage) -> Option<Vec<u8>> {
         if self.lost || m.size > m.data.len() as u64 {
             self.lost = true;
             return None;
@@ -1537,8 +1623,9 @@ fn split_target(target: &str) -> (&str, u16) {
 }
 
 /// The app's TLS ends here, with a certificate for the host it named (its SNI, else the
-/// tunnel's), and each request inside goes on as any other, its URL https://. A handshake
-/// the app broke off is a flow with why.
+/// tunnel's), and each request inside goes on as any other, its URL https://; what isn't
+/// HTTP (MQTT's 8883) goes on over TLS of the proxy's own (`relay_tls`). A handshake the
+/// app broke off is a flow with why.
 async fn decrypt(
     app: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     target: &str,
@@ -1569,6 +1656,28 @@ async fn decrypt(
             return;
         }
     };
+    // HTTP when ALPN says so (browsers preconnect, and speak only later); else by what the
+    // app says first, as `inside` tells it, a server that speaks first included.
+    let http = tls.get_ref().1.alpn_protocol().is_some();
+    let mut tls = tls;
+    let front = match http {
+        true => None,
+        false => {
+            let mut first = [0u8];
+            match tokio::time::timeout(FIRST_WORD, tls.read(&mut first)).await {
+                Ok(Ok(0) | Err(_)) => return,
+                Ok(Ok(_)) => Some(first[0]),
+                Err(_) => None,
+            }
+        }
+    };
+    let app = Rewound {
+        front: front.map(|b| vec![b]).unwrap_or_default(),
+        inner: tls,
+    };
+    if !http && !front.is_some_and(|b| b.is_ascii_uppercase()) {
+        return relay_tls(app, target, &name, started, p).await;
+    }
     let name = match name.parse::<std::net::Ipv6Addr>() {
         Ok(_) => format!("[{name}]"),
         Err(_) => name,
@@ -1577,7 +1686,41 @@ async fn decrypt(
         443 => format!("https://{name}"),
         _ => format!("https://{name}:{port}"),
     };
-    requests(TokioIo::new(tls), origin, &p).await;
+    requests(TokioIo::new(app), origin, &p).await;
+}
+
+/// What an app's decrypted TLS to `target` carries that isn't HTTP: on to it over TLS to
+/// `name` with the network settings' trust and client certificate, as a tunnel flow, read
+/// as MQTT's packets if it's that.
+async fn relay_tls(
+    app: impl AsyncRead + AsyncWrite + Unpin,
+    target: &str,
+    name: &str,
+    started: Instant,
+    p: Proxy,
+) {
+    let id = p.flows.start("CONNECT", target, &HeaderMap::new());
+    let upstream = async {
+        let tcp = connect(&p.clients.route, target, p.own).await?;
+        let net = p.clients.network();
+        let ring = rustls::crypto::ring::default_provider();
+        let cert = net.cert_for(&format!("https://{target}"));
+        let versions = rustls::DEFAULT_VERSIONS;
+        let config = crate::mqtt::tls_config(net, cert, net.insecure, ring, versions)?;
+        let server = rustls::pki_types::ServerName::try_from(name.to_owned())
+            .map_err(|e| format!("{name}: {e}"))?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        (connector.connect(server, tcp).await).map_err(|e| format!("{target}: {e}"))
+    };
+    match upstream.await {
+        Ok(server) => {
+            p.flows.update(id, |f| f.status = Some(200));
+            pipe(app, server, id, started, &p).await;
+        }
+        Err(e) => p.flows.update(id, |f| {
+            (f.error, f.elapsed) = (Some(e), Some(started.elapsed()));
+        }),
+    }
 }
 
 /// The requests an app sends inside a tunnel, each a flow: they name only their path, and
@@ -2719,12 +2862,13 @@ mod tests {
     fn the_oldest_messages_go_past_the_caps() {
         let flows = Flows::new(|| {});
         let id = flows.start("GET", "http://a.test/ws", &HeaderMap::new());
-        let message = |data: Vec<u8>| WsMessage {
+        let message = |data: Vec<u8>| StreamMessage {
             at: SystemTime::now(),
             sent: false,
             opcode: 1,
             size: data.len() as u64,
             data,
+            mqtt: None,
         };
         flows.update(id, |f| {
             f.keep((0..MAX_MESSAGES + 5).map(|_| message(vec![b'x'])).collect())
@@ -3138,6 +3282,7 @@ mod tests {
             messages: Vec::new(),
             dropped: 0,
             ended: None,
+            mqtt: None,
         };
         let json = [("content-type", "application/json")];
         let post = flow(
@@ -3188,6 +3333,209 @@ mod tests {
         assert_eq!(
             (req.examples[0].status, &*req.examples[0].body),
             (201, r#"{"id":9}"#)
+        );
+    }
+
+    /// What `mqtt::tests::exchange` sent and got, as the capture read it: each packet's side,
+    /// type, header line and message, pings left out (they come when they come).
+    fn mqtt_seen(f: &Flow) -> Vec<(bool, &'static str, String, String)> {
+        (f.messages.iter())
+            .filter_map(|m| {
+                let p = m.mqtt.as_ref()?;
+                let message = String::from_utf8_lossy(&m.data).into_owned();
+                (!p.name().starts_with("PING"))
+                    .then(|| (m.sent, p.name(), p.summary.clone(), message))
+            })
+            .collect()
+    }
+
+    /// What the VDI showed: apitool's own MQTT through the capture listed as a CONNECT with
+    /// byte counts, nothing of what went. Now the flow is MQTT's, with every packet both
+    /// ways: the login and will, the subscriptions, and each message's topic and payload,
+    /// in 3.1.1 and in 5 (whose properties sit before the message).
+    #[test]
+    fn mqtt_through_the_proxy_reads_as_its_packets() {
+        use crate::mqtt::tests::{broker, broker_v5, exchange, expected, request};
+        let rt = runtime();
+        let (addr, flows) = proxy(&rt, direct());
+        for v5 in [false, true] {
+            let net = Network {
+                proxy: ProxyMode::Manual,
+                proxy_url: format!("http://{addr}"),
+                no_proxy: String::new(),
+                ..Default::default()
+            };
+            let port = if v5 { broker_v5() } else { broker() };
+            let url = format!("mqtt://127.0.0.1:{port}");
+            assert_eq!(exchange(request(url, v5), net), expected(v5));
+            let f = flow_when(&flows, |f| f.elapsed.is_some());
+            assert_eq!(
+                (f.mqtt, f.error.as_ref()),
+                (Some(if v5 { 5 } else { 4 }), None)
+            );
+            let seen = mqtt_seen(&f);
+            let (connect, rest) = seen.split_first().unwrap();
+            assert_eq!((connect.0, connect.1), (true, "CONNECT"));
+            assert!(connect.2.starts_with("tester · clean "), "{connect:?}");
+            let fields = &f.messages[0].mqtt.as_ref().unwrap().fields;
+            assert_eq!(
+                fields,
+                &[
+                    (
+                        "will".into(),
+                        "status/tester · QoS 1 · retain · offline".into()
+                    ),
+                    ("username".into(), "u".into()),
+                    ("password".into(), "p".into()),
+                ]
+            );
+            // Each side's in order; how the two interleave is the network's.
+            let side = |sent: bool| -> Vec<_> {
+                (rest.iter())
+                    .filter(|m| m.0 == sent)
+                    .map(|(_, name, line, message)| (*name, line.as_str(), message.as_str()))
+                    .collect()
+            };
+            assert_eq!(
+                side(true),
+                [
+                    ("SUBSCRIBE", "id 1 · a/# QoS 1, denied QoS 0", ""),
+                    ("PUBLISH", "cmd · QoS 0", "ping"),
+                    ("UNSUBSCRIBE", "", ""),
+                    ("SUBSCRIBE", "id 3 · b/# QoS 0", ""),
+                    ("DISCONNECT", "", ""),
+                ],
+                "v5 {v5}"
+            );
+            assert_eq!(
+                side(false),
+                [
+                    ("CONNACK", "", ""),
+                    ("SUBACK", "", ""),
+                    ("PUBLISH", "a/1 · QoS 0", "hello"),
+                    ("PUBLISH", "a/echo · QoS 0", "echo cmd ping"),
+                    ("UNSUBACK", "", ""),
+                    ("SUBACK", "", ""),
+                ],
+                "v5 {v5}"
+            );
+        }
+    }
+
+    /// mqtts while decrypting: its TLS isn't HTTP's, so it went to the HTTP reader and the
+    /// connection broke. Now what isn't HTTP goes on over TLS of the proxy's own (with the
+    /// network settings' client certificate, which this broker insists on), and is read as
+    /// MQTT as plain MQTT is.
+    #[test]
+    fn mqtts_while_decrypting_goes_through_and_reads_as_its_packets() {
+        use crate::mqtt::tests::{exchange, expected, listen_tls, request, serve_v3, tls_broker};
+        let rt = runtime();
+        let client = rcgen::generate_simple_self_signed(vec!["client.test".into()]).unwrap();
+        let dir = std::env::temp_dir();
+        let id = std::process::id();
+        let client_pem = dir.join(format!("apitool-capture-mqtts-client-{id}.pem"));
+        let pem = client.signing_key.serialize_pem() + &client.cert.pem();
+        std::fs::write(&client_pem, pem).unwrap();
+        let (cert, key) = Ca::generate().unwrap();
+        let ca_pem = dir.join(format!("apitool-capture-mqtts-ca-{id}.pem"));
+        std::fs::write(&ca_pem, &cert).unwrap();
+        // The broker's own certificate is self-signed: only apitool's side checks it.
+        let net = Network {
+            insecure: true,
+            client_cert: client_pem.display().to_string(),
+            ..direct()
+        };
+        let controls = Controls {
+            decrypt: Mutex::new(Some(Arc::new(Ca::load(&cert, &key).unwrap()))),
+            ..Default::default()
+        };
+        let (addr, flows) = proxy_with(&rt, net, controls);
+        let app = Network {
+            proxy: ProxyMode::Manual,
+            proxy_url: format!("http://{addr}"),
+            no_proxy: String::new(),
+            ca_file: ca_pem.display().to_string(),
+            ..Default::default()
+        };
+        let port = listen_tls(tls_broker(client.cert.der()), serve_v3);
+        let url = format!("mqtts://localhost:{port}");
+        let events = exchange(request(url, false), app);
+        std::fs::remove_file(&client_pem).unwrap();
+        std::fs::remove_file(&ca_pem).unwrap();
+        assert_eq!(events, expected(false));
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!(
+            (f.url.as_str(), f.mqtt, f.error.as_ref()),
+            (&*format!("localhost:{port}"), Some(4), None)
+        );
+        let published: Vec<_> = (mqtt_seen(&f).into_iter())
+            .filter(|m| m.1 == "PUBLISH")
+            .map(|m| (m.0, m.3))
+            .collect();
+        assert_eq!(
+            published,
+            [
+                (false, "hello".into()),
+                (true, "ping".into()),
+                (false, "echo cmd ping".into()),
+            ]
+        );
+    }
+
+    /// A browser opens its TLS ahead and speaks only later: ALPN, not the first word, says
+    /// it's HTTP, so a request well past `FIRST_WORD` is still read as one, not passed on
+    /// as bytes to the server.
+    #[test]
+    fn https_whose_app_speaks_late_is_still_read_as_http() {
+        let rt = runtime();
+        let (cert, key) = Ca::generate().unwrap();
+        let net = Network {
+            insecure: true,
+            ..direct()
+        };
+        let controls = Controls {
+            decrypt: Mutex::new(Some(Arc::new(Ca::load(&cert, &key).unwrap()))),
+            ..Default::default()
+        };
+        let (addr, flows) = proxy_with(&rt, net, controls);
+        let (server, _) = h2_server(&rt, true);
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let target = format!("localhost:{}", server.port());
+        write!(s, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").unwrap();
+        let head = crate::http::tests::read_request(&mut s);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(cert.as_bytes()).unwrap())
+            .unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = (rustls::ClientConfig::builder_with_provider(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, s);
+        while tls.conn.is_handshaking() {
+            tls.conn.complete_io(&mut tls.sock).unwrap();
+        }
+        std::thread::sleep(FIRST_WORD + Duration::from_millis(300));
+        write!(tls, "GET /late HTTP/1.1\r\nHost: {target}\r\n\r\n").unwrap();
+        let mut answer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        // Chunked: "pong" in it, not at its end.
+        while !answer.windows(4).any(|w| w == b"pong") {
+            let n = tls.read(&mut chunk).unwrap();
+            assert!(n > 0, "{}", String::from_utf8_lossy(&answer));
+            answer.extend_from_slice(&chunk[..n]);
+        }
+        let f = flow_when(&flows, |f| f.status.is_some());
+        assert_eq!(
+            (f.method.as_str(), f.url.as_str(), f.status),
+            ("GET", &*format!("https://{target}/late"), Some(200))
         );
     }
 }

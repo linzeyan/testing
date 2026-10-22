@@ -366,8 +366,10 @@ SOCKS 通道裡的明文 HTTP 也會顯示成流量；既不是 HTTP 也不是 T
 macOS、Windows、Linux 與 WSL、Firefox、命令列工具（Node、Python、curl、Java）和手機的步驟，每一項都附上
 移除方式，指令會帶入匯出的檔案，點一下就能複製。應用程式支援 HTTP/2 時，解密後的連線就使用 HTTP/2，
 因此 gRPC 也能通過，包括它的 trailers；送往 http:// 伺服器的 gRPC（h2c）也一樣。WebSocket（與 Socket.IO）
-也能通過，每條連線一筆流量，附雙向的位元組數。gzip、deflate、br 壓縮的內容會解開顯示。最多保留最近
-1000 筆流量，每個內容保留前 256 KiB。
+也能通過，每條連線一筆流量，附雙向的位元組數。經過它的 MQTT（3.1、3.1.1 與 5）會列為 MQTT 流量，
+雙向逐一列出封包：CONNECT 的 client ID、登入資訊與遺囑、訂閱，以及每則 PUBLISH 的 topic、QoS 與訊息。
+解密時 mqtts 也一樣能讀，並以 apitool 的網路設定透過 TLS 連到 broker。gzip、deflate、br 壓縮的內容會
+解開顯示。最多保留最近 1000 筆流量，每個內容保留前 256 KiB。
 
 規則（同 Proxyman 的工具）會套用到 URL 符合的每筆流量（URL 中任意位置符合即可，`*` 代表任意部分），
 由上往下套用，並存在工作區：**對應本機檔案**以檔案內容回應、不會送到伺服器；**改送其他伺服器**改送到

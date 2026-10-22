@@ -13063,7 +13063,7 @@ fn flow_list(
         .filter(|f| {
             needle.is_empty()
                 || f.url.to_lowercase().contains(&needle)
-                || f.method.eq_ignore_ascii_case(&needle)
+                || flow_method(f).eq_ignore_ascii_case(&needle)
         })
         .collect();
     let shown = picked.and_then(|id| list.iter().find(|f| f.id == id));
@@ -13139,7 +13139,7 @@ fn flow_list(
                 ui.horizontal(|ui| {
                     ui.set_height(row_h);
                     ui.weak(RichText::new(clock(f.at, *UTC_OFFSET)).monospace());
-                    method_badge(ui, &f.method, 7);
+                    method_badge(ui, flow_method(f), 7);
                     let (status, color) = match (f.status, &f.error) {
                         (_, Some(_)) => ("ERR".to_owned(), RED),
                         (Some(s), None) => (s.to_string(), status_color(s)),
@@ -13183,6 +13183,14 @@ fn flow_list(
     open_as
 }
 
+/// What a flow is listed as: a tunnel that carries MQTT as MQTT.
+fn flow_method(f: &crate::capture::Flow) -> &str {
+    match f.mqtt {
+        Some(_) => "MQTT",
+        None => &f.method,
+    }
+}
+
 /// Where the capture listens, the same in its pane and the status bar: on every interface
 /// once other devices are let in, though this machine's apps still use 127.0.0.1.
 fn listening_on(view: Option<&CaptureView>, addr: std::net::SocketAddr) -> String {
@@ -13202,7 +13210,8 @@ enum BytesView {
 }
 
 /// A flow as it went: the request, then the answer, each with its headers, the start of
-/// its body and its trailers; a WebSocket's messages after its 101.
+/// its body and its trailers; a WebSocket's messages after its 101, an MQTT tunnel's
+/// packets.
 fn flow_text(f: &crate::capture::Flow, view: BytesView) -> String {
     use std::fmt::Write;
     // A body this long is a download, not something to read here; Copy has the same.
@@ -13245,8 +13254,11 @@ fn flow_text(f: &crate::capture::Flow, view: BytesView) -> String {
         message(&mut out, &f.response);
     }
     let ws = f.status == Some(101);
-    if ws {
+    if ws || f.mqtt.is_some() {
         out.push('\n');
+        if let Some(level) = f.mqtt {
+            let _ = writeln!(out, "{}", crate::capture::mqtt::version(level));
+        }
         let skipped = f.messages.len().saturating_sub(SHOWN_MESSAGES);
         let earlier = f.dropped + skipped as u64;
         if earlier > 0 {
@@ -13257,6 +13269,24 @@ fn flow_text(f: &crate::capture::Flow, view: BytesView) -> String {
             );
         }
         for m in &f.messages[skipped..] {
+            let (arrow, at) = (if m.sent { "↑" } else { "↓" }, clock(m.at, *UTC_OFFSET));
+            if let Some(p) = &m.mqtt {
+                let _ = write!(out, "{arrow} {at} {}", p.name());
+                if p.kind == crate::capture::mqtt::PUBLISH {
+                    let _ = write!(out, " {}", human_size(m.size as usize));
+                }
+                if !p.summary.is_empty() {
+                    let _ = write!(out, "  {}", p.summary);
+                }
+                out.push('\n');
+                for (name, value) in &p.fields {
+                    let _ = writeln!(out, "  {name}: {value}");
+                }
+                if !m.data.is_empty() {
+                    bytes_text(&mut out, &m.data, "", "", view, MESSAGE_SHOWN);
+                }
+                continue;
+            }
             let kind = match m.opcode {
                 0 => "continuation",
                 1 => "text",
@@ -13266,7 +13296,6 @@ fn flow_text(f: &crate::capture::Flow, view: BytesView) -> String {
                 10 => "pong",
                 _ => "?",
             };
-            let (arrow, at) = (if m.sent { "↑" } else { "↓" }, clock(m.at, *UTC_OFFSET));
             let _ = write!(out, "{arrow} {at} {kind} {}", human_size(m.size as usize));
             match m.close() {
                 Some(close) => _ = writeln!(out, "  {}", close_text(close)),
@@ -13281,7 +13310,11 @@ fn flow_text(f: &crate::capture::Flow, view: BytesView) -> String {
             }
         }
         // Who ended it and why: the first Close, else none came.
-        match f.close().and_then(|c| Some((c.sent, c.close()?))) {
+        match f
+            .close()
+            .and_then(|c| Some((c.sent, c.close()?)))
+            .filter(|_| ws)
+        {
             Some((true, close)) => {
                 let _ = writeln!(
                     out,
@@ -13296,7 +13329,7 @@ fn flow_text(f: &crate::capture::Flow, view: BytesView) -> String {
                     tf("Closed by the server: {}", &[&close_text(close)])
                 );
             }
-            None if f.elapsed.is_some() => {
+            None if ws && f.elapsed.is_some() => {
                 let ended = close_text((1006, String::new()));
                 let _ = writeln!(out, "\n{ended}");
             }
@@ -22466,7 +22499,7 @@ mod ui_tests {
     /// and who closed it with what code. No view puts a NUL in the text.
     #[test]
     fn captured_grpc_and_websockets_read_as_what_they_carry() {
-        use crate::capture::{CLOSE, Flow, Message, WsMessage};
+        use crate::capture::{CLOSE, Flow, Message, StreamMessage};
         let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
             p.iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -22492,6 +22525,7 @@ mod ui_tests {
             messages: Vec::new(),
             dropped: 0,
             ended: None,
+            mqtt: None,
         };
         let grpc = [("content-type", "application/grpc")];
         let call = flow(
@@ -22520,12 +22554,13 @@ mod ui_tests {
         assert!(flow_text(&call, BytesView::Hex).contains("00 00 00 00 02 3a 00"));
         assert!(flow_text(&call, BytesView::Base64).contains("\nAAAAAAI6AA==\n"));
 
-        let ws_message = |sent: bool, opcode: u8, data: &[u8]| WsMessage {
+        let ws_message = |sent: bool, opcode: u8, data: &[u8]| StreamMessage {
             at: std::time::SystemTime::now(),
             sent,
             opcode,
             data: data.to_vec(),
             size: data.len() as u64,
+            mqtt: None,
         };
         let mut ws = flow(
             "GET",
@@ -22580,6 +22615,48 @@ mod ui_tests {
             text.ends_with("\nEnded: connection aborted (os error 10053)\n"),
             "{text}"
         );
+
+        // An MQTT tunnel lists as MQTT and reads as its packets: each one's header, a
+        // CONNECT's login, a PUBLISH's message; no WebSocket Close is looked for.
+        assert_eq!(flow_method(&tunnel), "CONNECT");
+        let packet = |sent: bool, kind: u8, summary: &str, fields: &[(&str, &str)], data: &[u8]| {
+            StreamMessage {
+                mqtt: Some(crate::capture::mqtt::Packet {
+                    kind,
+                    summary: summary.into(),
+                    fields: pairs(fields),
+                }),
+                opcode: 2,
+                ..ws_message(sent, 2, data)
+            }
+        };
+        tunnel.mqtt = Some(4);
+        tunnel.messages = vec![
+            packet(
+                true,
+                1,
+                "tester · keep alive 60 s",
+                &[("username", "u")],
+                b"",
+            ),
+            packet(false, 3, "a/1 · QoS 0", &[], b"{\"t\":21}"),
+        ];
+        assert_eq!(flow_method(&tunnel), "MQTT");
+        let text = flow_text(&tunnel, BytesView::Auto);
+        let lines: Vec<_> = text.lines().collect();
+        let i = lines.iter().position(|l| *l == "MQTT 3.1.1").expect(&text);
+        assert!(lines[i + 1].starts_with("↑ "), "{text}");
+        assert!(
+            lines[i + 1].ends_with(" CONNECT  tester · keep alive 60 s"),
+            "{text}"
+        );
+        assert_eq!(lines[i + 2], "  username: u");
+        assert!(
+            lines[i + 3].ends_with(" PUBLISH 8 B  a/1 · QoS 0"),
+            "{text}"
+        );
+        assert_eq!(lines[i + 4], "{\"t\":21}");
+        assert!(!text.contains("1006"), "{text}");
     }
 
     /// Decrypt HTTPS hands the proxy a CA made once and kept in the workspace, its key

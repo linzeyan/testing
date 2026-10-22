@@ -672,7 +672,7 @@ pub mod tests {
 
     /// How the fake broker reads and writes MQTT bytes: straight on TCP, or in binary
     /// WebSocket messages.
-    trait Pipe {
+    pub(crate) trait Pipe {
         fn fill(&mut self, buf: &mut BytesMut);
         fn put(&mut self, bytes: &[u8]);
     }
@@ -741,7 +741,7 @@ pub mod tests {
     }
 
     /// Serves one connection over TLS. A failed handshake is the client's to report.
-    fn listen_tls(config: Arc<rustls::ServerConfig>, serve: fn(&mut dyn Pipe)) -> u16 {
+    pub(crate) fn listen_tls(config: Arc<rustls::ServerConfig>, serve: fn(&mut dyn Pipe)) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -759,7 +759,7 @@ pub mod tests {
 
     /// A broker with a self-signed certificate that wants a client certificate signed by
     /// `client_ca`.
-    fn tls_broker(client_ca: &CertificateDer<'static>) -> Arc<rustls::ServerConfig> {
+    pub(crate) fn tls_broker(client_ca: &CertificateDer<'static>) -> Arc<rustls::ServerConfig> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut roots = rustls::RootCertStore::empty();
         roots.add(client_ca.clone()).unwrap();
@@ -849,7 +849,7 @@ pub mod tests {
         listen(false, serve_v5)
     }
 
-    fn serve_v3(s: &mut dyn Pipe) {
+    pub(crate) fn serve_v3(s: &mut dyn Pipe) {
         let mut buf = BytesMut::new();
         let mut next = |s: &mut dyn Pipe| loop {
             match Packet::read(&mut buf, MAX_PACKET) {
@@ -989,7 +989,7 @@ pub mod tests {
         }
     }
 
-    fn request(url: String, v5: bool) -> Request {
+    pub(crate) fn request(url: String, v5: bool) -> Request {
         Request {
             method: "MQTT".into(),
             url,
@@ -1031,7 +1031,7 @@ pub mod tests {
     /// Subscribes to a/# and "denied"; answers the hello with a publish (with a user
     /// property, content type, response topic and expiry in MQTT 5); once the echo is back, swaps "denied" for b/# while
     /// connected; hangs up once b/# is subscribed.
-    fn exchange(req: Request, net: Network) -> Vec<Event> {
+    pub(crate) fn exchange(req: Request, net: Network) -> Vec<Event> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1080,7 +1080,7 @@ pub mod tests {
     }
 
     /// MQTT 5's refusal says why, and its messages carry their properties both ways.
-    fn expected(v5: bool) -> Vec<Event> {
+    pub(crate) fn expected(v5: bool) -> Vec<Event> {
         let (refused, unit) = match v5 {
             true => (
                 "refused (NotAuthorized)",
