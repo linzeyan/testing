@@ -430,9 +430,12 @@ naming the exported file, a click to copy each. Decrypted
 connections speak HTTP/2 when the app offers it, so gRPC goes through, its trailers too, and
 so does gRPC to an http:// server (h2c). WebSockets (and Socket.IO) go through, a flow each
 with the bytes sent and received. MQTT (3.1, 3.1.1 and 5) through it is a flow listed as MQTT,
-with each packet both ways: a CONNECT's client ID, login and will, the subscriptions, and each
-PUBLISH's topic, QoS and message. mqtts reads the same while decrypting, going on to the broker
-over TLS with apitool's network settings. A gzip, deflate or br body shows unpacked. The latest
+with each packet both ways: a CONNECT's client ID, login and will, each PUBLISH's topic, QoS and
+message (shown as its MQTT 5 content type says), what each subscription asked for and was
+granted, acknowledgements and reason codes by name, and MQTT 5's properties (a topic sent as an
+alias shows as the topic). mqtts reads the same while decrypting, going on to the broker over
+TLS with apitool's network settings, and so does MQTT over WebSocket (the `mqtt` subprotocol);
+ws:// in a CONNECT tunnel needs "Decrypt HTTPS" on to be read, as plain HTTP there does. A gzip, deflate or br body shows unpacked. The latest
 1000 flows are kept, each body's first 256 KiB.
 
 Rules, as Proxyman's tools, apply to every exchange whose URL matches (anywhere in the URL,

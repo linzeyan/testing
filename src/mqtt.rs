@@ -704,7 +704,7 @@ pub mod tests {
 
     /// Serves one connection on a free port. Over WebSocket it insists on the path
     /// /mqtt and the "mqtt" subprotocol, as brokers do.
-    fn listen(ws: bool, serve: fn(&mut dyn Pipe)) -> u16 {
+    pub(crate) fn listen(ws: bool, serve: fn(&mut dyn Pipe)) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -906,7 +906,7 @@ pub mod tests {
     }
 
     /// `serve_v3` in MQTT 5, which says why it refuses "denied".
-    fn serve_v5(s: &mut dyn Pipe) {
+    pub(crate) fn serve_v5(s: &mut dyn Pipe) {
         use p5::Packet;
         let max = Some(MAX_PACKET as u32);
         let mut buf = BytesMut::new();

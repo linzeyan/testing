@@ -13283,7 +13283,19 @@ fn flow_text(f: &crate::capture::Flow, view: BytesView) -> String {
                     let _ = writeln!(out, "  {name}: {value}");
                 }
                 if !m.data.is_empty() {
-                    bytes_text(&mut out, &m.data, "", "", view, MESSAGE_SHOWN);
+                    // MQTT 5 can say what its message is: shown as an HTTP body of that
+                    // type would be, UTF-8 as text.
+                    let field = |name: &str| {
+                        (p.fields.iter())
+                            .find(|(k, _)| k == name)
+                            .map(|(_, v)| v.as_str())
+                    };
+                    let kind = match (field("Content Type"), field("Payload Format Indicator")) {
+                        (Some(kind), _) => kind,
+                        (None, Some("UTF-8")) => "text/plain",
+                        _ => "",
+                    };
+                    bytes_text(&mut out, &m.data, kind, "", view, MESSAGE_SHOWN);
                 }
                 continue;
             }
@@ -22657,6 +22669,28 @@ mod ui_tests {
         );
         assert_eq!(lines[i + 4], "{\"t\":21}");
         assert!(!text.contains("1006"), "{text}");
+
+        // MQTT 5 saying its message is UTF-8 shows it as text, control characters and all,
+        // where bytes unlabelled read as binary.
+        let ticks = b"21\x1e22\x1e";
+        tunnel.messages = vec![
+            packet(
+                false,
+                3,
+                "t · QoS 0",
+                &[("Payload Format Indicator", "UTF-8")],
+                ticks,
+            ),
+            packet(false, 3, "t · QoS 0", &[], ticks),
+        ];
+        let text = flow_text(&tunnel, BytesView::Auto);
+        let lines: Vec<_> = text.lines().collect();
+        let i = lines
+            .iter()
+            .position(|l| l.ends_with("  t · QoS 0"))
+            .expect(&text);
+        assert_eq!(lines[i + 2], "21\u{fffd}22\u{fffd}");
+        assert!(lines[i + 4].starts_with("00000000  32 31 1e "), "{text}");
     }
 
     /// Decrypt HTTPS hands the proxy a CA made once and kept in the workspace, its key

@@ -859,11 +859,20 @@ fn switch(
         (f.status, f.response.headers) = (Some(status.as_u16()), shown);
     });
     let (flows, stopped) = (p.flows.clone(), p.stopped.clone());
+    // MQTT's subprotocol is "mqtt" (3.1's "mqttv3.1"): its packets ride binary messages.
+    let protocol = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok());
+    let carries = match protocol.is_some_and(|v| v.trim().to_ascii_lowercase().starts_with("mqtt"))
+    {
+        true => Carries::MqttWebSocket,
+        false => Carries::WebSocket,
+    };
     tokio::spawn(async move {
         let joined = async {
             let server = res.upgrade().await.map_err(|e| error_chain(&e))?;
             let app = TokioIo::new(app.await.map_err(|e| e.to_string())?);
-            both_ways(app, server, Carries::WebSocket, id, &flows, stopped).await
+            both_ways(app, server, carries, id, &flows, stopped).await
         };
         let result = joined.await;
         flows.update(id, |f| {
@@ -1035,6 +1044,8 @@ enum Carries {
     /// A tunnel's bytes: MQTT should the app's first ones be its CONNECT.
     Unknown,
     WebSocket,
+    /// A WebSocket whose binary messages carry MQTT's packets.
+    MqttWebSocket,
 }
 
 /// `app` and `server` joined until both are done, or one fails or the capture stops; what
@@ -1114,26 +1125,34 @@ struct Reading<'a> {
     first: Option<Vec<u8>>,
     /// MQTT's level, from the app's CONNECT: the broker's side is read by it.
     level: &'a OnceLock<u8>,
+    /// MQTT in a WebSocket's binary messages.
+    in_ws: bool,
 }
 
 impl<'a> Reading<'a> {
     fn new(sent: bool, carries: Carries, level: &'a OnceLock<u8>) -> Self {
-        let ws = (carries == Carries::WebSocket).then(|| Reader {
+        let in_ws = carries == Carries::MqttWebSocket;
+        let ws = (carries != Carries::Unknown).then(|| Reader {
             sent,
             ..Default::default()
         });
         Self {
             sent,
             ws,
-            mqtt: None,
+            mqtt: (in_ws && sent).then(mqtt::Packets::app),
             first: (sent && carries == Carries::Unknown).then(Vec::new),
             level,
+            in_ws,
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) -> Vec<StreamMessage> {
         if let Some(ws) = &mut self.ws {
-            return ws.feed(bytes);
+            let got = ws.feed(bytes);
+            if !self.in_ws {
+                return got;
+            }
+            return got.into_iter().flat_map(|m| self.packets_in(m)).collect();
         }
         if self.mqtt.is_none() {
             let start = match (&mut self.first, self.level.get()) {
@@ -1160,6 +1179,29 @@ impl<'a> Reading<'a> {
             return got;
         }
         (self.mqtt.as_mut()).map_or_else(Vec::new, |m| m.feed(bytes, self.level))
+    }
+
+    /// The packets a WebSocket message carries, or the message itself when it's no MQTT
+    /// (a Close, a ping) or can't be read as it (the broker's before the level is known, one
+    /// cut at `MAX_BODY`). After a cut, reading starts again at the next message: clients
+    /// send a packet a message.
+    fn packets_in(&mut self, m: StreamMessage) -> Vec<StreamMessage> {
+        if m.opcode != 2 && m.opcode != 0 {
+            return vec![m];
+        }
+        if m.size > m.data.len() as u64 {
+            self.mqtt = None;
+            return vec![m];
+        }
+        if self.mqtt.is_none()
+            && let Some(&level) = self.level.get()
+        {
+            self.mqtt = Some(mqtt::Packets::new(self.sent, Some(level)));
+        }
+        match &mut self.mqtt {
+            Some(packets) => packets.feed(&m.data, self.level),
+            None => vec![m],
+        }
     }
 }
 
@@ -3378,9 +3420,13 @@ mod tests {
             assert_eq!((connect.0, connect.1), (true, "CONNECT"));
             assert!(connect.2.starts_with("tester · clean "), "{connect:?}");
             let fields = &f.messages[0].mqtt.as_ref().unwrap().fields;
+            let login: Vec<_> = (fields.iter())
+                .filter(|(k, _)| ["will", "username", "password"].contains(&k.as_str()))
+                .cloned()
+                .collect();
             assert_eq!(
-                fields,
-                &[
+                login,
+                [
                     (
                         "will".into(),
                         "status/tester · QoS 1 · retain · offline".into()
@@ -3396,30 +3442,112 @@ mod tests {
                     .map(|(_, name, line, message)| (*name, line.as_str(), message.as_str()))
                     .collect()
             };
+            let (unsuback, bye) = match v5 {
+                true => ("id 2 · Success", "Normal disconnection"),
+                false => ("id 2", ""),
+            };
             assert_eq!(
                 side(true),
                 [
                     ("SUBSCRIBE", "id 1 · a/# QoS 1, denied QoS 0", ""),
                     ("PUBLISH", "cmd · QoS 0", "ping"),
-                    ("UNSUBSCRIBE", "", ""),
+                    ("UNSUBSCRIBE", "id 2 · denied", ""),
                     ("SUBSCRIBE", "id 3 · b/# QoS 0", ""),
-                    ("DISCONNECT", "", ""),
+                    ("DISCONNECT", bye, ""),
                 ],
                 "v5 {v5}"
             );
+            let (accepted, refused, granted) = match v5 {
+                true => (
+                    "Success",
+                    "id 1 · Granted QoS 1, 0x87 Not authorized",
+                    "id 3 · Granted QoS 0",
+                ),
+                false => (
+                    "Connection Accepted",
+                    "id 1 · QoS 1, 0x80 Failure",
+                    "id 3 · QoS 0",
+                ),
+            };
             assert_eq!(
                 side(false),
                 [
-                    ("CONNACK", "", ""),
-                    ("SUBACK", "", ""),
+                    ("CONNACK", accepted, ""),
+                    ("SUBACK", refused, ""),
                     ("PUBLISH", "a/1 · QoS 0", "hello"),
                     ("PUBLISH", "a/echo · QoS 0", "echo cmd ping"),
-                    ("UNSUBACK", "", ""),
-                    ("SUBACK", "", ""),
+                    ("UNSUBACK", unsuback, ""),
+                    ("SUBACK", granted, ""),
                 ],
                 "v5 {v5}"
             );
+            // MQTT 5's properties, the will's apart, as what the app set.
+            let packet = |name: &str, sent: bool| {
+                let m = (f.messages.iter()).find(|m| {
+                    m.sent == sent && m.mqtt.as_ref().is_some_and(|p| p.summary.starts_with(name))
+                });
+                m.and_then(|m| m.mqtt.clone()).unwrap().fields
+            };
+            let has = |fields: &[(String, String)], k: &str, v: &str| {
+                fields.iter().any(|(a, b)| a == k && b == v)
+            };
+            let cmd = packet("cmd", true);
+            let connect = &f.messages[0].mqtt.as_ref().unwrap().fields;
+            assert_eq!(
+                [
+                    has(&cmd, "Content Type", "text/plain"),
+                    has(&cmd, "Response Topic", "reply/1"),
+                    has(&cmd, "Message Expiry Interval", "60 s"),
+                    has(&cmd, "User Property", "unit=°C"),
+                    has(connect, "Will Message Expiry Interval", "300 s"),
+                    has(connect, "Will Content Type", "text/plain"),
+                ],
+                [v5; 6],
+                "{cmd:?} {connect:?}"
+            );
         }
+    }
+
+    /// MQTT over WebSocket (ws:// to /mqtt, subprotocol "mqtt") while decrypting: the
+    /// upgrade is a flow as any WebSocket's, and its binary messages read as the packets
+    /// they carry rather than as hex.
+    #[test]
+    fn mqtt_over_websocket_reads_as_its_packets() {
+        use crate::mqtt::tests::{exchange, expected, listen, request, serve_v5};
+        let rt = runtime();
+        let (cert, key) = Ca::generate().unwrap();
+        let controls = Controls {
+            decrypt: Mutex::new(Some(Arc::new(Ca::load(&cert, &key).unwrap()))),
+            ..Default::default()
+        };
+        let (addr, flows) = proxy_with(&rt, direct(), controls);
+        let net = Network {
+            proxy: ProxyMode::Manual,
+            proxy_url: format!("http://{addr}"),
+            no_proxy: String::new(),
+            ..Default::default()
+        };
+        let url = format!("ws://127.0.0.1:{}/mqtt", listen(true, serve_v5));
+        assert_eq!(exchange(request(url.clone(), true), net), expected(true));
+        let f = flow_when(&flows, |f| f.elapsed.is_some());
+        assert_eq!((f.status, f.mqtt), (Some(101), Some(5)));
+        let published: Vec<_> = (mqtt_seen(&f).into_iter())
+            .filter(|m| m.1 == "PUBLISH")
+            .map(|m| (m.0, m.2, m.3))
+            .collect();
+        assert_eq!(
+            published,
+            [
+                (false, "a/1 · QoS 0".into(), "hello".into()),
+                (true, "cmd · QoS 0".into(), "ping".into()),
+                (false, "a/echo · QoS 0".into(), "echo cmd ping".into()),
+            ]
+        );
+        assert!(
+            (f.messages.iter()).all(|m| m.mqtt.is_some() || m.opcode >= 8),
+            "every binary message read: {:?}",
+            f.messages
+        );
     }
 
     /// mqtts while decrypting: its TLS isn't HTTP's, so it went to the HTTP reader and the
@@ -3537,5 +3665,39 @@ mod tests {
             (f.method.as_str(), f.url.as_str(), f.status),
             ("GET", &*format!("https://{target}/late"), Some(200))
         );
+    }
+
+    /// MQTT over WebSocket: a message cut at `MAX_BODY` shows as the message it is, and
+    /// reading starts again at the next one, on whichever side, instead of taking what
+    /// follows for the rest of the cut packet.
+    #[test]
+    fn mqtt_over_websocket_cut_at_the_cap_starts_again_at_the_next_message() {
+        let level = OnceLock::new();
+        level.set(4).unwrap();
+        let small = b"\x30\x05\x00\x01thi";
+        // A PUBLISH past the cap, then two small ones.
+        let mut big = vec![0x30, 0x83, 0x80, 0x10, 0x00, 0x01, b't'];
+        big.resize(7 + 0x40000, b'x');
+        for sent in [false, true] {
+            let mut side = Reading::new(sent, Carries::MqttWebSocket, &level);
+            let mask = sent.then_some([1, 2, 3, 4]);
+            let mut bytes = ws_frame(true, false, 2, &big, mask);
+            for _ in 0..2 {
+                bytes.extend(ws_frame(true, false, 2, small, mask));
+            }
+            let got = side.feed(&bytes);
+            let seen: Vec<_> = (got.iter())
+                .map(|m| (m.sent, m.mqtt.as_ref().map(|p| p.summary.clone()), m.size))
+                .collect();
+            let publish = Some("t · QoS 0".to_owned());
+            assert_eq!(
+                seen,
+                [
+                    (sent, None, big.len() as u64),
+                    (sent, publish.clone(), 2),
+                    (sent, publish, 2),
+                ]
+            );
+        }
     }
 }

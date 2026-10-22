@@ -367,8 +367,11 @@ macOS、Windows、Linux 與 WSL、Firefox、命令列工具（Node、Python、cu
 移除方式，指令會帶入匯出的檔案，點一下就能複製。應用程式支援 HTTP/2 時，解密後的連線就使用 HTTP/2，
 因此 gRPC 也能通過，包括它的 trailers；送往 http:// 伺服器的 gRPC（h2c）也一樣。WebSocket（與 Socket.IO）
 也能通過，每條連線一筆流量，附雙向的位元組數。經過它的 MQTT（3.1、3.1.1 與 5）會列為 MQTT 流量，
-雙向逐一列出封包：CONNECT 的 client ID、登入資訊與遺囑、訂閱，以及每則 PUBLISH 的 topic、QoS 與訊息。
-解密時 mqtts 也一樣能讀，並以 apitool 的網路設定透過 TLS 連到 broker。gzip、deflate、br 壓縮的內容會
+雙向逐一列出封包：CONNECT 的 client ID、登入資訊與遺囑，每則 PUBLISH 的 topic、QoS 與訊息（依 MQTT 5 的
+content type 顯示），每個訂閱要求與獲准的內容，確認封包與具名的 reason code，以及 MQTT 5 的 properties
+（以 alias 送出的 topic 會還原成 topic 名稱）。解密時 mqtts 也一樣能讀，並以 apitool 的網路設定透過 TLS
+連到 broker；MQTT over WebSocket（`mqtt` subprotocol）亦同。CONNECT tunnel 裡的 ws:// 跟其中的明文
+HTTP 一樣，要勾選「解密 HTTPS」才讀得到。gzip、deflate、br 壓縮的內容會
 解開顯示。最多保留最近 1000 筆流量，每個內容保留前 256 KiB。
 
 規則（同 Proxyman 的工具）會套用到 URL 符合的每筆流量（URL 中任意位置符合即可，`*` 代表任意部分），

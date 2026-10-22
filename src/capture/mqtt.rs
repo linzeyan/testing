@@ -3,6 +3,7 @@
 //! rumqttc's: that one takes a packet only whole (up to 256 MB), refuses 3.1, and gives
 //! typed structs each to be laid out field by field.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
@@ -22,7 +23,15 @@ pub struct Packet {
 
 pub const PUBLISH: u8 = 3;
 const CONNECT: u8 = 1;
+const CONNACK: u8 = 2;
+const PUBACK: u8 = 4;
+const PUBCOMP: u8 = 7;
 const SUBSCRIBE: u8 = 8;
+const SUBACK: u8 = 9;
+const UNSUBSCRIBE: u8 = 10;
+const UNSUBACK: u8 = 11;
+const DISCONNECT: u8 = 14;
+const AUTH: u8 = 15;
 
 const NAMES: [&str; 16] = [
     "RESERVED",
@@ -102,6 +111,8 @@ pub struct Packets {
     packet: Option<Pending>,
     /// A fixed header that can't be one: where the next packet starts is unknown.
     lost: bool,
+    /// MQTT 5's topic aliases this side set: a PUBLISH may name its topic by one alone.
+    aliases: HashMap<u16, String>,
 }
 
 struct Pending {
@@ -123,13 +134,15 @@ impl Packets {
         Self::new(false, Some(level))
     }
 
-    fn new(sent: bool, level: Option<u8>) -> Self {
+    /// Starting afresh mid-connection, at a WebSocket message that begins a packet.
+    pub fn new(sent: bool, level: Option<u8>) -> Self {
         Self {
             sent,
             level,
             head: Vec::new(),
             packet: None,
             lost: false,
+            aliases: HashMap::new(),
         }
     }
 
@@ -181,6 +194,7 @@ impl Packets {
             bytes: &p.body,
             at: 0,
         };
+        let v5 = self.v5();
         let read = match kind {
             CONNECT => connect(&mut c).map(|(at, summary, fields)| {
                 if self.sent {
@@ -189,8 +203,14 @@ impl Packets {
                 }
                 (summary, fields)
             }),
-            PUBLISH => publish(&mut c, p.first, self.v5()).map(|s| (s, Vec::new())),
-            SUBSCRIBE => subscribe(&mut c, self.v5()).map(|s| (s, Vec::new())),
+            CONNACK => connack(&mut c, v5),
+            PUBLISH => publish(&mut c, p.first, v5, &mut self.aliases),
+            PUBACK..=PUBCOMP => ack(&mut c, v5),
+            SUBSCRIBE => subscribe(&mut c, v5),
+            SUBACK => suback(&mut c, v5),
+            UNSUBSCRIBE => unsubscribe(&mut c, v5),
+            UNSUBACK => unsuback(&mut c, v5),
+            DISCONNECT | AUTH if v5 => reason_only(&mut c, kind),
             _ => Some((String::new(), Vec::new())),
         };
         let (summary, fields) = read.unwrap_or_else(|| ("unreadable".into(), Vec::new()));
@@ -256,6 +276,10 @@ impl<'a> Cursor<'a> {
         Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?))
     }
 
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
+    }
+
     fn varint(&mut self) -> Option<u32> {
         let mut n = 0u32;
         for i in 0..4 {
@@ -282,27 +306,165 @@ impl<'a> Cursor<'a> {
         &self.bytes[self.at.min(self.bytes.len())..]
     }
 
-    /// MQTT 5's properties, passed over.
-    fn properties(&mut self) -> Option<()> {
+    /// MQTT 5's properties, each as its name and value (spec names, so they can be looked
+    /// up); none is left out, as a broker's limits and reasons are what one comes for.
+    fn properties(&mut self) -> Option<Fields> {
         let n = self.varint()? as usize;
-        self.take(n).map(|_| ())
+        let mut c = Cursor {
+            bytes: self.take(n)?,
+            at: 0,
+        };
+        let mut fields = Vec::new();
+        while !c.rest().is_empty() {
+            let id = c.varint()?;
+            let (name, kind) = PROPERTIES.iter().find(|p| p.0 == id).map(|p| (p.1, p.2))?;
+            let value = match kind {
+                Prop::Byte => match (id, c.u8()?) {
+                    (0x01, 0) => "bytes".into(),
+                    (0x01, 1) => "UTF-8".into(),
+                    (_, b) => b.to_string(),
+                },
+                Prop::U16 => c.u16()?.to_string(),
+                Prop::Secs => format!("{} s", c.u32()?),
+                Prop::U32 => c.u32()?.to_string(),
+                Prop::Varint => c.varint()?.to_string(),
+                Prop::Str => c.str()?,
+                Prop::Bin => readable(c.bin()?),
+                Prop::Pair => format!("{}={}", c.str()?, c.str()?),
+            };
+            // Server Keep Alive is in seconds too, but two bytes.
+            let value = if id == 0x13 {
+                format!("{value} s")
+            } else {
+                value
+            };
+            fields.push((name.to_owned(), value));
+        }
+        Some(fields)
     }
 }
 
 /// What a header says that doesn't fit its line: a name and its value each.
 type Fields = Vec<(String, String)>;
 
-/// A CONNECT's level, its client ID, session and keep alive in a line, and its will and
-/// login apart.
+#[derive(Clone, Copy)]
+enum Prop {
+    Byte,
+    U16,
+    U32,
+    /// Four bytes of seconds.
+    Secs,
+    Varint,
+    Str,
+    Bin,
+    Pair,
+}
+
+/// MQTT 5's properties (section 2.2.2.2): identifier, name, how its value is written.
+const PROPERTIES: &[(u32, &str, Prop)] = &[
+    (0x01, "Payload Format Indicator", Prop::Byte),
+    (0x02, "Message Expiry Interval", Prop::Secs),
+    (0x03, "Content Type", Prop::Str),
+    (0x08, "Response Topic", Prop::Str),
+    (0x09, "Correlation Data", Prop::Bin),
+    (0x0b, "Subscription Identifier", Prop::Varint),
+    (0x11, "Session Expiry Interval", Prop::Secs),
+    (0x12, "Assigned Client Identifier", Prop::Str),
+    (0x13, "Server Keep Alive", Prop::U16),
+    (0x15, "Authentication Method", Prop::Str),
+    (0x16, "Authentication Data", Prop::Bin),
+    (0x17, "Request Problem Information", Prop::Byte),
+    (0x18, "Will Delay Interval", Prop::Secs),
+    (0x19, "Request Response Information", Prop::Byte),
+    (0x1a, "Response Information", Prop::Str),
+    (0x1c, "Server Reference", Prop::Str),
+    (0x1f, "Reason String", Prop::Str),
+    (0x21, "Receive Maximum", Prop::U16),
+    (0x22, "Topic Alias Maximum", Prop::U16),
+    (0x23, "Topic Alias", Prop::U16),
+    (0x24, "Maximum QoS", Prop::Byte),
+    (0x25, "Retain Available", Prop::Byte),
+    (0x26, "User Property", Prop::Pair),
+    (0x27, "Maximum Packet Size", Prop::U32),
+    (0x28, "Wildcard Subscription Available", Prop::Byte),
+    (0x29, "Subscription Identifier Available", Prop::Byte),
+    (0x2a, "Shared Subscription Available", Prop::Byte),
+];
+
+/// Text when it is (a correlation ID often is), else hex.
+fn readable(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if !text.chars().any(char::is_control) => text.to_owned(),
+        _ => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+    }
+}
+
+/// A reason code as the spec names it (section 2.4), for the packet `kind` it's in: 0 and
+/// the granted QoS read as such, a failure with its code to search by.
+fn reason(code: u8, kind: u8) -> String {
+    let name = match (code, kind) {
+        (0x00, DISCONNECT) => "Normal disconnection",
+        (0x00, SUBACK) => "Granted QoS 0",
+        (0x00, _) => "Success",
+        (0x01, _) => "Granted QoS 1",
+        (0x02, _) => "Granted QoS 2",
+        (0x04, _) => "Disconnect with Will Message",
+        (0x10, _) => "No matching subscribers",
+        (0x11, _) => "No subscription existed",
+        (0x18, _) => "Continue authentication",
+        (0x19, _) => "Re-authenticate",
+        (0x80, _) => "Unspecified error",
+        (0x81, _) => "Malformed Packet",
+        (0x82, _) => "Protocol Error",
+        (0x83, _) => "Implementation specific error",
+        (0x84, _) => "Unsupported Protocol Version",
+        (0x85, _) => "Client Identifier not valid",
+        (0x86, _) => "Bad User Name or Password",
+        (0x87, _) => "Not authorized",
+        (0x88, _) => "Server unavailable",
+        (0x89, _) => "Server busy",
+        (0x8a, _) => "Banned",
+        (0x8b, _) => "Server shutting down",
+        (0x8c, _) => "Bad authentication method",
+        (0x8d, _) => "Keep Alive timeout",
+        (0x8e, _) => "Session taken over",
+        (0x8f, _) => "Topic Filter invalid",
+        (0x90, _) => "Topic Name invalid",
+        (0x91, _) => "Packet Identifier in use",
+        (0x92, _) => "Packet Identifier not found",
+        (0x93, _) => "Receive Maximum exceeded",
+        (0x94, _) => "Topic Alias invalid",
+        (0x95, _) => "Packet too large",
+        (0x96, _) => "Message rate too high",
+        (0x97, _) => "Quota exceeded",
+        (0x98, _) => "Administrative action",
+        (0x99, _) => "Payload format invalid",
+        (0x9a, _) => "Retain not supported",
+        (0x9b, _) => "QoS not supported",
+        (0x9c, _) => "Use another server",
+        (0x9d, _) => "Server moved",
+        (0x9e, _) => "Shared Subscriptions not supported",
+        (0x9f, _) => "Connection rate exceeded",
+        (0xa0, _) => "Maximum connect time",
+        (0xa1, _) => "Subscription Identifiers not supported",
+        (0xa2, _) => "Wildcard Subscriptions not supported",
+        _ => "",
+    };
+    match code {
+        0x00..=0x02 => name.to_owned(),
+        _ => format!("0x{code:02x} {name}").trim_end().to_owned(),
+    }
+}
+
+/// A CONNECT's level, its client ID, session and keep alive in a line; its will, login and
+/// properties apart, the will's own prefixed "Will".
 fn connect(c: &mut Cursor) -> Option<(u8, String, Fields)> {
     let _name = c.str()?;
     let level = c.u8()?;
     let flags = c.u8()?;
     let keep_alive = c.u16()?;
     let v5 = level == 5;
-    if v5 {
-        c.properties()?;
-    }
+    let properties = if v5 { c.properties()? } else { Vec::new() };
     let id = c.str()?;
     let mut line = vec![match id.is_empty() {
         true => "no client ID".to_owned(),
@@ -314,15 +476,17 @@ fn connect(c: &mut Cursor) -> Option<(u8, String, Fields)> {
     line.push(format!("keep alive {keep_alive} s"));
     let mut fields = Vec::new();
     if flags & 0x04 != 0 {
-        if v5 {
-            c.properties()?;
-        }
+        let will_properties = if v5 { c.properties()? } else { Vec::new() };
         let topic = c.str()?;
         let message = crate::binary::lossy(c.bin()?);
         let qos = (flags >> 3) & 3;
         let retain = if flags & 0x20 != 0 { " · retain" } else { "" };
         let will = format!("{topic} · QoS {qos}{retain} · {message}");
         fields.push(("will".into(), will));
+        let prefixed = will_properties
+            .into_iter()
+            .map(|(k, v)| (format!("Will {k}"), v));
+        fields.extend(prefixed);
     }
     if flags & 0x80 != 0 {
         fields.push(("username".into(), c.str()?));
@@ -330,18 +494,62 @@ fn connect(c: &mut Cursor) -> Option<(u8, String, Fields)> {
     if flags & 0x40 != 0 {
         fields.push(("password".into(), crate::binary::lossy(c.bin()?)));
     }
+    fields.extend(properties);
     Some((level, line.join(" · "), fields))
 }
 
-/// A PUBLISH's topic, QoS, packet ID and flags; the cursor is left at its message.
-fn publish(c: &mut Cursor, first: u8, v5: bool) -> Option<String> {
-    let qos = (first >> 1) & 3;
-    let mut line = vec![c.str()?, format!("QoS {qos}")];
-    if qos > 0 {
-        line.push(format!("id {}", c.u16()?));
+/// A CONNACK's verdict and whether a session was kept.
+fn connack(c: &mut Cursor, v5: bool) -> Option<(String, Fields)> {
+    let session = c.u8()? & 1 != 0;
+    let code = c.u8()?;
+    let mut line = vec![match v5 {
+        true => reason(code, CONNACK),
+        // 3.1.1's own return codes (section 3.2.2.3).
+        false => match code {
+            0 => "Connection Accepted".into(),
+            1 => "0x01 unacceptable protocol version".into(),
+            2 => "0x02 identifier rejected".into(),
+            3 => "0x03 Server unavailable".into(),
+            4 => "0x04 bad user name or password".into(),
+            5 => "0x05 not authorized".into(),
+            code => format!("0x{code:02x}"),
+        },
+    }];
+    if session {
+        line.push("session present".into());
     }
-    if v5 {
-        c.properties()?;
+    let fields = if v5 { c.properties()? } else { Vec::new() };
+    Some((line.join(" · "), fields))
+}
+
+/// A PUBLISH's topic, QoS, packet ID and flags; the cursor is left at its message. MQTT 5
+/// may name the topic by an alias it set earlier on this side: shown as the topic, alias
+/// noted.
+fn publish(
+    c: &mut Cursor,
+    first: u8,
+    v5: bool,
+    aliases: &mut HashMap<u16, String>,
+) -> Option<(String, Fields)> {
+    let qos = (first >> 1) & 3;
+    let mut topic = c.str()?;
+    let id = if qos > 0 { Some(c.u16()?) } else { None };
+    let fields = if v5 { c.properties()? } else { Vec::new() };
+    let alias = (fields.iter())
+        .find(|(k, _)| k == "Topic Alias")
+        .and_then(|(_, v)| v.parse::<u16>().ok());
+    if let Some(alias) = alias {
+        match topic.is_empty() {
+            true => {
+                let known = aliases.get(&alias).cloned();
+                topic = known.unwrap_or_else(|| "(unknown alias)".into());
+            }
+            false => _ = aliases.insert(alias, topic.clone()),
+        }
+    }
+    let mut line = vec![topic, format!("QoS {qos}")];
+    if let Some(id) = id {
+        line.push(format!("id {id}"));
     }
     if first & 0x01 != 0 {
         line.push("retain".into());
@@ -349,22 +557,104 @@ fn publish(c: &mut Cursor, first: u8, v5: bool) -> Option<String> {
     if first & 0x08 != 0 {
         line.push("dup".into());
     }
-    Some(line.join(" · "))
+    Some((line.join(" · "), fields))
 }
 
-/// A SUBSCRIBE's packet ID and each filter with the QoS it asks for.
-fn subscribe(c: &mut Cursor, v5: bool) -> Option<String> {
-    let id = c.u16()?;
-    if v5 {
-        c.properties()?;
+/// PUBACK, PUBREC, PUBREL, PUBCOMP: the packet ID, and MQTT 5's reason when it isn't
+/// success (left out, it is).
+fn ack(c: &mut Cursor, v5: bool) -> Option<(String, Fields)> {
+    let mut line = format!("id {}", c.u16()?);
+    if !v5 || c.rest().is_empty() {
+        return Some((line, Vec::new()));
     }
+    let code = c.u8()?;
+    if code != 0 {
+        line = format!("{line} · {}", reason(code, PUBACK));
+    }
+    let fields = match c.rest().is_empty() {
+        true => Vec::new(),
+        false => c.properties()?,
+    };
+    Some((line, fields))
+}
+
+/// A SUBSCRIBE's packet ID and each filter with the QoS it asks for, and MQTT 5's options
+/// when they aren't the defaults.
+fn subscribe(c: &mut Cursor, v5: bool) -> Option<(String, Fields)> {
+    let id = c.u16()?;
+    let fields = if v5 { c.properties()? } else { Vec::new() };
     let mut filters = Vec::new();
     while !c.rest().is_empty() {
         let filter = c.str()?;
-        let qos = c.u8()? & 3;
-        filters.push(format!("{filter} QoS {qos}"));
+        let options = c.u8()?;
+        let mut one = format!("{filter} QoS {}", options & 3);
+        if v5 {
+            if options & 0x04 != 0 {
+                one += " no local";
+            }
+            if options & 0x08 != 0 {
+                one += " retain as published";
+            }
+            match (options >> 4) & 3 {
+                1 => one += " retained if new",
+                2 => one += " no retained",
+                _ => {}
+            }
+        }
+        filters.push(one);
     }
-    Some(format!("id {id} · {}", filters.join(", ")))
+    Some((format!("id {id} · {}", filters.join(", ")), fields))
+}
+
+/// A SUBACK's packet ID and what each filter was granted, in the SUBSCRIBE's order.
+fn suback(c: &mut Cursor, v5: bool) -> Option<(String, Fields)> {
+    let id = c.u16()?;
+    let fields = if v5 { c.properties()? } else { Vec::new() };
+    let codes: Vec<_> = (c.rest().iter())
+        .map(|&code| match (v5, code) {
+            (false, 0..=2) => format!("QoS {code}"),
+            (false, _) => format!("0x{code:02x} Failure"),
+            (true, _) => reason(code, SUBACK),
+        })
+        .collect();
+    Some((format!("id {id} · {}", codes.join(", ")), fields))
+}
+
+/// An UNSUBSCRIBE's packet ID and filters.
+fn unsubscribe(c: &mut Cursor, v5: bool) -> Option<(String, Fields)> {
+    let id = c.u16()?;
+    let fields = if v5 { c.properties()? } else { Vec::new() };
+    let mut filters = Vec::new();
+    while !c.rest().is_empty() {
+        filters.push(c.str()?);
+    }
+    Some((format!("id {id} · {}", filters.join(", ")), fields))
+}
+
+/// An UNSUBACK's packet ID, and in MQTT 5 each filter's outcome.
+fn unsuback(c: &mut Cursor, v5: bool) -> Option<(String, Fields)> {
+    let id = c.u16()?;
+    if !v5 {
+        return Some((format!("id {id}"), Vec::new()));
+    }
+    let fields = c.properties()?;
+    let codes: Vec<_> = (c.rest().iter())
+        .map(|&code| reason(code, UNSUBACK))
+        .collect();
+    Some((format!("id {id} · {}", codes.join(", ")), fields))
+}
+
+/// MQTT 5's DISCONNECT and AUTH: a reason (success when left out) and properties.
+fn reason_only(c: &mut Cursor, kind: u8) -> Option<(String, Fields)> {
+    let code = match c.rest().is_empty() {
+        true => 0,
+        false => c.u8()?,
+    };
+    let fields = match c.rest().is_empty() {
+        true => Vec::new(),
+        false => c.properties()?,
+    };
+    Some((reason(code, kind), fields))
 }
 
 #[cfg(test)]
@@ -485,6 +775,112 @@ mod tests {
                 ),
                 ("PINGREQ", String::new(), Vec::new(), 0),
             ]
+        );
+    }
+
+    /// MQTT 5 as a broker answers: a verdict with its limits, refusals by name with their
+    /// code, a PUBLISH that names its topic by an alias set before, and why it hung up.
+    #[test]
+    fn mqtt_5_reasons_properties_and_aliases_read_by_name() {
+        use rumqttc::v5::mqttbytes::v5::{Packet as P5, Publish, PublishProperties};
+        let level = OnceLock::new();
+        let mut broker = Packets::broker(5);
+        let mut bytes = Vec::new();
+        // Session present, Success; Topic Alias Maximum 10, Assigned Client Identifier "abc".
+        bytes.extend(b"\x20\x0c\x01\x00\x09\x22\x00\x0a\x12\x00\x03abc");
+        // Granted QoS 1 to the first filter, Not authorized to the second.
+        bytes.extend(b"\x90\x05\x00\x01\x00\x01\x87");
+        let properties = PublishProperties {
+            topic_alias: Some(3),
+            content_type: Some("application/json".into()),
+            message_expiry_interval: Some(60),
+            user_properties: vec![("unit".into(), "°C".into())],
+            ..Default::default()
+        };
+        let named = Publish::new(
+            "a/b",
+            rumqttc::v5::mqttbytes::QoS::AtMostOnce,
+            "{\"t\":21}",
+            Some(properties),
+        );
+        let alias = PublishProperties {
+            topic_alias: Some(3),
+            ..Default::default()
+        };
+        let aliased = Publish::new(
+            "",
+            rumqttc::v5::mqttbytes::QoS::AtMostOnce,
+            "22",
+            Some(alias),
+        );
+        for p in [named, aliased] {
+            let mut out = bytes::BytesMut::new();
+            P5::Publish(p).write(&mut out, None).unwrap();
+            bytes.extend(&out);
+        }
+        // PUBACK for id 7: No matching subscribers.
+        bytes.extend(b"\x40\x03\x00\x07\x10");
+        // Session taken over, Reason String "kicked".
+        bytes.extend(b"\xe0\x0b\x8e\x09\x1f\x00\x06kicked");
+        let got = read(&mut broker, &bytes, &level);
+        let fields = |i: usize| got[i].mqtt.as_ref().unwrap().fields.clone();
+        let pairs = |p: &[(&str, &str)]| -> Fields {
+            p.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            lines(&got),
+            [
+                ("CONNACK", "Success · session present".into(), Vec::new(), 0),
+                (
+                    "SUBACK",
+                    "id 1 · Granted QoS 1, 0x87 Not authorized".into(),
+                    Vec::new(),
+                    0
+                ),
+                ("PUBLISH", "a/b · QoS 0".into(), b"{\"t\":21}".to_vec(), 8),
+                ("PUBLISH", "a/b · QoS 0".into(), b"22".to_vec(), 2),
+                (
+                    "PUBACK",
+                    "id 7 · 0x10 No matching subscribers".into(),
+                    Vec::new(),
+                    0
+                ),
+                (
+                    "DISCONNECT",
+                    "0x8e Session taken over".into(),
+                    Vec::new(),
+                    0
+                ),
+            ]
+        );
+        assert_eq!(
+            fields(0),
+            pairs(&[
+                ("Topic Alias Maximum", "10"),
+                ("Assigned Client Identifier", "abc")
+            ])
+        );
+        let mut named = fields(2);
+        named.sort();
+        assert_eq!(
+            named,
+            pairs(&[
+                ("Content Type", "application/json"),
+                ("Message Expiry Interval", "60 s"),
+                ("Topic Alias", "3"),
+                ("User Property", "unit=°C"),
+            ])
+        );
+        assert_eq!(fields(5), pairs(&[("Reason String", "kicked")]));
+
+        // What the app asks of a subscription past its QoS.
+        let mut app = Packets::new(true, Some(5));
+        let got = read(&mut app, b"\x82\x07\x00\x02\x00\x00\x01t\x2d", &level);
+        assert_eq!(
+            got[0].mqtt.as_ref().unwrap().summary,
+            "id 2 · t QoS 1 no local retain as published no retained"
         );
     }
 
