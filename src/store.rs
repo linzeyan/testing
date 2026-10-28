@@ -1269,6 +1269,17 @@ impl Workspace {
         }
     }
 
+    /// Unsaved edits of the open tabs, by request: what quitting, or being killed, leaves
+    /// for the next start. Apart from `state`, which is written on every click.
+    pub fn load_drafts(&self) -> Vec<(PathBuf, Request)> {
+        let drafts = self.get("drafts");
+        (drafts.and_then(|json| serde_json::from_str(&json).ok())).unwrap_or_default()
+    }
+
+    pub fn save_drafts(&self, drafts: &[(PathBuf, Request)]) -> Result<(), String> {
+        self.put("drafts", &to_json(&drafts)?)
+    }
+
     /// Reads the TOML tree under `dir` (see the module docs) in place of the requests,
     /// folders and environments here: what it doesn't have is deleted, except the globals
     /// when there's no globals.toml. Secrets stay. `first` also reads what workspaces from

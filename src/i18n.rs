@@ -142,6 +142,10 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Aa", "Aa"),
     (
+        "Above environments: a folder variable wins over an environment variable with the same name, an inner folder's over an outer one's. Keep secrets in a secret environment.",
+        "優先於環境：與環境變數同名時以資料夾變數為準，內層資料夾優先於外層。秘密請放在秘密環境中。",
+    ),
+    (
         "Accepted: received, but not acted on yet.",
         "Accepted：已收到，但尚未處理。",
     ),
@@ -202,8 +206,8 @@ const ZH_TW: &[(&str, &str)] = &[
         "自動：https 伺服器支援時使用 HTTP/2",
     ),
     (
-        "Available in every environment; an environment variable with the same name wins.",
-        "所有環境都可使用；與環境變數同名時，以環境變數為準。",
+        "Available in every environment; an environment or folder variable with the same name wins.",
+        "所有環境都可使用；與環境變數或資料夾變數同名時，以後者為準。",
     ),
     ("AWS Signature", "AWS 簽章"),
     (
@@ -218,10 +222,6 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Basic auth", "Basic 驗證"),
     ("Bearer token", "Bearer 權杖"),
     ("Beautify", "美化"),
-    (
-        "Below environments: an environment variable with the same name wins. Keep secrets in a secret environment.",
-        "優先順序低於環境：同名的環境變數優先。秘密請放在秘密環境中。",
-    ),
     // A file, or bytes typed as Base64 or hex.
     ("Binary", "二進位"),
     ("File", "檔案"),
@@ -1050,10 +1050,6 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Save as…", "另存為…"),
     ("Save changes", "儲存變更"),
     ("Save changes to \"{}\"?", "要儲存「{}」的變更嗎？"),
-    (
-        "Save or close the requests with unsaved edits first",
-        "請先儲存或關閉有未儲存修改的請求",
-    ),
     ("Save response body", "儲存回應內容"),
     (
         "Save the body to a file, as received",
@@ -1362,6 +1358,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "Unprocessable Content：格式正確，但值沒有通過驗證。",
     ),
     ("Unsaved changes", "尚未儲存的變更"),
+    (
+        "Unsaved edits not kept for the next start: {}",
+        "未儲存的變更沒能暫存到下次開啟：{}",
+    ),
     (
         "Unsupported Media Type: the server doesn't take this Content-Type.",
         "Unsupported Media Type：伺服器不接受此 Content-Type。",

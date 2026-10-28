@@ -204,15 +204,28 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
     out
 }
 
-/// Precedence like Postman: request-local > data row > environment > folder > globals.
+/// What a request's variables resolve to outside a run: its folders' (inner over outer,
+/// the collection outermost) over the environment's over the globals. Insomnia's and
+/// Hoppscotch's order, not Postman's (environment over collection): a value set where the
+/// request lives is the one meant for it.
+pub fn scoped(
+    globals: &HashMap<String, String>,
+    env: &HashMap<String, String>,
+    folders: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = globals.clone();
+    merged.extend(env.clone());
+    merged.extend(folders.clone());
+    merged
+}
+
+/// In a run, the data row and then request-local values go over `scoped`.
 fn merge(
     vars: &Vars,
     collection: &HashMap<String, String>,
     locals: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    let mut merged = vars.globals.clone();
-    merged.extend(collection.clone());
-    merged.extend(vars.env.clone());
+    let mut merged = scoped(&vars.globals, &vars.env, collection);
     merged.extend(vars.data.clone());
     merged.extend(locals.clone());
     merged
@@ -1350,7 +1363,7 @@ mod tests {
             .unwrap();
         let s = |v: &str| v.to_owned();
         let mut req = Request {
-            url: "{{base}}/x".into(),
+            url: "{{base}}/x?tier={{tier}}".into(),
             pre_request: "console.log('own');".into(),
             tests: r#"pm.test("own", function () {
                 pm.expect(pm.collectionVariables.get("stage")).to.equal("folder");
@@ -1362,6 +1375,7 @@ mod tests {
             vars: HashMap::from([
                 (s("base"), crate::http::tests::echo_server()),
                 (s("stage"), s("folder")),
+                (s("tier"), s("folder")),
             ]),
             auth: Some((
                 s("api"),
@@ -1380,18 +1394,24 @@ mod tests {
             tests: vec![(s("api"), s("pm.collectionVariables.set('x', 1);"))],
         };
         let vars = Vars {
-            env: HashMap::from([(s("token"), s("s3cret")), (s("stage"), s("env"))]),
+            env: HashMap::from([
+                (s("token"), s("s3cret")),
+                (s("stage"), s("env")),
+                (s("tier"), s("env")),
+            ]),
             ..Default::default()
         };
         let out = rt.block_on(run(client, &Info::single("t".into()), req, vars));
 
         assert_eq!(out.logs, ["outer", "inner", "own"]);
         let wire = out.response.unwrap().body.to_lowercase();
-        assert!(wire.starts_with("get /users/x "), "{wire}");
+        // Set where the request lives, a value is meant for it: the folder's wins over the
+        // environment's, in the URL as in a script's pm.variables.
+        assert!(wire.starts_with("get /users/x?tier=folder "), "{wire}");
         assert!(wire.contains("authorization: bearer s3cret"), "{wire}");
         assert!(
-            wire.contains("x-stage: env"),
-            "environment beats folder: {wire}"
+            wire.contains("x-stage: folder"),
+            "folder beats environment: {wire}"
         );
         let tests: Vec<_> = out
             .tests

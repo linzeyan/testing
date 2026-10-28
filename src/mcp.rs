@@ -620,12 +620,9 @@ impl Server {
         Ok((name, req))
     }
 
-    /// What `req`'s {{variables}} can name: the globals, its folders', the environment's.
+    /// What `req`'s {{variables}} can name: the globals, the environment's, its folders'.
     fn all_vars(&self, req: &Request, vars: &Vars) -> HashMap<String, String> {
-        let mut all = vars.globals.clone();
-        all.extend(req.inherited.vars.clone());
-        all.extend(vars.env.clone());
-        all
+        crate::runner::scoped(&vars.globals, &vars.env, &req.inherited.vars)
     }
 
     fn send_request(&mut self, args: &Value) -> Result<Value, String> {

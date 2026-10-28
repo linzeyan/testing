@@ -170,8 +170,8 @@ pm.variables = {
   get: function (k) {
     if (__has(__locals, k)) return __locals[k];
     if (__has(__in.data, k)) return __in.data[k];
-    if (__has(__in.env, k)) return __in.env[k];
     if (__has(__in.collection, k)) return __in.collection[k];
+    if (__has(__in.env, k)) return __in.env[k];
     return __in.globals[k];
   },
   set: function (k, v) { v = __str(v); __locals[k] = v; __out.locals[k] = v; },

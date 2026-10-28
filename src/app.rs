@@ -244,7 +244,8 @@ struct Tab {
     /// Opened by a plain click in the tree: the next click there reuses this tab instead
     /// of adding one. Editing or double-clicking keeps it.
     preview: bool,
-    /// Background tabs only; also `None` for tabs restored at startup and not shown yet.
+    /// Background tabs only; also `None` for tabs restored at startup and not shown yet,
+    /// unless quitting left unsaved edits in them (`App::restore_drafts`).
     parked: Option<Parked>,
 }
 
@@ -782,7 +783,6 @@ enum Next {
     /// With a draft to put in place of the saved version (restoring from history).
     Open(PathBuf, Box<Request>),
     Close(PathBuf),
-    Quit,
 }
 
 enum Dialog {
@@ -1249,7 +1249,10 @@ pub struct App {
     next_run_id: u64,
     network: Network,
     network_editor: Option<Network>,
-    allow_close: bool,
+    /// The unsaved edits last written for the next start (`Workspace::save_drafts`).
+    kept_drafts: Vec<(PathBuf, Request)>,
+    /// When to write them next: a while after the user did something.
+    drafts_due: Option<Instant>,
     rt: tokio::runtime::Runtime,
     client: SharedClient,
     tx: mpsc::Sender<Msg>,
@@ -1363,7 +1366,8 @@ impl App {
             next_run_id: 0,
             network: state.network,
             network_editor: None,
-            allow_close: false,
+            kept_drafts: Vec::new(),
+            drafts_due: None,
             // One worker is plenty for interactive use; each tokio worker costs a stack.
             rt: tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -1380,6 +1384,7 @@ impl App {
         app.set_env(env);
         let tabs = state.tabs.into_iter().filter(|p| app.ws.exists(p));
         app.tabs = tabs.map(|p| Tab::new(p, false)).collect();
+        app.restore_drafts();
         if let Some(path) = state.open.filter(|p| app.ws.exists(p)) {
             app.activate(path, true);
         }
@@ -2310,28 +2315,66 @@ impl App {
         self.save_state();
     }
 
-    /// Requests with unsaved edits, in any tab.
-    fn unsaved(&self) -> Vec<String> {
-        let parked = self.tabs.iter().filter_map(|t| t.parked.as_ref());
-        let opens = self.open.iter().chain(parked.map(|p| &p.open));
-        opens.filter(|o| o.dirty()).map(Open::name).collect()
-    }
-
-    /// Returns false (the status bar says why) if any write failed.
-    fn save_all(&mut self) -> bool {
-        if self.open.as_ref().is_some_and(Open::dirty) && !self.save() {
-            return false;
-        }
-        for p in self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()) {
-            if p.open.dirty() {
-                if let Err(e) = self.ws.save_request(&p.open.path, &p.open.draft) {
-                    self.fail(e);
-                    return false;
-                }
-                p.open.saved = p.open.draft.clone();
+    /// The drafts of requests with unsaved edits, in tab order: switching tabs alone
+    /// changes nothing to write.
+    fn drafts(&self) -> Vec<(PathBuf, Request)> {
+        let mut drafts = Vec::new();
+        for tab in &self.tabs {
+            let open = match &tab.parked {
+                Some(p) => Some(&p.open),
+                None => self.open.as_ref().filter(|o| o.path == tab.path),
+            };
+            if let Some(o) = open.filter(|o| o.dirty()) {
+                drafts.push((o.path.clone(), o.draft.clone()));
             }
         }
-        true
+        drafts
+    }
+
+    /// Writes the unsaved edits for the next start, if they changed since last written.
+    /// Quitting doesn't ask to save: they come back as they were, like an editor's hot exit.
+    fn keep_drafts(&mut self) {
+        let drafts = self.drafts();
+        if drafts == self.kept_drafts {
+            return;
+        }
+        match self.ws.save_drafts(&drafts) {
+            Ok(()) => self.kept_drafts = drafts,
+            Err(e) => self.fail(tf("Unsaved edits not kept for the next start: {}", &[&e])),
+        }
+    }
+
+    /// Puts the unsaved edits the last run left back in their tabs. A request deleted or
+    /// renamed meanwhile has no tab to go back to, and its edits are dropped.
+    fn restore_drafts(&mut self) {
+        for (path, mut draft) in self.ws.load_drafts() {
+            let Some(i) = self.tab_index(&path) else {
+                continue;
+            };
+            let saved = match self.ws.load_request(&path) {
+                Ok(saved) => saved,
+                Err(e) => {
+                    self.fail(e);
+                    continue;
+                }
+            };
+            // As `force_open_with`: examples belong to the file, folder settings to the folder.
+            draft.examples = saved.examples.clone();
+            draft.inherited = saved.inherited.clone();
+            self.kept_drafts.push((path.clone(), draft.clone()));
+            let open = Open {
+                path,
+                saved,
+                draft,
+                undo: Vec::new(),
+            };
+            self.tabs[i].parked = Some(Parked {
+                open,
+                response: None,
+                dropped: false,
+                load: None,
+            });
+        }
     }
 
     /// The runner pane can't be left mid-run; says so in the status bar.
@@ -2896,12 +2939,12 @@ impl App {
 
     /// Everything `{{name}}` can resolve to, with the same precedence as the runner.
     fn all_vars(&self) -> HashMap<String, String> {
-        let mut all = self.globals.clone();
-        if let Some(open) = &self.open {
-            all.extend(open.draft.inherited.vars.clone());
-        }
-        all.extend(self.vars.clone());
-        all
+        let none = HashMap::new();
+        let folders = self
+            .open
+            .as_ref()
+            .map_or(&none, |o| &o.draft.inherited.vars);
+        crate::runner::scoped(&self.globals, &self.vars, folders)
     }
 
     /// Keeps tabs (and their unsaved drafts) pointing at moved or renamed files.
@@ -3628,14 +3671,24 @@ impl eframe::App for App {
             // Selected, as in a browser's address bar, so typing replaces it.
             focus_all(ui.ctx(), egui::Id::new("url"), &open.draft.url);
         }
-        if ui.input(|i| i.viewport().close_requested()) {
-            if !self.allow_close && !self.unsaved().is_empty() {
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.dialog = Some(Dialog::Unsaved(Next::Quit));
-            } else {
-                self.sync();
+        // Unsaved edits are written for the next start a while after the user did
+        // something, not only on quitting: a kill or a VDI logoff loses at most that while.
+        // Not on a timer of its own: an idle window draws no frames, which WARP pays for.
+        if self.drafts_due.is_none() && ui.input(|i| !i.events.is_empty()) {
+            self.drafts_due = Some(Instant::now() + KEEP_DRAFTS);
+        }
+        if let Some(due) = self.drafts_due {
+            match due.saturating_duration_since(Instant::now()) {
+                left if left.is_zero() => {
+                    self.drafts_due = None;
+                    self.keep_drafts();
+                }
+                left => ui.ctx().request_repaint_after(left),
             }
+        }
+        if ui.input(|i| i.viewport().close_requested()) {
+            self.keep_drafts();
+            self.sync();
         }
 
         // egui keeps a text field's undo history under its id, and the editor's fields have
@@ -3922,17 +3975,9 @@ impl App {
                 if !failed && left.is_zero() {
                     self.status.clear();
                 }
-                if !self.status.is_empty() {
-                    let text = RichText::new(&self.status);
-                    if failed {
-                        ui.label(text.color(RED));
-                        if icon_button(ui, icon::X, t("Dismiss"), None).clicked() {
-                            self.status.clear();
-                        }
-                    } else {
-                        ui.label(text);
-                        ui.ctx().request_repaint_after(left);
-                    }
+                if !self.status.is_empty() && !failed {
+                    ui.label(&self.status);
+                    ui.ctx().request_repaint_after(left);
                     ui.separator();
                 }
                 if let Some(m) = memory_stats::memory_stats() {
@@ -3944,7 +3989,23 @@ impl App {
                         ));
                     ui.separator();
                 }
-                ui.weak(self.ws.root.display().to_string());
+                // An error has a cell of its own at the right end: beside RAM it read as
+                // part of it. Laid out from the right so it keeps its room and the path
+                // gives way, cut short, instead.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if failed {
+                        if icon_button(ui, icon::X, t("Dismiss"), None).clicked() {
+                            self.status.clear();
+                        }
+                        let text = RichText::new(&self.status).color(RED);
+                        ui.add(egui::Label::new(text).truncate());
+                        ui.separator();
+                    }
+                    let root = self.ws.root.display().to_string();
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(root).weak()).truncate());
+                    });
+                });
             });
         });
     }
@@ -6237,7 +6298,6 @@ impl App {
     }
 
     fn dialog_ui(&mut self, ctx: &egui::Context) {
-        let unsaved = self.unsaved().join("\", \"");
         let history_len = self.history.len();
         let cookie_count = match &self.dialog {
             Some(Dialog::Confirm(Doomed::Cookies)) => self.cookies.rows().len(),
@@ -6482,18 +6542,16 @@ impl App {
                         cancel = ui.button(t("Cancel")).clicked();
                     });
                 }
-                Dialog::Unsaved(next) => {
-                    let quit = matches!(next, Next::Quit);
+                Dialog::Unsaved(_) => {
                     ui.heading(t("Unsaved changes"));
-                    let names = if quit { &unsaved } else { &open_name };
-                    ui.label(tf("Save changes to \"{}\"?", &[&names]));
+                    ui.label(tf("Save changes to \"{}\"?", &[&open_name]));
                     ui.horizontal(|ui| {
                         let save = ui.add(primary(t("Save"))).clicked() || enter_pressed(ui);
                         let discard = ui.button(t("Discard")).clicked();
                         cancel = ui.button(t("Cancel")).clicked();
                         if save || discard {
-                            then = Some(Box::new(move |app, ctx| {
-                                if save && !(if quit { app.save_all() } else { app.save() }) {
+                            then = Some(Box::new(move |app, _| {
+                                if save && !app.save() {
                                     return; // keep the dialog; the status bar shows why
                                 }
                                 let Some(Dialog::Unsaved(next)) = app.dialog.take() else {
@@ -6505,10 +6563,6 @@ impl App {
                                         if let Some(i) = app.tab_index(&path) {
                                             app.drop_tab(i);
                                         }
-                                    }
-                                    Next::Quit => {
-                                        app.allow_close = true;
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                     }
                                 }
                             }));
@@ -6841,7 +6895,7 @@ impl App {
                 None => ui.heading(t("Globals")),
             };
             if ed.env.is_none() {
-                ui.weak(t("Available in every environment; an environment variable with the same name wins."));
+                ui.weak(t("Available in every environment; an environment or folder variable with the same name wins."));
             }
             egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                 ui.label(RichText::new(t("Shared")).strong());
@@ -7006,8 +7060,9 @@ impl App {
                 .show(ui, |ui| match ed.tab {
                     FolderTab::Vars => {
                         ui.weak(t(
-                            "Below environments: an environment variable with the same name \
-                             wins. Keep secrets in a secret environment.",
+                            "Above environments: a folder variable wins over an environment \
+                             variable with the same name, an inner folder's over an outer \
+                             one's. Keep secrets in a secret environment.",
                         ));
                         kv_table(
                             ui,
@@ -7199,6 +7254,28 @@ impl App {
                             })
                             .inner
                         };
+                        // Nearest first, as they win.
+                        if !folder.is_empty() {
+                            ui.strong(t("Folders"));
+                            ui.weak(t("Set in Folder settings."));
+                            egui::Grid::new("qv-folder")
+                                .num_columns(2)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for (k, v) in sorted(&folder) {
+                                        scope_var(
+                                            ui,
+                                            egui::Id::new(("qv-folder", &k)),
+                                            &k,
+                                            &v,
+                                            None,
+                                            false,
+                                            false,
+                                        );
+                                    }
+                                });
+                            ui.add_space(8.0);
+                        }
                         match &env {
                             Some(name) => {
                                 if heading(
@@ -7214,8 +7291,10 @@ impl App {
                                         for (k, v) in sorted(&self.vars) {
                                             let id = egui::Id::new(("qv-env", &k));
                                             let hide = masked(&k);
+                                            let over =
+                                                folder.contains_key(&k).then_some(t("Folders"));
                                             if let Some(new) =
-                                                scope_var(ui, id, &k, &v, None, true, hide)
+                                                scope_var(ui, id, &k, &v, over, true, hide)
                                             {
                                                 set = Some((env.clone(), k, new));
                                             }
@@ -7227,31 +7306,6 @@ impl App {
                                 ui.strong(t("No environment"));
                             }
                         }
-                        if !folder.is_empty() {
-                            ui.add_space(8.0);
-                            ui.strong(t("Folders"));
-                            ui.weak(t("Set in Folder settings."));
-                            egui::Grid::new("qv-folder")
-                                .num_columns(2)
-                                .striped(true)
-                                .show(ui, |ui| {
-                                    for (k, v) in sorted(&folder) {
-                                        let over = self
-                                            .vars
-                                            .contains_key(&k)
-                                            .then_some(env_label.as_str());
-                                        scope_var(
-                                            ui,
-                                            egui::Id::new(("qv-folder", &k)),
-                                            &k,
-                                            &v,
-                                            over,
-                                            false,
-                                            false,
-                                        );
-                                    }
-                                });
-                        }
                         ui.add_space(8.0);
                         if heading(ui, t("Globals").to_owned(), t("Edit Globals").to_owned()) {
                             edit = Some(None);
@@ -7261,10 +7315,10 @@ impl App {
                             .striped(true)
                             .show(ui, |ui| {
                                 for (k, v) in sorted(&self.globals) {
-                                    let over = if self.vars.contains_key(&k) {
-                                        Some(env_label.as_str())
-                                    } else if folder.contains_key(&k) {
+                                    let over = if folder.contains_key(&k) {
                                         Some(t("Folders"))
+                                    } else if self.vars.contains_key(&k) {
+                                        Some(env_label.as_str())
                                     } else {
                                         None
                                     };
@@ -7836,8 +7890,6 @@ impl App {
         // Why the system's script was skipped: what Windows is configured with says nothing
         // about whether it worked.
         let skipped = (self.client.get()).and_then(|c| c.as_ref().ok()?.note.clone());
-        // A restart that waited on the unsaved-edits question could come on a later close.
-        let unsaved = !self.unsaved().is_empty();
         let (net_draft, net_now) = (&mut self.network_editor, &self.network);
         let mut apply_net = false;
         let families = self
@@ -8029,14 +8081,7 @@ impl App {
                                 }
                                 Update::Installed(v) => {
                                     ui.label(tf("{} is installed and starts next time", &[v]));
-                                    restart = (ui.add_enabled(
-                                        !unsaved,
-                                        egui::Button::new(t("Restart now")),
-                                    ))
-                                    .on_disabled_hover_text(t(
-                                        "Save or close the requests with unsaved edits first",
-                                    ))
-                                    .clicked();
+                                    restart = ui.button(t("Restart now")).clicked();
                                 }
                                 Update::Failed(e) => {
                                     ui.colored_label(ORANGE, clip(e, 200));
@@ -8342,7 +8387,7 @@ impl App {
             self.install_update(release, ctx);
         }
         if restart {
-            // Through the usual close, which asks about unsaved edits first.
+            // Through the usual close, which keeps unsaved edits for the next start.
             (crate::update::RESTART).store(true, std::sync::atomic::Ordering::Relaxed);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -12290,6 +12335,9 @@ const GREEN: Color32 = Color32::from_rgb(40, 150, 70);
 /// How long a status message stays: long enough to read twice.
 const STATUS_FADE: Duration = Duration::from_secs(8);
 
+/// How long after the user did something unsaved edits are written for the next start.
+const KEEP_DRAFTS: Duration = Duration::from_secs(2);
+
 /// Enter meant for a dialog's OK: pressed in a single-line field (which lets go of focus on
 /// Enter) or with nothing focused. A multi-line editor or a focused button keeps it. Call
 /// after the dialog's fields are drawn. Consumed, so a dialog opened by this one (New
@@ -15888,6 +15936,13 @@ mod ui_tests {
         h.get_by_label("r").click();
         h.run();
         h.get_by_label_contains("Undefined: base");
+        // The environment's value only stands in until the collection sets its own: set
+        // where the request lives, that one is meant for it.
+        let env = [KeyValue::new("base", "http://127.0.0.1:1")];
+        h.state().ws.save_env(Some("dev"), &env, &[]).unwrap();
+        h.state_mut().set_env(Some("dev".into()));
+        h.run();
+        assert!(h.query_by_label_contains("Undefined").is_none());
         let draft = KeyValue::new("X-Draft", "1");
         h.state_mut()
             .open
@@ -15922,6 +15977,8 @@ mod ui_tests {
         assert!(h.query_by_label_contains("Undefined").is_none());
         let open = h.state().open.as_ref().unwrap();
         assert!(open.draft.headers.contains(&draft), "unsaved edits kept");
+        let base = h.state().all_vars()["base"].clone();
+        assert!(!base.ends_with(":1"), "the collection's base wins: {base}");
         h.get_by_label("Send").click();
         wait(&mut h, |app| app.response.is_some());
         let shown = h
@@ -15971,10 +16028,11 @@ mod ui_tests {
         shot(&mut h, "13-tabs");
         assert_eq!(draft(&h).url, "http://edited");
 
-        // Quitting must count edits in background tabs too.
+        // Quitting must keep edits in background tabs too.
         h.get_all_by_label("c").last().unwrap().click();
         h.run();
-        assert_eq!(h.state().unsaved(), ["b"]);
+        let kept: Vec<_> = h.state().drafts().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(kept, std::slice::from_ref(&b));
         // Closing the edited tab asks, with it in front so Save saves what's shown.
         let close = egui_kittest::kittest::By::new()
             .role(Role::Button)
@@ -15994,6 +16052,70 @@ mod ui_tests {
         h.key_press_modifiers(Modifiers::COMMAND, Key::W);
         h.run();
         assert!(h.state().tabs.is_empty() && h.state().open.is_none());
+    }
+
+    /// Quitting doesn't ask about unsaved edits: they are kept, a background tab's too,
+    /// and the next start has them back as they were, still unsaved. A VDI session can end
+    /// without a quit, so they are written a while after an edit as well.
+    #[test]
+    fn quitting_keeps_unsaved_edits_for_the_next_start() {
+        let ws = workspace("drafts");
+        for name in ["a", "b"] {
+            ws.create_request(&ws.collections(), name).unwrap();
+        }
+        let (a, b) = (
+            ws.collections().join("a.toml"),
+            ws.collections().join("b.toml"),
+        );
+        let root = ws.root.clone();
+        let mut h = harness(ws);
+        h.run();
+        h.get_by_label("a").click();
+        h.run();
+        type_into(&mut h, 0, "http://a-edited");
+        h.get_all_by_label("b").next().unwrap().click();
+        h.run();
+        type_into(&mut h, 0, "http://b-edited");
+        let urls = |drafts: Vec<(PathBuf, Request)>| -> Vec<(PathBuf, String)> {
+            drafts.into_iter().map(|(p, r)| (p, r.url)).collect()
+        };
+        let both = [
+            (a.clone(), "http://a-edited".to_owned()),
+            (b.clone(), "http://b-edited".to_owned()),
+        ];
+        // The while after the edit, over.
+        h.state_mut().drafts_due = Some(Instant::now());
+        h.run();
+        assert_eq!(urls(h.state().ws.load_drafts()), both);
+
+        type_into(&mut h, 0, "/more");
+        let close = &mut h.input_mut().viewports;
+        let root_view = close.entry(egui::ViewportId::ROOT).or_default();
+        root_view.events.push(egui::ViewportEvent::Close);
+        h.run();
+        assert!(h.state().dialog.is_none(), "quitting asks nothing");
+        let more = "http://b-edited/more".to_owned();
+        let kept = [both[0].clone(), (b.clone(), more.clone())];
+        assert_eq!(urls(h.state().ws.load_drafts()), kept);
+        drop(h);
+
+        let mut h = harness(Workspace::open(root.clone()).unwrap());
+        h.run();
+        assert_eq!(draft(&h).url, more);
+        assert!(h.state().open.as_ref().unwrap().dirty());
+        assert_eq!(
+            h.state().ws.load_request(&b).unwrap().url,
+            "",
+            "file untouched"
+        );
+        h.get_all_by_label("a").last().unwrap().click();
+        h.run();
+        assert_eq!(draft(&h).url, "http://a-edited");
+        // Saved, a request's edits are no longer kept; the other's still are.
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        h.run();
+        h.state_mut().keep_drafts();
+        assert_eq!(urls(h.state().ws.load_drafts()), [(b, more)]);
     }
 
     /// A preview tab in use is kept as a normal one: the next request clicked took the
@@ -23316,6 +23438,20 @@ mod ui_tests {
         out
     }
 
+    /// The colour the last frame painted `text` in, if it did.
+    fn painted_color<S>(h: &Harness<'_, S>, text: &str) -> Option<Color32> {
+        fn walk(shape: &egui::Shape, text: &str) -> Option<Color32> {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| walk(s, text)),
+                egui::Shape::Text(t) if t.galley.text() == text => {
+                    Some(t.galley.job.sections.first()?.format.color)
+                }
+                _ => None,
+            }
+        }
+        h.output().shapes.iter().find_map(|c| walk(&c.shape, text))
+    }
+
     /// The circles the last frame painted in `color`.
     fn painted_dots<S>(h: &Harness<'_, S>, color: Color32) -> Vec<egui::Pos2> {
         fn walk(shape: &egui::Shape, color: Color32, out: &mut Vec<egui::Pos2>) {
@@ -23547,8 +23683,9 @@ mod ui_tests {
     }
 
     /// A status message fades and an error stays until dismissed: they never cleared, so
-    /// an old "Saved" read as news. Both sit before the workspace path, which a long path
-    /// pushed them past.
+    /// an old "Saved" read as news. A message sits before the workspace path, which a long
+    /// path pushed it past; an error in a cell of its own at the right end, past RAM and
+    /// the path, as beside RAM it read as part of it.
     #[test]
     fn a_message_fades_and_an_error_stays_until_dismissed() {
         let mut h = with_request("status");
@@ -23568,10 +23705,15 @@ mod ui_tests {
         h.state_mut().fail("Saving r: disk full");
         h.run();
         age(&mut h);
-        assert!(h.query_by_label("Saving r: disk full").is_some());
+        let error = h.get_by_label("Saving r: disk full").rect();
+        assert!(error.left() >= h.get_by_label(&path).rect().right());
+        let ram = h.get_by_label_contains("RAM ").rect();
+        assert!(error.left() >= ram.right());
+        assert_eq!(painted_color(&h, "Saving r: disk full"), Some(RED));
         h.get_by_label("Dismiss").click();
         h.run();
         assert!(h.state().status.is_empty());
+        assert!(h.query_by_label("Saving r: disk full").is_none());
     }
 
     /// The response's Copy takes what the tab shows and says so: it copied the body from

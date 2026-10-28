@@ -2798,7 +2798,7 @@ struct Made {
     example: Option<crate::model::Example>,
 }
 
-/// The requests under `dir`, resolved with `globals`, their folders' variables and `env`
+/// The requests under `dir`, resolved with `globals`, `env` and their folders' variables
 /// in that precedence, as Send resolves them; and how many were left out: streams and
 /// gRPC, which neither curl nor HAR speaks.
 fn made_under(
@@ -2816,9 +2816,7 @@ fn made_under(
             left += 1;
             continue;
         }
-        let mut vars = globals.clone();
-        vars.extend(req.inherited.vars.clone());
-        vars.extend(env.clone());
+        let vars = crate::runner::scoped(globals, env, &req.inherited.vars);
         made.push(Made {
             name: unescape_name(&path.file_stem().unwrap_or_default().to_string_lossy()),
             example: req.examples.first().cloned(),
@@ -3041,7 +3039,8 @@ mod tests {
             panic!("a collection")
         };
         let (_, first) = &requests[0];
-        assert_eq!(first.url, "https://env.test/items?page=2");
+        // The folder's base, set where the requests live, wins over the environment's.
+        assert_eq!(first.url, "https://folder.test/items?page=2");
         let bearer = KeyValue::new("authorization", "Bearer t");
         assert!(first.headers.contains(&bearer), "{:?}", first.headers);
         assert_eq!(
@@ -3084,7 +3083,7 @@ mod tests {
         let back = crate::curl::from_curl(command).unwrap();
         assert_eq!(
             (back.method.as_str(), back.url.as_str()),
-            ("POST", "https://env.test/login")
+            ("POST", "https://folder.test/login")
         );
         assert_eq!(
             back.body,
