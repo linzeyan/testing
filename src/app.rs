@@ -3679,7 +3679,9 @@ impl eframe::App for App {
         }
         if let Some(due) = self.drafts_due {
             match due.saturating_duration_since(Instant::now()) {
-                left if left.is_zero() => {
+                // Nearly due is due: a repaint asked for within the next frame's time is
+                // drawn at once, again and again until the moment comes.
+                left if left < DRAFTS_SLACK => {
                     self.drafts_due = None;
                     self.keep_drafts();
                 }
@@ -12337,6 +12339,7 @@ const STATUS_FADE: Duration = Duration::from_secs(8);
 
 /// How long after the user did something unsaved edits are written for the next start.
 const KEEP_DRAFTS: Duration = Duration::from_secs(2);
+const DRAFTS_SLACK: Duration = Duration::from_millis(500);
 
 /// Enter meant for a dialog's OK: pressed in a single-line field (which lets go of focus on
 /// Enter) or with nothing focused. A multi-line editor or a focused button keeps it. Call
@@ -16083,8 +16086,9 @@ mod ui_tests {
             (a.clone(), "http://a-edited".to_owned()),
             (b.clone(), "http://b-edited".to_owned()),
         ];
-        // The while after the edit, over.
-        h.state_mut().drafts_due = Some(Instant::now());
+        // The while after the edit, nearly over: written now, rather than frame after
+        // frame drawn until the moment comes.
+        h.state_mut().drafts_due = Some(Instant::now() + Duration::from_millis(200));
         h.run();
         assert_eq!(urls(h.state().ws.load_drafts()), both);
 
