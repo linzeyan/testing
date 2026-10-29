@@ -191,7 +191,11 @@ Snippets fill some in):
 
 - `pm.*`, chai, `jsonSchema`, `pm.variables.replaceIn`.
 - `require` of Postman's sandbox modules (crypto-js, lodash, moment, uuid, tv4, chai), plus
-  `atob`/`btoa`; each is evaluated only when required.
+  `atob`/`btoa` and tweetnacl (Ed25519 signing); each is evaluated only when required.
+  `pm.require('npm:tweetnacl@1.0.3')` loads the bundled one; other npm packages aren't
+  fetched.
+- A script that throws, an async function in it included, stops the request, with the
+  error's kind and line.
 - `pm.cookies` and `pm.cookies.jar()` read and write the jar Send uses.
 - `pm.sendRequest` with a callback or `await`, through the same clients, e.g. to fetch a
   token first.
@@ -289,7 +293,7 @@ the right with the status code. All three are kept across restarts, as are the
 window's size, place and maximized. A screen too small for the default window gets it maximized.
 With the sidebar folded, the environment picker moves to the right end of the tab strip.
 Messages in the status bar fade after a few seconds; an error stays, in red at the bar's right
-end, until its × dismisses it.
+end, until its × dismisses it. A send that fails is there too, named, until the next Send.
 
 ## Keyboard shortcuts
 

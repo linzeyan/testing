@@ -163,7 +163,9 @@ Postman 風格的請求前與測試指令碼，預設是空的，由你自己撰
 
 - `pm.*`、chai、`jsonSchema`、`pm.variables.replaceIn`。
 - 可 `require` Postman 沙箱的模組（crypto-js、lodash、moment、uuid、tv4、chai），另有
-  `atob`/`btoa`；每個模組在被 require 時才載入。
+  `atob`/`btoa` 與 tweetnacl（Ed25519 簽章）；每個模組在被 require 時才載入。
+  `pm.require('npm:tweetnacl@1.0.3')` 載入內建的那份；其他 npm 套件不會下載。
+- 指令碼丟出錯誤（包括其中的 async 函式）就不送出請求，並顯示錯誤種類與行號。
 - `pm.cookies` 與 `pm.cookies.jar()` 讀寫傳送時所用的同一個 Cookie jar。
 - `pm.sendRequest` 支援 callback 或 `await`，走同一套用戶端，例如先取得 token。
 - 在執行器中，`pm.execution.setNextRequest(name)`（或 `postman.setNextRequest`）可跳轉或迴圈，
@@ -245,7 +247,7 @@ Postman 風格的請求前與測試指令碼，預設是空的，由你自己撰
 側邊欄拖不到比它的按鈕還窄。上下堆疊時，請求佔大部分高度。回應右上的 ⌄（或 `Ctrl+J`）可把回應收成
 請求下方的一列，仍顯示上次的狀態碼、時間與大小；左右並排時則是 › 往右收成一條，只顯示狀態碼。
 三者在重新啟動後都會保留，視窗的大小、位置與是否最大化也是。螢幕放不下預設大小的視窗時，會自動最大化。
-收起側邊欄時，環境選單會移到分頁列的右端。狀態列的訊息幾秒後淡出；錯誤則以紅字顯示在狀態列最右邊，直到按 × 關閉。
+收起側邊欄時，環境選單會移到分頁列的右端。狀態列的訊息幾秒後淡出；錯誤則以紅字顯示在狀態列最右邊，直到按 × 關閉。送出失敗也會顯示在那裡（附請求名稱），直到下一次送出。
 
 ## 鍵盤快捷鍵
 

@@ -15,7 +15,16 @@ const LIBS: &[(&str, &str)] = &[
     ("crypto-js", include_str!("../vendor/crypto-js.js")),
     ("lodash", include_str!("../vendor/lodash.min.js")),
     ("moment", include_str!("../vendor/moment.min.js")),
+    // Not in Postman's sandbox, where it comes through `pm.require('npm:tweetnacl@…')`;
+    // bundled for Ed25519 signing, which crypto-js lacks.
+    ("tweetnacl", include_str!("../vendor/tweetnacl.min.js")),
 ];
+/// The user's script is evaluated under this file name, so its frames in a stack stand
+/// apart from the prelude's (`eval_script`).
+const FILE: &str = "script";
+/// Top-level `await` needs an async function around the script; on the same line, so
+/// error lines don't move (columns on line 1 move by its length).
+const ASYNC_OPEN: &str = "(async function () { ";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -103,6 +112,8 @@ var __in = JSON.parse(__input);
 var __out = { tests: [], logs: [], env: {}, globals: {}, locals: {}, request: null, next: null, skip: false };
 function __str(v) {
   if (typeof v === 'string') return v;
+  // As Node's console prints one: as JSON an Error is `{}`.
+  if (v instanceof Error) return String(v) + (v.stack ? '\n' + String(v.stack).replace(/\s+$/, '') : '');
   try { var s = JSON.stringify(v); return s === undefined ? String(v) : s; } catch (e) { return String(v); }
 }
 var console = { log: function () { __out.logs.push(Array.prototype.map.call(arguments, __str).join(' ')); } };
@@ -257,7 +268,16 @@ pm.sendRequest = function (req, cb) {
   if (cb) { cb(err, res); return; }
   return err ? Promise.reject(err) : Promise.resolve(res);
 };
-var __asyncError;
+// Rejected promises nothing handles yet, as the runtime reports them: an async function
+// that throws fails the script, as a throw at the top does, instead of its request going
+// out without what it was to set.
+var __rejected = [];
+function __track(p, reason, handled) {
+  var i = -1;
+  for (var j = 0; j < __rejected.length; j++) if (__rejected[j][0] === p) i = j;
+  if (handled) { if (i >= 0) __rejected.splice(i, 1); }
+  else if (i < 0) __rejected.push([p, reason]);
+}
 // Postman's sandbox modules. uuid and tv4 stand on what's native here already.
 var __modules = {
   chai: chai,
@@ -279,11 +299,20 @@ function require(name) {
   name = String(name);
   if (__has(__modules, name)) return __modules[name];
   var src = __lib(name);
-  if (src === undefined || src === null) throw new Error("require: no module '" + name + "' here (crypto-js, lodash, moment, uuid, tv4, chai, atob, btoa)");
+  if (src === undefined || src === null) throw new Error("require: no module '" + name + "' here (crypto-js, lodash, moment, tweetnacl, uuid, tv4, chai, atob, btoa)");
   var module = { exports: {} };
-  new Function('module', 'exports', 'require', src)(module, module.exports, require);
+  // What a library probes for (crypto-js and tweetnacl try Node's `crypto`) is missing,
+  // not an error: they do without it.
+  var probe = function (n) { return __has(__modules, n) || __lib(n) != null ? require(n) : undefined; };
+  new Function('module', 'exports', 'require', src)(module, module.exports, probe);
   return __modules[name] = module.exports;
 }
+// Postman's package library: `npm:name@version` comes from the registry there. Here the
+// name picks a bundled module, whatever the version.
+pm.require = function (name) {
+  var m = /^npm:(@?[^@]+)(@.*)?$/.exec(String(name));
+  return require(m ? m[1] : name);
+};
 if (typeof btoa !== 'function') {
   var __b64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   // Latin-1 in and out, as in browsers: a byte per character.
@@ -473,9 +502,16 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
     // A script with an endless loop must not hang the request forever.
     let deadline = Instant::now() + timeout;
     rt.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
+    rt.set_host_promise_rejection_tracker(Some(Box::new(|ctx, promise, reason, handled| {
+        // Before the prelude there is no `__track`, and nothing of the user's to report.
+        let track = ctx.globals().get::<_, rquickjs::Function>("__track");
+        if track.is_ok_and(|f| f.call::<_, ()>((promise, reason, handled)).is_err()) {
+            ctx.catch();
+        }
+    })));
     let ctx = rquickjs::Context::full(&rt).map_err(|e| e.to_string())?;
     ctx.with(|ctx| {
-        let caught = |e: rquickjs::Error| exception(&ctx, e, deadline, timeout);
+        let caught = |e: rquickjs::Error| exception(&ctx, e, deadline, timeout, 0);
         ctx.globals().set("__input", json).map_err(caught)?;
         // chai's UMD wrapper looks for window/global/self and otherwise uses `this`, which
         // is undefined here; `self` is the one alias that doesn't imply a browser.
@@ -548,7 +584,9 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
         let client = input.client.cloned();
         let send = move |spec: String| -> String {
             let reply = (|| {
-                let client = client.as_ref().ok_or("pm.sendRequest isn't available here")?;
+                let client = client
+                    .as_ref()
+                    .ok_or("pm.sendRequest isn't available here")?;
                 let req = send_request(&spec)?;
                 let handle = tokio::runtime::Handle::try_current().map_err(|e| e.to_string())?;
                 // Scripts run under `block_in_place`, where blocking on the runtime is allowed.
@@ -570,34 +608,23 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
             )
             .map_err(caught)?;
         ctx.eval::<(), _>(PRELUDE).map_err(caught)?;
-        // Top-level `await` (for `await pm.sendRequest(…)`) needs an async function around
-        // the script; on the same line, so error positions don't move.
-        let wrapped;
-        let script = match AWAIT.is_match(script) {
-            true => {
-                wrapped = format!(
-                    "(async function () {{ {script}\n}})().catch(function (e) {{ __asyncError = e; }});"
-                );
-                &wrapped
-            }
-            false => script,
+        // For `await pm.sendRequest(…)`; a rejection of it is tracked as any other.
+        let (source, shift) = match AWAIT.is_match(script) {
+            true => (format!("{ASYNC_OPEN}{script}\n}})();"), ASYNC_OPEN.len()),
+            false => (script.to_owned(), 0),
         };
+        let mut options = rquickjs::context::EvalOptions::default();
+        options.filename = Some(FILE.into());
         // The user's script may throw; keep whatever it recorded before that.
-        let mut error = ctx
-            .eval::<(), _>(script)
-            .err()
-            .map(|e| exception(&ctx, e, deadline, timeout));
+        let mut error = (ctx.eval_with_options::<(), _>(source, options).err())
+            .map(|e| exception(&ctx, e, deadline, timeout, shift));
         while ctx.execute_pending_job() {}
         if error.is_none() {
-            let async_error: rquickjs::Value = ctx.globals().get("__asyncError").map_err(caught)?;
-            if !async_error.is_undefined() {
-                error = Some(match async_error.as_exception() {
-                    Some(x) => x.message().unwrap_or_default(),
-                    None => async_error
-                        .as_string()
-                        .and_then(|s| s.to_string().ok())
-                        .unwrap_or_else(|| "script failed".into()),
-                });
+            let reason: rquickjs::Value = ctx
+                .eval("__rejected.length ? __rejected[0][1] : undefined")
+                .map_err(caught)?;
+            if !reason.is_undefined() {
+                error = Some(thrown(&reason, shift));
             }
         }
         let out: String = ctx.eval(EPILOGUE).map_err(caught)?;
@@ -738,31 +765,48 @@ fn exception(
     e: rquickjs::Error,
     deadline: Instant,
     timeout: Duration,
+    shift: usize,
 ) -> String {
     if Instant::now() > deadline {
         return format!("script timed out after {:.1} s", timeout.as_secs_f32());
     }
-    if e.is_exception() {
-        let value = ctx.catch();
-        if let Some(x) = value.as_exception() {
-            let message = x.message().unwrap_or_default();
-            let line = x.stack().and_then(|s| {
-                s.lines()
-                    .find(|l| l.contains("<eval>"))
-                    .map(str::trim)
-                    .map(str::to_owned)
-            });
-            return match line {
-                Some(at) => format!("{message} ({at})"),
-                None => message,
-            };
-        }
-        if let Some(s) = value.as_string().and_then(|s| s.to_string().ok()) {
-            return s;
-        }
+    match e.is_exception() {
+        true => thrown(&ctx.catch(), shift),
+        false => e.to_string(),
     }
-    e.to_string()
 }
+
+/// What a script threw, as "TypeError: not a function (line 3:25)": QuickJS's messages
+/// name neither the kind nor the place. The place is the innermost frame in the user's
+/// script, the one to look at; `shift` is what the async wrapper added to line 1.
+fn thrown(value: &rquickjs::Value<'_>, shift: usize) -> String {
+    let Some(x) = value.as_exception() else {
+        return match value.as_string().and_then(|s| s.to_string().ok()) {
+            Some(s) => s,
+            None => "script failed".into(),
+        };
+    };
+    let message = x.message().unwrap_or_default();
+    let text = match x.get::<_, String>("name") {
+        Ok(name) if !name.is_empty() => format!("{name}: {message}"),
+        _ => message,
+    };
+    let stack = x.stack().unwrap_or_default();
+    let Some(at) = FRAME.captures(&stack) else {
+        return text;
+    };
+    let (line, column) = (&at[1], at[2].parse::<usize>().unwrap_or_default());
+    // QuickJS counts columns from 0 on line 1 and from 1 on the others.
+    let column = match line {
+        "1" => (column + 1).saturating_sub(shift),
+        _ => column,
+    };
+    format!("{text} (line {line}:{column})")
+}
+
+static FRAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(&format!(r"\b{FILE}:(\d+):(\d+)")).expect("valid")
+});
 
 #[cfg(test)]
 mod tests {
@@ -1049,6 +1093,101 @@ mod tests {
             ]
         );
         assert!(out.error.unwrap().contains("no module 'left-pad'"));
+    }
+
+    /// Ed25519 request signing as Postman scripts do it: `pm.require` of an npm package,
+    /// in an async function. `pm.require` was missing ("not a function"). RFC 8032's
+    /// first vector (empty message) checks the signature itself.
+    #[test]
+    fn pm_require_signs_ed25519_with_tweetnacl() {
+        let req = request();
+        let env = HashMap::from([
+            (
+                "seed".to_owned(),
+                "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60".to_owned(),
+            ),
+            (
+                "public".to_owned(),
+                "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".to_owned(),
+            ),
+        ]);
+        let out = run(
+            r#"
+            (async function () {
+              const imported = pm.require('npm:tweetnacl@1.0.3');
+              const nacl = imported.default || imported;
+              const hex = k => new Uint8Array(pm.environment.get(k).match(/.{2}/g).map(x => parseInt(x, 16)));
+              const pair = nacl.sign.keyPair.fromSeed(hex('seed'));
+              const signature = nacl.sign.detached(new Uint8Array(), pair.secretKey);
+              pm.variables.set('signature', btoa(String.fromCharCode(...signature)));
+              pm.variables.set('same', pair.publicKey.every((b, i) => b === hex('public')[i]));
+              pm.variables.set('verified', nacl.sign.detached.verify(new Uint8Array(), signature, pair.publicKey));
+            })();
+            "#,
+            &input(&req, &env, None),
+        );
+        assert_eq!(out.error, None);
+        assert_eq!(
+            out.locals["signature"].as_deref(),
+            Some(
+                "5VZDAMNgrHKQhuLMgG6CioSHfx645dl02HPgZSJJAVVfuIIVkKM7rMYeOXAc+bRr0lv18FlbviRlUUFDjnoQCw=="
+            )
+        );
+        assert_eq!(out.locals["same"].as_deref(), Some("true"));
+        assert_eq!(out.locals["verified"].as_deref(), Some("true"));
+
+        // A package that isn't bundled says what is, rather than "not a function".
+        let out = run(
+            "pm.require('npm:@noble/ed25519@2.1.0');",
+            &input(&req, &env, None),
+        );
+        let e = out.error.unwrap();
+        assert!(
+            e.contains("no module '@noble/ed25519'") && e.contains("tweetnacl"),
+            "{e}"
+        );
+    }
+
+    /// An async function that throws failed nothing: the request went out without the
+    /// variables it was to set. And QuickJS's "not a function" named neither the kind nor
+    /// the line, and a logged Error read `{}`.
+    #[test]
+    fn a_rejected_async_function_fails_the_script_with_the_line() {
+        let (req, env) = (request(), HashMap::new());
+        let async_throw = "(async function () {\n  console.error('failed:', new Error('no key'));\n  pm.nope();\n})();";
+        let out = run(async_throw, &input(&req, &env, None));
+        assert_eq!(
+            out.error.as_deref(),
+            Some("TypeError: not a function (line 3:6)")
+        );
+        let logged = &out.logs[0];
+        assert!(logged.starts_with("failed: Error: no key\n"), "{logged}");
+        assert!(logged.contains("script:2:"), "{logged}");
+
+        // Columns count from 1 on line 1 too (QuickJS counts them from 0 there only), and
+        // inside the top-level-await wrapper still from the script's own start.
+        let out = run("pm.nope();", &input(&req, &env, None));
+        assert_eq!(
+            out.error.as_deref(),
+            Some("TypeError: not a function (line 1:4)")
+        );
+        let out = run("await 1; pm.nope();", &input(&req, &env, None));
+        assert_eq!(
+            out.error.as_deref(),
+            Some("TypeError: not a function (line 1:13)")
+        );
+
+        // Handled, even later, is no failure.
+        let out = run(
+            "var p = Promise.reject(new Error('x')); p.catch(function () {});",
+            &input(&req, &env, None),
+        );
+        assert_eq!(out.error, None);
+        let out = run(
+            "(async function () { try { await Promise.reject(1); } catch (e) {} })();",
+            &input(&req, &env, None),
+        );
+        assert_eq!(out.error, None);
     }
 
     /// The generated schema seeds a contract test: the response it came from must pass,

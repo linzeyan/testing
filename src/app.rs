@@ -2819,7 +2819,13 @@ impl App {
                         let (ms, size) = (r.elapsed.as_millis(), r.body.len());
                         log::info!("{method} {url}: {} in {ms} ms, {size} B", r.status);
                     }
-                    Err(e) => log::warn!("{method} {url}: {}", redact(e)),
+                    Err(e) => {
+                        log::warn!("{method} {url}: {}", redact(e));
+                        // In the status bar too: the response pane shows only the open tab's.
+                        // The next Send clears it, as it clears any status.
+                        let name = self.ws.display_name(&path);
+                        self.fail(format!("{name}: {}", failure_line(e)));
+                    }
                 }
                 self.record_history(sent, &outcome);
             }
@@ -13965,6 +13971,19 @@ fn font_picker<'a>(
         });
 }
 
+/// A send's failure in one line, as Postman's "Could not send request" says it. Of a chain
+/// (`http::error_chain`) the innermost cause, the one that says what to fix; a script's
+/// failure whole, as its last line alone ("Request failed: not a function") hid that
+/// nothing was sent, and why.
+fn failure_line(e: &str) -> String {
+    let last = e.lines().last().unwrap_or_default().trim();
+    match last.strip_prefix("caused by: ") {
+        Some(why) => tf("Request failed: {}", &[&why]),
+        None if e.contains('\n') => e.lines().map(str::trim).collect::<Vec<_>>().join(" "),
+        None => tf("Request failed: {}", &[&last]),
+    }
+}
+
 /// Status, time (hover: where it went), size (hover: headers and body) and version.
 fn status_line(ui: &mut egui::Ui, view: &ResponseView) {
     let h = &view.head;
@@ -14078,14 +14097,8 @@ fn response_ui(
             // The reason in the bar too, as Postman's "Could not send request" does: the
             // chain below can start with a line that says little.
             Err(e) => {
-                // The innermost cause (`http::error_chain`) is the one that says what to fix.
-                let why = e.lines().last().unwrap_or_default().trim();
-                let why = why.strip_prefix("caused by: ").unwrap_or(why);
-                ui.add(
-                    egui::Label::new(RichText::new(tf("Request failed: {}", &[&why])).color(RED))
-                        .truncate(),
-                )
-                .on_hover_text(e.as_str());
+                ui.add(egui::Label::new(RichText::new(failure_line(e)).color(RED)).truncate())
+                    .on_hover_text(e.as_str());
             }
         }
         let actions = egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true);
@@ -16939,6 +16952,37 @@ mod ui_tests {
         h.get_by_label("Close").click();
         h.run();
         assert!(h.state().load.is_none(), "back to the response");
+    }
+
+    /// A send's failure is in the status bar too, red: the response pane shows only the
+    /// open tab's. The next Send clears it. A script's failure says nothing was sent, and
+    /// why, where the bar read "Request failed: not a function".
+    #[test]
+    fn a_send_failure_is_in_the_status_bar_until_the_next_send() {
+        let addr = crate::http::tests::serve(|_| ("200 OK".into(), "ok".into()));
+        let mut h = with_request("send-fail-status");
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        (d.url, d.pre_request) = (format!("http://{addr}/"), "\n\npm.nope();".into());
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| app.response.is_some());
+        let why =
+            "Pre-request script failed, request not sent: TypeError: not a function (line 3:4)";
+        assert!(h.query_by_label(why).is_some());
+        let status = format!("r: {why}");
+        assert_eq!(painted_color(&h, &status), Some(RED));
+
+        h.state_mut()
+            .open
+            .as_mut()
+            .unwrap()
+            .draft
+            .pre_request
+            .clear();
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| {
+            app.response.as_ref().is_some_and(|s| s.result.is_ok())
+        });
+        assert!(h.query_by_label(&status).is_none());
     }
 
     /// A stray click on another body type and back loses nothing, as in Postman: None
