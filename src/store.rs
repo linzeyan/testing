@@ -1,10 +1,12 @@
 //! The workspace is a directory holding `apitool.db`, one SQLite file with the requests,
 //! folders, environments (secrets included), history, cookies and UI state.
 //!
-//! Requests and folders are keyed by their place in the tree ("users/get user"). Callers
-//! name them by the path they would have as files under `collections/`, which is where
-//! `export` writes them: this TOML tree, for git.
-//!   collections/**/<name>.toml   one request per file, folders are directories
+//! Folders are keyed by their place in the tree ("users"), requests by their folder's key
+//! and their id ("users/0190…"): names repeat and hold any character, so a request's name
+//! is a field of it. Callers name them by the path they would have as files under
+//! `collections/`, which is where `export` writes them: this TOML tree, for git. A path
+//! ending in a name rather than an id stands for the request of that name there (`key`).
+//!   collections/**/<id>.toml     one request per file, folders are directories
 //!   collections/**/.folder.toml  variables, auth and scripts shared by a folder
 //!   environments/<name>.toml      shared variables
 //!   globals.toml                  workspace-wide shared variables
@@ -24,7 +26,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::{t, tf};
-use crate::model::{Auth, Folder, Inherited, KeyValue, Request};
+use crate::model::{Auth, Folder, Inherited, KeyValue, Request, SortBy};
 
 const DB: &str = "apitool.db";
 /// The workspace directory may be a git repo of the exported tree; the database and the
@@ -75,7 +77,7 @@ pub struct ResponseMeta {
 pub struct HistoryEntry {
     /// Unix seconds.
     pub at: u64,
-    /// As shown in the tree, e.g. `users/get user`.
+    /// Its key, `users/<id>` (`users/get user` from before ids, which `key` still finds).
     pub path: String,
     /// 0 when there was no response.
     pub status: u16,
@@ -86,6 +88,19 @@ pub struct HistoryEntry {
 }
 
 impl HistoryEntry {
+    /// "folder/name" as people read it.
+    pub fn display(&self) -> String {
+        let (parent, leaf) = self.path.rsplit_once('/').unwrap_or(("", &self.path));
+        let name = match self.request.name.is_empty() {
+            true => unescape_name(leaf),
+            false => self.request.name.clone(),
+        };
+        match parent {
+            "" => name,
+            p => format!("{}/{name}", unescape_path(p)),
+        }
+    }
+
     pub fn new(path: String, status: u16, ms: u64, mut request: Request) -> Self {
         // Examples are saved with the request already; repeating them per send is waste.
         request.examples.clear();
@@ -117,6 +132,8 @@ pub enum Node {
         name: String,
         path: PathBuf,
         children: Vec<Node>,
+        /// How it lists its requests, and whether the other way round (`Folder::sort`).
+        sort: (SortBy, bool),
     },
     Request {
         name: String,
@@ -124,6 +141,9 @@ pub enum Node {
         method: String,
         /// As saved, `{{variables}}` unresolved: for Ctrl+K.
         url: String,
+        /// Unix milliseconds: from its id, and of its last saved change; 0 unknown.
+        created: u64,
+        updated: u64,
     },
 }
 
@@ -178,6 +198,8 @@ pub struct State {
     pub appearance: crate::appearance::Appearance,
     /// How much goes into apitool.log (Settings).
     pub log_level: crate::logfile::Level,
+    /// Sends don't add to a request's past responses (Settings); off, so they're kept.
+    pub forget_responses: bool,
     pub updates: crate::update::Updates,
     /// MCP clients may operate the window (Settings).
     pub mcp_window: bool,
@@ -262,6 +284,101 @@ pub fn requests_in(nodes: &[Node], scope: &Path, out: &mut Vec<PathBuf>) {
             Node::Request { path, .. } if path.starts_with(scope) => out.push(path.clone()),
             Node::Request { .. } => {}
         }
+    }
+}
+
+/// A request's id: a UUID v7, so ids sort by when they were made (`id_time`). Increasing
+/// within this process even within one millisecond or with the clock set back.
+pub fn new_id() -> String {
+    static LAST: Mutex<(u64, u16)> = Mutex::new((0, 0));
+    let now = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+        .map_or(0, |d| d.as_millis() as u64);
+    let (ms, seq) = {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        *last = match *last {
+            (ms, seq) if now <= ms && seq < 0xfff => (ms, seq + 1),
+            (ms, _) if now <= ms => (ms + 1, 0),
+            _ => (now, 0),
+        };
+        *last
+    };
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b[8..]).expect("the system's random source");
+    b[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
+    b[6] = 0x70 | (seq >> 8) as u8;
+    b[7] = seq as u8;
+    b[8] = 0x80 | (b[8] & 0x3f);
+    uuid_text(&b)
+}
+
+/// The id a request from before ids gets, from its key: the same on every machine that
+/// converts the same tree, so a workspace shared through git doesn't fork. Its time is 0:
+/// when it was made isn't known.
+fn legacy_id(key: &str) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(key.as_bytes());
+    let mut b = [0u8; 16];
+    b[6..].copy_from_slice(&hash[6..16]);
+    b[6] = 0x70 | (b[6] & 0x0f);
+    b[8] = 0x80 | (b[8] & 0x3f);
+    uuid_text(&b)
+}
+
+fn uuid_text(b: &[u8; 16]) -> String {
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+/// Whether a key's last segment is an id rather than a name from before ids.
+pub fn is_id(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_digit() || ('a'..='f').contains(&c),
+        })
+}
+
+/// When the request with this id was made, in Unix milliseconds; 0 for one from before ids.
+pub fn id_time(id: &str) -> u64 {
+    let hex = id.get(..8).unwrap_or_default().to_owned() + id.get(9..13).unwrap_or_default();
+    u64::from_str_radix(&hex, 16).unwrap_or(0)
+}
+
+fn now_ms() -> u64 {
+    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn join_key(parent: &str, leaf: &str) -> String {
+    match parent {
+        "" => leaf.to_owned(),
+        p => format!("{p}/{leaf}"),
+    }
+}
+
+fn leaf_of(key: &str) -> &str {
+    key.rsplit_once('/').map_or(key, |(_, leaf)| leaf)
+}
+
+/// A request key from before ids → its id key; any other key as it is.
+fn upgrade_key(key: &str) -> String {
+    match is_id(leaf_of(key)) {
+        true => key.to_owned(),
+        false => join_key(parent_of(key), &legacy_id(key)),
+    }
+}
+
+/// A folder's `order` entries from before ids, request names, as their ids.
+fn upgrade_order(folder_key: &str, order: &mut [String]) {
+    for t in order.iter_mut().filter(|t| !t.ends_with('/') && !is_id(t)) {
+        *t = legacy_id(&join_key(folder_key, t));
     }
 }
 
@@ -377,6 +494,7 @@ impl Workspace {
         };
         ws.ignore()?;
         ws.seal_secrets();
+        ws.upgrade_ids()?;
         ws.tidy();
         Ok(ws)
     }
@@ -447,15 +565,151 @@ impl Workspace {
         self.db.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// "users/get user" for a request, "users" for a folder, "" for the root: segments
-    /// escaped (`escape_name`), so it goes back through `request_path` unchanged.
+    /// "users/<id>" for a request, "users" for a folder, "" for the root: segments
+    /// escaped (`escape_name`), so it goes back through `request_path` unchanged. A request
+    /// path ending in a name instead of an id (typed in the CLI or MCP, or kept from before
+    /// ids) is the oldest request of that name in its folder, else the one it was before
+    /// ids; else it's left as it is, for `save_request` to create.
     pub fn key(&self, path: &Path) -> String {
+        let rel = self.rel_key(path);
+        match is_request(path) && !is_id(leaf_of(&rel)) {
+            true => self.named(&rel).unwrap_or(rel),
+            false => rel,
+        }
+    }
+
+    fn rel_key(&self, path: &Path) -> String {
         let rel = path.strip_prefix(self.collections()).unwrap_or(path);
         let rel = match is_request(path) {
             true => rel.with_extension(""),
             false => rel.to_owned(),
         };
         rel.to_string_lossy().replace('\\', "/")
+    }
+
+    /// See `key`.
+    fn named(&self, key: &str) -> Option<String> {
+        let db = self.db();
+        let query = "SELECT path FROM requests WHERE json_extract(request, '$.name') = ?1 \
+                     ORDER BY path";
+        let mut q = db.prepare_cached(query).ok()?;
+        let hits = q.query_map([unescape_name(leaf_of(key))], |r| r.get::<_, String>(0));
+        let parent = parent_of(key);
+        let hit = (hits.ok()?.flatten()).find(|k| parent_of(k) == parent);
+        hit.or_else(|| {
+            let old = upgrade_key(key);
+            let there = db.query_row("SELECT 1 FROM requests WHERE path = ?1", [&old], |_| Ok(()));
+            there.ok().map(|_| old)
+        })
+    }
+
+    /// A request as stored, without what `load_request` adds.
+    fn stored(&self, key: &str) -> Result<Request, String> {
+        let json: Option<String> = sql(self
+            .db()
+            .query_row("SELECT request FROM requests WHERE path = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional())?;
+        let json = json.ok_or_else(|| format!("no request \"{key}\""))?;
+        serde_json::from_str(&json).map_err(|e| format!("request \"{key}\": {e}"))
+    }
+
+    /// Converts what's from before ids: requests keyed by name (their past responses with
+    /// them), folder orders listing names, history, tabs, unsaved edits and run orders
+    /// pointing at them. `legacy_id` makes each the id an import of the same tree gives.
+    /// Each step writes only when it finds something to convert.
+    fn upgrade_ids(&self) -> Result<(), String> {
+        let mut db = self.db();
+        let tx = sql(db.transaction())?;
+        let all = |query: &str| -> Result<Vec<(String, String)>, String> {
+            let mut q = sql(tx.prepare(query))?;
+            let rows = sql(q.query_map([], |r| Ok((r.get(0)?, r.get(1)?))))?;
+            sql(rows.collect())
+        };
+        for (key, json) in all("SELECT path, request FROM requests")? {
+            if is_id(leaf_of(&key)) {
+                continue;
+            }
+            let mut req: Request =
+                serde_json::from_str(&json).map_err(|e| format!("request \"{key}\": {e}"))?;
+            if req.name.is_empty() {
+                req.name = unescape_name(leaf_of(&key));
+            }
+            let new = upgrade_key(&key);
+            sql(tx.execute(
+                "UPDATE requests SET path = ?2, request = ?3 WHERE path = ?1",
+                [&key, &new, &to_json(&req)?],
+            ))?;
+            sql(tx.execute(
+                "UPDATE responses SET path = ?2 WHERE path = ?1",
+                [&key, &new],
+            ))?;
+        }
+        for (key, settings) in all("SELECT path, settings FROM folders WHERE settings != ''")? {
+            let mut folder: Folder =
+                serde_json::from_str(&settings).map_err(|e| format!("folder \"{key}\": {e}"))?;
+            let before = folder.order.clone();
+            upgrade_order(&key, &mut folder.order);
+            if folder.order != before {
+                let update = "UPDATE folders SET settings = ?2 WHERE path = ?1";
+                sql(tx.execute(update, [&key, &folder_json(&folder)?]))?;
+            }
+        }
+        let history: Vec<(i64, String)> = {
+            let mut q = sql(tx.prepare("SELECT id, entry FROM history"))?;
+            let rows = sql(q.query_map([], |r| Ok((r.get(0)?, r.get(1)?))))?;
+            sql(rows.collect())?
+        };
+        for (id, json) in history {
+            let Ok(mut e) = serde_json::from_str::<HistoryEntry>(&json) else {
+                continue;
+            };
+            if is_id(leaf_of(&e.path)) {
+                continue;
+            }
+            if e.request.name.is_empty() {
+                e.request.name = unescape_name(leaf_of(&e.path));
+            }
+            e.path = upgrade_key(&e.path);
+            let update = "UPDATE history SET entry = ?2 WHERE id = ?1";
+            sql(tx.execute(update, rusqlite::params![id, to_json(&e)?]))?;
+        }
+        sql(tx.commit())?;
+        drop(db);
+
+        let upgrade_path = |p: &mut PathBuf| {
+            let key = self.rel_key(p);
+            if is_request(p) && !is_id(leaf_of(&key)) {
+                *p = self.request_at(&upgrade_key(&key));
+            }
+        };
+        let mut state = self.load_state();
+        let before = to_json(&state)?;
+        state.tabs.iter_mut().for_each(upgrade_path);
+        state.open.iter_mut().for_each(upgrade_path);
+        for order in state.run_orders.values_mut() {
+            for (key, _) in order.iter_mut() {
+                *key = upgrade_key(key);
+            }
+        }
+        if to_json(&state)? != before {
+            self.save_state(&state);
+        }
+        let mut drafts = self.load_drafts();
+        let before = to_json(&drafts)?;
+        for (path, req) in &mut drafts {
+            if req.name.is_empty()
+                && !is_id(&path.file_stem().unwrap_or_default().to_string_lossy())
+            {
+                req.name = unescape_name(&path.file_stem().unwrap_or_default().to_string_lossy());
+            }
+            upgrade_path(path);
+        }
+        if to_json(&drafts)? != before {
+            self.save_drafts(&drafts)?;
+        }
+        Ok(())
     }
 
     fn folder_at(&self, key: &str) -> PathBuf {
@@ -734,7 +988,23 @@ impl Workspace {
     /// "folder/request" as people read it (runner results, the status bar); `key` is the
     /// form that goes back through `request_path`.
     pub fn display_name(&self, path: &Path) -> String {
-        unescape_path(&self.key(path))
+        let key = self.key(path);
+        if !is_request(path) {
+            return unescape_path(&key);
+        }
+        let name: Option<String> = (self.db())
+            .query_row(
+                "SELECT json_extract(request, '$.name') FROM requests WHERE path = ?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        let name = (name.filter(|n| !n.is_empty())).unwrap_or_else(|| unescape_name(leaf_of(&key)));
+        match parent_of(&key) {
+            "" => name,
+            p => format!("{}/{name}", unescape_path(p)),
+        }
     }
 
     /// Whether a request (`….toml`) or folder is in the workspace.
@@ -812,25 +1082,34 @@ impl Workspace {
             rows.collect()
         };
         let folders = rows("SELECT path, settings FROM folders");
-        let requests = || -> rusqlite::Result<Vec<(String, String, String)>> {
-            let query = "SELECT path, method, ifnull(json_extract(request, '$.url'), '') \
-                         FROM requests";
+        let requests = || -> rusqlite::Result<Vec<Listed>> {
+            let query = "SELECT path, method, ifnull(json_extract(request, '$.url'), ''), \
+                         ifnull(json_extract(request, '$.name'), ''), \
+                         ifnull(json_extract(request, '$.updated'), 0) FROM requests";
             let mut q = db.prepare(query)?;
-            let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let rows = q.query_map([], |r| {
+                Ok(Listed {
+                    key: r.get(0)?,
+                    method: r.get(1)?,
+                    url: r.get(2)?,
+                    name: r.get(3)?,
+                    updated: r.get::<_, i64>(4)? as u64,
+                })
+            })?;
             rows.collect()
         };
         let requests = requests();
         drop(db);
         match (folders, requests) {
             (Ok(mut folders), Ok(requests)) => {
-                let orders = (folders.iter_mut())
+                let settings = (folders.iter_mut())
                     .filter_map(|(key, settings)| {
-                        let f = serde_json::from_str::<Folder>(settings).ok();
-                        Some((key.clone(), f?.order)).filter(|(_, o)| !o.is_empty())
+                        let f = serde_json::from_str::<Folder>(settings).ok()?;
+                        Some((key.clone(), f))
                     })
                     .collect();
                 folders.retain(|(key, _)| !key.is_empty());
-                self.nodes("", &folders, &requests, &orders)
+                self.nodes("", &folders, &requests, &settings)
             }
             (Err(e), _) | (_, Err(e)) => {
                 log::error!("workspace database: {e}");
@@ -839,45 +1118,52 @@ impl Workspace {
         }
     }
 
-    /// The folder's own order if it has one; else (and for what it doesn't list) folders
+    /// The folder's sort if it has one: its folders first, as below, then its requests by
+    /// that. Else its own order if it has one; else (and for what it doesn't list) folders
     /// first, then requests, each by name ignoring case.
     fn nodes(
         &self,
         parent: &str,
         folders: &[(String, String)],
-        requests: &[(String, String, String)],
-        orders: &HashMap<String, Vec<String>>,
+        requests: &[Listed],
+        settings: &HashMap<String, Folder>,
     ) -> Vec<Node> {
-        let leaf = |key: &str| unescape_name(key.rsplit('/').next().unwrap_or(key));
         let mut subfolders: Vec<Node> = folders
             .iter()
             .filter(|(key, _)| parent_of(key) == parent)
             .map(|(key, _)| Node::Folder {
-                name: leaf(key),
+                name: unescape_name(leaf_of(key)),
                 path: self.folder_at(key),
-                children: self.nodes(key, folders, requests, orders),
+                children: self.nodes(key, folders, requests, settings),
+                sort: (settings.get(key)).map_or((SortBy::None, false), |f| (f.sort, f.descending)),
             })
             .collect();
         let mut here: Vec<Node> = requests
             .iter()
-            .filter(|(key, ..)| parent_of(key) == parent)
-            .map(|(key, method, url)| Node::Request {
-                name: leaf(key),
-                path: self.request_at(key),
-                method: method.clone(),
-                url: url.clone(),
+            .filter(|r| parent_of(&r.key) == parent)
+            .map(|r| Node::Request {
+                name: match r.name.is_empty() {
+                    true => unescape_name(leaf_of(&r.key)),
+                    false => r.name.clone(),
+                },
+                path: self.request_at(&r.key),
+                method: r.method.clone(),
+                url: r.url.clone(),
+                created: id_time(leaf_of(&r.key)),
+                updated: r.updated,
             })
             .collect();
-        let name = |n: &Node| match n {
-            Node::Folder { name, .. } | Node::Request { name, .. } => name.to_lowercase(),
-        };
-        subfolders.sort_by_key(name);
-        here.sort_by_key(name);
+        default_sort(&mut subfolders);
+        default_sort(&mut here);
         subfolders.extend(here);
-        if let Some(order) = orders.get(parent) {
+        let folder = settings.get(parent);
+        if let Some(order) = folder.map(|f| &f.order).filter(|o| !o.is_empty()) {
             // Stable, so the unlisted follow in the default order.
             let at = |n: &Node| order.iter().position(|t| *t == tag(n.path()));
             subfolders.sort_by_key(|n| at(n).unwrap_or(usize::MAX));
+        }
+        if let Some(f) = folder.filter(|f| !f.sort.is_none()) {
+            sort_requests(&mut subfolders, f.sort, f.descending);
         }
         subfolders
     }
@@ -899,8 +1185,24 @@ impl Workspace {
         order.retain(|t| *t != tag(&new));
         let at = (order.iter().position(|t| *t == tag(target))).ok_or("the target is gone")?;
         order.insert(at + after as usize, tag(&new));
+        let mut default = siblings.to_vec();
+        let (mut folders, mut requests): (Vec<Node>, Vec<Node>) = default
+            .drain(..)
+            .partition(|n| matches!(n, Node::Folder { .. }));
+        default_sort(&mut folders);
+        default_sort(&mut requests);
+        let default: Vec<String> = folders
+            .iter()
+            .chain(&requests)
+            .map(|n| tag(n.path()))
+            .collect();
         let mut folder = self.load_folder(dir)?;
-        folder.order = Folder::order_of(order);
+        folder.order = match order == default {
+            true => Vec::new(),
+            false => order,
+        };
+        // Put somewhere by hand: the folder's sort would put it back.
+        folder.sort = SortBy::None;
         self.save_folder(dir, &folder)?;
         Ok(new)
     }
@@ -984,10 +1286,28 @@ impl Workspace {
         Ok(out)
     }
 
-    /// Creates the folders above it as needed.
+    /// Creates the folders above it as needed, and the request when `path` ends in a name
+    /// no request there has (`key`): a new id, with that name unless `req` has one. Its
+    /// `updated` is now when anything in it changed.
     pub fn save_request(&self, path: &Path, req: &Request) -> Result<(), String> {
-        let key = self.key(path);
-        let json = to_json(req)?;
+        let mut key = self.key(path);
+        let mut req = req.clone();
+        if !is_id(leaf_of(&key)) {
+            if req.name.is_empty() {
+                req.name = unescape_name(leaf_of(&key));
+            }
+            key = join_key(parent_of(&key), &new_id());
+        }
+        let old = self.stored(&key).ok();
+        // Saved from what didn't carry it (an MCP client's JSON): it keeps its name.
+        if let Some(old) = old.as_ref().filter(|_| req.name.is_empty()) {
+            req.name = old.name.clone();
+        }
+        req.updated = match old {
+            Some(old) if old.same_as(&req) => old.updated,
+            _ => now_ms(),
+        };
+        let json = to_json(&req)?;
         let mut db = self.db();
         let tx = sql(db.transaction())?;
         ensure_folders(&tx, parent_of(&key))?;
@@ -1009,7 +1329,13 @@ impl Workspace {
         for dir in dirs.split('/').filter(|d| !d.is_empty()) {
             path.push(normal(dir)?);
         }
-        Ok(path.join(format!("{}.toml", normal(file)?)))
+        let path = path.join(format!("{}.toml", normal(file)?));
+        // The request a name stands for, by its id, when there is one.
+        let key = self.key(&path);
+        Ok(match is_id(leaf_of(&key)) {
+            true => self.request_at(&key),
+            false => path,
+        })
     }
 
     /// Every request under `scope` (a folder or a single request), in tree order, with
@@ -1026,13 +1352,14 @@ impl Workspace {
             .collect()
     }
 
-    /// Creates `<dir>/<name>`, refusing to overwrite.
+    /// A new request named `name` in `dir`; others there may have that name too.
     pub fn create_request(&self, dir: &Path, name: &str) -> Result<PathBuf, String> {
-        let path = request_in(dir, name)?;
-        if self.exists(&path) {
-            return Err(tf("\"{}\" already exists", &[&name]));
-        }
-        self.save_request(&path, &Request::default())?;
+        let path = new_request_in(dir);
+        let req = Request {
+            name: request_name(name)?,
+            ..Default::default()
+        };
+        self.save_request(&path, &req)?;
         Ok(path)
     }
 
@@ -1048,13 +1375,18 @@ impl Workspace {
         Ok(path)
     }
 
-    /// Renames a request or folder in place; returns the new path.
+    /// Renames a request or folder in place; returns the new path, which for a request is
+    /// the one it had: a name is only a field of it.
     pub fn rename(&self, path: &Path, name: &str) -> Result<PathBuf, String> {
-        let request = is_request(path);
-        let new = match request {
-            true => path.with_file_name(format!("{}.toml", segment(name)?)),
-            false => path.with_file_name(folder_segment(name)?),
-        };
+        if is_request(path) {
+            let key = self.key(path);
+            let mut req = self.stored(&key)?;
+            req.name = request_name(name)?;
+            let path = self.request_at(&key);
+            self.save_request(&path, &req)?;
+            return Ok(path);
+        }
+        let new = path.with_file_name(folder_segment(name)?);
         // OK on an unchanged name: it is itself, not another one already there.
         if new == path {
             return Ok(new);
@@ -1115,43 +1447,65 @@ impl Workspace {
         sql(tx.commit())
     }
 
-    /// The first free "<name> copy", "<name> copy 2", … next to `path`.
+    /// The first free "<name> copy", "<name> copy 2", … next to the folder `path`.
     fn copy_of(&self, path: &Path) -> PathBuf {
-        let request = is_request(path);
         // A dot in a folder name is not an extension.
-        let stem = match request {
-            true => path.file_stem(),
-            false => path.file_name(),
-        };
-        let stem = stem.unwrap_or_default().to_string_lossy();
+        let stem = path.file_name().unwrap_or_default().to_string_lossy();
         (1..)
-            .map(|n| copy_name(&stem, n))
-            .map(|name| match request {
-                true => path.with_file_name(format!("{name}.toml")),
-                false => path.with_file_name(name),
-            })
+            .map(|n| path.with_file_name(copy_name(&stem, n)))
             .find(|p| !self.exists(p))
             .expect("some name is free")
     }
 
-    /// Copies a request or a whole folder next to itself as "<name> copy" ("copy 2", …).
+    /// Copies a request next to itself as "<name> copy", or a whole folder as "<name> copy"
+    /// ("copy 2", …); the requests copied get ids of their own.
     pub fn duplicate(&self, path: &Path) -> Result<PathBuf, String> {
-        let request = is_request(path);
+        if is_request(path) {
+            let key = self.key(path);
+            let mut req = self.stored(&key)?;
+            req.name = copy_name(&req.name, 1);
+            let new = self.request_at(&join_key(parent_of(&key), &new_id()));
+            self.save_request(&new, &req)?;
+            return Ok(new);
+        }
         let new = self.copy_of(path);
         let (old_key, new_key) = (self.key(path), self.key(&new));
+        let moved = |key: &str| format!("{new_key}{}", &key[old_key.len()..]);
         let mut db = self.db();
         let tx = sql(db.transaction())?;
-        let tables: &[(&str, &str)] = match request {
-            true => &[("requests", "method, request")],
-            false => &[("folders", "settings"), ("requests", "method, request")],
-        };
-        let rows = rows_of(request);
-        for (table, columns) in tables {
-            let copy = format!(
-                "INSERT INTO {table} (path, {columns}) \
-                 SELECT ?2 || substr(path, length(?1) + 1), {columns} FROM {table} WHERE {rows}"
+        let rows = |table: &str, columns: &str| -> Result<Vec<(String, String, String)>, String> {
+            let query = format!(
+                "SELECT path, {columns} FROM {table} WHERE {}",
+                rows_of(false)
             );
-            sql(tx.execute(&copy, [&old_key, &new_key]))?;
+            let mut q = sql(tx.prepare(&query))?;
+            let rows = sql(q.query_map([&old_key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?;
+            sql(rows.collect())
+        };
+        let requests = rows("requests", "method, request")?;
+        let folders = rows("folders", "settings, ''")?;
+        let ids: HashMap<&str, String> = (requests.iter())
+            .map(|(key, ..)| (leaf_of(key), new_id()))
+            .collect();
+        for (key, method, json) in &requests {
+            let key = join_key(&moved(parent_of(key)), &ids[leaf_of(key)]);
+            let insert = "INSERT INTO requests (path, method, request) VALUES (?1, ?2, ?3)";
+            sql(tx.execute(insert, [&key, method, json]))?;
+        }
+        for (key, settings, _) in &folders {
+            let mut settings = settings.clone();
+            if !settings.is_empty() {
+                let mut folder: Folder = serde_json::from_str(&settings)
+                    .map_err(|e| format!("folder \"{key}\": {e}"))?;
+                for t in &mut folder.order {
+                    if let Some(id) = ids.get(t.as_str()) {
+                        *t = id.clone();
+                    }
+                }
+                settings = folder_json(&folder)?;
+            }
+            let insert = "INSERT INTO folders (path, settings) VALUES (?1, ?2)";
+            sql(tx.execute(insert, [&moved(key), &settings]))?;
         }
         sql(tx.commit())?;
         Ok(new)
@@ -1414,13 +1768,32 @@ impl Workspace {
                 false => format!("{top}/{key}"),
             })
         };
-        let folders: Vec<(String, String)> = folders
-            .iter()
-            .map(|(key, f)| Ok((under(key)?, folder_json(f)?)))
-            .collect::<Result<_, String>>()?;
+        // Requests keyed by name (as importers make them) get ids; their names were their
+        // keys' unless they carry one, which may repeat.
+        let mut ids: HashMap<String, String> = HashMap::new();
         let requests: Vec<(String, Request)> = requests
             .iter()
-            .map(|(key, r)| Ok((under(key)?, r.clone())))
+            .map(|(key, r)| {
+                let mut r = r.clone();
+                if r.name.is_empty() {
+                    r.name = unescape_name(leaf_of(key));
+                }
+                let id = new_id();
+                ids.insert(key.clone(), id.clone());
+                Ok((join_key(&under(parent_of(key))?, &id), r))
+            })
+            .collect::<Result<_, String>>()?;
+        let folders: Vec<(String, String)> = folders
+            .iter()
+            .map(|(key, f)| {
+                let mut f = f.clone();
+                for t in f.order.iter_mut().filter(|t| !t.ends_with('/')) {
+                    if let Some(id) = ids.get(&join_key(key, t)) {
+                        *t = id.clone();
+                    }
+                }
+                Ok((under(key)?, folder_json(&f)?))
+            })
             .collect::<Result<_, String>>()?;
         self.put_tree(&folders, &requests)?;
         Ok(dir)
@@ -1736,8 +2109,9 @@ fn read_tree(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("read {}: {e}", dir.join(FOLDER).display())),
         Ok(text) => {
-            let folder: Folder = toml::from_str(&text)
+            let mut folder: Folder = toml::from_str(&text)
                 .map_err(|e| format!("parse {}: {e}", dir.join(FOLDER).display()))?;
+            upgrade_order(key, &mut folder.order);
             to_json(&folder)?
         }
     };
@@ -1759,9 +2133,13 @@ fn read_tree(
         } else if let Some(stem) = name.strip_suffix(".toml") {
             let text =
                 fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-            let req: Request =
+            let mut req: Request =
                 toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
-            requests.push((child(stem), req));
+            // A file from before ids, named by its request.
+            if !is_id(stem) && req.name.is_empty() {
+                req.name = unescape_name(stem);
+            }
+            requests.push((upgrade_key(&child(stem)), req));
         }
     }
     Ok(())
@@ -1861,9 +2239,82 @@ pub fn unescape_path(key: &str) -> String {
     parts.join("/")
 }
 
-/// Where a request named `name` goes in `dir`.
-pub fn request_in(dir: &Path, name: &str) -> Result<PathBuf, String> {
-    Ok(dir.join(format!("{}.toml", segment(name)?)))
+/// Where a new request goes in `dir`: a path with a new id.
+pub fn new_request_in(dir: &Path) -> PathBuf {
+    dir.join(format!("{}.toml", new_id()))
+}
+
+/// A request's name as typed: any text but blank, trimmed.
+pub fn request_name(name: &str) -> Result<String, String> {
+    match name.trim() {
+        "" => Err(t("name can't be empty").into()),
+        name => Ok(name.to_owned()),
+    }
+}
+
+/// The folders first, then the requests, each by name ignoring case.
+fn default_sort(nodes: &mut [Node]) {
+    nodes.sort_by_key(|n| match n {
+        Node::Folder { name, .. } => (false, name.to_lowercase()),
+        Node::Request { name, .. } => (true, name.to_lowercase()),
+    });
+}
+
+/// A folder's `sort`: its folders first, as they were, then its requests by `by`; ties by
+/// name, ascending either way.
+fn sort_requests(nodes: &mut [Node], by: SortBy, descending: bool) {
+    use std::cmp::Ordering;
+    let rank = |n: &Node| matches!(n, Node::Request { .. });
+    nodes.sort_by(|a, b| match (a, b) {
+        (
+            Node::Request {
+                name: na,
+                created: ca,
+                updated: ua,
+                path: pa,
+                ..
+            },
+            Node::Request {
+                name: nb,
+                created: cb,
+                updated: ub,
+                path: pb,
+                ..
+            },
+        ) => {
+            let names = || na.to_lowercase().cmp(&nb.to_lowercase());
+            // Ids order what was made, or saved, within one millisecond; from before ids
+            // (time 0), names do.
+            let ids = || match ca + cb {
+                0 => Ordering::Equal,
+                _ => ca.cmp(cb).then_with(|| pa.file_stem().cmp(&pb.file_stem())),
+            };
+            let primary = match by {
+                SortBy::Created => ids(),
+                SortBy::Updated => ua.cmp(ub).then_with(ids),
+                SortBy::Name | SortBy::None => names(),
+            };
+            let primary = if descending {
+                primary.reverse()
+            } else {
+                primary
+            };
+            primary.then_with(|| match by {
+                SortBy::Name | SortBy::None => Ordering::Equal,
+                _ => names(),
+            })
+        }
+        _ => rank(a).cmp(&rank(b)),
+    });
+}
+
+/// A request row as the tree lists it.
+struct Listed {
+    key: String,
+    method: String,
+    url: String,
+    name: String,
+    updated: u64,
 }
 
 /// A name typed or imported, as a key segment.
@@ -1961,24 +2412,36 @@ mod tests {
 
         let folder = ws.create_folder(&ws.collections(), "Users").unwrap();
         let path = ws.create_request(&folder, "Get user").unwrap();
-        assert!(
-            ws.create_request(&folder, "Get user").is_err(),
-            "must not overwrite"
-        );
+        // 10-30: a name is a field, not the key: a second "Get user" (a POST, or another
+        // GET) is a request of its own, and a name holds any character.
+        let twin = ws.create_request(&folder, "Get user").unwrap();
+        assert_ne!(path, twin);
+        assert!(is_id(&path.file_stem().unwrap().to_string_lossy()));
+        let odd = ws.create_request(&folder, "a/b: \"c\" <d>?").unwrap();
+        assert_eq!(ws.display_name(&odd), "Users/a/b: \"c\" <d>?");
         assert!(
             ws.create_request(&folder, " ").is_err(),
             "a name can't be blank"
         );
+        // Typed by name (the CLI, MCP), it's the oldest of that name.
+        assert_eq!(ws.request_path("Users/Get user").unwrap(), path);
+        ws.delete(&twin).unwrap();
+        ws.delete(&odd).unwrap();
 
         let renamed = ws.rename(&path, "Fetch user").unwrap();
+        assert_eq!(
+            renamed, path,
+            "a rename keeps its id, tabs and past responses"
+        );
         assert!(matches!(&ws.tree()[0], Node::Folder { children, .. }
             if matches!(&children[0], Node::Request { name, .. } if name == "Fetch user")));
-        assert_eq!(ws.load_request(&renamed).unwrap(), Request::default());
-        assert!(!ws.exists(&path) && ws.exists(&renamed));
-        // OK left as it was is no rename, not a clash with itself.
-        assert_eq!(ws.rename(&renamed, "Fetch user"), Ok(renamed.clone()));
+        let loaded = ws.load_request(&renamed).unwrap();
+        assert_eq!(
+            (loaded.name.as_str(), loaded.url.as_str()),
+            ("Fetch user", "")
+        );
+        assert!(ws.request_path("Users/Get user").unwrap() != path);
         assert_eq!(ws.rename(&folder, "Users"), Ok(folder.clone()));
-
         // Renaming a folder carries what's inside.
         let moved = ws.rename(&folder, "People").unwrap();
         assert_eq!(
@@ -2133,8 +2596,10 @@ mod tests {
         let copy = ws.duplicate(&get).unwrap();
         assert_eq!(ws.display_name(&copy), "api.v2/get copy");
         assert_eq!(ws.load_request(&copy).unwrap().url, "{{base}}/x");
+        // Names repeat: a second copy is another "get copy", with an id of its own.
         let again = ws.duplicate(&get).unwrap();
-        assert_eq!(ws.display_name(&again), "api.v2/get copy 2");
+        assert_eq!(ws.display_name(&again), "api.v2/get copy");
+        assert_ne!(again, copy);
 
         let folder = ws.duplicate(&api).unwrap();
         assert_eq!(folder.file_name().unwrap(), "api.v2 copy");
@@ -2149,9 +2614,18 @@ mod tests {
             [
                 "api.v2 copy/get",
                 "api.v2 copy/get copy",
-                "api.v2 copy/get copy 2"
+                "api.v2 copy/get copy"
             ]
         );
+        // Ids of their own: one id, one request.
+        let ids = |dir: &Path| {
+            let mut all = Vec::new();
+            requests_in(&ws.tree(), dir, &mut all);
+            all.into_iter()
+                .map(|p| p.file_name().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(ids(&folder).iter().all(|id| !ids(&api).contains(id)));
         // Deleting the copy leaves the original whole.
         ws.delete(&folder).unwrap();
         assert_eq!(ws.load_requests_in(&api).unwrap().len(), 3);
@@ -2285,7 +2759,6 @@ mod tests {
         assert!(ws.load_response(big).is_err());
         // Renaming keeps them with the request; deleting takes them along.
         let renamed = ws.rename(&path, "s").unwrap();
-        assert!(ws.responses(&path).is_empty());
         assert_eq!(ws.responses(&renamed).len(), MAX_RESPONSES);
         ws.delete(&renamed).unwrap();
         let again = ws.create_request(&ws.collections(), "s").unwrap();
@@ -2372,18 +2845,25 @@ mod tests {
             ..Default::default()
         };
         ws.save_request(&r, &req).unwrap();
+        let id = r.file_name().unwrap().to_owned();
         let r = ws.move_into(&r, &v1).unwrap();
-        assert_eq!(r, v1.join("r.toml"));
+        assert_eq!(r, v1.join(&id));
         assert_eq!(ws.load_request(&r).unwrap().url, "http://x");
         // A folder moves with everything in it.
         let v1 = ws.move_into(&v1, &api).unwrap();
-        assert_eq!(ws.load_request(&v1.join("r.toml")).unwrap().url, "http://x");
+        assert_eq!(ws.load_request(&v1.join(&id)).unwrap().url, "http://x");
         assert!(ws.move_into(&api, &v1).is_err(), "not into itself");
-        // A same-named request there stays as it is.
+        // A same-named request goes in beside it: names repeat.
         let other = ws.create_request(&top, "r").unwrap();
-        let err = ws.move_into(&other, &v1).unwrap_err();
-        assert!(err.contains("already exists"), "{err}");
-        assert_eq!(ws.load_request(&v1.join("r.toml")).unwrap().url, "http://x");
+        let other = ws.move_into(&other, &v1).unwrap();
+        assert_eq!(ws.load_request(&v1.join(&id)).unwrap().url, "http://x");
+        assert_eq!(ws.load_request(&other).unwrap().url, "");
+        let dup = ws.create_folder(&top, "v1").unwrap();
+        let err = ws.move_into(&dup, &api).unwrap_err();
+        assert!(
+            err.contains("already exists"),
+            "a folder's name is its key: {err}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2392,8 +2872,14 @@ mod tests {
         let root = fresh("order");
         let ws = Workspace::open(root.clone()).unwrap();
         let top = ws.collections();
-        let names =
-            |nodes: &[Node]| -> Vec<String> { nodes.iter().map(|n| tag(n.path())).collect() };
+        let names = |nodes: &[Node]| -> Vec<String> {
+            (nodes.iter())
+                .map(|n| match n {
+                    Node::Folder { name, .. } => format!("{name}/"),
+                    Node::Request { name, .. } => name.clone(),
+                })
+                .collect()
+        };
         let api = ws.create_folder(&top, "api").unwrap();
         let a = ws.create_request(&top, "a").unwrap();
         let b = ws.create_request(&top, "b").unwrap();
@@ -2412,7 +2898,7 @@ mod tests {
         // Into another folder, at a spot among what is there.
         let inner = ws.create_request(&api, "x").unwrap();
         let moved = ws.place(&c, &inner, false).unwrap();
-        assert_eq!(moved, api.join("c.toml"));
+        assert_eq!(moved, api.join(c.file_name().unwrap()));
         let Node::Folder { children, .. } = &ws.tree()[1] else {
             panic!("api")
         };
@@ -2495,6 +2981,13 @@ mod tests {
             ..Default::default()
         };
         ws.save_request(&get, &req).unwrap();
+        // Saved by name, it was made with an id: its file is named by that.
+        let get = ws.request_path("users/get").unwrap();
+        let file = get
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         ws.create_folder(&ws.collections(), "empty").unwrap();
         ws.save_env(
             Some("dev"),
@@ -2511,14 +3004,15 @@ mod tests {
         fs::write(out.join("collections/users/gone.toml"), "url = 'x'").unwrap();
         assert_eq!(ws.export(&out).unwrap(), 1);
         let read = |p: &str| fs::read_to_string(out.join(p)).unwrap();
-        assert!(read("collections/users/get.toml").contains("{{host}}/users"));
+        assert!(read(&file).contains("{{host}}/users"));
+        assert!(read(&file).starts_with("name = \"get\""), "{}", read(&file));
         assert!(read("collections/users/.folder.toml").contains("page"));
         assert!(out.join("collections/empty").is_dir(), "empty folders too");
         assert!(read("environments/dev.toml").contains("host"));
         assert!(read("globals.toml").contains("g"));
         assert!(out.join("collections/users/schema.proto").exists());
         assert!(!out.join("collections/users/gone.toml").exists());
-        let everything: String = ["collections/users/get.toml", "environments/dev.toml"]
+        let everything: String = [file.as_str(), "environments/dev.toml"]
             .iter()
             .map(|p| read(p))
             .collect();
@@ -2564,7 +3058,7 @@ mod tests {
         let r = ws.create_request(&dir, "r").unwrap();
         ws.save_env(Some("dev"), &[KeyValue::new("host", "h")], &[])
             .unwrap();
-        let file = root.join("collections/a/r.toml");
+        let file = r.clone();
         let read = || fs::read_to_string(&file).unwrap();
         let url = |url: &str| Request {
             url: url.into(),
@@ -2611,14 +3105,143 @@ mod tests {
         assert_eq!(ws.sync().unwrap(), Synced::Exported);
         assert!(read().contains("theirs"));
 
-        // A fresh clone, written by hand: in step on open, so nothing to ask.
+        // A fresh clone, written by hand: in step on open, so nothing to ask. A file named
+        // by its request, as before ids, is written again under its id with that name, the
+        // same id on every machine.
         let clone = root.join("clone");
         fs::create_dir_all(clone.join("collections")).unwrap();
         fs::write(clone.join("collections/x.toml"), "url='http://x'").unwrap();
         let cloned = Workspace::open(clone.clone()).unwrap();
         assert_eq!(cloned.sync().unwrap(), Synced::Exported);
-        let x = fs::read_to_string(clone.join("collections/x.toml")).unwrap();
-        assert!(x.contains("url = \"http://x\""), "{x}");
+        assert!(!clone.join("collections/x.toml").exists());
+        let id = clone.join(format!("collections/{}.toml", legacy_id("x")));
+        let x = fs::read_to_string(&id).unwrap();
+        assert!(
+            x.contains("url = \"http://x\"") && x.contains("name = \"x\""),
+            "{x}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 10-30: requests keyed by name couldn't share one. A database from before is converted
+    /// on open, with everything that pointed at them by name: past responses, the folder's
+    /// dragged order, history, tabs.
+    #[test]
+    fn a_database_from_before_ids_is_converted_on_open() {
+        let root = fresh("upgrade");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let db = ws.db();
+        let put = "INSERT INTO requests (path, method, request) VALUES (?1, 'GET', ?2)";
+        db.execute(put, ["api/get %2Fuser", r#"{"url":"http://x"}"#])
+            .unwrap();
+        db.execute(put, ["api/b", r#"{"url":"http://b"}"#]).unwrap();
+        let resp =
+            "INSERT INTO responses (path, at, status, ms, response) VALUES (?1, 1, 201, 1, '{}')";
+        db.execute(resp, ["api/get %2Fuser"]).unwrap();
+        let order = r#"{"order":["get %2Fuser","b"]}"#;
+        db.execute(
+            "UPDATE folders SET settings = ?1 WHERE path = 'api'",
+            [order],
+        )
+        .unwrap();
+        drop(db);
+        let old = api.join("get %2Fuser.toml");
+        ws.save_state(&State {
+            tabs: vec![old.clone()],
+            open: Some(old.clone()),
+            ..Default::default()
+        });
+        let entry = HistoryEntry::new("api/get %2Fuser".into(), 201, 1, Request::default());
+        ws.append_history(&entry).unwrap();
+        drop(ws);
+
+        let ws = Workspace::open(root.clone()).unwrap();
+        let Node::Folder { children, .. } = &ws.tree()[0] else {
+            panic!("api")
+        };
+        let listed: Vec<_> = (children.iter())
+            .map(|n| match n {
+                Node::Request { name, path, .. } => (name.clone(), path.clone()),
+                Node::Folder { .. } => panic!("no folders"),
+            })
+            .collect();
+        // Still in the order dragged, named as they were.
+        assert_eq!(listed[0].0, "get /user");
+        assert_eq!(listed[1].0, "b");
+        let get = listed[0].1.clone();
+        assert_eq!(
+            get,
+            api.join(format!("{}.toml", legacy_id("api/get %2Fuser")))
+        );
+        assert_eq!(ws.load_request(&get).unwrap().url, "http://x");
+        assert_eq!(ws.responses(&get)[0].status, 201);
+        let state = ws.load_state();
+        assert_eq!(
+            (state.tabs, state.open),
+            (vec![get.clone()], Some(get.clone()))
+        );
+        assert_eq!(ws.load_history()[0].path, ws.key(&get));
+        assert_eq!(ws.load_history()[0].display(), "api/get /user");
+        // What still says the old name finds it.
+        assert_eq!(ws.key(&old), ws.key(&get));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 10-30: a folder lists its requests by when they were made, last changed, or name,
+    /// either way; None keeps the dragged order. Folders stay above, and dragging a request
+    /// puts the folder back to None so it stays where it was dropped.
+    #[test]
+    fn a_folder_sorts_its_requests_by_creation_change_or_name() {
+        let root = fresh("sort");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let top = ws.create_folder(&ws.collections(), "top").unwrap();
+        ws.create_folder(&top, "zz sub").unwrap();
+        let b = ws.create_request(&top, "b").unwrap();
+        let a = ws.create_request(&top, "A").unwrap();
+        let c = ws.create_request(&top, "c").unwrap();
+        // Edited last, though made first.
+        std::thread::sleep(Duration::from_millis(5));
+        let edit = Request {
+            url: "http://b".into(),
+            ..Default::default()
+        };
+        ws.save_request(&b, &edit).unwrap();
+        // Saving it unchanged isn't a change.
+        let stamp = ws.load_request(&b).unwrap().updated;
+        std::thread::sleep(Duration::from_millis(5));
+        ws.save_request(&b, &ws.load_request(&b).unwrap()).unwrap();
+        assert_eq!(ws.load_request(&b).unwrap().updated, stamp);
+
+        let listed = |by: SortBy, descending: bool| {
+            let mut f = ws.load_folder(&top).unwrap();
+            (f.sort, f.descending) = (by, descending);
+            ws.save_folder(&top, &f).unwrap();
+            let Node::Folder { children, .. } = &ws.tree()[0] else {
+                panic!("top")
+            };
+            (children.iter())
+                .map(|n| match n {
+                    Node::Folder { name, .. } => format!("{name}/"),
+                    Node::Request { name, .. } => name.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed(SortBy::None, false), ["zz sub/", "A", "b", "c"]);
+        assert_eq!(listed(SortBy::Name, true), ["zz sub/", "c", "b", "A"]);
+        assert_eq!(listed(SortBy::Created, false), ["zz sub/", "b", "A", "c"]);
+        assert_eq!(listed(SortBy::Created, true), ["zz sub/", "c", "A", "b"]);
+        assert_eq!(listed(SortBy::Updated, true), ["zz sub/", "b", "c", "A"]);
+        // The sort goes along with the folder through git.
+        let out = root.join("export");
+        ws.export(&out).unwrap();
+        let folder = fs::read_to_string(out.join("collections/top/.folder.toml")).unwrap();
+        assert!(folder.contains("sort = \"updated\"") && folder.contains("descending = true"));
+
+        ws.place(&a, &c, true).unwrap();
+        let f = ws.load_folder(&top).unwrap();
+        assert_eq!(f.sort, SortBy::None);
+        assert_eq!(listed(SortBy::None, false), ["zz sub/", "b", "c", "A"]);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2664,7 +3287,12 @@ mod tests {
         );
         let dev = ws.env_vars(Some("dev")).unwrap();
         assert_eq!((dev["host"].as_str(), dev["token"].as_str()), ("h", "s"));
-        assert_eq!(ws.load_history(), [entry]);
+        // History points at the request under its id, and keeps its name.
+        let mut upgraded = entry.clone();
+        upgraded.path = ws.key(&list);
+        upgraded.request.name = "list".into();
+        assert_eq!(ws.load_history(), [upgraded]);
+        assert_eq!(ws.load_history()[0].display(), "api/list");
         assert_eq!(ws.load_cookies(), "[]");
         assert_eq!(ws.load_state().active_env.as_deref(), Some("dev"));
         drop(ws);

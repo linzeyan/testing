@@ -55,6 +55,7 @@ pub fn import(root: &Value) -> Import {
             .expect("some name is free");
 
         let mut req = Request {
+            name: format!("{method} {path}"),
             url: url.to_owned(),
             headers: pairs(&r["headers"])
                 .into_iter()

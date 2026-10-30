@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::http::{OFFLINE, build, error_chain};
 use crate::model::{Auth, Body, HttpVersion, KeyValue, Request, Settings, is_streaming};
-use crate::store::{Workspace, unescape_name};
+use crate::store::Workspace;
 
 type Generator = fn(&Wire) -> String;
 
@@ -2818,7 +2818,7 @@ fn made_under(
         }
         let vars = crate::runner::scoped(globals, env, &req.inherited.vars);
         made.push(Made {
-            name: unescape_name(&path.file_stem().unwrap_or_default().to_string_lossy()),
+            name: req.name.clone(),
             example: req.examples.first().cloned(),
             req: req.resolved(&vars).0,
         });

@@ -18,6 +18,8 @@ const LIBS: &[(&str, &str)] = &[
     // Not in Postman's sandbox, where it comes through `pm.require('npm:tweetnacl@…')`;
     // bundled for Ed25519 signing, which crypto-js lacks.
     ("tweetnacl", include_str!("../vendor/tweetnacl.min.js")),
+    // 3.2.0 as CommonJS (see its end); its SHA-512 is set when loaded (`__setup`).
+    ("@noble/ed25519", include_str!("../vendor/noble-ed25519.js")),
 ];
 /// The user's script is evaluated under this file name, so its frames in a stack stand
 /// apart from the prelude's (`eval_script`).
@@ -32,6 +34,10 @@ pub struct WireRequest {
     pub method: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// A JSON or text body's text, `{{variables}}` unresolved (`pm.request.body.raw`);
+    /// None for no body or one of another kind.
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -167,6 +173,23 @@ var pm = {
         if (i < 0) __req.headers.push([String(h.key), __str(h.value)]); else __req.headers[i][1] = __str(h.value);
       },
       remove: function (n) { var i; while ((i = __findHeader(__req.headers, n)) >= 0) __req.headers.splice(i, 1); }
+    },
+    // Postman's RequestBody, raw mode only: a script signing the body reads it here and
+    // writes the signed one back.
+    body: {
+      get mode() { return __req.body === null || __req.body === undefined ? undefined : 'raw'; },
+      get raw() { return __req.body === null ? undefined : __req.body; },
+      set raw(v) { __req.body = v === undefined || v === null ? '' : __str(v); },
+      update: function (v) {
+        if (v !== null && typeof v === 'object') {
+          if (v.mode !== undefined && v.mode !== 'raw') throw new Error("pm.request.body.update: only mode 'raw' here");
+          v = v.raw;
+        }
+        this.raw = v;
+      },
+      isEmpty: function () { return !__req.body; },
+      toString: function () { return __req.body || ''; },
+      toJSON: function () { return { mode: this.mode, raw: this.raw }; }
     }
   }
 };
@@ -295,16 +318,150 @@ var __modules = {
     }
   }
 };
+function __hex(b) {
+  var s = '';
+  for (var i = 0; i < b.length; i++) s += (b[i] < 16 ? '0' : '') + b[i].toString(16);
+  return s;
+}
+function __unhex(h) {
+  var b = new Uint8Array(h.length >> 1);
+  for (var i = 0; i < b.length; i++) {
+    var v = parseInt(h.substr(i * 2, 2), 16);
+    if (isNaN(v)) return b.subarray(0, i); // as Node: up to the first bad pair
+    b[i] = v;
+  }
+  return b;
+}
+// BufferSource (or a plain array) as bytes, without copying a typed array.
+function __bytes(v) {
+  if (v instanceof Uint8Array) return v;
+  if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+  if (v instanceof ArrayBuffer) return new Uint8Array(v);
+  if (Array.isArray(v)) return Uint8Array.from(v);
+  throw new TypeError('expected bytes (a Uint8Array, ArrayBuffer or DataView), got ' + typeof v);
+}
+function __utf8(s) {
+  s = String(s);
+  var out = [];
+  for (var i = 0; i < s.length; i++) {
+    var c = s.codePointAt(i);
+    if (c > 0xffff) i++;
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | c >> 6, 0x80 | c & 63);
+    else if (c < 0x10000) out.push(0xe0 | c >> 12, 0x80 | c >> 6 & 63, 0x80 | c & 63);
+    else out.push(0xf0 | c >> 18, 0x80 | c >> 12 & 63, 0x80 | c >> 6 & 63, 0x80 | c & 63);
+  }
+  return Uint8Array.from(out);
+}
+function __unutf8(b) {
+  var s = '';
+  for (var i = 0; i < b.length;) {
+    var c = b[i++], n = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
+    if (n) c &= 0x3f >> n;
+    while (n-- > 0 && i < b.length) c = c << 6 | b[i++] & 63;
+    s += String.fromCodePoint(c);
+  }
+  return s;
+}
+function __digestSync(alg, data) {
+  var bytes = typeof data === 'string' ? __utf8(data) : __bytes(data);
+  var h = __digest(String(alg).toUpperCase(), __hex(bytes));
+  if (!h) throw new Error("digest: '" + alg + "' isn't supported here (SHA-256, SHA-384, SHA-512)");
+  return __unhex(h);
+}
+// WebCrypto's random numbers and digests, as browsers and Node have them: tweetnacl,
+// crypto-js and noble-ed25519 take their randomness here, and noble's async API its SHA-512.
+var crypto = {
+  getRandomValues: function (a) {
+    var b = __bytes(a);
+    if (b.length > 65536) throw new Error('getRandomValues: at most 65536 bytes at a time');
+    b.set(__unhex(__random(b.length)));
+    return a;
+  },
+  randomUUID: function () { return __dynamic('$guid'); },
+  subtle: {
+    digest: function (alg, data) {
+      try { var h = __digestSync(typeof alg === 'string' ? alg : alg && alg.name, data); }
+      catch (e) { return Promise.reject(e); }
+      return Promise.resolve(h.buffer);
+    }
+  }
+};
+if (typeof TextEncoder === 'undefined') {
+  var TextEncoder = function () {};
+  TextEncoder.prototype.encoding = 'utf-8';
+  TextEncoder.prototype.encode = function (s) { return __utf8(s === undefined ? '' : s); };
+  var TextDecoder = function () {};
+  TextDecoder.prototype.encoding = 'utf-8';
+  TextDecoder.prototype.decode = function (b) { return b === undefined ? '' : __unutf8(__bytes(b)); };
+}
+// Node's Buffer, which Postman's sandbox has: the encodings signing scripts use.
+var Buffer = class Buffer extends Uint8Array {
+  static from(v, enc) {
+    if (typeof v !== 'string') {
+      if (v instanceof ArrayBuffer) return new Buffer(v, enc || 0, arguments.length > 2 ? arguments[2] : v.byteLength - (enc || 0));
+      var src = __bytes(v), b = new Buffer(src.length);
+      b.set(src);
+      return b;
+    }
+    switch (String(enc || 'utf8').toLowerCase()) {
+      case 'hex': return Buffer.from(__unhex(v));
+      case 'base64': case 'base64url':
+        var bin = atob(v.replace(/-/g, '+').replace(/_/g, '/'));
+        return Buffer.from(Array.prototype.map.call(bin, function (c) { return c.charCodeAt(0); }));
+      case 'latin1': case 'binary': case 'ascii':
+        return Buffer.from(Array.prototype.map.call(v, function (c) { return c.charCodeAt(0) & 255; }));
+      case 'utf8': case 'utf-8': return Buffer.from(__utf8(v));
+      default: throw new Error('Buffer: unknown encoding ' + enc);
+    }
+  }
+  static alloc(n, fill) { var b = new Buffer(n); if (fill !== undefined) b.fill(typeof fill === 'number' ? fill : Buffer.from(fill)[0]); return b; }
+  static isBuffer(b) { return b instanceof Buffer; }
+  static byteLength(s, enc) { return typeof s === 'string' ? Buffer.from(s, enc).length : __bytes(s).length; }
+  static concat(list) {
+    var n = 0, at = 0;
+    list.forEach(function (b) { n += b.length; });
+    var out = new Buffer(n);
+    list.forEach(function (b) { out.set(b, at); at += b.length; });
+    return out;
+  }
+  toString(enc) {
+    switch (String(enc || 'utf8').toLowerCase()) {
+      case 'hex': return __hex(this);
+      case 'base64': case 'base64url':
+        var s = btoa(String.fromCharCode.apply(null, Array.from(this)));
+        return String(enc).toLowerCase() === 'base64' ? s : s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      case 'latin1': case 'binary': case 'ascii': return String.fromCharCode.apply(null, Array.from(this));
+      default: return __unutf8(this);
+    }
+  }
+  equals(o) { o = __bytes(o); return o.length === this.length && this.every(function (x, i) { return x === o[i]; }); }
+  toJSON() { return { type: 'Buffer', data: Array.from(this) }; }
+};
+function __hashes() {
+  var f = function (alg) { return function (m) { return __digestSync(alg, m); }; };
+  return { sha256: f('SHA-256'), sha384: f('SHA-384'), sha512: f('SHA-512') };
+}
+// noble's hash modules, for code that sets `etc.sha512Sync` (v2) or `hashes.sha512` (v3).
+['@noble/hashes/sha2', '@noble/hashes/sha256', '@noble/hashes/sha512'].forEach(function (n) {
+  __modules[n] = __modules[n + '.js'] = __hashes();
+});
+// What a bundled module needs set once it's loaded.
+var __setup = {
+  '@noble/ed25519': function (ed) { ed.hashes.sha512 = __hashes().sha512; }
+};
+var __known = 'crypto-js, lodash, moment, tweetnacl, @noble/ed25519, @noble/hashes/sha2, uuid, tv4, chai, atob, btoa';
 function require(name) {
   name = String(name);
   if (__has(__modules, name)) return __modules[name];
   var src = __lib(name);
-  if (src === undefined || src === null) throw new Error("require: no module '" + name + "' here (crypto-js, lodash, moment, tweetnacl, uuid, tv4, chai, atob, btoa)");
+  if (src === undefined || src === null) throw new Error("require: no module '" + name + "' here (" + __known + ")");
   var module = { exports: {} };
   // What a library probes for (crypto-js and tweetnacl try Node's `crypto`) is missing,
   // not an error: they do without it.
   var probe = function (n) { return __has(__modules, n) || __lib(n) != null ? require(n) : undefined; };
   new Function('module', 'exports', 'require', src)(module, module.exports, probe);
+  if (__has(__setup, name)) __setup[name](module.exports);
   return __modules[name] = module.exports;
 }
 // Postman's package library: `npm:name@version` comes from the registry there. Here the
@@ -540,6 +697,24 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
                     .map_err(caught)?,
             )
             .map_err(caught)?;
+        // Bytes cross as hex: few and small (keys, signatures, digests of a body).
+        ctx.globals()
+            .set(
+                "__random",
+                rquickjs::Function::new(ctx.clone(), |n: usize| {
+                    let mut buf = vec![0; n.min(65536)];
+                    getrandom::fill(&mut buf).expect("the system's random source");
+                    hex(&buf)
+                })
+                .map_err(caught)?,
+            )
+            .map_err(caught)?;
+        ctx.globals()
+            .set(
+                "__digest",
+                rquickjs::Function::new(ctx.clone(), digest).map_err(caught)?,
+            )
+            .map_err(caught)?;
         let jar = input.jar.cloned();
         let jar_call = move |op: String, url: String, name: String, value: String| -> String {
             let reply = (|| {
@@ -632,6 +807,25 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
         out.error = error;
         Ok(out)
     })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `crypto.subtle.digest` and noble's hashes: hex in, hex out; "" for an algorithm
+/// that isn't here.
+fn digest(alg: String, data: String) -> String {
+    use sha2::Digest;
+    let bytes: Vec<u8> = (0..data.len() / 2)
+        .filter_map(|i| u8::from_str_radix(data.get(i * 2..i * 2 + 2)?, 16).ok())
+        .collect();
+    match alg.as_str() {
+        "SHA-256" => hex(&sha2::Sha256::digest(&bytes)),
+        "SHA-384" => hex(&sha2::Sha384::digest(&bytes)),
+        "SHA-512" => hex(&sha2::Sha512::digest(&bytes)),
+        _ => String::new(),
+    }
 }
 
 static AWAIT: std::sync::LazyLock<regex::Regex> =
@@ -817,6 +1011,7 @@ mod tests {
             method: "GET".into(),
             url: "https://{{host}}/users".into(),
             headers: vec![],
+            body: None,
         }
     }
 
@@ -1138,14 +1333,112 @@ mod tests {
 
         // A package that isn't bundled says what is, rather than "not a function".
         let out = run(
-            "pm.require('npm:@noble/ed25519@2.1.0');",
+            "pm.require('npm:@noble/curves@1.4.0');",
             &input(&req, &env, None),
         );
         let e = out.error.unwrap();
         assert!(
-            e.contains("no module '@noble/ed25519'") && e.contains("tweetnacl"),
+            e.contains("no module '@noble/curves'") && e.contains("@noble/ed25519"),
             "{e}"
         );
+    }
+
+    /// The 10-30 VDI script required `@noble/ed25519`, which wasn't bundled. Scripts for it
+    /// come in its v2 style (`etc.sha512Sync` from `@noble/hashes`, `randomPrivateKey`) and
+    /// its v3 one (`hashes.sha512`, async calls on WebCrypto); both must sign, and the
+    /// helpers they use around it (Buffer, TextEncoder, crypto) must be there. RFC 8032's
+    /// second vector (message 0x72) checks the signature itself.
+    #[test]
+    fn noble_ed25519_signs_in_its_v2_and_v3_styles() {
+        let req = request();
+        let env = HashMap::from([(
+            "seed".to_owned(),
+            "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb".to_owned(),
+        )]);
+        let want = "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da\
+                    085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00";
+        let v2 = r#"
+            const ed = require('@noble/ed25519');
+            const { sha512 } = require('@noble/hashes/sha512');
+            ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
+            const seed = Buffer.from(pm.environment.get('seed'), 'hex');
+            const sig = ed.sign(new Uint8Array([0x72]), seed);
+            pm.variables.set('sig', Buffer.from(sig).toString('hex'));
+            pm.variables.set('ok', ed.verify(sig, new Uint8Array([0x72]), ed.getPublicKey(seed)));
+            pm.variables.set('fresh', ed.utils.randomPrivateKey().length);
+        "#;
+        let v3 = r#"
+            const ed = pm.require('npm:@noble/ed25519@3.0.0');
+            const seed = ed.etc.hexToBytes(pm.environment.get('seed'));
+            const sig = await ed.signAsync(Uint8Array.of(0x72), seed);
+            pm.variables.set('sig', ed.etc.bytesToHex(sig));
+            const pub = await ed.getPublicKeyAsync(seed);
+            pm.variables.set('ok', await ed.verifyAsync(sig, Uint8Array.of(0x72), pub));
+            pm.variables.set('fresh', (await ed.keygenAsync()).secretKey.length);
+        "#;
+        for script in [v2, v3] {
+            let out = run(script, &input(&req, &env, None));
+            assert_eq!(out.error, None, "{script}");
+            assert_eq!(out.locals["sig"].as_deref(), Some(want), "{script}");
+            assert_eq!(out.locals["ok"].as_deref(), Some("true"));
+            assert_eq!(out.locals["fresh"].as_deref(), Some("32"));
+        }
+
+        let out = run(
+            r#"
+            const bytes = new TextEncoder().encode('é€😀');
+            console.log(Buffer.from(bytes).toString('hex'), new TextDecoder().decode(bytes));
+            console.log(Buffer.from('aGk/Pz4+', 'base64').toString(), Buffer.from('hi??>>').toString('base64url'));
+            console.log(Buffer.concat([Buffer.from('a'), Buffer.from([98])]).toString('latin1'));
+            const r = crypto.getRandomValues(new Uint8Array(16));
+            console.log(r.length, r.some(b => b !== 0));
+            crypto.subtle.digest('SHA-256', new TextEncoder().encode('abc'))
+              .then(h => console.log(Buffer.from(h).toString('hex')));
+            "#,
+            &input(&req, &env, None),
+        );
+        assert_eq!(out.error, None);
+        assert_eq!(
+            out.logs,
+            [
+                "c3a9e282acf09f9880 é€😀",
+                "hi??>> aGk_Pz4-",
+                "ab",
+                "16 true",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ]
+        );
+    }
+
+    /// `pm.request.body` is what a script signs: it reads the raw body and writes the
+    /// signed one back, which is what goes out.
+    #[test]
+    fn scripts_read_and_rewrite_the_raw_body() {
+        let mut req = request();
+        req.body = Some(r#"{"Data":"{{data}}"}"#.into());
+        let env = HashMap::new();
+        let out = run(
+            r#"
+            const body = JSON.parse(pm.request.body.raw);
+            console.log(pm.request.body.mode, body.Data);
+            body.Signature = 'c2ln';
+            pm.request.body.update(JSON.stringify(body));
+            "#,
+            &input(&req, &env, None),
+        );
+        assert_eq!(out.error, None);
+        assert_eq!(out.logs, ["raw {{data}}"]);
+        assert_eq!(
+            out.request.unwrap().body.as_deref(),
+            Some(r#"{"Data":"{{data}}","Signature":"c2ln"}"#)
+        );
+        // No body: no mode, and one can be set.
+        let out = run(
+            "console.log(String(pm.request.body.mode)); pm.request.body.raw = {a: 1};",
+            &input(&request(), &env, None),
+        );
+        assert_eq!(out.logs, ["undefined"]);
+        assert_eq!(out.request.unwrap().body.as_deref(), Some(r#"{"a":1}"#));
     }
 
     /// An async function that throws failed nothing: the request went out without the

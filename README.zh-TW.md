@@ -163,8 +163,13 @@ Postman 風格的請求前與測試指令碼，預設是空的，由你自己撰
 
 - `pm.*`、chai、`jsonSchema`、`pm.variables.replaceIn`。
 - 可 `require` Postman 沙箱的模組（crypto-js、lodash、moment、uuid、tv4、chai），另有
-  `atob`/`btoa` 與 tweetnacl（Ed25519 簽章）；每個模組在被 require 時才載入。
+  `atob`/`btoa`、tweetnacl 與 `@noble/ed25519`（Ed25519 簽章，v2 與 v3 的寫法都可以，SHA-512
+  由 `@noble/hashes/sha2` 提供）；每個模組在被 require 時才載入。
   `pm.require('npm:tweetnacl@1.0.3')` 載入內建的那份；其他 npm 套件不會下載。
+- `Buffer`（hex、base64、base64url、latin1、utf8）、`TextEncoder`/`TextDecoder`，以及
+  `crypto.getRandomValues`、`crypto.randomUUID`、`crypto.subtle.digest`。
+- `pm.request.body.raw` 讀取 JSON 或文字 body，`pm.request.body.update(text)` 在送出前改寫它，
+  例如加上簽章。
 - 指令碼丟出錯誤（包括其中的 async 函式）就不送出請求，並顯示錯誤種類與行號。
 - `pm.cookies` 與 `pm.cookies.jar()` 讀寫傳送時所用的同一個 Cookie jar。
 - `pm.sendRequest` 支援 callback 或 `await`，走同一套用戶端，例如先取得 token。
@@ -194,7 +199,8 @@ Postman 風格的請求前與測試指令碼，預設是空的，由你自己撰
 - 「美化 / 原始」：XML 回應也會縮排；選了「原始」之後，同一種 Content-Type 會記住這個選擇。
 - 以 JSONPath 篩選（`$.items[*].id`、`..id`、`$.items[?(@.price < 10 && @.tag == 'x')]`），
   XML 則用 XPath（`//item[@id='b']/name/text()`，忽略命名空間前綴）。最近用過的 10 筆可從
-  「最近」叫回；「儲存…」仍會寫出完整內容。
+  「最近」叫回；「儲存…」仍會寫出完整內容。Pretty 的 JSON 裡，點行號左邊的 `+` 就篩選出每個
+  項目的同一個值，例如 `$.data.items[*].market.createdAt`。
 - 尋找（Ctrl+F）：可選大小寫須相符、全字相符或規則運算式；最多計數到 10 000 筆。
   重新傳送同一個請求時，篩選與尋找的內容會保留。
 - PNG、JPEG、GIF（第一格）、WebP 直接顯示為圖片，SVG 也可以（「預覽」，位於「美化」與「原始」旁），PDF 逐頁
@@ -215,8 +221,8 @@ Postman 風格的請求前與測試指令碼，預設是空的，由你自己撰
 - 「儲存…」把內容寫入檔案（二進位內容逐位元組原樣寫出）。
 - 在回應內容中選取文字後按右鍵，可設為變數，用法和請求的輸入框相同。
 - 回應列的「歷史紀錄」選單：每個請求最近 10 筆回應，各列出狀態碼、耗時與大小，存在磁碟上，
-  每筆最多保留 1 MiB 內容。
-  另有請求歷史紀錄與已儲存的回應範例。
+  每筆最多保留 1 MiB 內容（可在「設定 > 一般 > 回應歷史」關閉）。
+  另有請求歷史紀錄與已儲存的回應範例；範例只有按「存為範例」才會保留。
 - 側邊欄的「歷史紀錄」：每次傳送都標出是多久以前，可依名稱或 URL 篩選；點一下即可叫回當時送出的內容。
 
 **大型內容**：超過 5 MiB 的文字內容會先停在「仍然顯示 / 儲存到檔案…」；超過 16 MiB 的內容只
@@ -227,6 +233,10 @@ Postman 風格的請求前與測試指令碼，預設是空的，由你自己撰
 **樹狀清單**
 
 - 可依名稱篩選。每個請求那一列會顯示最後一次的狀態碼。
+- 名稱不必唯一：同一個資料夾裡的兩個請求可以同名，不論 method 是否相同。每個請求以 id
+  （UUID v7）保存，`collections/` 裡的檔名就是這個 id；名稱只是其中一個欄位，可以用任何字元。
+- 資料夾選單 >「請求排序」：不排序（依手動排列，預設）、建立時間、修改時間或名稱，可遞增或遞減。
+  只排這個資料夾自己的請求；裡面的子資料夾各有各的設定。
 - 把請求或資料夾拖到某個資料夾上（或樹狀清單下方的空白處）即可移動，已開啟的分頁會跟著走；
   拖到某一列的上緣或下緣，則放到該列之前或之後。順序記錄在 `.folder.toml`；從 Postman 與
   Insomnia 匯入時保留原本的順序。

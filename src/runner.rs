@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::model::{KeyValue, Request};
+use crate::model::{Body, KeyValue, Request};
 use crate::script::{self, Changes, Output, ScriptResponse, TestResult, WireRequest};
 use crate::{grpc, http, net};
 
@@ -90,6 +90,7 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
                 .filter(|h| h.enabled && !h.key.is_empty())
                 .map(|h| (h.key.clone(), h.value.clone()))
                 .collect(),
+            body: raw_body(&req.body),
         };
         let input = script::Input {
             name: &info.name,
@@ -131,6 +132,17 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
                 .into_iter()
                 .map(|(k, v)| KeyValue::new(k, v))
                 .collect();
+            if let Some(text) = w.body.filter(|t| Some(t) != raw_body(&req.body).as_ref()) {
+                req.body = match req.body {
+                    Body::Text { .. } => Body::Text { text },
+                    Body::Json { .. } => Body::Json { text },
+                    // A body set where there was none (or a form): JSON if it reads as JSON.
+                    _ if serde_json::from_str::<serde_json::Value>(&text).is_ok() => {
+                        Body::Json { text }
+                    }
+                    _ => Body::Text { text },
+                };
+            }
         }
     }
 
@@ -165,6 +177,7 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
                 method: req.method.clone(),
                 url: req.url.clone(),
                 headers: Vec::new(),
+                body: None,
             };
             let sr = ScriptResponse {
                 code: resp.status,
@@ -538,6 +551,14 @@ pub fn load_data(path: &Path) -> Result<Vec<HashMap<String, String>>, String> {
         .collect()
 }
 
+/// What `pm.request.body.raw` reads: a JSON or text body's text.
+fn raw_body(body: &Body) -> Option<String> {
+    match body {
+        Body::Json { text } | Body::Text { text } => Some(text.clone()),
+        _ => None,
+    }
+}
+
 /// Folds one script's output into the running state; returns its edited request.
 fn absorb(
     out: &mut Outcome,
@@ -669,6 +690,117 @@ mod tests {
             !body.contains("sid="),
             "unset in the jar before sending: {body}"
         );
+    }
+
+    /// A Connect JSON-RPC call signed as jpay's `MakeGrpcRequest` (service_test.go) signs
+    /// it: a fresh Ed25519 key, the inner message as protobuf bytes in `Data`, its signature
+    /// in `Signature`, all Base64. The server checks the signature with ring, another
+    /// implementation than the script's, as the Go service does with crypto/ed25519. Each
+    /// way a Postman script is written for it must get through: noble-ed25519 rewriting
+    /// the body, tweetnacl filling `{{variables}}`, noble's v2 synchronous calls.
+    #[test]
+    fn a_pre_request_script_signs_a_json_rpc_body_with_ed25519() {
+        use base64::Engine;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = rt
+            .block_on(build_client(Network {
+                proxy: ProxyMode::None,
+                ..Default::default()
+            }))
+            .unwrap();
+        let account = "00000000-0000-0000-0000-000000000001";
+        let addr = crate::http::tests::serve(move |raw| {
+            let verdict = (|| {
+                let body = raw.split_once("\r\n\r\n").ok_or("no body")?.1;
+                let req: serde_json::Value =
+                    serde_json::from_str(body).map_err(|e| e.to_string())?;
+                let field = |k: &str| {
+                    let b64 = req[k].as_str().ok_or(format!("no {k}"))?;
+                    (base64::engine::general_purpose::STANDARD.decode(b64))
+                        .map_err(|e| format!("{k}: {e}"))
+                };
+                let (key, sig, data) = (field("PublicKey")?, field("Signature")?, field("Data")?);
+                ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
+                    .verify(&data, &sig)
+                    .map_err(|_| "bad signature".to_owned())?;
+                // GetRemindRequest { AccountID = 1 }: tag 0x0a, length, the text.
+                let want = [&[0x0a, account.len() as u8][..], account.as_bytes()].concat();
+                match (data == want, req["Method"].as_str()) {
+                    (true, Some("GetRemind")) => Ok(()),
+                    _ => Err(format!("unexpected request {req}")),
+                }
+            })();
+            match verdict {
+                Ok(()) => (
+                    "200 OK\r\ncontent-type: application/json".into(),
+                    r#"{"Code":0}"#.into(),
+                ),
+                Err(e) => ("401 Unauthorized".into(), e),
+            }
+        });
+        let body = r#"{"Service": "Authorize", "Method": "GetRemind", "Session": "",
+            "PublicKey": "{{PublicKey}}", "Signature": "{{Signature}}", "Data": "{{Data}}"}"#;
+        let noble = r#"
+            const ed = pm.require('npm:@noble/ed25519@3.2.0');
+            const data = new TextEncoder().encode(pm.environment.get('account'));
+            const msg = Uint8Array.of(0x0a, data.length, ...data);
+            const { secretKey, publicKey } = await ed.keygenAsync();
+            const body = JSON.parse(pm.request.body.raw);
+            body.PublicKey = Buffer.from(publicKey).toString('base64');
+            body.Signature = Buffer.from(await ed.signAsync(msg, secretKey)).toString('base64');
+            body.Data = Buffer.from(msg).toString('base64');
+            pm.request.body.update(JSON.stringify(body));
+        "#;
+        let nacl = r#"
+            const nacl = require('tweetnacl');
+            const id = pm.environment.get('account');
+            const msg = new Uint8Array([0x0a, id.length].concat(id.split('').map(c => c.charCodeAt(0))));
+            const pair = nacl.sign.keyPair();
+            const b64 = bytes => btoa(String.fromCharCode.apply(null, bytes));
+            pm.variables.set('PublicKey', b64(pair.publicKey));
+            pm.variables.set('Signature', b64(nacl.sign.detached(msg, pair.secretKey)));
+            pm.variables.set('Data', b64(msg));
+        "#;
+        let noble_v2 = r#"
+            const ed = require('@noble/ed25519');
+            const { sha512 } = require('@noble/hashes/sha512');
+            ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
+            const priv = ed.utils.randomPrivateKey();
+            const msg = Buffer.concat([Buffer.from([0x0a, 36]), Buffer.from(pm.environment.get('account'))]);
+            pm.environment.set('PublicKey', Buffer.from(ed.getPublicKey(priv)).toString('base64'));
+            pm.environment.set('Signature', Buffer.from(ed.sign(msg, priv)).toString('base64'));
+            pm.environment.set('Data', msg.toString('base64'));
+        "#;
+        for script in [noble, nacl, noble_v2] {
+            let req = Request {
+                method: "POST".into(),
+                url: format!("http://{addr}/V0.AuthLoginService/GetRemind"),
+                headers: vec![KeyValue::new("Content-Type", "application/json")],
+                body: Body::Json { text: body.into() },
+                pre_request: script.into(),
+                ..Default::default()
+            };
+            let vars = Vars {
+                env: HashMap::from([("account".to_owned(), account.to_owned())]),
+                ..Default::default()
+            };
+            let out = rt.block_on(super::run(
+                client.clone(),
+                &Info::single("t".into()),
+                req,
+                vars,
+            ));
+            let resp = out.response.unwrap_or_else(|e| panic!("{script}\n{e}"));
+            assert_eq!(
+                (resp.status, resp.body.as_str()),
+                (200, r#"{"Code":0}"#),
+                "{script}"
+            );
+        }
     }
 
     /// The usual reason for `pm.sendRequest`: fetch a token before the request that needs

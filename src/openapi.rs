@@ -91,7 +91,8 @@ pub fn import(root: &Value) -> Import {
                     str::to_owned,
                 );
             let key = s.unique(&folder, &escape_name(&name));
-            let req = s.request(method, path, item, op, &key);
+            let mut req = s.request(method, path, item, op, &key);
+            req.name = name;
             requests.push((key, req));
         }
     }
@@ -728,6 +729,7 @@ impl Out {
                     name,
                     path,
                     children,
+                    ..
                 } => {
                     let tag = match tag {
                         "" => name.clone(),

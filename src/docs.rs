@@ -70,6 +70,7 @@ fn walk(ws: &Workspace, nodes: &[Node], level: usize, out: &mut String) -> Resul
             name,
             path,
             children,
+            ..
         } = node
         {
             let _ = write!(out, "{h} {name}\n\n");

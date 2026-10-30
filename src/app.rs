@@ -15,7 +15,9 @@ use crate::i18n::{fill, n_, t, tf};
 use crate::icons::{self as icon, Icon};
 use crate::loadtest::{self, Stats};
 use crate::logfile::redact;
-use crate::model::{self, Auth, Body, Example, Folder, Inherited, KeyValue, METHODS, Request};
+use crate::model::{
+    self, Auth, Body, Example, Folder, Inherited, KeyValue, METHODS, Request, SortBy,
+};
 use crate::net::{self, Network, ProxyMode};
 use crate::runner::{self, Outcome, RunItem, RunOptions, RunPlan, Vars};
 use crate::script::{Changes, TestResult};
@@ -230,7 +232,10 @@ struct Open {
 
 impl Open {
     fn name(&self) -> String {
-        leaf_name(&self.path)
+        match self.saved.name.is_empty() {
+            true => leaf_name(&self.path),
+            false => self.saved.name.clone(),
+        }
     }
     fn dirty(&self) -> bool {
         !self.saved.same_as(&self.draft)
@@ -905,6 +910,8 @@ enum TreeAction {
     Move(Vec<PathBuf>, PathBuf),
     /// What, next to which, after it (else before).
     Place(Vec<PathBuf>, PathBuf, bool),
+    /// A folder's requests listed by this, descending if true.
+    Sort(PathBuf, SortBy, bool),
 }
 
 /// What a folder's requests can be copied or exported as, under Copy as and Export.
@@ -1096,6 +1103,8 @@ impl RunState {
 pub struct App {
     ws: Workspace,
     tree: Vec<Node>,
+    /// Request names by path, from `tree` (`set_tree`): a request's path ends in its id.
+    names: HashMap<PathBuf, String>,
     /// Each request's latest kept status, shown on its tree row.
     statuses: HashMap<PathBuf, u16>,
     envs: Vec<String>,
@@ -1165,6 +1174,7 @@ pub struct App {
     raw_types: Vec<String>,
     appearance: Appearance,
     log_level: crate::logfile::Level,
+    forget_responses: bool,
     /// What `appearance` was when last applied; differs on the first frame and after a
     /// change in Settings.
     applied: Option<Appearance>,
@@ -1267,7 +1277,8 @@ impl App {
         crate::logfile::set_level(state.log_level);
         crate::auth::import(&ws.load_tokens());
         let mut app = Self {
-            tree: ws.tree(),
+            tree: Vec::new(),
+            names: HashMap::new(),
             statuses: ws.last_statuses(),
             envs: ws.env_names(),
             history: ws.load_history(),
@@ -1309,6 +1320,7 @@ impl App {
             raw_types: state.raw_types.clone(),
             appearance: state.appearance.clone(),
             log_level: state.log_level,
+            forget_responses: state.forget_responses,
             applied: None,
             title_bar: None,
             fitted: false,
@@ -1379,6 +1391,7 @@ impl App {
             rx,
             renderer,
         };
+        app.set_tree(app.ws.tree());
         app.sync();
         let env = state.active_env.filter(|e| app.envs.contains(e));
         app.set_env(env);
@@ -1462,7 +1475,7 @@ impl App {
         {
             self.dialog = Some(Dialog::name(
                 NameKind::Rename(path.clone()),
-                leaf_name(&path),
+                self.name_of(&path),
             ));
         }
         if pressed(&CODE) && self.open.is_some() {
@@ -1618,6 +1631,7 @@ impl App {
             run_options: self.run_options.clone(),
             appearance: self.appearance.clone(),
             log_level: self.log_level,
+            forget_responses: self.forget_responses,
             updates: self.updates.clone(),
             mcp_window: self.mcp_window,
             mcp_bind_host: self.mcp_bind_host.clone(),
@@ -1873,6 +1887,10 @@ impl App {
             req.method = req.method.trim().to_uppercase();
             req.sync_params();
             req.inherited = open.draft.inherited.clone();
+            // An agent edits the URL, headers or body; leaving out the name isn't renaming.
+            if req.name.is_empty() {
+                req.name = open.draft.name.clone();
+            }
             open.draft = req;
         }
         Ok(())
@@ -2022,7 +2040,7 @@ impl App {
     }
 
     fn reload(&mut self) {
-        self.tree = self.ws.tree();
+        self.set_tree(self.ws.tree());
         self.statuses = self.ws.last_statuses();
         self.envs = self.ws.env_names();
     }
@@ -2485,7 +2503,7 @@ impl App {
             Ok(()) => {
                 open.saved = open.draft.clone();
                 self.status = tf("Saved {}", &[&open.name()]);
-                self.tree = self.ws.tree(); // method badge may have changed
+                self.set_tree(self.ws.tree()); // method badge may have changed
                 true
             }
             Err(e) => {
@@ -2840,6 +2858,10 @@ impl App {
             let failed = outcome.response.is_err() || outcome.tests.iter().any(|t| !t.passed);
             let to_tests = failed && !outcome.tests.is_empty();
             let past = match &outcome.response {
+                Ok(r) if self.forget_responses => {
+                    self.statuses.insert(path.clone(), r.status);
+                    None
+                }
                 Ok(r) => {
                     self.statuses.insert(path.clone(), r.status);
                     (self.ws.add_response(&path, r))
@@ -3011,13 +3033,12 @@ impl App {
     /// Like Postman: the original keeps what was saved, and this tab, response included,
     /// becomes the new request.
     fn save_as(&mut self, old: &Path, folder: &Path, name: &str) -> Result<PathBuf, String> {
-        let new = store::request_in(folder, name)?;
-        if self.ws.exists(&new) {
-            return Err(tf("\"{}\" already exists", &[&self.ws.display_name(&new)]));
-        }
+        let new = store::new_request_in(folder);
+        let name = store::request_name(name)?;
         let Some(open) = self.open.as_mut().filter(|o| o.path == old) else {
             return Err(t("The request isn't open any more").into());
         };
+        open.draft.name = name;
         self.ws.save_request(&new, &open.draft)?;
         open.saved = open.draft.clone();
         self.follow_move(old, &new);
@@ -3036,7 +3057,10 @@ impl App {
         let result = match kind {
             NameKind::NewRequest(dir) => self.ws.create_request(dir, &name).map(Some),
             NameKind::Captured { folder, request } => (self.ws.create_request(folder, &name))
-                .and_then(|path| self.ws.save_request(&path, request).map(|()| Some(path))),
+                .and_then(|path| {
+                    request.name = name.clone();
+                    self.ws.save_request(&path, request).map(|()| Some(path))
+                }),
             NameKind::NewFolder(dir) => self.ws.create_folder(dir, &name).map(|_| None),
             // Never overwrite: an existing name would silently wipe that environment.
             NameKind::NewEnv | NameKind::DuplicateEnv(_) if self.envs.contains(&name) => {
@@ -3089,7 +3113,31 @@ impl App {
     }
 }
 
-/// A request's or folder's name as people read it, from its path.
+impl App {
+    fn set_tree(&mut self, tree: Vec<Node>) {
+        fn walk(nodes: &[Node], out: &mut HashMap<PathBuf, String>) {
+            for node in nodes {
+                match node {
+                    Node::Folder { children, .. } => walk(children, out),
+                    Node::Request { name, path, .. } => {
+                        drop(out.insert(path.clone(), name.clone()))
+                    }
+                }
+            }
+        }
+        self.names.clear();
+        walk(&tree, &mut self.names);
+        self.tree = tree;
+    }
+
+    /// A request's or folder's name as the tree shows it.
+    fn name_of(&self, path: &Path) -> String {
+        (self.names.get(path).cloned()).unwrap_or_else(|| leaf_name(path))
+    }
+}
+
+/// A folder's name as people read it, from its path; a request's only from before ids
+/// (`App::name_of`).
 fn leaf_name(path: &Path) -> String {
     let leaf = match store::is_request(path) {
         true => path.file_stem(),
@@ -3304,6 +3352,69 @@ fn filter_bar(ui: &mut egui::Ui, view: &mut ResponseView, recent: &mut Vec<Strin
 
 /// The line that closes the `{`/`[` ending line `open`, found by indentation: pretty JSON
 /// puts the closing bracket at the opening line's indent. None if `open` opens nothing.
+/// The JSONPath of the value on `line` (0-based) of pretty JSON (`http::pretty_json`: one
+/// key or element per line), every array index as `[*]`: clicked on one item's field, the
+/// filter shows that field of them all. None for the root, a closing bracket, or a key
+/// neither quote can hold.
+fn json_path_at(text: &str, line_starts: &[usize], line: usize) -> Option<String> {
+    // Per open container: whether it's an array, and the step that led into it.
+    let mut stack: Vec<(bool, String)> = Vec::new();
+    for i in 0..=line {
+        let end = line_starts.get(i + 1).copied().unwrap_or(text.len());
+        let l = text.get(line_starts[i]..end)?.trim();
+        if l.starts_with(['}', ']']) {
+            stack.pop();
+            if i == line {
+                return None;
+            }
+            continue;
+        }
+        let step = match stack.last() {
+            None => String::new(),
+            Some((true, _)) => "[*]".to_owned(),
+            Some((false, _)) => {
+                // The key: a JSON string up to its unescaped closing quote.
+                let mut close = None;
+                let mut escaped = false;
+                for (j, c) in l.char_indices().skip(1) {
+                    match (escaped, c) {
+                        (true, _) => escaped = false,
+                        (false, '\\') => escaped = true,
+                        (false, '"') => {
+                            close = Some(j);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let key: String = serde_json::from_str(l.get(..close? + 1)?).ok()?;
+                let plain = !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || "_$-".contains(c))
+                    && key != "*";
+                match (plain, key.contains('\'')) {
+                    (true, _) => format!(".{key}"),
+                    (false, false) => format!("['{key}']"),
+                    (false, true) if !key.contains('"') => format!("[\"{key}\"]"),
+                    (false, true) => return None,
+                }
+            }
+        };
+        if i == line {
+            if stack.is_empty() {
+                return None;
+            }
+            let path: String = stack.iter().map(|(_, s)| s.as_str()).collect();
+            return Some(format!("${path}{step}"));
+        }
+        if l.trim_end_matches(',').ends_with(['{', '[']) {
+            stack.push((l.trim_end_matches(',').ends_with('['), step));
+        }
+    }
+    None
+}
+
 fn fold_end(text: &str, line_starts: &[usize], open: usize) -> Option<usize> {
     let line = |i: usize| {
         let end = line_starts.get(i + 1).copied().unwrap_or(text.len());
@@ -4247,7 +4358,7 @@ impl App {
         {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             let text = match held.as_slice() {
-                [one] => leaf_name(one),
+                [one] => self.name_of(one),
                 all => tf("{} items", &[&all.len()]),
             };
             egui::Area::new(egui::Id::new("tree-drag"))
@@ -4326,6 +4437,16 @@ impl App {
                 TreeAction::Copy(dir, format) => self.copy_as(&dir, format, ui.ctx()),
                 TreeAction::Export(dir, format) => self.export_dialog(&dir, format),
                 TreeAction::Mock(dir) => self.start_mock(dir, ui.ctx()),
+                TreeAction::Sort(dir, by, descending) => {
+                    let sorted = self.ws.load_folder(&dir).and_then(|mut f| {
+                        (f.sort, f.descending) = (by, descending);
+                        self.ws.save_folder(&dir, &f)
+                    });
+                    match sorted {
+                        Ok(()) => self.reload(),
+                        Err(e) => self.fail(e),
+                    }
+                }
                 TreeAction::Move(paths, folder) => {
                     let moves = (paths.into_iter())
                         .map(|p| {
@@ -5025,7 +5146,7 @@ impl App {
                 }
                 let mut shown = 0;
                 for (i, e) in self.history.iter().enumerate().rev() {
-                    let name = store::unescape_path(&e.path);
+                    let name = e.display();
                     let hit = |s: &str| s.to_lowercase().contains(&query);
                     if !query.is_empty() && !hit(&name) && !hit(&e.request.url) {
                         continue;
@@ -5074,11 +5195,13 @@ impl App {
             let e = &self.history[i];
             match self.ws.request_path(&e.path) {
                 Ok(path) if self.ws.exists(&path) => {
-                    let draft = Box::new(e.request.clone());
+                    let mut draft = Box::new(e.request.clone());
+                    // Renamed since, it isn't an edit to bring back.
+                    draft.name = self.name_of(&path);
                     self.restore(path, draft);
                 }
                 _ => {
-                    let name = store::unescape_path(&e.path);
+                    let name = e.display();
                     self.status = tf("\"{}\" no longer exists", &[&name]);
                 }
             }
@@ -5141,7 +5264,7 @@ impl App {
                         let m = &o.draft.method;
                         whole = method_badge(ui, m, 0).rect;
                     }
-                    let mut text = RichText::new(leaf_name(&tab.path));
+                    let mut text = RichText::new(self.name_of(&tab.path));
                     if tab.preview {
                         text = text.italics();
                     }
@@ -6147,10 +6270,7 @@ impl App {
         }
         if rename && let Some(open) = &self.open {
             let path = open.path.clone();
-            self.dialog = Some(Dialog::name(
-                NameKind::Rename(path.clone()),
-                leaf_name(&path),
-            ));
+            self.dialog = Some(Dialog::name(NameKind::Rename(path), open.name()));
         }
     }
 
@@ -6317,6 +6437,7 @@ impl App {
         let open_name = self.open.as_ref().map(Open::name).unwrap_or_default();
         let root = self.ws.root.display().to_string();
         let collections = self.ws.collections();
+        let names = |p: &Path| (self.names.get(p).cloned()).unwrap_or_else(|| leaf_name(p));
         let mut cancel = false;
         let mut then: Option<Then> = None;
         let targets = match dialog {
@@ -6438,7 +6559,7 @@ impl App {
                             "Delete the folder \"{}\" and everything in it?",
                             &[&leaf_name(path)],
                         ),
-                        [path] => tf("Delete the request \"{}\"?", &[&leaf_name(path)]),
+                        [path] => tf("Delete the request \"{}\"?", &[&names(path)]),
                         _ if paths.iter().all(|p| crate::store::is_request(p)) => {
                             tf("Delete these {} requests?", &[&paths.len()])
                         }
@@ -6456,7 +6577,7 @@ impl App {
                             } else {
                                 "/"
                             };
-                            ui.weak(format!("• {}{slash}", leaf_name(path)));
+                            ui.weak(format!("• {}{slash}", names(path)));
                         }
                         if paths.len() > SHOWN {
                             ui.weak(tf("… and {} more", &[&(paths.len() - SHOWN)]));
@@ -7905,6 +8026,7 @@ impl App {
             .get_or_insert_with(crate::appearance::families);
         let a = &mut self.appearance;
         let log_level = &mut self.log_level;
+        let forget_responses = &mut self.forget_responses;
         let mut open_logs = false;
         let (updates, update) = (&mut self.updates, &self.update);
         let (mcp_window, mcp_client) = (&mut self.mcp_window, &mut self.mcp_client);
@@ -8024,6 +8146,14 @@ impl App {
                                         .clicked();
                                 }
                             });
+                            ui.end_row();
+                            ui.label(t("Response history"));
+                            let mut keep = !*forget_responses;
+                            ui.checkbox(&mut keep, t("Keep each request's last 10 responses"))
+                                .on_hover_text(t(
+                                    "Each Send keeps its response for the response's History menu (the clock icon). Examples are separate: only Save as example adds one.",
+                                ));
+                            *forget_responses = !keep;
                             ui.end_row();
                         });
                 }
@@ -8926,33 +9056,40 @@ fn switch_targets(
     root: &Path,
     envs: &[String],
 ) -> Vec<(String, String, Go, String)> {
-    fn walk(nodes: &[Node], root: &Path, out: &mut Vec<(String, String, Go, String)>) {
-        let label = |path: &Path| {
-            let rel = path.strip_prefix(root).unwrap_or(path);
-            let rel = match store::is_request(path) {
-                true => rel.with_extension(""),
-                false => rel.to_owned(),
-            };
-            store::unescape_path(&rel.to_string_lossy().replace('\\', "/"))
+    // "folder/sub/name": folders by their path, a request by its name in its folder's.
+    fn walk(nodes: &[Node], at: &str, out: &mut Vec<(String, String, Go, String)>) {
+        let label = |name: &str| match at {
+            "" => name.to_owned(),
+            at => format!("{at}/{name}"),
         };
         for node in nodes {
             match node {
-                Node::Folder { path, children, .. } => {
+                Node::Folder {
+                    name,
+                    path,
+                    children,
+                    ..
+                } => {
                     let go = Go::Folder(path.clone());
-                    out.push((label(path), "DIR".to_owned(), go, String::new()));
-                    walk(children, root, out);
+                    out.push((label(name), "DIR".to_owned(), go, String::new()));
+                    walk(children, &label(name), out);
                 }
                 Node::Request {
-                    path, method, url, ..
+                    name,
+                    path,
+                    method,
+                    url,
+                    ..
                 } => {
                     let go = Go::Request(path.clone());
-                    out.push((label(path), method.clone(), go, url.clone()));
+                    out.push((label(name), method.clone(), go, url.clone()));
                 }
             }
         }
     }
+    let _ = root;
     let mut out = Vec::new();
-    walk(nodes, root, &mut out);
+    walk(nodes, "", &mut out);
     let envs = envs.iter().map(|e| {
         (
             e.clone(),
@@ -9000,12 +9137,14 @@ fn filtered(nodes: &[Node], query: &str) -> Vec<Node> {
                 name,
                 path,
                 children,
+                sort,
             } => {
                 let children = filtered(children, query);
                 (!children.is_empty()).then(|| Node::Folder {
                     name: name.clone(),
                     path: path.clone(),
                     children,
+                    sort: *sort,
                 })
             }
             Node::Request { name, .. } => hit(name).then(|| node.clone()),
@@ -9061,6 +9200,7 @@ fn tree_ui(
                 name,
                 path,
                 children,
+                sort,
             } => {
                 let id = egui::Id::new(("tree-folder", path));
                 // Reveal the open request on startup instead of hiding it in a collapsed folder.
@@ -9114,7 +9254,7 @@ fn tree_ui(
                     actions.push(TreeAction::Drag(path.clone()));
                 }
                 let own = |ui: &mut egui::Ui, a: &mut Vec<TreeAction>| {
-                    folder_menu(ui, path, name, collection, a)
+                    folder_menu(ui, path, name, collection, *sort, a)
                 };
                 row.context_menu(|ui| row_menu(ui, view.picked, path, actions, own));
                 more_button(ui, &row, path, |ui| {
@@ -9377,6 +9517,7 @@ fn folder_menu(
     path: &Path,
     name: &str,
     collection: bool,
+    sort: (SortBy, bool),
     actions: &mut Vec<TreeAction>,
 ) {
     let (rename_key, delete_key) = (shortcut_label(ui.ctx(), &RENAME), delete_key(ui.ctx()));
@@ -9415,8 +9556,10 @@ fn folder_menu(
     );
     let delete = TreeAction::Dialog(Dialog::Delete(vec![path.clone()]));
     keyed(ui, t("Delete"), Some(delete_key), delete);
-    let mut item = |ui: &mut egui::Ui, label: &str, a: TreeAction| keyed(ui, label, None, a);
     ui.separator();
+    let mut sorted = Vec::new();
+    sort_menu(ui, &path, sort, &mut sorted);
+    let mut item = |ui: &mut egui::Ui, label: &str, a: TreeAction| keyed(ui, label, None, a);
     let settings = match collection {
         true => t("Collection settings…"),
         false => t("Folder settings…"),
@@ -9428,6 +9571,38 @@ fn folder_menu(
         true => TreeAction::Export(path, format),
         false => TreeAction::Copy(path, format),
     }));
+    actions.extend(sorted);
+}
+
+/// How a folder lists its requests: by hand (None), or by when made, last changed or name,
+/// either way. Its subfolders keep theirs.
+fn sort_menu(
+    ui: &mut egui::Ui,
+    path: &Path,
+    (by, descending): (SortBy, bool),
+    actions: &mut Vec<TreeAction>,
+) {
+    ui.menu_button(t("Sort requests"), |ui| {
+        let mut pick = |ui: &mut egui::Ui, to: (SortBy, bool), label: &str| {
+            if ui.radio((by, descending) == to, label).clicked() {
+                actions.push(TreeAction::Sort(path.to_path_buf(), to.0, to.1));
+                ui.close();
+            }
+        };
+        pick(ui, (SortBy::None, false), t("None (as arranged)"));
+        for (to, label) in [
+            (SortBy::Created, t("Date created")),
+            (SortBy::Updated, t("Date modified")),
+            (SortBy::Name, t("Name")),
+        ] {
+            pick(ui, (to, if by == to { descending } else { false }), label);
+        }
+        ui.separator();
+        ui.add_enabled_ui(by != SortBy::None, |ui| {
+            pick(ui, (by, false), t("Ascending"));
+            pick(ui, (by, true), t("Descending"));
+        });
+    });
 }
 
 /// Copy as and Export, a submenu of every format each, in a folder's menu and the
@@ -14447,7 +14622,10 @@ fn response_ui(
             let arrow_w = if foldable { char_w * 1.5 } else { 0.0 };
             let spacing = ui.spacing().item_spacing.x;
             let arrow = if foldable { arrow_w + spacing } else { 0.0 };
-            let gutter = (digits + 1) as f32 * char_w + spacing + arrow;
+            // The whole body as pretty JSON: a line's `+` filters to the path of its value.
+            let pickable = view.json && view.pretty && view.unfiltered.is_none();
+            let plus = if pickable { arrow_w + spacing } else { 0.0 };
+            let gutter = (digits + 1) as f32 * char_w + spacing + arrow + plus;
             if *wrap {
                 let width = ui.available_width() - gutter - ui.spacing().scroll.bar_width;
                 let cols = (width / char_w).floor().max(20.0) as usize;
@@ -14509,6 +14687,8 @@ fn response_ui(
             }
             let weak = ui.visuals().weak_text_color();
             let mut toggle = None;
+            let mut pick = None;
+            let pointer = ui.input(|i| i.pointer.hover_pos());
             crate::varedit::track_label_selection(ui);
             area.show_rows(ui, row_height, count, |ui, range| {
                 for i in range.map(|v| unhide(&hidden, v)) {
@@ -14536,6 +14716,44 @@ fn response_ui(
                         .binary_search_by_key(&(i + 1), |&(first, _)| first)
                         .is_ok();
                     ui.horizontal(|ui| {
+                        if pickable {
+                            let size = egui::vec2(arrow_w, row_height);
+                            let (rect, click) = ui.allocate_exact_size(size, egui::Sense::click());
+                            let at = line as usize;
+                            // A line holding a value: not the root's, not a closing bracket.
+                            let value = at > 1 && {
+                                let text = view.text[start..end].trim_start();
+                                !text.starts_with(['}', ']'])
+                            };
+                            let row = pointer.is_some_and(|p| {
+                                rect.y_range().contains(p.y)
+                                    && ui.clip_rect().x_range().contains(p.x)
+                            });
+                            if value {
+                                click.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Button,
+                                        true,
+                                        t("Filter to this value"),
+                                    )
+                                });
+                                // Only on the row under the pointer: on every line it's noise.
+                                if row {
+                                    let color = match click.hovered() {
+                                        true => ui.visuals().text_color(),
+                                        false => weak,
+                                    };
+                                    icon::PLUS.paint(ui, rect, font.size.round(), color);
+                                }
+                                let click = click.on_hover_ui(|ui| {
+                                    let path = json_path_at(&view.text, &view.line_starts, at - 1);
+                                    ui.label(RichText::new(path.unwrap_or_default()).monospace());
+                                });
+                                if click.clicked() {
+                                    pick = Some(at - 1);
+                                }
+                            }
+                        }
                         let number = match line {
                             0 => String::new(),
                             n => n.to_string(),
@@ -14593,6 +14811,14 @@ fn response_ui(
                 && let Some(close) = fold_end(&view.text, &view.line_starts, open)
             {
                 view.folds.insert(open, close);
+            }
+            if let Some(path) = pick.and_then(|at| json_path_at(&view.text, &view.line_starts, at))
+            {
+                view.filter = path;
+                view.apply_filter();
+                if view.filter_error.is_empty() {
+                    remember(recent, &view.applied);
+                }
             }
         }
     }
@@ -16018,12 +16244,12 @@ mod ui_tests {
         for name in ["a", "b", "c"] {
             ws.create_request(&ws.collections(), name).unwrap();
         }
-        let b = ws.collections().join("b.toml");
+        let b = ws.request_path("b").unwrap();
         let mut h = harness(ws);
         h.run();
         let tabs = |h: &Harness<'_, App>| -> Vec<String> {
-            let stem = |t: &Tab| t.path.file_stem().unwrap().to_string_lossy().into_owned();
-            h.state().tabs.iter().map(stem).collect()
+            let name = |t: &Tab| h.state().name_of(&t.path);
+            h.state().tabs.iter().map(name).collect()
         };
         h.get_by_label("a").click();
         h.run();
@@ -16079,10 +16305,7 @@ mod ui_tests {
         for name in ["a", "b"] {
             ws.create_request(&ws.collections(), name).unwrap();
         }
-        let (a, b) = (
-            ws.collections().join("a.toml"),
-            ws.collections().join("b.toml"),
-        );
+        let (a, b) = (ws.request_path("a").unwrap(), ws.request_path("b").unwrap());
         let root = ws.root.clone();
         let mut h = harness(ws);
         h.run();
@@ -16208,21 +16431,20 @@ mod ui_tests {
     fn the_tab_menu_closes_in_bulk_but_never_drops_edits() {
         let ws = workspace("tabmenu");
         let dir = ws.collections();
-        for name in ["a", "b", "c", "d"] {
-            ws.create_request(&dir, name).unwrap();
-        }
+        let paths: HashMap<&str, PathBuf> = (["a", "b", "c", "d"].into_iter())
+            .map(|name| (name, ws.create_request(&dir, name).unwrap()))
+            .collect();
         let mut h = harness(ws);
         h.run();
         for name in ["a", "b", "c", "d", "b"] {
-            h.state_mut()
-                .activate(dir.join(format!("{name}.toml")), true);
+            h.state_mut().activate(paths[name].clone(), true);
             h.run();
         }
         h.state_mut().open.as_mut().unwrap().draft.url = "http://edited".into();
         h.run();
         let tabs = |h: &Harness<'_, App>| -> Vec<String> {
-            let stem = |t: &Tab| t.path.file_stem().unwrap().to_string_lossy().into_owned();
-            h.state().tabs.iter().map(stem).collect()
+            let name = |t: &Tab| h.state().name_of(&t.path);
+            h.state().tabs.iter().map(name).collect()
         };
         // The tree's label comes first, then the tab's (the active one's title is a third).
         let menu = |h: &mut Harness<'_, App>, tab: &str, item: &str| {
@@ -16258,13 +16480,13 @@ mod ui_tests {
         assert_eq!(tabs(&h), ["b", "c copy", "c"]);
         reopen(&mut h);
         assert_eq!(tabs(&h), ["a", "b", "c copy", "c"]);
-        assert_eq!(h.state().open.as_ref().unwrap().path, dir.join("a.toml"));
+        assert_eq!(h.state().open.as_ref().unwrap().path, paths["a"]);
         // A request deleted since is passed over for the tab closed before it.
-        h.state_mut().activate(dir.join("c.toml"), false);
+        h.state_mut().activate(paths["c"].clone(), false);
         h.run();
         h.key_press_modifiers(Modifiers::COMMAND, Key::W);
         h.run();
-        h.state().ws.delete(&dir.join("c.toml")).unwrap();
+        h.state().ws.delete(&paths["c"]).unwrap();
         reopen(&mut h);
         assert_eq!(tabs(&h), ["a", "b", "c copy", "d"]);
     }
@@ -16437,8 +16659,9 @@ mod ui_tests {
         // Not "sync": that folder is the GitHub sync test's, wiped here if both run at once.
         let mut h = with_request("files-sync");
         let root = h.state().ws.root.clone();
+        // The request's file is named by its id, as its path is.
         let (file, env) = (
-            root.join("collections/r.toml"),
+            h.state().open.as_ref().unwrap().path.clone(),
             root.join("environments/dev.toml"),
         );
         let read = || std::fs::read_to_string(&file).unwrap();
@@ -16773,7 +16996,13 @@ mod ui_tests {
         h.get_by_label("Send").click();
         wait(&mut h, |app| app.response.is_some());
         let entry = &h.state().history[0];
-        assert_eq!((entry.path.as_str(), entry.status), ("r", 200));
+        assert_eq!((entry.display().as_str(), entry.status), ("r", 200));
+        let r = h.state().open.as_ref().unwrap().path.clone();
+        assert_eq!(
+            entry.path,
+            h.state().ws.key(&r),
+            "kept by id, not by its name"
+        );
         assert_eq!(h.state().ws.load_history(), h.state().history, "persisted");
 
         // Edit after sending, then go back to what was sent.
@@ -17246,10 +17475,10 @@ mod ui_tests {
         let ws = workspace("drag");
         let top = ws.collections();
         let api = ws.create_folder(&top, "api").unwrap();
-        ws.create_request(&top, "r").unwrap();
+        let path = ws.create_request(&top, "r").unwrap();
         let mut h = harness(ws);
         h.run();
-        h.state_mut().activate(top.join("r.toml"), true);
+        h.state_mut().activate(path.clone(), true);
         h.state_mut().open.as_mut().unwrap().draft.url = "http://unsaved".into();
         h.run();
         let drag = |h: &mut Harness<'_, App>, from: egui::Pos2, to: egui::Pos2| {
@@ -17267,7 +17496,8 @@ mod ui_tests {
         let r = h.get_all_by_label("r").next().unwrap().rect().center();
         let folder = h.get_by_label("api").rect().center();
         drag(&mut h, r, folder);
-        let moved = api.join("r.toml");
+        // Moved, it keeps its id: the file's name is the same in the new folder.
+        let moved = api.join(path.file_name().unwrap());
         assert!(
             h.state().ws.load_request(&moved).is_ok(),
             "{}",
@@ -17279,8 +17509,8 @@ mod ui_tests {
         // And back out: the space under the tree is the top level.
         let r = h.get_all_by_label("r").next().unwrap().rect().center();
         drag(&mut h, r, egui::pos2(r.x, 600.0));
-        assert!(h.state().ws.load_request(&top.join("r.toml")).is_ok());
-        assert_eq!(h.state().open.as_ref().unwrap().path, top.join("r.toml"));
+        assert!(h.state().ws.load_request(&path).is_ok());
+        assert_eq!(h.state().open.as_ref().unwrap().path, path);
     }
 
     #[test]
@@ -17304,7 +17534,7 @@ mod ui_tests {
         };
         let order = |h: &Harness<'_, App>| -> Vec<String> {
             (h.state().ws.tree().iter())
-                .map(|n| n.path().file_name().unwrap().to_string_lossy().into_owned())
+                .map(|n| h.state().name_of(n.path()))
                 .collect()
         };
         let row =
@@ -17312,12 +17542,7 @@ mod ui_tests {
         // b onto a's upper half: before a.
         let (b, a) = (row(&h, "b"), row(&h, "a"));
         drag(&mut h, b.center(), egui::pos2(a.center().x, a.top() + 2.0));
-        assert_eq!(
-            order(&h),
-            ["api", "b.toml", "a.toml"],
-            "{}",
-            h.state().status
-        );
+        assert_eq!(order(&h), ["api", "b", "a"], "{}", h.state().status);
         // a onto the folder header's top edge: before the folder, not into it.
         let (a, folder) = (row(&h, "a"), h.get_by_label("api").rect());
         drag(
@@ -17325,8 +17550,9 @@ mod ui_tests {
             a.center(),
             egui::pos2(folder.center().x, folder.top() + 1.0),
         );
-        assert_eq!(order(&h), ["a.toml", "api", "b.toml"]);
-        assert!(h.state().ws.exists(&top.join("a.toml")));
+        assert_eq!(order(&h), ["a", "api", "b"]);
+        let a = h.state().ws.request_path("a").unwrap();
+        assert!(a.starts_with(&top) && h.state().ws.exists(&a));
     }
 
     /// Every height over the tree lands somewhere: the spacing between rows belongs to the
@@ -17377,7 +17603,7 @@ mod ui_tests {
         };
         let names = |h: &Harness<'_, App>| -> Vec<String> {
             (h.state().tree_picked.iter())
-                .map(|p| leaf_name(p))
+                .map(|p| h.state().name_of(p))
                 .collect()
         };
         click(&mut h, "a", Modifiers::NONE);
@@ -17407,7 +17633,7 @@ mod ui_tests {
                 true => &tree[..],
                 false => crate::docs::find(&tree, dir).unwrap(),
             };
-            nodes.iter().map(|n| leaf_name(n.path())).collect()
+            nodes.iter().map(|n| h.state().name_of(n.path())).collect()
         };
         assert_eq!(order(&h, &api), ["b", "c"], "{}", h.state().status);
         assert_eq!(order(&h, &top), ["api", "a", "d"]);
@@ -17589,7 +17815,8 @@ mod ui_tests {
         h.run();
         assert!(matches!(
             &h.state().dialog,
-            Some(Dialog::Name { kind: NameKind::Rename(p), .. }) if *p == top.join("r.toml")
+            Some(Dialog::Name { kind: NameKind::Rename(p), .. })
+                if *p == h.state().ws.request_path("r").unwrap() && p.starts_with(&top)
         ));
     }
 
@@ -17601,9 +17828,8 @@ mod ui_tests {
         let ws = workspace("row-menus");
         let top = ws.collections();
         ws.create_folder(&top, "api").unwrap();
-        let (a, b) = (top.join("a.toml"), top.join("b.toml"));
-        ws.create_request(&top, "a").unwrap();
-        ws.create_request(&top, "b").unwrap();
+        let a = ws.create_request(&top, "a").unwrap();
+        let b = ws.create_request(&top, "b").unwrap();
         let mut h = harness(ws);
         h.run();
         let top_of = |h: &Harness<'_, App>, l: &str| button(h, l).rect().top();
@@ -17918,10 +18144,10 @@ mod ui_tests {
             ..Default::default()
         };
         ws.save_folder(&api, &folder).unwrap();
-        ws.create_request(&users, "r").unwrap();
+        let r = ws.create_request(&users, "r").unwrap();
         let mut h = harness(ws);
         h.run();
-        h.state_mut().activate(users.join("r.toml"), true);
+        h.state_mut().activate(r, true);
         h.state_mut().req_tab = ReqTab::Auth;
         h.run();
         assert!(h.query_by_label_contains("from folder \"api\"").is_some());
@@ -18068,6 +18294,7 @@ mod ui_tests {
             ..Default::default()
         };
         ws.save_folder(&team, &folder).unwrap();
+        let original = h.state().open.as_ref().unwrap().path.clone();
         h.state_mut().open.as_mut().unwrap().draft.url = "http://api.test/v2".into();
         h.run();
         h.get_by_label("More save options").click();
@@ -18089,9 +18316,9 @@ mod ui_tests {
         shot(&mut h, "61-saved-as");
 
         assert!(h.state().dialog.is_none());
-        let copy = team.join("r v2.toml");
+        let copy = ws.request_path("team/r v2").unwrap();
+        assert_eq!(copy.parent(), Some(team.as_path()));
         assert_eq!(ws.load_request(&copy).unwrap().url, "http://api.test/v2");
-        let original = ws.collections().join("r.toml");
         assert_eq!(ws.load_request(&original).unwrap().url, "", "kept as saved");
         let open = h.state().open.as_ref().unwrap();
         assert_eq!(open.path, copy, "the tab follows the copy");
@@ -18099,7 +18326,8 @@ mod ui_tests {
         assert_eq!(open.draft.inherited.vars.get("tenant").unwrap(), "t1");
         assert_eq!(h.state().tabs.len(), 1);
 
-        // Never over another request.
+        // A name taken in that folder is no obstacle: names aren't keys, so it's a second
+        // request of that name, and the first one stays as it was.
         h.get_by_label("More save options").click();
         h.run();
         button(&h, "Save as…").click();
@@ -18112,10 +18340,11 @@ mod ui_tests {
         }
         h.key_press(Key::Enter);
         h.run();
-        let Some(Dialog::Name { error, .. }) = &h.state().dialog else {
-            panic!("the dialog should stay to say why");
-        };
-        assert!(error.contains("already exists"), "{error}");
+        assert!(h.state().dialog.is_none());
+        let second = h.state().open.as_ref().unwrap().path.clone();
+        assert!(second != original && second.parent() == original.parent());
+        assert_eq!(h.state().name_of(&second), "r");
+        assert_eq!(ws.load_request(&second).unwrap().url, "http://api.test/v2");
         assert_eq!(ws.load_request(&original).unwrap().url, "");
     }
 
@@ -18552,7 +18781,12 @@ mod ui_tests {
         assert_eq!(xml.matches("<testsuite ").count(), 1, "{xml}");
 
         let kept = [row("c", true), row("b", false), row("a", true)];
-        assert_eq!(h.state().run_orders[""], kept);
+        // Kept by key (the id), which a rename leaves alone.
+        let ws = &h.state().ws;
+        let named =
+            |(key, on): &(String, bool)| (ws.display_name(&ws.request_path(key).unwrap()), *on);
+        let saved: Vec<_> = h.state().run_orders[""].iter().map(named).collect();
+        assert_eq!(saved, kept);
         h.state_mut().runner = None;
         h.state_mut().open_runner(top);
         h.run();
@@ -18836,10 +19070,12 @@ mod ui_tests {
     fn ctrl_k_jumps_to_a_request_folder_or_environment_from_the_keyboard() {
         let ws = workspace("switch");
         let top = ws.collections();
-        for folder in ["admin", "users"] {
-            let dir = ws.create_folder(&top, folder).unwrap();
-            ws.create_request(&dir, "get user").unwrap();
-        }
+        let gets: Vec<PathBuf> = (["admin", "users"].iter())
+            .map(|folder| {
+                let dir = ws.create_folder(&top, folder).unwrap();
+                ws.create_request(&dir, "get user").unwrap()
+            })
+            .collect();
         ws.save_env(Some("prod"), &[], &[]).unwrap();
         let order = ws.create_request(&top, "fetch one").unwrap();
         let url = "{{baseUrl}}/orders/:id";
@@ -18873,11 +19109,11 @@ mod ui_tests {
         let open = |h: &Harness<'_, App>| h.state().open.as_ref().map(|o| o.path.clone());
         // Scattered letters across the folder and the name.
         switch(&mut h, "adm get", 0);
-        assert_eq!(open(&h), Some(top.join("admin/get user.toml")));
+        assert_eq!(open(&h).as_ref(), Some(&gets[0]));
         assert!(h.state().dialog.is_none());
         // Same name in two folders: the second one is a ↓ away.
         switch(&mut h, "get user", 1);
-        assert_eq!(open(&h), Some(top.join("users/get user.toml")));
+        assert_eq!(open(&h).as_ref(), Some(&gets[1]));
         switch(&mut h, "prod", 0);
         assert_eq!(h.state().active_env.as_deref(), Some("prod"));
         // Actions do what their buttons do, saved state included.
@@ -18968,6 +19204,74 @@ mod ui_tests {
             bytes: None,
         };
         assert_eq!(media_type(&head), "application/json");
+    }
+
+    /// 10-30: a `+` left of a line number filters to that value's path, with every array
+    /// index as `[*]`: clicked on one market's createdAt, it lists them all.
+    #[test]
+    fn the_plus_by_a_line_filters_to_its_value() {
+        let mut h = with_request("json-pick");
+        let body = r#"{"code":0,"message":"success","data":{"items":[
+            {"market":{"id":"019f69d0-2d23-7645-bfd2-b589ef44a2f5","createdAt":1784186678563374639}},
+            {"market":{"id":"b","createdAt":2}}]}}"#;
+        h.state_mut().response = Some(Shown {
+            result: Ok(into_view(http::Response {
+                status: 200,
+                reason: "OK".into(),
+                version: "HTTP/1.1".into(),
+                elapsed: Duration::ZERO,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: body.into(),
+                truncated: false,
+                sent: Default::default(),
+                bytes: None,
+            })),
+            tests: Vec::new(),
+            logs: Vec::new(),
+            past: None,
+        });
+        h.run();
+        // Lines 2 to 9 hold values; the 8th button is line 9's, "createdAt".
+        let plus: Vec<_> = h.get_all_by_label("Filter to this value").collect();
+        assert!(plus.len() >= 8, "{}", plus.len());
+        plus[7].click();
+        h.run();
+        let view = (h.state().response.as_ref().unwrap().result.as_ref()).unwrap();
+        assert_eq!(view.applied, "$.data.items[*].market.createdAt");
+        assert_eq!(view.text, "[\n  1784186678563374639,\n  2\n]");
+        assert_eq!(h.state().recent_filters[0], view.applied);
+        // Filtered, the lines aren't the body's: no `+` until it's whole again.
+        let by = egui_kittest::kittest::By::new().label("Filter to this value");
+        assert_eq!(h.query_all(by).count(), 0);
+    }
+
+    #[test]
+    fn json_paths_of_lines_quote_odd_keys_and_skip_brackets() {
+        let text =
+            http::pretty_json(r#"{"a b":{"it's":[1,{"x.y":true}],"ok":{}},"z":[]}"#).unwrap();
+        let starts = line_starts(&text);
+        let paths: Vec<_> = (0..starts.len())
+            .map(|i| json_path_at(&text, &starts, i))
+            .collect();
+        let want = [
+            None,
+            Some("$['a b']"),
+            Some("$['a b'][\"it's\"]"),
+            Some("$['a b'][\"it's\"][*]"),
+            Some("$['a b'][\"it's\"][*]"),
+            Some("$['a b'][\"it's\"][*]['x.y']"),
+            None,
+            None,
+            Some("$['a b'].ok"),
+            None,
+            Some("$.z"),
+            None,
+        ];
+        assert_eq!(paths, want.map(|p| p.map(String::from)), "{text}");
+        // Each path selects what its line holds.
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let x = crate::jsonpath::select(&doc, want[5].unwrap()).unwrap();
+        assert_eq!(x, serde_json::json!([true]));
     }
 
     #[test]
@@ -19133,6 +19437,7 @@ mod ui_tests {
                 method: "GET".into(),
                 url: String::new(),
                 headers: Vec::new(),
+                body: None,
             },
         );
         let out = crate::script::run(
@@ -19385,9 +19690,9 @@ mod ui_tests {
         let ws = workspace("crumbs");
         let api = ws.create_folder(&ws.collections(), "api").unwrap();
         let users = ws.create_folder(&api, "users").unwrap();
-        ws.create_request(&users, "get user").unwrap();
+        let get = ws.create_request(&users, "get user").unwrap();
         let mut h = harness(ws);
-        h.state_mut().activate(users.join("get user.toml"), true);
+        h.state_mut().activate(get, true);
         h.run();
         shot(&mut h, "57-breadcrumb");
         // The tree is folded, so this "users" is the breadcrumb's.
@@ -19461,6 +19766,29 @@ mod ui_tests {
             h.query_by_label("Expires").is_none(),
             "back on the body, not an empty table"
         );
+    }
+
+    /// Settings > General > Response history off: a send still shows its response and the
+    /// row's status, but none is kept to look back at, and the choice outlasts a restart.
+    #[test]
+    fn with_response_history_off_a_send_keeps_no_response() {
+        let mut h = with_request("forget");
+        h.state_mut().settings = true;
+        h.state_mut().settings_tab = SettingsTab::General;
+        h.run();
+        h.get_by_label("Keep each request's last 10 responses")
+            .click();
+        h.run();
+        h.state().save_state();
+        assert!(h.state().ws.load_state().forget_responses);
+        h.state_mut().settings = false;
+        h.state_mut().open.as_mut().unwrap().draft.url = crate::http::tests::echo_server();
+        h.run();
+        h.get_by_label("Send").click();
+        wait(&mut h, |app| app.response.is_some());
+        let path = h.state().open.as_ref().unwrap().path.clone();
+        assert_eq!(h.state().statuses.get(&path), Some(&200));
+        assert!(h.state().ws.responses(&path).is_empty(), "nothing kept");
     }
 
     #[test]
@@ -21555,6 +21883,8 @@ mod ui_tests {
         assert!(h.state().tree.iter().any(shown), "the tree reloaded");
         assert_eq!(text(4)["environment"], "dev");
         assert_eq!(text(5)["unsaved"], true);
+        // The inline request left its name out: still "list", not renamed to nothing.
+        assert_eq!(h.state().open.as_ref().unwrap().draft.name, "list");
 
         // Send went out as the window has it: unsaved header, environment's host.
         let sent = text(6);
@@ -21843,14 +22173,13 @@ mod ui_tests {
     fn every_shortcut_does_its_own_thing() {
         let ws = workspace("shortcuts");
         let dir = ws.collections();
-        for name in ["a", "b", "c"] {
-            ws.create_request(&dir, name).unwrap();
-        }
+        let paths: Vec<PathBuf> = (["a", "b", "c"].iter())
+            .map(|name| ws.create_request(&dir, name).unwrap())
+            .collect();
         let mut h = harness(ws);
         h.run();
-        for name in ["a", "b", "c"] {
-            h.state_mut()
-                .activate(dir.join(format!("{name}.toml")), true);
+        for path in paths {
+            h.state_mut().activate(path, true);
             h.run();
         }
         let open = |h: &Harness<'_, App>| h.state().open.as_ref().unwrap().name();
@@ -23377,7 +23706,13 @@ mod ui_tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("timed out waiting for the app");
+        let app = h.state();
+        panic!(
+            "timed out waiting for the app; status {:?}, open {:?}, pending {}",
+            app.status,
+            app.open.as_ref().map(|o| (&o.path, &o.draft.url)),
+            app.pending.len()
+        );
     }
 
     /// A path field with its file button takes one row: laid out right to left on its own,

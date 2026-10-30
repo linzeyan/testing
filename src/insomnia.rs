@@ -154,6 +154,7 @@ impl Reader {
             pre_request: script(v, "preRequestScript", "preRequest"),
             tests: script(v, "afterResponseScript", "afterResponse"),
             order: Vec::new(),
+            ..Default::default()
         };
         // Insomnia folders can carry headers for their requests; apitool's don't.
         if headers(&v["headers"]).iter().any(|h| h.enabled) {
@@ -191,6 +192,7 @@ impl Reader {
                 || (kind.is_empty() && !child["method"].is_string() && child["url"].is_string())
             {
                 let req = Request {
+                    name: str_of(&child["name"]).trim().to_owned(),
                     method: "WS".into(),
                     url: str_of(&child["url"]).to_owned(),
                     headers: headers(&child["headers"]),
@@ -211,6 +213,7 @@ impl Reader {
 
     fn request(&mut self, key: &str, v: &Value) {
         let mut req = Request {
+            name: str_of(&v["name"]).trim().to_owned(),
             url: str_of(&v["url"]).to_owned(),
             params: rows(&v["parameters"]),
             path_vars: rows(&v["pathParameters"]),
@@ -551,6 +554,7 @@ impl Out {
                     name,
                     path,
                     children,
+                    ..
                 } => {
                     let mut f = ws.load_folder(path)?;
                     if let Some(top) = top {
@@ -1234,7 +1238,7 @@ environments:
         assert_eq!(folders["admin"].pre_request, top.pre_request);
         for (name, _) in requests.iter().filter(|(n, _)| *n != "api/feed") {
             let mut want = ws.load_request(&ws.request_path(name).unwrap()).unwrap();
-            want.inherited = Default::default();
+            (want.inherited, want.updated) = Default::default();
             if !name.starts_with("api/admin/") {
                 adopt(&top, &mut want.auth, &mut want.pre_request, &mut want.tests);
             }

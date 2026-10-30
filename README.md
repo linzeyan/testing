@@ -191,9 +191,14 @@ Snippets fill some in):
 
 - `pm.*`, chai, `jsonSchema`, `pm.variables.replaceIn`.
 - `require` of Postman's sandbox modules (crypto-js, lodash, moment, uuid, tv4, chai), plus
-  `atob`/`btoa` and tweetnacl (Ed25519 signing); each is evaluated only when required.
+  `atob`/`btoa`, tweetnacl and `@noble/ed25519` (Ed25519 signing, its v2 and v3 calls, with
+  `@noble/hashes/sha2` for its SHA-512); each is evaluated only when required.
   `pm.require('npm:tweetnacl@1.0.3')` loads the bundled one; other npm packages aren't
   fetched.
+- `Buffer` (hex, base64, base64url, latin1, utf8), `TextEncoder`/`TextDecoder` and
+  `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.subtle.digest`.
+- `pm.request.body.raw` reads a JSON or text body and `pm.request.body.update(text)` rewrites
+  it before it's sent, e.g. to sign it.
 - A script that throws, an async function in it included, stops the request, with the
   error's kind and line.
 - `pm.cookies` and `pm.cookies.jar()` read and write the jar Send uses.
@@ -227,7 +232,8 @@ filters All / Passed / Failed, with counts.
 - Pretty / Raw. XML responses are indented too; Raw, once chosen, sticks to that content type.
 - Filter with JSONPath (`$.items[*].id`, `..id`, `$.items[?(@.price < 10 && @.tag == 'x')]`)
   or, on XML, XPath (`//item[@id='b']/name/text()`, prefixes ignored). The last 10 come back
-  from Recent; Save… still writes the whole body.
+  from Recent; Save… still writes the whole body. In Pretty JSON the `+` left of a line's
+  number filters to that value in every item alike: `$.data.items[*].market.createdAt`.
 - Find (Ctrl+F): match case, whole word or regular expression; counts up to 10 000 hits.
   The filter and the find stay on when the request is sent again.
 - PNG, JPEG, GIF (its first frame) and WebP show as pictures, SVG too (Preview, beside Pretty and Raw), PDF page by
@@ -251,8 +257,9 @@ filters All / Passed / Failed, with counts.
 - Select text in the body and right-click it to set it as a variable, as in a request's text
   boxes.
 - The History menu in the response bar: the last 10 responses of each request, each with its
-  status, time and size, kept on disk with 1 MiB of body each. Request history and saved
-  response examples too.
+  status, time and size, kept on disk with 1 MiB of body each (Settings > General > Response
+  history turns this off). Request history and saved response examples too; an example is
+  kept only by "Save as example".
 - The sidebar's History: each send with how long ago, filtered by name or URL; a click
   brings back what was sent.
 
@@ -264,6 +271,12 @@ past 16 MiB keep only their start, to spare RAM. Send and download keeps a whole
 **Tree**
 
 - Filter by name. Each request's row shows its last status code.
+- Names needn't be unique: two requests in a folder may share one, whatever their methods.
+  Each request is kept by an id (a UUID v7), which is also its file's name in `collections/`;
+  the name is a field in it and can hold any character.
+- A folder's menu > Sort requests: as arranged (the default), by date created, date modified
+  or name, ascending or descending. It sorts that folder's own requests; folders inside
+  keep their own setting.
 - Drag a request or folder onto a folder (or the empty space under the tree) to move it,
   open tabs following, or onto a row's top or bottom edge to put it before or after that
   row. The order is kept in `.folder.toml`; Postman and Insomnia imports keep theirs.

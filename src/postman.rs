@@ -97,6 +97,7 @@ impl Reader {
             pre_request: script(&v["event"], "prerequest"),
             tests: script(&v["event"], "test"),
             order: Vec::new(),
+            ..Default::default()
         };
         let at = self.folders.len();
         self.folders.push((key.to_owned(), folder));
@@ -134,7 +135,11 @@ impl Reader {
 
     fn request(&mut self, key: &str, item: &Value) {
         let r = &item["request"];
-        let mut req = Request::default();
+        // As named there, a name other requests may share; its key is made unique.
+        let mut req = Request {
+            name: str_of(&item["name"]).trim().to_owned(),
+            ..Default::default()
+        };
         let method = str_of(&r["method"]).to_uppercase();
         if model::METHODS.contains(&method.as_str()) {
             req.method = method;
@@ -553,6 +558,7 @@ fn group(
                 name,
                 path,
                 children,
+                ..
             } => {
                 let inner = group(ws, &ws.load_folder(path)?, children, counts)?;
                 let mut g = Map::from_iter([("name".to_owned(), json!(name))]);
@@ -1236,7 +1242,7 @@ mod tests {
             }),
             pre_request: "console.log(1);\n".into(),
             tests: "pm.test('x', () => {});".into(),
-            order: Vec::new(),
+            ..Default::default()
         };
         ws.save_folder(&api, &folder).unwrap();
         let sub = Folder {
@@ -1512,7 +1518,7 @@ mod tests {
         assert_eq!(back.len(), 11);
         for (name, _) in requests.iter().filter(|(n, _)| *n != "api/live") {
             let mut saved = ws.load_request(&ws.request_path(name).unwrap()).unwrap();
-            saved.inherited = Default::default();
+            (saved.inherited, saved.updated) = Default::default();
             assert_eq!(back[name.strip_prefix("api/").unwrap()], saved, "{name}");
         }
         let _ = std::fs::remove_dir_all(&root);

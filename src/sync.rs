@@ -1324,7 +1324,10 @@ mod tests {
         put(&a, "users/list", "http://h.test/a");
         put(&b, "users/list", "http://h.test/b");
         assert_eq!(sync(&a, None), synced(0, 1));
-        let asked = Outcome::Conflicts(vec!["collections/users/list.toml".into()]);
+        // Named by its id, the same on both machines: b has it from a.
+        let list = a.key(&a.request_path("users/list").unwrap());
+        assert_eq!(list, b.key(&b.request_path("users/list").unwrap()));
+        let asked = Outcome::Conflicts(vec![format!("collections/{list}.toml")]);
         assert_eq!(sync(&b, None), asked);
         assert_eq!(url(&b, "users/list"), "http://h.test/b");
         assert_eq!(sync(&b, Some(Resolution::UseRemote)), synced(1, 0));

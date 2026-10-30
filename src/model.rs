@@ -19,6 +19,13 @@ pub fn is_streaming(method: &str) -> bool {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Request {
+    /// As shown in the tree: any text, and not unique (a GET and a POST "users", or two
+    /// GETs). What identifies a request is its id, its key's last segment (`store::new_id`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Unix milliseconds of the last saved change (`Workspace::save_request`); 0 unknown.
+    #[serde(skip_serializing_if = "is_zero_ms")]
+    pub updated: u64,
     pub method: String,
     pub url: String,
     /// gRPC only: `.proto` file (relative to the workspace, so it syncs via git) and the
@@ -378,6 +385,32 @@ pub struct Folder {
     /// default order, so a new or renamed-elsewhere item never vanishes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub order: Vec<String>,
+    /// How its own requests are listed; `None` keeps `order`. Folders stay above them.
+    #[serde(skip_serializing_if = "SortBy::is_none")]
+    pub sort: SortBy,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub descending: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SortBy {
+    /// As dragged (`Folder::order`), else by name.
+    #[default]
+    None,
+    Created,
+    Updated,
+    Name,
+}
+
+impl SortBy {
+    pub fn is_none(&self) -> bool {
+        *self == SortBy::None
+    }
+}
+
+fn is_zero_ms(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Folder {
@@ -421,6 +454,8 @@ pub struct Example {
 impl Default for Request {
     fn default() -> Self {
         Self {
+            name: String::new(),
+            updated: 0,
             method: "GET".into(),
             url: String::new(),
             proto: String::new(),
@@ -1116,6 +1151,8 @@ impl Request {
             .filter(|p| !p.value.is_empty())
             .fold(self.url.clone(), |url, p| fill(&url, &p.key, &p.value));
         let mut req = Request {
+            name: self.name.clone(),
+            updated: self.updated,
             method: self.method.clone(),
             url: r(&url),
             proto: r(&self.proto),
@@ -1291,6 +1328,9 @@ impl Request {
     /// `inherited` comes from the folders, never from the file, and isn't compared.
     pub fn same_as(&self, other: &Request) -> bool {
         let Request {
+            name,
+            // When it was saved, not what: an edit undone is no edit.
+            updated: _,
             method,
             url,
             proto,
@@ -1314,6 +1354,7 @@ impl Request {
             inherited: _,
         } = self;
         (method, url, proto, rpc) == (&other.method, &other.url, &other.proto, &other.rpc)
+            && name == &other.name
             && operation == &other.operation
             && (description, params, path_vars)
                 == (&other.description, &other.params, &other.path_vars)
@@ -1691,6 +1732,8 @@ mod tests {
         let mut off = KeyValue::new("X-Off", "1");
         off.enabled = false;
         let req = Request {
+            name: "Get / user: \"one\"".into(),
+            updated: 1_784_186_678_563,
             method: "POST".into(),
             url: "https://{{host}}/users/:id".into(),
             proto: "protos/users.proto".into(),

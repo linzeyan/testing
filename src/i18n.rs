@@ -1192,6 +1192,22 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Debug", "除錯"),
     ("Trace", "追蹤"),
     ("Open the log's folder", "開啟記錄檔所在的資料夾"),
+    ("Response history", "回應歷史"),
+    ("Filter to this value", "篩選出這個值"),
+    ("Sort requests", "請求排序"),
+    ("None (as arranged)", "不排序（依手動排列）"),
+    ("Date created", "建立時間"),
+    ("Date modified", "修改時間"),
+    ("Ascending", "遞增"),
+    ("Descending", "遞減"),
+    (
+        "Keep each request's last 10 responses",
+        "保留每個請求最近 10 筆回應",
+    ),
+    (
+        "Each Send keeps its response for the response's History menu (the clock icon). Examples are separate: only Save as example adds one.",
+        "每次傳送都會保留回應，供回應區的歷史紀錄選單（時鐘圖示）回看。範例與此無關：只有按「存為範例」才會新增。",
+    ),
     (
         "How much goes into apitool.log. Debug adds each step of a request or stream: proxy picked, connection, TLS, redirects, status. Trace also each message's size. Headers, bodies and tokens are never written, nor a URL's query.",
         "apitool.log 要記錄多少。「除錯」會加上請求與串流的每個步驟：選用的代理伺服器、連線、TLS、重新導向、狀態碼；「追蹤」再加上每則訊息的大小。標頭、內文與權杖一律不寫入，URL 的查詢字串也不會。",
