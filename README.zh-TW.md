@@ -159,7 +159,8 @@ token 過期時，若提供者有給 refresh token 就自動換新，不必重�
 ## 指令碼與測試
 
 Postman 風格的請求前與測試指令碼，預設是空的，由你自己撰寫（「插入範本」與「程式碼片段」可以
-幫你填入一些）：
+幫你填入一些）。指令碼可以是 JavaScript 或 TypeScript，不用切換：無法當 JavaScript 解析的會先拿掉型別
+（內建 sucrase；enum 轉成物件）再執行，錯誤行號仍對應你寫的那一行。不做型別檢查。
 
 - `pm.*`、chai、`jsonSchema`、`pm.variables.replaceIn`。
 - 可 `require` Postman 沙箱的模組（crypto-js、lodash、moment、uuid、tv4、chai），另有

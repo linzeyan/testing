@@ -100,6 +100,16 @@ const JS_WORDS: &[&str] = &[
     "while",
     "yield",
     "require",
+    // TypeScript's, as scripts may be TypeScript. Not `type`, which JavaScript uses as a
+    // name all the time.
+    "as",
+    "enum",
+    "implements",
+    "interface",
+    "keyof",
+    "namespace",
+    "readonly",
+    "satisfies",
 ];
 
 fn spec(lang: Lang) -> Spec {

@@ -12463,6 +12463,9 @@ fn scripts_editor(
                 }
             }
         });
+        // Nothing to pick: a script that isn't JavaScript runs as TypeScript.
+        ui.weak("JavaScript · TypeScript")
+            .on_hover_text(t("TypeScript's types are stripped before it runs; they aren't checked."));
     });
     let above = match tab {
         ScriptTab::Pre => &inherited.pre_request,

@@ -21,6 +21,9 @@ const LIBS: &[(&str, &str)] = &[
     // 3.2.0 as CommonJS (see its end); its SHA-512 is set when loaded (`__setup`).
     ("@noble/ed25519", include_str!("../vendor/noble-ed25519.js")),
 ];
+/// Strips TypeScript's types (sucrase keeps every line where it was, so error lines still
+/// point into what was typed). Loaded only for a script that isn't JavaScript.
+const SUCRASE: &str = include_str!("../vendor/sucrase.js");
 /// The user's script is evaluated under this file name, so its frames in a stack stand
 /// apart from the prelude's (`eval_script`).
 const FILE: &str = "script";
@@ -784,10 +787,24 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
             .map_err(caught)?;
         ctx.eval::<(), _>(PRELUDE).map_err(caught)?;
         // For `await pm.sendRequest(…)`; a rejection of it is tracked as any other.
-        let (source, shift) = match AWAIT.is_match(script) {
+        let wrap = |script: &str| match AWAIT.is_match(script) {
             true => (format!("{ASYNC_OPEN}{script}\n}})();"), ASYNC_OPEN.len()),
             false => (script.to_owned(), 0),
         };
+        let (mut source, mut shift) = wrap(script);
+        // No flag says which language a script is: TypeScript is what doesn't parse as
+        // JavaScript. Parsed only, never run, so nothing happens twice.
+        ctx.globals().set("__source", source.as_str()).map_err(caught)?;
+        let not_js: Option<String> = ctx
+            .eval("try { new Function(__source); null } catch (e) { e instanceof SyntaxError ? String(e.message) : null }")
+            .map_err(caught)?;
+        let mut not_ts = None;
+        if not_js.is_some() {
+            match typescript(&ctx, script) {
+                Ok(js) => (source, shift) = wrap(&js),
+                Err(e) => not_ts = Some(e),
+            }
+        }
         let mut options = rquickjs::context::EvalOptions::default();
         options.filename = Some(FILE.into());
         // The user's script may throw; keep whatever it recorded before that.
@@ -804,9 +821,47 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
         }
         let out: String = ctx.eval(EPILOGUE).map_err(caught)?;
         let mut out: Output = serde_json::from_str(&out).map_err(|e| e.to_string())?;
-        out.error = error;
+        // JavaScript's error first: most scripts are, and a typo reads best as one.
+        out.error = match (error, not_ts) {
+            (Some(e), Some(ts)) => Some(format!("{e}\n(Not TypeScript either: {ts})")),
+            (error, _) => error,
+        };
         Ok(out)
     })
+}
+
+/// Transpiled scripts by their text: sucrase is 200 KB of JavaScript to load, and a load
+/// test runs the same script thousands of times.
+static TRANSPILED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// `script` as JavaScript, its types stripped (and enums made objects), or sucrase's
+/// complaint.
+fn typescript(ctx: &rquickjs::Ctx<'_>, script: &str) -> Result<String, String> {
+    if let Some(js) = TRANSPILED.lock().unwrap().get(script) {
+        return Ok(js.clone());
+    }
+    let failed = |e: rquickjs::Error| match e {
+        rquickjs::Error::Exception => {
+            let thrown: rquickjs::Value = ctx.catch();
+            (thrown.as_object())
+                .and_then(|o| o.get::<_, String>("message").ok())
+                .unwrap_or_else(|| "can't be read".into())
+        }
+        e => e.to_string(),
+    };
+    ctx.eval::<(), _>(SUCRASE).map_err(failed)?;
+    ctx.globals().set("__ts", script).map_err(failed)?;
+    // ES syntax stays as written: QuickJS runs it all, and lines stay put.
+    let js: String = ctx
+        .eval("__sucrase(__ts, { transforms: ['typescript'], disableESTransforms: true }).code")
+        .map_err(failed)?;
+    let mut cache = TRANSPILED.lock().unwrap();
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(script.to_owned(), js.clone());
+    Ok(js)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1531,5 +1586,66 @@ mod tests {
         );
         assert!(out.error.unwrap().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// 11-02: a script may be TypeScript, with nothing to switch: interfaces, annotations,
+    /// generics, `as`, `!` and enums all run, `await` too, and an error's line is the
+    /// line typed, as the types are stripped in place.
+    #[test]
+    fn typescript_scripts_run_with_their_lines_kept() {
+        let (req, env) = (request(), HashMap::new());
+        let headers = vec![];
+        let resp = ScriptResponse {
+            code: 200,
+            status: "OK",
+            time: 1,
+            headers: &headers,
+            body: r#"{"access":"t1"}"#,
+        };
+        let ts = r#"interface Tok { access: string }
+enum Kind { A = 1, B }
+const body = pm.response.json() as Tok;
+function first<T>(xs: T[]): T { return xs[0]; }
+pm.environment.set("token", body.access!);
+pm.environment.set("kind", String(Kind.B) + first<string>(["x"]));
+pm.test("typed", (): void => { pm.expect(body.access).to.equal("t1"); });
+"#;
+        let out = run(ts, &input(&req, &env, Some(resp)));
+        assert_eq!(out.error, None);
+        assert_eq!(out.env["token"], Some("t1".into()));
+        assert_eq!(out.env["kind"], Some("2x".into()));
+        assert!(out.tests[0].passed);
+
+        let out = run(
+            "const n: number = 1;\nawait Promise.resolve(n);\nconst m: string = missing;",
+            &input(&req, &env, None),
+        );
+        let e = out.error.unwrap();
+        assert!(e.contains("missing") && e.contains("line 3"), "{e}");
+
+        // Neither language: JavaScript's complaint, then TypeScript's.
+        let out = run("let x: = 1;", &input(&req, &env, None));
+        let e = out.error.unwrap();
+        assert!(
+            e.contains("SyntaxError") && e.contains("Not TypeScript either"),
+            "{e}"
+        );
+    }
+
+    /// A SyntaxError thrown while running (JSON.parse) is the script's own error: it isn't
+    /// taken for TypeScript and run a second time.
+    #[test]
+    fn a_runtime_syntax_error_runs_the_script_once() {
+        let (req, env) = (request(), HashMap::new());
+        let out = run(
+            "console.log('ran'); JSON.parse('{');",
+            &input(&req, &env, None),
+        );
+        assert_eq!(out.logs, ["ran"]);
+        let e = out.error.unwrap();
+        assert!(
+            e.contains("SyntaxError") && !e.contains("TypeScript"),
+            "{e}"
+        );
     }
 }

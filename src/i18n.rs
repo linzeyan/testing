@@ -1203,6 +1203,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "類型（HTTP、GraphQL、WebSocket…）",
     ),
     ("Method (GET, POST…)", "方法（GET、POST…）"),
+    (
+        "TypeScript's types are stripped before it runs; they aren't checked.",
+        "TypeScript 的型別在執行前拿掉，不做型別檢查。",
+    ),
     ("Ascending", "遞增"),
     ("Descending", "遞減"),
     (

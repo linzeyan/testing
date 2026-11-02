@@ -187,7 +187,9 @@ empty is the one Postman defaults to (HS256 for JWT).
 ## Scripts and tests
 
 Pre-request and test scripts in Postman's style, empty until written ("Insert template" and
-Snippets fill some in):
+Snippets fill some in). A script is JavaScript or TypeScript, with nothing to pick: one that
+doesn't parse as JavaScript has its types stripped (sucrase, bundled; enums become objects)
+and runs, with errors on the lines as typed. Types aren't checked.
 
 - `pm.*`, chai, `jsonSchema`, `pm.variables.replaceIn`.
 - `require` of Postman's sandbox modules (crypto-js, lodash, moment, uuid, tv4, chai), plus
