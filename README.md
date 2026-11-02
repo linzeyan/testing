@@ -274,9 +274,11 @@ past 16 MiB keep only their start, to spare RAM. Send and download keeps a whole
 - Names needn't be unique: two requests in a folder may share one, whatever their methods.
   Each request is kept by an id (a UUID v7), which is also its file's name in `collections/`;
   the name is a field in it and can hold any character.
-- A folder's menu > Sort requests: as arranged (the default), by date created, date modified
-  or name, ascending or descending. It sorts that folder's own requests; folders inside
-  keep their own setting.
+- A folder's menu > Sort requests: as arranged (the default), by date created, date modified,
+  name, type (all HTTP methods as one kind, then GraphQL, WebSocket, SSE, gRPC, MQTT,
+  Socket.IO) or method (each HTTP method its own kind, GET before POST as usually listed),
+  ascending or descending; requests of one kind are by name. It sorts that folder's own
+  requests; folders inside keep their own setting.
 - Drag a request or folder onto a folder (or the empty space under the tree) to move it,
   open tabs following, or onto a row's top or bottom edge to put it before or after that
   row. The order is kept in `.folder.toml`; Postman and Insomnia imports keep theirs.

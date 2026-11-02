@@ -401,12 +401,37 @@ pub enum SortBy {
     Created,
     Updated,
     Name,
+    /// HTTP as one kind, then each other protocol, in `METHODS` order.
+    Type,
+    /// Each method its own kind, in `METHODS` order.
+    Method,
 }
 
 impl SortBy {
     pub fn is_none(&self) -> bool {
         *self == SortBy::None
     }
+
+    /// Where a `method` request goes in a `Type` or `Method` sort. `METHODS` order rather
+    /// than alphabetical: GET before DELETE, as every API reference lists them. A method
+    /// not in it (a custom verb) goes out as HTTP; by method it comes last.
+    pub fn kind_rank(self, method: &str) -> usize {
+        let m = method.to_ascii_uppercase();
+        let at = METHODS.iter().position(|k| *k == m);
+        match (self, at) {
+            (SortBy::Method, at) => at.unwrap_or(METHODS.len()),
+            (_, Some(i)) if !is_http(METHODS[i]) => i,
+            _ => 0,
+        }
+    }
+}
+
+/// A plain HTTP request, as opposed to GraphQL, a stream or an RPC.
+pub fn is_http(method: &str) -> bool {
+    !matches!(
+        method,
+        "GRAPHQL" | "WS" | "SSE" | "GRPC" | "MQTT" | "SOCKETIO"
+    )
 }
 
 fn is_zero_ms(n: &u64) -> bool {

@@ -1198,6 +1198,11 @@ const ZH_TW: &[(&str, &str)] = &[
     ("None (as arranged)", "不排序（依手動排列）"),
     ("Date created", "建立時間"),
     ("Date modified", "修改時間"),
+    (
+        "Type (HTTP, GraphQL, WebSocket…)",
+        "類型（HTTP、GraphQL、WebSocket…）",
+    ),
+    ("Method (GET, POST…)", "方法（GET、POST…）"),
     ("Ascending", "遞增"),
     ("Descending", "遞減"),
     (

@@ -2269,6 +2269,7 @@ fn sort_requests(nodes: &mut [Node], by: SortBy, descending: bool) {
         (
             Node::Request {
                 name: na,
+                method: ma,
                 created: ca,
                 updated: ua,
                 path: pa,
@@ -2276,6 +2277,7 @@ fn sort_requests(nodes: &mut [Node], by: SortBy, descending: bool) {
             },
             Node::Request {
                 name: nb,
+                method: mb,
                 created: cb,
                 updated: ub,
                 path: pb,
@@ -2293,6 +2295,7 @@ fn sort_requests(nodes: &mut [Node], by: SortBy, descending: bool) {
                 SortBy::Created => ids(),
                 SortBy::Updated => ua.cmp(ub).then_with(ids),
                 SortBy::Name | SortBy::None => names(),
+                SortBy::Type | SortBy::Method => by.kind_rank(ma).cmp(&by.kind_rank(mb)),
             };
             let primary = if descending {
                 primary.reverse()
@@ -3242,6 +3245,31 @@ mod tests {
         let f = ws.load_folder(&top).unwrap();
         assert_eq!(f.sort, SortBy::None);
         assert_eq!(listed(SortBy::None, false), ["zz sub/", "b", "c", "A"]);
+        // 11-02: by kind. As a type, every HTTP method is one kind, names ordering
+        // within it; by method each is its own, GET before POST as `METHODS` lists them,
+        // whatever the alphabet says. Descending turns the kinds round, not the names.
+        for (path, method) in [(&b, "POST"), (&a, "WS"), (&c, "GET")] {
+            let mut r = ws.load_request(path).unwrap();
+            r.method = method.into();
+            ws.save_request(path, &r).unwrap();
+        }
+        let d = ws.create_request(&top, "d").unwrap();
+        let mut r = ws.load_request(&d).unwrap();
+        r.method = "GRPC".into();
+        ws.save_request(&d, &r).unwrap();
+        assert_eq!(listed(SortBy::Type, false), ["zz sub/", "b", "c", "A", "d"]);
+        assert_eq!(
+            listed(SortBy::Method, false),
+            ["zz sub/", "c", "b", "A", "d"]
+        );
+        assert_eq!(
+            listed(SortBy::Method, true),
+            ["zz sub/", "d", "A", "b", "c"]
+        );
+        assert_eq!(listed(SortBy::Type, true), ["zz sub/", "d", "A", "b", "c"]);
+        ws.export(&out).unwrap();
+        let folder = fs::read_to_string(out.join("collections/top/.folder.toml")).unwrap();
+        assert!(folder.contains("sort = \"type\""));
         let _ = fs::remove_dir_all(&root);
     }
 

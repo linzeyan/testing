@@ -9574,8 +9574,8 @@ fn folder_menu(
     actions.extend(sorted);
 }
 
-/// How a folder lists its requests: by hand (None), or by when made, last changed or name,
-/// either way. Its subfolders keep theirs.
+/// How a folder lists its requests: by hand (None), or by when made, last changed, name or
+/// kind, either way. Its subfolders keep theirs.
 fn sort_menu(
     ui: &mut egui::Ui,
     path: &Path,
@@ -9594,6 +9594,8 @@ fn sort_menu(
             (SortBy::Created, t("Date created")),
             (SortBy::Updated, t("Date modified")),
             (SortBy::Name, t("Name")),
+            (SortBy::Type, t("Type (HTTP, GraphQL, WebSocket…)")),
+            (SortBy::Method, t("Method (GET, POST…)")),
         ] {
             pick(ui, (to, if by == to { descending } else { false }), label);
         }
