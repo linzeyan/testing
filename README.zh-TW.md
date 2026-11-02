@@ -97,9 +97,17 @@ MQTT：
   按面板上的眼睛圖示才會顯示，環境編輯視窗也一樣。
 - 環境選單可直接編輯任一環境（✎），不必先切換過去；選單最後是「新增環境」。
 - 環境可以設定顏色（例如 prod 設紅色），顯示在環境選單上，並在視窗頂端加一條色帶。
-- 資料夾設定（在資料夾上按右鍵）可設定變數、驗證與指令碼，由資料夾內所有請求共用，相當於
-  Postman 的集合與資料夾設定。請求繼承的驗證會標出來源資料夾，點一下即可開啟該資料夾的「驗證」分頁。
-  同名變數取離請求最近的值：全域 < 環境 < 集合 < 資料夾（內層優先）< 執行時的資料列 < `pm.variables`。
+- 點集合或資料夾即開啟它的頁面（分頁列顯示「集合：x」，`Ctrl+S` 儲存）：變數、參數、標頭、驗證、
+  指令碼、設定與文件，由其中所有請求共用，相當於 Postman 的集合與資料夾設定。環境編輯器有同樣的分頁，
+  作用於該環境啟用時的所有請求；全域變數的也一樣，作用於所有請求。
+- 請求依序繼承全域、目前環境，再由集合往內的每一層資料夾：
+  - 指令碼：全部都跑，外層先、請求自己的最後（pre-request 與 tests 皆同）；出錯時會標出來自哪個資料夾或環境。
+  - 驗證：取最近一層設定的，除非請求自己有設定。「繼承上層」會標出來源，點一下即開啟該處。
+  - 標頭與參數：以灰字列在請求的分頁並標出來源，「覆寫」可複製一份到請求上編輯。離請求較近的同名列會
+    取代它（標頭名稱不分大小寫），未勾選的同名列則把它排除。驗證已設定的標頭不會重複加入，表單 body 也不加
+    Content-Type；MQTT 兩者都不帶，gRPC 不帶參數。指令碼可在 `pm.request` 看到並移除它們。
+  - 設定：逐項繼承，來自上層的標示「來自 …」；請求自己設定的有 ↺ 可改回繼承值。「改用繼承的設定」全部重設。
+- 同名變數取離請求最近的值：全域 < 環境 < 集合 < 資料夾（內層優先）< 執行時的資料列 < `pm.variables`。
   與 Insomnia、Hoppscotch 相同；Postman 則是環境優先於集合。
 
 **網路**（設定 > 網路；狀態列顯示目前的代理伺服器，點一下即可開啟）。變更按「套用」（或 Enter）才生效；
@@ -324,15 +332,15 @@ Ctrl+K 可依資料夾與名稱（依序打出其中幾個字母即可）或 URL
 | Postman v2.1 | 集合、環境或全域變數 |
 | Postman v3（Native Git、Postman CLI） | 一個集合的 YAML 資料夾，或整個工作區資料夾連同其中的集合、環境與全域變數（「選擇資料夾…」）；也可匯入單一 v3 文件。支援 HTTP、GraphQL、gRPC、WebSocket、Socket.IO 與 MQTT 請求，以及資料夾的驗證、變數、指令碼、範例與存下的訊息。已存在的全域變數保留原值；MCP 與 LLM 請求、spec、flow、mock 會列為未匯入 |
 | OpenAPI 3 / Swagger 2（JSON 或 YAML） | 每個 operation 一個請求、每個 tag 一個資料夾；`{{baseUrl}}` 取自 server，驗證取自 security scheme，內容與已儲存範例取自 schema，因此匯入後模擬伺服器馬上就能回應 |
-| Insomnia v4 JSON / v5 YAML | 資料夾、驗證與指令碼；`{{ _.x }}` 轉為 `{{x}}`；base environment 成為集合變數，每個 sub-environment 成為一個環境 |
+| Insomnia v4 JSON / v5 YAML | 資料夾及其標頭、驗證與指令碼；`{{ _.x }}` 轉為 `{{x}}`；base environment 成為集合變數，每個 sub-environment 成為一個環境 |
 | 瀏覽器開發者工具的 HAR | 每個主機一個資料夾，每筆回應保留為該請求的範例 |
 
 在資料夾或集合上按右鍵 >「複製為」或「匯出」，可以轉成其他工具能匯入的各種格式：
 
 | 格式 | 內容 | 可匯入的工具 |
 |---|---|---|
-| Postman 集合 v2.1 | 資料夾、驗證、指令碼、變數、範例；不含 WebSocket、SSE、gRPC | Postman、Hoppscotch、Insomnia、Bruno、Yaak、Restfox、Yaade |
-| Insomnia v4 | 資料夾及其變數、驗證、指令碼，含 WebSocket；集合的變數成為基礎環境，驗證與指令碼放在直屬項目上 | Insomnia、Hoppscotch、Bruno、Yaak、Restfox |
+| Postman 集合 v2.1 | 資料夾、驗證、指令碼、變數、設定、範例；資料夾的標頭與參數（Postman 資料夾沒有）寫成其 pre-request 指令碼開頭幾行，匯入時還原為表格列；不含 WebSocket、SSE、gRPC | Postman、Hoppscotch、Insomnia、Bruno、Yaak、Restfox、Yaade |
+| Insomnia v4 | 資料夾及其變數、標頭、驗證、指令碼，含 WebSocket；集合的變數成為基礎環境，驗證與指令碼放在直屬項目上 | Insomnia、Hoppscotch、Bruno、Yaak、Restfox |
 | OpenAPI 3.1、Markdown | API 文件，見下方 | |
 | HAR 1.2 | 每個請求實際送出的樣子，變數已代入，第一個已儲存範例當作回應 | Hoppscotch、Insomnia、瀏覽器開發者工具 |
 | cURL | 每個請求實際送出的樣子，一個指令配一行註解標明名稱 | 各工具的 cURL 匯入、shell |

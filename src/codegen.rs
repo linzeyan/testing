@@ -2805,13 +2805,13 @@ fn made_under(
     ws: &Workspace,
     dir: &Path,
     globals: &Vars,
-    env: &Vars,
+    (env, env_name): (&Vars, Option<&str>),
 ) -> Result<(Vec<Made>, usize), String> {
     let mut paths = Vec::new();
     crate::store::requests_in(&ws.tree(), dir, &mut paths);
     let (mut made, mut left) = (Vec::new(), 0);
     for path in paths {
-        let req = ws.load_request(&path)?;
+        let req = ws.load_request_in(&path, env_name)?;
         if is_streaming(&req.method) || req.method == "GRPC" {
             left += 1;
             continue;
@@ -2828,11 +2828,12 @@ fn made_under(
 
 /// The requests under `dir` as a shell script: a cURL command each, under a comment naming
 /// it, which every API client's cURL import takes one at a time.
+/// `env` is the environment's variables and its name.
 pub fn curl_script(
     ws: &Workspace,
     dir: &Path,
     globals: &Vars,
-    env: &Vars,
+    env: (&Vars, Option<&str>),
 ) -> Result<(String, usize), String> {
     let (made, left) = made_under(ws, dir, globals, env)?;
     let mut out = String::new();
@@ -2851,7 +2852,7 @@ pub fn har(
     ws: &Workspace,
     dir: &Path,
     globals: &Vars,
-    env: &Vars,
+    env: (&Vars, Option<&str>),
 ) -> Result<(String, usize), String> {
     let (made, mut left) = made_under(ws, dir, globals, env)?;
     let started = crate::fake::value("$isoTimestamp").unwrap_or_default();
@@ -2955,8 +2956,11 @@ mod tests {
                 KeyValue::new("base", "https://folder.test"),
                 KeyValue::new("page", "2"),
             ],
-            auth: Auth::Bearer {
-                token: "{{token}}".into(),
+            scope: crate::model::Scope {
+                auth: Auth::Bearer {
+                    token: "{{token}}".into(),
+                },
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -3016,7 +3020,7 @@ mod tests {
         let globals = vars(&[("user", "me"), ("base", "https://global.test")]);
         let env = vars(&[("token", "t"), ("base", "https://env.test")]);
 
-        let (text, left) = har(&ws, &api, &globals, &env).unwrap();
+        let (text, left) = har(&ws, &api, &globals, (&env, None)).unwrap();
         assert_eq!(left, 2, "the WebSocket, and the bytes");
         let v: Value = serde_json::from_str(&text).unwrap();
         let entries = v["log"]["entries"].as_array().unwrap();
@@ -3066,7 +3070,7 @@ mod tests {
             "its own: none"
         );
 
-        let (script, left) = curl_script(&ws, &api, &globals, &env).unwrap();
+        let (script, left) = curl_script(&ws, &api, &globals, (&env, None)).unwrap();
         assert_eq!(left, 1);
         let commands: Vec<_> = script
             .split("\n\n")

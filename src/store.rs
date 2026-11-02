@@ -26,7 +26,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::{t, tf};
-use crate::model::{Auth, Folder, Inherited, KeyValue, Request, SortBy};
+use crate::model::{Folder, Inherited, KeyValue, Request, Scope, SortBy, Source};
 
 const DB: &str = "apitool.db";
 /// The workspace directory may be a git repo of the exported tree; the database and the
@@ -48,7 +48,7 @@ const MAX_HISTORY_BODY: usize = 32 * 1024;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS folders (path TEXT PRIMARY KEY, settings TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS requests (path TEXT PRIMARY KEY, method TEXT NOT NULL, request TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS envs (name TEXT PRIMARY KEY, shared TEXT NOT NULL, secret TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS envs (name TEXT PRIMARY KEY, shared TEXT NOT NULL, secret TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, entry TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS responses (id INTEGER PRIMARY KEY, path TEXT NOT NULL, at INTEGER NOT NULL, status INTEGER NOT NULL, ms INTEGER NOT NULL, response TEXT NOT NULL);
@@ -159,6 +159,8 @@ impl Node {
 struct EnvFile {
     #[serde(default)]
     vars: Vec<KeyValue>,
+    #[serde(flatten)]
+    scope: Scope,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -392,6 +394,16 @@ fn connect(path: &Path) -> Result<Connection, String> {
     // don't give. The app and `apitool-cli mcp` take turns through the busy timeout.
     sql(conn.busy_timeout(Duration::from_secs(5)))?;
     sql(conn.execute_batch(SCHEMA))?;
+    // Environments' headers, params, auth, scripts and settings came after the table. The
+    // app and `apitool-cli mcp` may both add the column; the one that loses finds it there.
+    let has_scope = |c: &Connection| c.prepare("SELECT scope FROM envs LIMIT 0").is_ok();
+    if !has_scope(&conn) {
+        let added =
+            conn.execute_batch("ALTER TABLE envs ADD COLUMN scope TEXT NOT NULL DEFAULT ''");
+        if !has_scope(&conn) {
+            sql(added)?;
+        }
+    }
     Ok(conn)
 }
 
@@ -1221,7 +1233,16 @@ impl Workspace {
         let mut req: Request =
             serde_json::from_str(&json).map_err(|e| format!("request \"{key}\": {e}"))?;
         req.sync_params();
-        req.inherited = self.inherited(path)?;
+        req.inherited = self.inherited(path, None)?;
+        Ok(req)
+    }
+
+    /// As `load_request`, under the environment `env` too: what to send it with.
+    pub fn load_request_in(&self, path: &Path, env: Option<&str>) -> Result<Request, String> {
+        let mut req = self.load_request(path)?;
+        if env.is_some() {
+            req.inherited = self.inherited(path, env)?;
+        }
         Ok(req)
     }
 
@@ -1255,8 +1276,9 @@ impl Workspace {
         sql(tx.commit())
     }
 
-    /// The settings of every folder between `collections/` and the request at `path`.
-    pub fn inherited(&self, path: &Path) -> Result<Inherited, String> {
+    /// What the globals, the environment `env` and every folder between `collections/`
+    /// and the request (or folder) at `path` give it.
+    pub fn inherited(&self, path: &Path, env: Option<&str>) -> Result<Inherited, String> {
         let root = self.collections();
         let mut dirs: Vec<&Path> = path
             .ancestors()
@@ -1265,23 +1287,21 @@ impl Workspace {
             .collect();
         dirs.reverse();
         let mut out = Inherited::default();
+        out.absorb(Source::Globals, &self.load_scope(None)?);
+        if let Some(env) = env {
+            out.absorb(
+                Source::Environment(env.to_owned()),
+                &self.load_scope(Some(env))?,
+            );
+        }
         for dir in dirs {
             let f = self.load_folder(dir)?;
-            let name = folder_name(&root, dir);
             let vars = f
                 .vars
                 .into_iter()
                 .filter(|v| v.enabled && !v.key.is_empty());
             out.vars.extend(vars.map(|v| (v.key, v.value)));
-            if f.auth != Auth::Inherit {
-                out.auth = Some((name.clone(), f.auth));
-            }
-            if !f.pre_request.trim().is_empty() {
-                out.pre_request.push((name.clone(), f.pre_request));
-            }
-            if !f.tests.trim().is_empty() {
-                out.tests.push((name, f.tests));
-            }
+            out.absorb(Source::Folder(folder_name(&root, dir)), &f.scope);
         }
         Ok(out)
     }
@@ -1339,8 +1359,12 @@ impl Workspace {
     }
 
     /// Every request under `scope` (a folder or a single request), in tree order, with
-    /// display names.
-    pub fn load_requests_in(&self, scope: &Path) -> Result<Vec<(String, Request)>, String> {
+    /// display names, under the environment `env`.
+    pub fn load_requests_in(
+        &self,
+        scope: &Path,
+        env: Option<&str>,
+    ) -> Result<Vec<(String, Request)>, String> {
         let mut paths = Vec::new();
         requests_in(&self.tree(), scope, &mut paths);
         if paths.is_empty() {
@@ -1348,7 +1372,7 @@ impl Workspace {
         }
         paths
             .iter()
-            .map(|p| Ok((self.display_name(p), self.load_request(p)?)))
+            .map(|p| Ok((self.display_name(p), self.load_request_in(p, env)?)))
             .collect()
     }
 
@@ -1579,10 +1603,46 @@ impl Workspace {
         let secret = crate::vault::seal(&keep(secret)?)
             .map_err(|e| format!("secrets aren't saved unencrypted, and sealing failed: {e}"))?;
         sql(self.db().execute(
-            "INSERT OR REPLACE INTO envs (name, shared, secret) VALUES (?1, ?2, ?3)",
+            "INSERT INTO envs (name, shared, secret) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(name) DO UPDATE SET shared = excluded.shared, secret = excluded.secret",
             [env.unwrap_or(""), &keep(shared)?, &secret],
         ))
         .map(drop)
+    }
+
+    /// What an environment (`None`: the globals) gives every request besides variables.
+    pub fn load_scope(&self, env: Option<&str>) -> Result<Scope, String> {
+        let name = env.unwrap_or("");
+        let json: Option<String> = sql(self
+            .db()
+            .query_row("SELECT scope FROM envs WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional())?;
+        match json.as_deref() {
+            None | Some("") => Ok(Scope::default()),
+            Some(json) => {
+                serde_json::from_str(json).map_err(|e| format!("environment \"{name}\": {e}"))
+            }
+        }
+    }
+
+    /// Creates the environment, without variables, when it isn't there.
+    pub fn save_scope(&self, env: Option<&str>, scope: &Scope) -> Result<(), String> {
+        let mut scope = scope.clone();
+        scope.headers.retain(|h| !h.key.is_empty());
+        scope.params.retain(|p| !p.key.is_empty());
+        let json = match scope.is_empty() {
+            true => String::new(),
+            false => to_json(&scope)?,
+        };
+        let name = env.unwrap_or("");
+        let update = "UPDATE envs SET scope = ?2 WHERE name = ?1";
+        if sql(self.db().execute(update, [name, &json]))? == 0 {
+            self.save_env(env, &[], &[])?;
+            sql(self.db().execute(update, [name, &json]))?;
+        }
+        Ok(())
     }
 
     /// Saves a new environment, never over one: a same-named environment may hold this
@@ -1657,7 +1717,9 @@ impl Workspace {
         let env_names: HashSet<String> = envs.iter().map(|(name, _)| name.clone()).collect();
         let mut vars = Vec::new();
         for (name, path) in envs {
-            let shared = read_vars(&path)?;
+            let file = read_env(&path)?;
+            let scope = file.as_ref().map(|f| f.scope.clone());
+            let shared = file.map(|f| f.vars);
             let secret = match (first, &shared) {
                 (true, _) => read_vars(&path.with_file_name(format!(
                     "{}{SECRET_SUFFIX}.toml",
@@ -1672,13 +1734,15 @@ impl Workspace {
             };
             // Globals without a file have nothing to replace.
             if shared.is_some() || secret.is_some() {
-                vars.push((name, shared.unwrap_or_default(), secret.unwrap_or_default()));
+                let (shared, secret) = (shared.unwrap_or_default(), secret.unwrap_or_default());
+                vars.push((name, shared, secret, scope.unwrap_or_default()));
             }
         }
         self.put_tree(&folders, &requests)?;
-        for (name, shared, secret) in vars {
+        for (name, shared, secret, scope) in vars {
             let env = Some(name.as_str()).filter(|n| !n.is_empty());
             self.save_env(env, &shared, &secret)?;
+            self.save_scope(env, &scope)?;
         }
         let folder_keys = folders.iter().map(|(k, _)| k.clone()).collect();
         let request_keys = requests.iter().map(|(k, _)| k.clone()).collect();
@@ -1960,7 +2024,9 @@ impl Workspace {
         for (name, shared) in &env_names {
             let vars: Vec<KeyValue> =
                 serde_json::from_str(shared).map_err(|e| format!("environment \"{name}\": {e}"))?;
-            let text = toml::to_string_pretty(&EnvFile { vars }).map_err(|e| e.to_string())?;
+            let scope = self.load_scope(Some(name.as_str()).filter(|n| !n.is_empty()))?;
+            let text =
+                toml::to_string_pretty(&EnvFile { vars, scope }).map_err(|e| e.to_string())?;
             let path = match name.is_empty() {
                 true => dir.join("globals.toml"),
                 false => env_dir.join(format!("{name}.toml")),
@@ -2146,14 +2212,18 @@ fn read_tree(
 }
 
 /// `None` when the file isn't there.
-fn read_vars(path: &Path) -> Result<Option<Vec<KeyValue>>, String> {
+fn read_env(path: &Path) -> Result<Option<EnvFile>, String> {
     match fs::read_to_string(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("read {}: {e}", path.display())),
         Ok(text) => toml::from_str::<EnvFile>(&text)
-            .map(|f| Some(f.vars))
+            .map(Some)
             .map_err(|e| format!("parse {}: {e}", path.display())),
     }
+}
+
+fn read_vars(path: &Path) -> Result<Option<Vec<KeyValue>>, String> {
+    Ok(read_env(path)?.map(|f| f.vars))
 }
 
 /// Removes `.toml` files under `dir` that aren't `wanted`, then folders that end up empty
@@ -2380,6 +2450,7 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Auth, Settings};
 
     /// The XDG variable when it's an absolute path, else its default under home. Not on
     /// Windows, which has no XDG and where `/data` isn't absolute.
@@ -2406,6 +2477,114 @@ mod tests {
         let root = std::env::temp_dir().join(format!("apitool-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
+    }
+
+    /// What the globals, an environment and the folders give their requests is kept
+    /// apart from the variables (saving those doesn't drop it), comes in that order, and
+    /// goes through the files git shares and back.
+    #[test]
+    fn environments_and_folders_pass_their_scope_down_through_git() {
+        let root = fresh("scope");
+        let ws = Workspace::open(root.clone()).unwrap();
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let req = ws.create_request(&api, "r").unwrap();
+        let folder = Folder {
+            scope: Scope {
+                headers: vec![KeyValue::new("X-Folder", "f")],
+                pre_request: "folder()".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        ws.save_folder(&api, &folder).unwrap();
+        let dev = Scope {
+            headers: vec![KeyValue::new("X-Env", "{{token}}")],
+            params: vec![KeyValue::new("region", "eu")],
+            auth: Auth::Bearer {
+                token: "{{token}}".into(),
+            },
+            pre_request: "env()".into(),
+            settings: Settings {
+                timeout_ms: 30_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        ws.save_scope(Some("dev"), &dev).unwrap();
+        ws.save_scope(
+            None,
+            &Scope {
+                tests: "globals()".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Variables saved after: the scope stays.
+        let token = [KeyValue::new("token", "s3cret")];
+        ws.save_env(Some("dev"), &[KeyValue::new("host", "h")], &token)
+            .unwrap();
+        assert_eq!(ws.load_scope(Some("dev")).unwrap(), dev);
+
+        let got = ws.inherited(&req, Some("dev")).unwrap();
+        let from: Vec<_> = got.pre_request.iter().map(|(f, _)| f.clone()).collect();
+        assert_eq!(
+            from,
+            [
+                Source::Environment("dev".into()),
+                Source::Folder("api".into())
+            ]
+        );
+        assert_eq!(got.tests[0].0, Source::Globals);
+        assert_eq!(got.headers.len(), 2);
+        assert_eq!(
+            got.auth.as_ref().unwrap().0,
+            Source::Environment("dev".into())
+        );
+        assert_eq!(got.settings.timeout_ms, 30_000);
+        // Without an environment, only the globals' and the folders'.
+        let plain = ws.load_request(&req).unwrap().inherited;
+        assert_eq!((plain.headers.len(), plain.auth), (1, None));
+
+        let out = root.join("export");
+        ws.export(&out).unwrap();
+        let read = |p: &str| fs::read_to_string(out.join(p)).unwrap();
+        let env_file = read("environments/dev.toml");
+        assert!(env_file.contains("X-Env") && env_file.contains("timeout_ms = 30000"));
+        assert!(!env_file.contains("s3cret"), "{env_file}");
+        assert!(read("collections/api/.folder.toml").contains("X-Folder"));
+        assert!(read("globals.toml").contains("globals()"));
+        let clone = Workspace::open(out.clone()).unwrap();
+        assert_eq!(clone.load_scope(Some("dev")).unwrap(), dev);
+        let cloned = clone
+            .load_requests_in(&clone.collections(), Some("dev"))
+            .unwrap();
+        assert_eq!(cloned[0].1.inherited, got);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A workspace from before environments had a scope opens with the column added, its
+    /// environments as they were.
+    #[test]
+    fn an_older_database_gets_the_scope_column() {
+        let root = fresh("scope-column");
+        fs::create_dir_all(&root).unwrap();
+        let old = Connection::open(root.join(DB)).unwrap();
+        old.execute_batch(
+            "CREATE TABLE envs (name TEXT PRIMARY KEY, shared TEXT NOT NULL, secret TEXT NOT NULL);
+             INSERT INTO envs VALUES ('dev', '[{\"key\":\"host\",\"value\":\"h\"}]', '[]');",
+        )
+        .unwrap();
+        drop(old);
+        let ws = Workspace::open(root.clone()).unwrap();
+        assert_eq!(ws.env_vars(Some("dev")).unwrap()["host"], "h");
+        assert!(ws.load_scope(Some("dev")).unwrap().is_empty());
+        let scope = Scope {
+            params: vec![KeyValue::new("a", "1")],
+            ..Default::default()
+        };
+        ws.save_scope(Some("dev"), &scope).unwrap();
+        assert_eq!(ws.load_scope(Some("dev")).unwrap(), scope);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2448,7 +2627,7 @@ mod tests {
         // Renaming a folder carries what's inside.
         let moved = ws.rename(&folder, "People").unwrap();
         assert_eq!(
-            ws.load_requests_in(&moved).unwrap()[0].0,
+            ws.load_requests_in(&moved, None).unwrap()[0].0,
             "People/Fetch user"
         );
 
@@ -2568,7 +2747,7 @@ mod tests {
         let out = root.join("export");
         ws.export(&out).unwrap();
         let clone = Workspace::open(out).unwrap();
-        let names: Vec<String> = (clone.load_requests_in(&clone.collections()).unwrap())
+        let names: Vec<String> = (clone.load_requests_in(&clone.collections(), None).unwrap())
             .into_iter()
             .map(|(n, _)| n)
             .collect();
@@ -2610,7 +2789,7 @@ mod tests {
             ws.load_folder(&folder).unwrap().description,
             "settings come along"
         );
-        let copied = ws.load_requests_in(&folder).unwrap();
+        let copied = ws.load_requests_in(&folder, None).unwrap();
         let names: Vec<_> = copied.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
@@ -2631,7 +2810,7 @@ mod tests {
         assert!(ids(&folder).iter().all(|id| !ids(&api).contains(id)));
         // Deleting the copy leaves the original whole.
         ws.delete(&folder).unwrap();
-        assert_eq!(ws.load_requests_in(&api).unwrap().len(), 3);
+        assert_eq!(ws.load_requests_in(&api, None).unwrap().len(), 3);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2646,7 +2825,7 @@ mod tests {
         let renamed = ws.rename(&request, "people").unwrap();
         ws.delete(&renamed).unwrap();
         ws.delete(&copy).unwrap();
-        let left = ws.load_requests_in(&ws.collections()).unwrap();
+        let left = ws.load_requests_in(&ws.collections(), None).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].0, "users/inside", "the folder keeps what's inside");
         let _ = fs::remove_dir_all(&root);
@@ -2664,14 +2843,20 @@ mod tests {
         };
         let outer = Folder {
             vars: vec![KeyValue::new("base", "outer"), KeyValue::new("page", "1")],
-            auth: bearer.clone(),
-            pre_request: "outer()".into(),
+            scope: Scope {
+                auth: bearer.clone(),
+                pre_request: "outer()".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         ws.save_folder(&api, &outer).unwrap();
         let inner = Folder {
             vars: vec![KeyValue::new("base", "inner")],
-            pre_request: "inner()".into(),
+            scope: Scope {
+                pre_request: "inner()".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         ws.save_folder(&admin, &inner).unwrap();
@@ -2680,15 +2865,22 @@ mod tests {
         // The inner folder wins; one that sets no auth passes its parent's down.
         assert_eq!(got.vars["base"], "inner");
         assert_eq!(got.vars["page"], "1");
-        assert_eq!(got.auth, Some(("api".into(), bearer)));
+        assert_eq!(got.auth, Some((Source::Folder("api".into()), bearer)));
         // Outermost first, as Postman runs collection then folder scripts. A dot in a
         // folder name is not an extension.
         let pre: Vec<_> = got
             .pre_request
             .iter()
-            .map(|(f, s)| (f.as_str(), s.as_str()))
+            .map(|(f, s)| (f.to_string(), s.as_str()))
             .collect();
-        assert_eq!(pre, [("api", "outer()"), ("api/admin.v2", "inner()")]);
+        let folder = |f: &str| Source::Folder(f.into()).to_string();
+        assert_eq!(
+            pre,
+            [
+                (folder("api"), "outer()"),
+                (folder("api/admin.v2"), "inner()")
+            ]
+        );
         assert!(
             matches!(&ws.tree()[0], Node::Folder { children, .. } if children.len() == 1),
             "settings are not requests"
@@ -3026,7 +3218,7 @@ mod tests {
 
         // A fresh clone of that tree opens with the same requests.
         let clone = Workspace::open(out.clone()).unwrap();
-        let names: Vec<_> = clone.load_requests_in(&clone.collections()).unwrap();
+        let names: Vec<_> = clone.load_requests_in(&clone.collections(), None).unwrap();
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].0, "users/get");
         assert_eq!(names[0].1.inherited.vars["page"], "1");

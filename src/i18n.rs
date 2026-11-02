@@ -615,7 +615,6 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Find in the response", "在回應中尋找"),
     ("Fold", "收合"),
     ("Folder", "資料夾"),
-    ("Folder scripts run first: {}", "會先執行資料夾指令碼：{}"),
     ("Folder settings", "資料夾設定"),
     ("Folder settings…", "資料夾設定…"),
     ("Folder: {}", "資料夾：{}"),
@@ -822,10 +821,6 @@ const ZH_TW: &[(&str, &str)] = &[
     (
         "No environment selected: pm.environment.set was stored as a global",
         "未選擇環境：pm.environment.set 已存為全域變數",
-    ),
-    (
-        "No folder above sets auth, so none is sent.",
-        "上層資料夾都沒有設定驗證，因此不送驗證。",
     ),
     ("No proxy", "不用代理伺服器"),
     ("no request is open", "沒有開啟的請求"),
@@ -1423,15 +1418,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "Uses the OS proxy settings and HTTP(S)_PROXY / NO_PROXY variables.",
         "使用作業系統的代理伺服器設定，以及 HTTP(S)_PROXY / NO_PROXY 變數。",
     ),
-    (
-        "Uses {} from folder \"{}\".",
-        "使用 {}，設定於資料夾「{}」。",
-    ),
     ("Value", "值"),
     ("Values for this request", "這個請求的值"),
     ("Variables", "變數"),
     ("Vars", "回應變數"),
-    ("Variables ({})", "變數 ({})"),
     (
         "Variables are filled in; scripts don't run.",
         "已代入變數；不執行指令碼。",
@@ -1859,10 +1849,6 @@ const ZH_TW: &[(&str, &str)] = &[
         "Import: Postman, OpenAPI, Insomnia, HAR ({})",
         "匯入：Postman、OpenAPI、Insomnia、HAR（{}）",
     ),
-    (
-        "Sent without credentials, whatever the folders above set.",
-        "不帶任何憑證送出，不論上層資料夾怎麼設定。",
-    ),
     ("Session", "工作階段"),
     (
         "Delete all {} requests in History? This can't be undone.",
@@ -2199,6 +2185,57 @@ const ZH_TW: &[(&str, &str)] = &[
         "Set {} as the HTTP or SOCKS proxy of an app or of the system: what it sends shows here, forwarded with apitool's network settings. HTTPS is decrypted: an app that doesn't trust apitool's CA fails to connect.",
         "把 {} 設為應用程式或系統的 HTTP 或 SOCKS 代理：送出的請求會顯示在這裡，並以 apitool 的網路設定轉送。HTTPS 會被解密：不信任 apitool CA 的應用程式將無法連線。",
     ),
+    // Folders', environments' and the globals' headers, params, auth, scripts and settings.
+    (
+        "Added to the query of every request below, unless it has a param of the same name. Not for gRPC or MQTT.",
+        "加到底下每個請求的查詢字串，除非該請求有同名參數。不適用於 gRPC 與 MQTT。",
+    ),
+    (
+        "Off accepts any certificate, for every request below",
+        "關閉即接受任何憑證，適用於底下每個請求",
+    ),
+    ("Close the folder settings", "關閉資料夾設定"),
+    (
+        "Copies it into the table above: change it there, or uncheck it to leave it out",
+        "複製到上方表格：在那裡修改，或取消勾選就不送出",
+    ),
+    ("Environment settings…", "環境設定…"),
+    (
+        "For every request below that doesn't set its own; each kind of request uses the ones that apply to it.",
+        "套用到底下每個沒有自行設定的請求；各類請求只採用適用於自己的項目。",
+    ),
+    ("Globals…", "全域變數…"),
+    (
+        "Nothing above sets auth, so none is sent.",
+        "上層都沒有設定驗證，因此不送驗證。",
+    ),
+    ("Override", "覆寫"),
+    (
+        "Save or discard the changes to {} first",
+        "請先儲存或捨棄「{}」的變更",
+    ),
+    (
+        "Sent with every request below, unless it has a header of the same name; an unchecked one keeps it out. Its auth's header and a form's Content-Type win too. Not for MQTT.",
+        "隨底下每個請求送出，除非該請求有同名標頭；同名但未勾選的會把它擋下。請求驗證產生的標頭與表單的 Content-Type 也優先。不適用於 MQTT。",
+    ),
+    (
+        "Sent without credentials, whatever is set above.",
+        "不帶任何憑證送出，不論上層怎麼設定。",
+    ),
+    ("Set here. Reset to the default", "在此設定。重設為預設值"),
+    ("Set here. Use the value from {}", "在此設定。改用{}的值"),
+    ("These run first: {}", "會先執行：{}"),
+    ("Use the inherited settings", "改用繼承的設定"),
+    ("Uses {} from {}.", "使用 {}，設定於{}。"),
+    ("collection \"{}\"", "集合「{}」"),
+    ("environment \"{}\"", "環境「{}」"),
+    ("folder \"{}\"", "資料夾「{}」"),
+    ("the globals", "全域變數"),
+    (
+        "{} has unsaved changes: close again to discard them",
+        "「{}」有未儲存的變更：再關閉一次即捨棄",
+    ),
+    ("{} inherited", "繼承的 {} 項"),
 ];
 
 #[cfg(test)]

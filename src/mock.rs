@@ -58,7 +58,7 @@ async fn handle(ws: &Workspace, scope: &std::path::Path, mut stream: TcpStream) 
                 "CORS preflight".to_owned(),
             )
         } else {
-            let requests = ws.load_requests_in(scope).unwrap_or_default();
+            let requests = ws.load_requests_in(scope, None).unwrap_or_default();
             let want = header("x-mock-response-name").or(header("x-mock-response-code"));
             match find(&requests, &method, path, want) {
                 Some((name, ex)) => {

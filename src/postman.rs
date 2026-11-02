@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::model::{
     self, Auth, AwsV4, Body, EdgeGrid, Example, Folder, Grant, Hawk, Jwt, KeyValue, Ntlm, OAuth1,
-    OAuth2, Request, Settings,
+    OAuth2, Request, Scope, Settings,
 };
 use crate::store::{Node, Workspace, escape_name, folder_name, safe_name, unescape_name};
 
@@ -90,12 +90,19 @@ impl Reader {
 
     /// The collection itself, or a folder in it.
     fn group(&mut self, key: &str, v: &Value, description: &Value) {
+        let mut pre_request = script(&v["event"], "prerequest");
+        let (headers, params) = rows_of_script(&mut pre_request);
         let folder = Folder {
             description: description_of(description),
             vars: rows(&v["variable"]),
-            auth: self.auth(key, &v["auth"]),
-            pre_request: script(&v["event"], "prerequest"),
-            tests: script(&v["event"], "test"),
+            scope: Scope {
+                headers,
+                params,
+                auth: self.auth(key, &v["auth"]),
+                pre_request,
+                tests: script(&v["event"], "test"),
+                settings: settings(&v["protocolProfileBehavior"]),
+            },
             order: Vec::new(),
             ..Default::default()
         };
@@ -468,8 +475,28 @@ fn settings(p: &Value) -> Settings {
             .filter_map(|c| Some(c.as_str()?.to_owned()))
             .collect();
     }
+    // Set at its default, it's still set: over a folder's other value.
+    for (key, field) in BEHAVIOR {
+        if !p[key].is_null() && !s.owns(field) {
+            s.pinned.push(field.to_owned());
+        }
+    }
     s
 }
+
+/// Postman's `protocolProfileBehavior` keys and the settings they are. Not
+/// `tlsDisabledProtocols`: one list for two settings, it can't say which one was set.
+const BEHAVIOR: [(&str, &str); 9] = [
+    ("followRedirects", "follow_redirects"),
+    ("maxRedirects", "max_redirects"),
+    ("strictSSL", "verify_tls"),
+    ("disableCookies", "cookies"),
+    ("followOriginalHttpMethod", "follow_original_method"),
+    ("followAuthorizationHeader", "follow_auth_header"),
+    ("removeRefererHeaderOnRedirect", "remove_referer"),
+    ("insecureHTTPParser", "insecure_parser"),
+    ("tlsCipherSelection", "ciphers"),
+];
 
 fn example(r: &Value) -> Example {
     let content_type = rows(&r["header"])
@@ -581,12 +608,17 @@ fn group(
     if !folder.description.is_empty() {
         g.insert("description".into(), json!(folder.description));
     }
-    if let Some(auth) = auth_json(&folder.auth) {
+    if let Some(auth) = auth_json(&folder.scope.auth) {
         g.insert("auth".into(), auth);
     }
-    let events = events_json(&folder.pre_request, &folder.tests);
+    let pre_request = rows_script(&folder.scope) + &folder.scope.pre_request;
+    let events = events_json(&pre_request, &folder.scope.tests);
     if !events.is_empty() {
         g.insert("event".into(), Value::Array(events));
+    }
+    let behavior = behavior_json(&folder.scope.settings);
+    if !behavior.is_empty() {
+        g.insert("protocolProfileBehavior".into(), Value::Object(behavior));
     }
     if !folder.vars.is_empty() {
         g.insert("variable".into(), rows_json(&folder.vars));
@@ -883,42 +915,104 @@ fn events_json(pre_request: &str, tests: &str) -> Vec<Value> {
 }
 
 /// ponytail: Postman has no per-request HTTP version or timeout, so those stay behind.
+/// What `s` sets (see `Settings::owns`), for an item or a folder.
 fn behavior_json(s: &Settings) -> Map<String, Value> {
-    let d = Settings::default();
     let mut p = Map::new();
-    if s.follow_redirects != d.follow_redirects {
+    let set = |field: &str| s.owns(field);
+    if set("follow_redirects") {
         p.insert("followRedirects".into(), json!(s.follow_redirects));
     }
-    if s.max_redirects != d.max_redirects {
+    if set("max_redirects") {
         p.insert("maxRedirects".into(), json!(s.max_redirects));
     }
-    if s.verify_tls != d.verify_tls {
+    if set("verify_tls") {
         p.insert("strictSSL".into(), json!(s.verify_tls));
     }
-    if s.cookies != d.cookies {
+    if set("cookies") {
         p.insert("disableCookies".into(), json!(!s.cookies));
     }
-    for (key, on) in [
-        ("followOriginalHttpMethod", s.follow_original_method),
-        ("followAuthorizationHeader", s.follow_auth_header),
-        ("removeRefererHeaderOnRedirect", s.remove_referer),
-        ("insecureHTTPParser", s.insecure_parser),
+    for (key, field, on) in [
+        (
+            "followOriginalHttpMethod",
+            "follow_original_method",
+            s.follow_original_method,
+        ),
+        (
+            "followAuthorizationHeader",
+            "follow_auth_header",
+            s.follow_auth_header,
+        ),
+        (
+            "removeRefererHeaderOnRedirect",
+            "remove_referer",
+            s.remove_referer,
+        ),
+        ("insecureHTTPParser", "insecure_parser", s.insecure_parser),
     ] {
-        if on {
-            p.insert(key.into(), json!(true));
+        if set(field) {
+            p.insert(key.into(), json!(on));
         }
     }
     let off: Vec<&str> = [("TLSv1_2", s.disable_tls12), ("TLSv1_3", s.disable_tls13)]
         .into_iter()
         .filter_map(|(version, off)| off.then_some(version))
         .collect();
-    if !off.is_empty() {
+    if set("disable_tls12") || set("disable_tls13") {
         p.insert("tlsDisabledProtocols".into(), json!(off));
     }
-    if !s.ciphers.is_empty() {
+    if set("ciphers") {
         p.insert("tlsCipherSelection".into(), json!(s.ciphers));
     }
     p
+}
+
+/// The lines a folder's headers and params, which Postman's folders don't have, go to
+/// Postman as: the start of its pre-request script, adding them as apitool does (unless
+/// the request has its own). Read back as the rows they were (`rows_of_script`).
+const ROWS_LINE: &str = "for (const [key, value] of ";
+const HEADERS_ADD: &str =
+    ") if (!pm.request.headers.has(key)) pm.request.headers.add({ key, value });";
+const PARAMS_ADD: &str =
+    ") if (!pm.request.url.query.has(key)) pm.request.url.query.add({ key, value });";
+
+fn rows_script(scope: &Scope) -> String {
+    let mut out = String::new();
+    for (rows, add) in [(&scope.headers, HEADERS_ADD), (&scope.params, PARAMS_ADD)] {
+        let on: Vec<_> = (rows.iter())
+            .filter(|r| r.enabled && !r.key.trim().is_empty())
+            .map(|r| [&r.key, &r.value])
+            .collect();
+        if !on.is_empty() {
+            out += &format!("{ROWS_LINE}{}{add}\n", json!(on));
+        }
+    }
+    out
+}
+
+/// `rows_script`'s lines taken off the start of `script`, as (headers, params).
+fn rows_of_script(script: &mut String) -> (Vec<KeyValue>, Vec<KeyValue>) {
+    let (mut headers, mut params) = (Vec::new(), Vec::new());
+    let mut taken = 0;
+    for line in script.split_inclusive('\n') {
+        let Some(rest) = line.trim_end().strip_prefix(ROWS_LINE) else {
+            break;
+        };
+        let (pairs, into) = match (
+            rest.strip_suffix(HEADERS_ADD),
+            rest.strip_suffix(PARAMS_ADD),
+        ) {
+            (Some(pairs), _) => (pairs, &mut headers),
+            (_, Some(pairs)) => (pairs, &mut params),
+            _ => break,
+        };
+        let Ok(pairs) = serde_json::from_str::<Vec<(String, String)>>(pairs) else {
+            break;
+        };
+        into.extend(pairs.into_iter().map(|(k, v)| KeyValue::new(k, v)));
+        taken += line.len();
+    }
+    script.drain(..taken);
+    (headers, params)
 }
 
 fn example_json(e: &Example) -> Value {
@@ -1052,12 +1146,12 @@ mod tests {
             [KeyValue::new("base", "https://shop.test"), retries]
         );
         assert_eq!(
-            top.auth,
+            top.scope.auth,
             Auth::Bearer {
                 token: "{{token}}".into()
             }
         );
-        assert_eq!(top.pre_request, "pm.variables.set('t', Date.now());");
+        assert_eq!(top.scope.pre_request, "pm.variables.set('t', Date.now());");
         // v2.0's object form of auth settings reads the same.
         let users = &folders["users"];
         assert_eq!(users.description, "User endpoints");
@@ -1065,7 +1159,7 @@ mod tests {
             username: "u".into(),
             password: "p".into(),
         };
-        assert_eq!(users.auth, basic);
+        assert_eq!(users.scope.auth, basic);
 
         let r: HashMap<_, _> = requests.into_iter().collect();
         let mut keys: Vec<_> = r.keys().map(String::as_str).collect();
@@ -1230,25 +1324,31 @@ mod tests {
         let folder = Folder {
             description: "The API".into(),
             vars: vec![KeyValue::new("base", "https://x.test:8443/v1")],
-            auth: Auth::OAuth2(OAuth2 {
-                grant: Grant::Password,
-                token_url: "{{base}}/token".into(),
-                client_id: "c".into(),
-                client_secret: "{{secret}}".into(),
-                scope: "read".into(),
-                username: "u".into(),
-                password: "p".into(),
+            scope: Scope {
+                auth: Auth::OAuth2(OAuth2 {
+                    grant: Grant::Password,
+                    token_url: "{{base}}/token".into(),
+                    client_id: "c".into(),
+                    client_secret: "{{secret}}".into(),
+                    scope: "read".into(),
+                    username: "u".into(),
+                    password: "p".into(),
+                    ..Default::default()
+                }),
+                pre_request: "console.log(1);\n".into(),
+                tests: "pm.test('x', () => {});".into(),
                 ..Default::default()
-            }),
-            pre_request: "console.log(1);\n".into(),
-            tests: "pm.test('x', () => {});".into(),
+            },
             ..Default::default()
         };
         ws.save_folder(&api, &folder).unwrap();
         let sub = Folder {
-            auth: Auth::Digest {
-                username: "d".into(),
-                password: "{{pw}}".into(),
+            scope: Scope {
+                auth: Auth::Digest {
+                    username: "d".into(),
+                    password: "{{pw}}".into(),
+                },
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1521,6 +1621,53 @@ mod tests {
             (saved.inherited, saved.updated) = Default::default();
             assert_eq!(back[name.strip_prefix("api/").unwrap()], saved, "{name}");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Postman's folders have no headers or params: they go as the first lines of the
+    /// folder's script, adding them as apitool does (Postman's own calls), and come back
+    /// as the rows they were, not as a script. Folder settings go as Postman's own.
+    #[test]
+    fn folder_headers_and_params_go_to_postman_and_back_as_rows() {
+        let root = std::env::temp_dir().join(format!("apitool-pm-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = Workspace::open(root.clone()).unwrap();
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let folder = Folder {
+            scope: Scope {
+                headers: vec![KeyValue::new("X-Team", "{{team}}")],
+                params: vec![KeyValue::new("lang", "en")],
+                pre_request: "console.log('own');".into(),
+                settings: Settings {
+                    verify_tls: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        ws.save_folder(&api, &folder).unwrap();
+        ws.create_request(&api, "r").unwrap();
+
+        let (json, _, _) = collection(&ws, &api).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["protocolProfileBehavior"], json!({ "strictSSL": false }));
+        let exec = &v["event"][0]["script"]["exec"];
+        assert_eq!(
+            exec[0],
+            "for (const [key, value] of [[\"X-Team\",\"{{team}}\"]]) \
+             if (!pm.request.headers.has(key)) pm.request.headers.add({ key, value });"
+        );
+        assert!(
+            exec[1]
+                .as_str()
+                .unwrap()
+                .contains("pm.request.url.query.add")
+        );
+        let Import::Collection { folders, .. } = crate::import::parse(&json).unwrap() else {
+            panic!("not a collection");
+        };
+        assert_eq!(folders[0].1, folder);
         let _ = std::fs::remove_dir_all(&root);
     }
 

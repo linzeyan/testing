@@ -368,8 +368,8 @@ impl Server {
     }
 
     fn generate_code(&self, args: &Value) -> Result<Value, String> {
-        let (_, req) = self.request_arg(args)?;
         let env = self.environment(args)?;
+        let (_, req) = self.request_arg(args, env.as_deref())?;
         let mut all = self.all_vars(&req, &self.vars(env.as_deref())?);
         // Secrets stay out of the model's context, as in get_environment: where one is the
         // value in effect, the snippet keeps its {{name}}.
@@ -420,8 +420,8 @@ impl Server {
     /// Connects a stream (SSE, WebSocket, Socket.IO, MQTT, gRPC streaming, a GraphQL
     /// subscription), sends `messages`, and returns what happened within `seconds`.
     fn stream_request(&mut self, args: &Value) -> Result<Value, String> {
-        let (_, req) = self.request_arg(args)?;
         let env = self.environment(args)?;
+        let (_, req) = self.request_arg(args, env.as_deref())?;
         let (req, missing) = req.resolved(&self.all_vars(&req, &self.vars(env.as_deref())?));
         let streams = model::is_streaming(&req.method)
             || req.method == "GRPC"
@@ -601,17 +601,23 @@ impl Server {
         })
     }
 
-    /// The request a tool is about: a saved one by `path`, or an inline `request`.
-    fn request_arg(&self, args: &Value) -> Result<(String, Request), String> {
+    /// The request a tool is about: a saved one by `path`, or an inline `request`, under
+    /// the environment `env`. An inline one is in no folder: it gets the globals' and the
+    /// environment's headers, auth, scripts and settings only.
+    fn request_arg(&self, args: &Value, env: Option<&str>) -> Result<(String, Request), String> {
         let (name, mut req) = match (args["path"].as_str(), args.get("request")) {
             (_, Some(inline)) if !inline.is_null() => {
-                let req: Request =
+                let mut req: Request =
                     serde_json::from_value(inline.clone()).map_err(|e| format!("request: {e}"))?;
+                req.inherited = self.ws.inherited(&self.ws.collections(), env)?;
                 ("inline request".to_owned(), req)
             }
             (Some(path), _) => {
                 let file = self.ws.request_path(path)?;
-                (self.ws.display_name(&file), self.ws.load_request(&file)?)
+                (
+                    self.ws.display_name(&file),
+                    self.ws.load_request_in(&file, env)?,
+                )
             }
             _ => return Err("pass `path` of a saved request, or an inline `request`".into()),
         };
@@ -626,11 +632,11 @@ impl Server {
     }
 
     fn send_request(&mut self, args: &Value) -> Result<Value, String> {
-        let (name, req) = self.request_arg(args)?;
+        let env = self.environment(args)?;
+        let (name, req) = self.request_arg(args, env.as_deref())?;
         if model::is_streaming(&req.method) || crate::stream::subscribes(&req) {
             return Err("a stream: connect it with stream_request".into());
         }
-        let env = self.environment(args)?;
         let vars = self.vars(env.as_deref())?;
         let (_, missing) = req.resolved(&self.all_vars(&req, &vars));
         let client = self.client()?;
@@ -686,12 +692,12 @@ impl Server {
                 }
             }
         };
-        let requests = self.ws.load_requests_in(&scope)?;
+        let env = self.environment(args)?;
+        let requests = self.ws.load_requests_in(&scope, env.as_deref())?;
         let data = match args["data_file"].as_str() {
             Some(p) => runner::load_data(std::path::Path::new(p))?,
             None => Vec::new(),
         };
-        let env = self.environment(args)?;
         let plan = RunPlan {
             requests,
             data,

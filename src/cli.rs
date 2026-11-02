@@ -107,11 +107,11 @@ fn run(args: Vec<String>) -> Result<bool, String> {
     let ws = store::open_workspace(workspace)?;
     crate::auth::import(&ws.load_tokens());
     let grants = crate::auth::grants();
-    let requests = ws.load_requests_in(&scope(&ws, &target))?;
+    if let Some(name) = env.as_ref().filter(|n| !ws.env_names().contains(n)) {
+        return Err(format!("unknown environment \"{name}\""));
+    }
+    let requests = ws.load_requests_in(&scope(&ws, &target), env.as_deref())?;
     let env = match env {
-        Some(name) if !ws.env_names().contains(&name) => {
-            return Err(format!("unknown environment \"{name}\""));
-        }
         Some(name) => ws.env_vars(Some(&name))?,
         None => HashMap::new(),
     };
@@ -257,7 +257,7 @@ fn mock(args: &[String]) -> Result<bool, String> {
         None => 3000,
     };
     let (ws, dir) = open_folder(target, &values)?;
-    let requests = ws.load_requests_in(&dir)?;
+    let requests = ws.load_requests_in(&dir, None)?;
     let mocked = requests
         .iter()
         .filter(|(_, r)| !r.examples.is_empty())

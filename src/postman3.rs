@@ -768,26 +768,27 @@ order: 3000
         assert_eq!(root.vars.len(), 2);
         assert!(!root.vars[1].enabled, "a disabled variable stays off");
         assert_eq!(
-            root.auth,
+            root.scope.auth,
             Auth::Bearer {
                 token: "{{token}}".into()
             }
         );
         assert!(
-            root.pre_request.contains("pm.variables.set") && root.tests.contains("pm.test('ok'")
+            root.scope.pre_request.contains("pm.variables.set")
+                && root.scope.tests.contains("pm.test('ok'")
         );
         // Postman's order, not the tree's by-name one (Binary before GraphQL query).
         assert_eq!(root.order, ["Users/", "GraphQL query", "Binary"]);
 
         let users = find(&folders, "Users");
         assert_eq!(
-            users.auth,
+            users.scope.auth,
             Auth::Basic {
                 username: "u".into(),
                 password: "p".into()
             }
         );
-        assert_eq!(users.pre_request, "console.log('folder');");
+        assert_eq!(users.scope.pre_request, "console.log('folder');");
         assert_eq!(
             users.vars,
             [KeyValue::new("team", "red")],

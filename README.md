@@ -116,12 +116,27 @@ closes it.
   "New environment".
 - An environment can have a colour (prod in red), shown on its selector and as a strip
   across the top.
-- Folder settings (right-click a folder) hold variables, auth and scripts shared by every
-  request inside, like Postman's collection and folder settings. A request's inherited auth
-  names the folder it comes from and opens that folder's Auth tab. A variable set in several
-  places takes the value nearest the request: globals < environment < collection < folder
-  (inner over outer) < a run's data row < `pm.variables`. As Insomnia and Hoppscotch have it;
-  Postman puts the environment over the collection.
+- Click a collection or folder for its page ("Collection: x" in the tab strip, `Ctrl+S`
+  saves it): variables, params, headers, auth, scripts, settings and docs shared by every
+  request inside, like Postman's collection and folder settings. The environment editor has
+  the same tabs, for every request while that environment is active, and so do the globals,
+  for every request.
+- A request takes these from the globals, the active environment, then each folder from the
+  collection inward:
+  - Scripts: all of them, outer first, before the request's own (pre-request and tests
+    alike); an error names the folder or environment it came from.
+  - Auth: the nearest one set, unless the request sets its own. "Inherit from parent" names where it
+    comes from and opens it.
+  - Headers and params: listed greyed in the request's tabs with where each comes from;
+    Override copies one into the request to edit. A row of the same name nearer the request
+    replaces it (header names in any case) and an unticked one keeps it out. The header the
+    auth sets isn't added, nor Content-Type on a form body; MQTT takes neither, gRPC no
+    params. Scripts see them in `pm.request` and may remove them.
+  - Settings, one by one: each set above shows "from …"; one set on the request shows ↺ to
+    take the inherited value back. "Use the inherited settings" resets them all.
+- A variable set in several places takes the value nearest the request: globals <
+  environment < collection < folder (inner over outer) < a run's data row < `pm.variables`.
+  As Insomnia and Hoppscotch have it; Postman puts the environment over the collection.
 
 **Network** (Settings > Network; the status bar shows the proxy in use and opens it). Changes
 take effect on Apply (or Enter); closing Settings without it drops them.
@@ -379,7 +394,7 @@ empty tree): paste it, give its path or drop the file (or folder).
 | Postman v2.1 | A collection, an environment or the globals |
 | Postman v3 (Native Git, the Postman CLI) | A collection's folder of YAML, or a whole workspace folder with its collections, environments and globals ("Choose folder…"); also one v3 document. HTTP, GraphQL, gRPC, WebSocket, Socket.IO and MQTT requests, with folder auth, variables, scripts, examples and saved messages. Globals already set keep their value; MCP and LLM requests, specs, flows and mocks are listed as left out |
 | OpenAPI 3 / Swagger 2, JSON or YAML | A request per operation, a folder per tag, `{{baseUrl}}` from the server, auth from the security schemes, bodies and saved examples from the schemas, so the mock server answers right away |
-| Insomnia v4 JSON / v5 YAML | Folders, auth and scripts; `{{ _.x }}` as `{{x}}`; the base environment as collection variables and each sub-environment as an environment |
+| Insomnia v4 JSON / v5 YAML | Folders with their headers, auth and scripts; `{{ _.x }}` as `{{x}}`; the base environment as collection variables and each sub-environment as an environment |
 | HAR from browser devtools | A folder per host, each response kept as the request's example |
 
 Right-click a folder or collection > "Copy as" or "Export" for every format the other clients
@@ -387,8 +402,8 @@ import:
 
 | Format | What it holds | Imported by |
 |---|---|---|
-| Postman collection v2.1 | Folders, auth, scripts, variables, examples; not WebSocket, SSE or gRPC | Postman, Hoppscotch, Insomnia, Bruno, Yaak, Restfox, Yaade |
-| Insomnia v4 | Folders with their variables, auth and scripts, WebSocket too; the collection's variables as the base environment, its auth and scripts on what's directly in it | Insomnia, Hoppscotch, Bruno, Yaak, Restfox |
+| Postman collection v2.1 | Folders, auth, scripts, variables, settings, examples; a folder's headers and params, which Postman's folders lack, as the first lines of its pre-request script (read back as rows); not WebSocket, SSE or gRPC | Postman, Hoppscotch, Insomnia, Bruno, Yaak, Restfox, Yaade |
+| Insomnia v4 | Folders with their variables, headers, auth and scripts, WebSocket too; the collection's variables as the base environment, its auth and scripts on what's directly in it | Insomnia, Hoppscotch, Bruno, Yaak, Restfox |
 | OpenAPI 3.1, Markdown | API docs, see below | |
 | HAR 1.2 | Each request as sent, variables filled in, with its first saved example as the answer | Hoppscotch, Insomnia, browser devtools |
 | cURL | Each request as sent, a command under a comment naming it | Every client's cURL import, a shell |

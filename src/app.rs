@@ -17,7 +17,7 @@ use crate::icons::{self as icon, Icon};
 use crate::loadtest::{self, Stats};
 use crate::logfile::redact;
 use crate::model::{
-    self, Auth, Body, Example, Folder, Inherited, KeyValue, METHODS, Request, SortBy,
+    self, Auth, Body, Example, Folder, Inherited, KeyValue, METHODS, Request, Scope, SortBy, Source,
 };
 use crate::net::{self, Network, ProxyMode};
 use crate::runner::{self, Outcome, RunItem, RunOptions, RunPlan, Vars};
@@ -202,8 +202,11 @@ enum SettingsTab {
 #[derive(PartialEq, Clone, Copy)]
 enum FolderTab {
     Vars,
+    Params,
+    Headers,
     Auth,
     Scripts,
+    Settings,
     Docs,
 }
 
@@ -860,19 +863,23 @@ struct EnvEditor {
     env: Option<String>,
     shared: Vec<KeyValue>,
     secret: Vec<KeyValue>,
+    scope: Scope,
     /// What's on disk, so Close can tell whether it would throw edits away.
-    saved: (Vec<KeyValue>, Vec<KeyValue>),
+    saved: (Vec<KeyValue>, Vec<KeyValue>, Scope),
+    /// What the globals give an environment; nothing for the globals.
+    parent: Inherited,
+    tab: FolderTab,
     error: String,
     confirm_discard: bool,
 }
 
 impl EnvEditor {
     fn dirty(&self) -> bool {
-        (&self.shared, &self.secret) != (&self.saved.0, &self.saved.1)
+        (&self.shared, &self.secret, &self.scope) != (&self.saved.0, &self.saved.1, &self.saved.2)
     }
 }
 
-/// Edits a folder's `.folder.toml`.
+/// Edits a folder's `.folder.toml`, in the main area in place of the request.
 struct FolderEditor {
     dir: PathBuf,
     name: String,
@@ -893,7 +900,10 @@ enum TreeAction {
     Dialog(Dialog),
     Duplicate(PathBuf),
     Run(PathBuf),
+    /// From its menu: ready to type into its variables.
     FolderSettings(PathBuf),
+    /// A plain click: the tree keeps the keys (F2, Delete).
+    FolderPage(PathBuf),
     /// A folder's requests onto the clipboard as this format.
     Copy(PathBuf, Format),
     /// A folder's requests to a file in this format.
@@ -973,7 +983,11 @@ impl Format {
         ws: &Workspace,
         dir: &Path,
         file: &Path,
-        vars: (&HashMap<String, String>, &HashMap<String, String>),
+        vars: (
+            &HashMap<String, String>,
+            &HashMap<String, String>,
+            Option<&str>,
+        ),
     ) -> Result<(String, String), String> {
         let (text, left, why) = match self {
             Format::Markdown | Format::OpenApi => {
@@ -996,10 +1010,10 @@ impl Format {
                 (text, left, why)
             }
             Format::Har | Format::Curl => {
-                let (globals, env) = vars;
+                let (globals, env, name) = vars;
                 let (text, left) = match self {
-                    Format::Har => crate::codegen::har(ws, dir, globals, env)?,
-                    _ => crate::codegen::curl_script(ws, dir, globals, env)?,
+                    Format::Har => crate::codegen::har(ws, dir, globals, (env, name))?,
+                    _ => crate::codegen::curl_script(ws, dir, globals, (env, name))?,
                 };
                 let why = t("; left out {} streams and gRPC requests, which it can't hold");
                 (text, left, why)
@@ -1240,6 +1254,8 @@ pub struct App {
     dialog: Option<Dialog>,
     env_editor: Option<EnvEditor>,
     folder_editor: Option<FolderEditor>,
+    /// The folder page is in front, as `runner_shown`.
+    folder_shown: bool,
     runner: Option<RunnerView>,
     /// `status` as it was set by `fail`: red, and kept until dismissed or replaced, while
     /// other messages fade.
@@ -1368,6 +1384,7 @@ impl App {
             dialog: None,
             env_editor: None,
             folder_editor: None,
+            folder_shown: false,
             runner: None,
             failed: String::new(),
             status_since: (String::new(), Instant::now()),
@@ -1451,8 +1468,7 @@ impl App {
     fn shortcuts(&mut self, ui: &mut egui::Ui) {
         use crate::appearance::{DEFAULT_SIZE, SIZES};
         let pressed = |key: &KeyboardShortcut| ui.input_mut(|i| i.consume_shortcut(key));
-        let free =
-            self.dialog.is_none() && self.env_editor.is_none() && self.folder_editor.is_none();
+        let free = self.dialog.is_none() && self.env_editor.is_none();
         for (key, action) in KEYED_ACTIONS {
             if pressed(&key) && free {
                 self.act(action);
@@ -2001,6 +2017,8 @@ impl App {
             .map(|n| load(Some(&n)))
             .unwrap_or_default();
         (self.globals, self.vars) = (globals, vars);
+        // The environment's headers, auth, scripts and settings come with its variables.
+        self.refresh_inherited();
         let env = self.active_env.as_deref();
         let secret = |env| {
             self.ws
@@ -2015,9 +2033,17 @@ impl App {
 
     /// `add` appends empty rows for these keys, e.g. the undefined names in the URL.
     fn open_env_editor(&mut self, env: Option<String>, add: &[String]) {
-        match self.ws.load_env(env.as_deref()) {
-            Ok((mut shared, secret)) => {
-                let saved = (shared.clone(), secret.clone());
+        let loaded = self.ws.load_env(env.as_deref()).and_then(|vars| {
+            let scope = self.ws.load_scope(env.as_deref())?;
+            let parent = match env {
+                Some(_) => Inherited::default().under(Source::Globals, &self.ws.load_scope(None)?),
+                None => Inherited::default(),
+            };
+            Ok((vars, scope, parent))
+        });
+        match loaded {
+            Ok(((mut shared, secret), scope, parent)) => {
+                let saved = (shared.clone(), secret.clone(), scope.clone());
                 for key in add {
                     shared.push(KeyValue::new(key.clone(), ""));
                 }
@@ -2031,7 +2057,10 @@ impl App {
                     env,
                     shared,
                     secret,
+                    scope,
                     saved,
+                    parent,
+                    tab: FolderTab::Vars,
                     error: String::new(),
                     confirm_discard: false,
                 });
@@ -2041,6 +2070,10 @@ impl App {
     }
 
     fn reload(&mut self) {
+        // A folder deleted, here or on disk, takes its page along.
+        if (self.folder_editor.as_ref()).is_some_and(|ed| !self.ws.exists(&ed.dir)) {
+            (self.folder_editor, self.folder_shown) = (None, false);
+        }
         self.set_tree(self.ws.tree());
         self.statuses = self.ws.last_statuses();
         self.envs = self.ws.env_names();
@@ -2140,7 +2173,12 @@ impl App {
 
     /// The open request against its file: reloaded if it has no unsaved edits, else flagged.
     fn refresh_open(&mut self) {
+        self.refresh_open_file();
+        // After: a request read from disk has only what the folders give it.
         self.refresh_inherited();
+    }
+
+    fn refresh_open_file(&mut self) {
         let Some(open) = &mut self.open else { return };
         match self.ws.load_request(&open.path) {
             // As saved, not as typed: an empty body picked in the editor reads back as none.
@@ -2163,11 +2201,18 @@ impl App {
         }
     }
 
-    /// Folder settings apply to the open request at once, unsaved edits or not: they
-    /// aren't part of its file.
+    /// Folder and environment settings apply to the open request at once, unsaved edits
+    /// or not: they aren't part of its file.
     fn refresh_inherited(&mut self) {
+        let env = self.active_env.clone();
+        if let Some(ed) = &mut self.folder_editor {
+            match self.ws.inherited(&ed.dir, env.as_deref()) {
+                Ok(parent) => ed.parent = parent,
+                Err(e) => ed.error = e,
+            }
+        }
         let Some(open) = &mut self.open else { return };
-        match self.ws.inherited(&open.path) {
+        match self.ws.inherited(&open.path, env.as_deref()) {
             Ok(inherited) => {
                 open.saved.inherited = inherited.clone();
                 open.draft.inherited = inherited;
@@ -2186,7 +2231,7 @@ impl App {
         log::debug!("open {}", self.ws.key(&path));
         // The tree is at the request now, not at the folder clicked before.
         self.tree_folder = None;
-        (self.runner_shown, self.capture_shown) = (false, false);
+        (self.runner_shown, self.capture_shown, self.folder_shown) = (false, false, false);
         let current = self.open.as_ref().map(|o| o.path.clone());
         let kinds = |app: &Self| (app.open.as_ref()).map(|o| ReqTab::of(&o.draft.method));
         let before = kinds(self);
@@ -2462,7 +2507,7 @@ impl App {
     }
 
     fn force_open(&mut self, path: PathBuf) {
-        match self.ws.load_request(&path) {
+        match self.ws.load_request_in(&path, self.active_env.as_deref()) {
             Ok(req) => {
                 self.open = Some(Open {
                     path,
@@ -2993,6 +3038,12 @@ impl App {
         // The same request still: it keeps its undo history.
         self.editing.iter_mut().for_each(moved);
         self.tree_folder.iter_mut().for_each(moved);
+        if let Some(ed) = &mut self.folder_editor {
+            moved(&mut ed.dir);
+            ed.name = store::folder_name(&self.ws.collections(), &ed.dir);
+        }
+        // Folders' names are where a request's inherited parts say they're from.
+        self.refresh_inherited();
     }
 
     /// After a drag and drop in the tree, with where each went; a reorder in place keeps
@@ -3072,6 +3123,10 @@ impl App {
                 .ws
                 .load_env(Some(from))
                 .and_then(|(shared, secret)| self.ws.save_env(Some(&name), &shared, &secret))
+                .and_then(|()| {
+                    self.ws
+                        .save_scope(Some(&name), &self.ws.load_scope(Some(from))?)
+                })
                 .map(|()| None),
             NameKind::Rename(old) => {
                 let old = old.clone();
@@ -3692,7 +3747,7 @@ impl eframe::App for App {
             // Save what the user is looking at, not the request hidden behind the editor.
             if self.env_editor.is_some() {
                 self.save_env_editor();
-            } else if self.folder_editor.is_some() {
+            } else if self.folder_shown && self.folder_editor.is_some() {
                 self.save_folder_editor();
             } else {
                 self.save();
@@ -3722,7 +3777,6 @@ impl eframe::App for App {
         if ui.input_mut(|i| i.consume_shortcut(&CLOSE_TAB))
             && self.dialog.is_none()
             && self.env_editor.is_none()
-            && self.folder_editor.is_none()
             && let Some(path) = self.open.as_ref().map(|o| o.path.clone())
         {
             self.close_tab(&path);
@@ -3730,14 +3784,12 @@ impl eframe::App for App {
         if ui.input_mut(|i| i.consume_shortcut(&REOPEN_TAB))
             && self.dialog.is_none()
             && self.env_editor.is_none()
-            && self.folder_editor.is_none()
         {
             self.reopen_tab();
         }
         if ui.input_mut(|i| i.consume_shortcut(&DUPLICATE))
             && self.dialog.is_none()
             && self.env_editor.is_none()
-            && self.folder_editor.is_none()
             && let Some(path) = self.open.as_ref().map(|o| o.path.clone())
         {
             self.duplicate(&path);
@@ -3745,14 +3797,12 @@ impl eframe::App for App {
         if ui.input_mut(|i| i.consume_shortcut(&NEW_REQUEST))
             && self.dialog.is_none()
             && self.env_editor.is_none()
-            && self.folder_editor.is_none()
         {
             self.new_request();
         }
         if ui.input_mut(|i| i.consume_shortcut(&SWITCH))
             && self.dialog.is_none()
             && self.env_editor.is_none()
-            && self.folder_editor.is_none()
         {
             self.dialog = Some(Dialog::Switch {
                 query: String::new(),
@@ -3776,7 +3826,6 @@ impl eframe::App for App {
         if let Some(doomed) = doomed
             && self.dialog.is_none()
             && self.env_editor.is_none()
-            && self.folder_editor.is_none()
             && !ui.ctx().text_edit_focused()
             && ui.input_mut(|i| {
                 i.consume_key(Modifiers::NONE, Key::Delete)
@@ -3935,7 +3984,6 @@ impl eframe::App for App {
         }
         self.dialog_ui(ui.ctx());
         self.env_editor_ui(ui.ctx());
-        self.folder_editor_ui(ui.ctx());
         self.cookie_manager_ui(ui.ctx());
         if let Some(id) = self.focus_request.take() {
             ui.memory_mut(|m| m.request_focus(id));
@@ -4087,7 +4135,7 @@ impl App {
                     .on_hover_text(t("Capture what apps send through a local HTTP or SOCKS proxy"))
                     .clicked()
                 {
-                    (self.capture_shown, self.runner_shown) = (true, false);
+                    (self.capture_shown, self.runner_shown, self.folder_shown) = (true, false, false);
                 }
                 ui.separator();
                 // Before the path, which pushed it out of sight. A message fades; an error
@@ -4439,7 +4487,18 @@ impl App {
                 TreeAction::Dialog(d) => self.dialog = Some(d),
                 TreeAction::Duplicate(path) => self.duplicate(&path),
                 TreeAction::Run(path) => self.open_runner(path),
-                TreeAction::FolderSettings(dir) => self.open_folder_editor(dir),
+                TreeAction::FolderPage(dir) => self.open_folder_editor(dir),
+                TreeAction::FolderSettings(dir) => {
+                    self.open_folder_editor(dir.clone());
+                    // Ready to type into the blank row, like the environment editor.
+                    if let Some(ed) = &mut self.folder_editor
+                        && ed.dir == dir
+                    {
+                        ed.tab = FolderTab::Vars;
+                        let row = ed.folder.vars.len();
+                        self.focus_request = Some(egui::Id::new(("folder-vars", row, 0)));
+                    }
+                }
                 TreeAction::Copy(dir, format) => self.copy_as(&dir, format, ui.ctx()),
                 TreeAction::Export(dir, format) => self.export_dialog(&dir, format),
                 TreeAction::Mock(dir) => self.start_mock(dir, ui.ctx()),
@@ -4525,7 +4584,7 @@ impl App {
     /// For Postman's Import > Raw text.
     fn copy_as(&mut self, dir: &Path, format: Format, ctx: &egui::Context) {
         let (file, _) = format.file("API");
-        let vars = (&self.globals, &self.vars);
+        let vars = (&self.globals, &self.vars, self.active_env.as_deref());
         self.status = match format.text(&self.ws, dir, Path::new(&file), vars) {
             Ok((text, left)) => {
                 ctx.copy_text(text);
@@ -4584,7 +4643,7 @@ impl App {
 
     fn export(&mut self, dir: &Path, format: Format, to: &Path) {
         let shown = to.display();
-        let vars = (&self.globals, &self.vars);
+        let vars = (&self.globals, &self.vars, self.active_env.as_deref());
         let written = format
             .text(&self.ws, dir, to, vars)
             .and_then(|(text, left)| {
@@ -5083,7 +5142,7 @@ impl App {
 
     /// Port 3000 when free, so a frontend can keep one base URL across restarts.
     fn start_mock(&mut self, dir: PathBuf, ctx: &egui::Context) {
-        let requests = self.ws.load_requests_in(&dir).unwrap_or_default();
+        let requests = self.ws.load_requests_in(&dir, None).unwrap_or_default();
         if !requests.iter().any(|(_, r)| !r.examples.is_empty()) {
             self.status = t("Nothing to mock yet: send a request, then \"Save as example\"").into();
             return;
@@ -5222,18 +5281,37 @@ impl App {
             All,
             Reopen,
         }
-        // No request tab is lit while the runner's or the capture's chip is.
+        // No request tab is lit while the runner's, the capture's or a folder's chip is.
         let runner = self.runner.as_ref().filter(|_| self.runner_shown).is_some();
+        let folder = self
+            .folder_editor
+            .as_ref()
+            .filter(|_| self.folder_shown)
+            .is_some();
         let active = self
             .open
             .as_ref()
             .map(|o| o.path.clone())
-            .filter(|_| !runner && !self.capture_shown);
+            .filter(|_| !runner && !self.capture_shown && !folder);
         let (mut show, mut close, mut menu) = (None, None, None);
         let (mut show_runner, mut close_runner) = (false, false);
         let (mut show_capture, mut close_capture) = (false, false);
+        let (mut show_folder, mut close_folder) = (false, false);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
+                if let Some(ed) = &self.folder_editor {
+                    let unsaved = (ed.folder != ed.saved).then_some(ORANGE);
+                    let lit = folder && !runner && !self.capture_shown;
+                    // As its page's heading, as the runner's chip is "Run: …".
+                    let name = match ed.dir.parent() == Some(&self.ws.collections()) {
+                        true => tf("Collection: {}", &[&ed.name]),
+                        false => tf("Folder: {}", &[&ed.name]),
+                    };
+                    show_folder = tab_label(ui, lit, name, unsaved).clicked();
+                    close_folder =
+                        icon_button(ui, icon::X, t("Close the folder settings"), None).clicked();
+                    ui.separator();
+                }
                 if self.capture_shown || self.capture.is_some() {
                     if self.capture.as_ref().is_some_and(|c| c.server.is_some()) {
                         dot(ui, GREEN);
@@ -5345,11 +5423,15 @@ impl App {
         } else if let Some(path) = show {
             self.activate(path, false);
         } else if show_runner {
-            (self.runner_shown, self.capture_shown) = (true, false);
+            (self.runner_shown, self.capture_shown, self.folder_shown) = (true, false, false);
         } else if close_runner {
             self.close_runner();
         } else if show_capture {
-            (self.capture_shown, self.runner_shown) = (true, false);
+            (self.capture_shown, self.runner_shown, self.folder_shown) = (true, false, false);
+        } else if show_folder {
+            (self.folder_shown, self.runner_shown, self.capture_shown) = (true, false, false);
+        } else if close_folder {
+            self.close_folder_page();
         } else if close_capture {
             self.restore_system_proxy();
             (self.capture, self.capture_shown) = (None, false);
@@ -5358,7 +5440,9 @@ impl App {
 
     fn main_area(&mut self, ui: &mut egui::Ui) {
         let capture = self.capture_shown || self.capture.is_some();
-        if !self.tabs.is_empty() || self.runner.is_some() || capture || self.hide_sidebar {
+        let folder = self.folder_editor.is_some();
+        if !self.tabs.is_empty() || self.runner.is_some() || capture || folder || self.hide_sidebar
+        {
             egui::Panel::top("tabs").show(ui, |ui| {
                 if !self.hide_sidebar {
                     return self.tab_bar(ui);
@@ -5378,6 +5462,10 @@ impl App {
         }
         if self.runner.is_some() && self.runner_shown {
             self.runner_ui(ui);
+            return;
+        }
+        if self.folder_shown && self.folder_editor.is_some() {
+            self.folder_page(ui);
             return;
         }
         let all_vars = self.all_vars();
@@ -5415,6 +5503,8 @@ impl App {
             .rev()
             .collect();
         let mut folder_clicked: Option<PathBuf> = None;
+        // An environment's (`Some(None)`: the globals') settings asked for.
+        let mut env_clicked: Option<Option<String>> = None;
         // Opened on its Auth tab: asked for from an inherited auth.
         let mut folder_auth = false;
         let mut rename = false;
@@ -5865,16 +5955,42 @@ impl App {
                         if kv_table(ui, "params", &mut open.draft.params, &all_vars, true) {
                             open.draft.url_from_params();
                         }
+                        let d = &mut open.draft;
+                        let mut adopted = d.clone();
+                        adopted.adopt_inherited();
+                        // The ones that go: adopted after the request's own.
+                        let came = &adopted.params[d.params.len().min(adopted.params.len())..];
+                        let rows: Vec<_> = (d.inherited.params.iter())
+                            .filter(|(_, p)| came.iter().any(|c| c.key == p.key))
+                            .collect();
+                        if let Some(row) = inherited_rows(ui, &rows) {
+                            d.params.push(row);
+                            d.url_from_params();
+                        }
                         path_vars_table(ui, &mut open.draft.path_vars, &all_vars);
                     }
                     ReqTab::Headers => {
                         kv_table(ui, "headers", &mut open.draft.headers, &all_vars, true);
+                        let d = &mut open.draft;
+                        let mut adopted = d.clone();
+                        adopted.adopt_inherited();
+                        let came = &adopted.headers[d.headers.len().min(adopted.headers.len())..];
+                        let rows: Vec<_> = (d.inherited.headers.iter())
+                            .filter(|(_, h)| came.iter().any(|c| c.key == h.key))
+                            .collect();
+                        let copy = inherited_rows(ui, &rows);
                         // What an HTTP send adds; a gRPC call goes out its own way.
-                        if open.draft.method != "GRPC" {
-                            let (wire, _) = open.draft.resolved(&all_vars);
-                            let own = &open.draft.headers;
-                            let auto = http::auto_headers(wire, own, &self.network);
+                        if d.method != "GRPC" {
+                            let (wire, _) = d.resolved(&all_vars);
+                            let mut auto = http::auto_headers(wire, &d.headers, &self.network);
+                            // Listed above, with where they're from.
+                            auto.retain(|(k, _, _)| {
+                                !came.iter().any(|c| c.key.trim().eq_ignore_ascii_case(k))
+                            });
                             change_defaults |= auto_headers_ui(ui, auto);
+                        }
+                        if let Some(row) = copy {
+                            d.headers.push(row);
                         }
                     }
                     ReqTab::Body => {
@@ -5917,11 +6033,17 @@ impl App {
                         let d = &mut open.draft;
                         let inherited = d.inherited.auth.as_ref();
                         if auth_editor(ui, &mut d.auth, &all_vars, inherited, &d.method)
-                            && let Some((name, _)) = inherited
+                            && let Some((from, _)) = inherited
                         {
-                            folder_clicked = (open.path.ancestors())
-                                .find(|dir| store::folder_name(&root, dir) == *name)
-                                .map(Path::to_path_buf);
+                            match from {
+                                Source::Folder(name) => {
+                                    folder_clicked = (open.path.ancestors())
+                                        .find(|dir| store::folder_name(&root, dir) == *name)
+                                        .map(Path::to_path_buf);
+                                }
+                                Source::Environment(name) => env_clicked = Some(Some(name.clone())),
+                                Source::Globals => env_clicked = Some(None),
+                            }
                             folder_auth = true;
                         }
                     }
@@ -5958,12 +6080,11 @@ impl App {
                     }
                     ReqTab::Settings => {
                         let (d, timeout) = (&mut open.draft, self.network.timeout_secs);
+                        let (s, above) = (&mut d.settings, &d.inherited);
                         match d.method.as_str() {
-                            "MQTT" => mqtt_settings(ui, &mut d.mqtt, &mut d.settings, timeout),
-                            "SOCKETIO" => {
-                                socketio_settings(ui, &mut d.socketio, &mut d.settings, timeout)
-                            }
-                            method => settings_editor(ui, &mut d.settings, method, timeout),
+                            "MQTT" => mqtt_settings(ui, &mut d.mqtt, s, above, timeout),
+                            "SOCKETIO" => socketio_settings(ui, &mut d.socketio, s, above, timeout),
+                            method => settings_editor(ui, s, above, method, timeout),
                         }
                     }
                     ReqTab::Topics => {
@@ -6270,6 +6391,12 @@ impl App {
             self.reveal = Some(dir.clone());
             self.open_folder_editor(dir);
             if folder_auth && let Some(ed) = &mut self.folder_editor {
+                ed.tab = FolderTab::Auth;
+            }
+        }
+        if let Some(env) = env_clicked {
+            self.open_env_editor(env, &[]);
+            if folder_auth && let Some(ed) = &mut self.env_editor {
                 // Not the Variables tab's blank row: it isn't drawn on this one.
                 (ed.tab, self.focus_request) = (FolderTab::Auth, None);
             }
@@ -7023,7 +7150,12 @@ impl App {
         let file =
             (ed.env.as_ref()).map_or("globals.toml".into(), |n| format!("environments/{n}.toml"));
         // Only explicit buttons close this one: a stray click outside must not drop edits.
-        egui::Modal::new(egui::Id::new("env-editor")).show(ctx, |ui| {
+        // Hung from the top, not centred: a tab shorter than the last moved the whole
+        // window, its tabs out from under the pointer. (A fixed height instead kept the
+        // fields from taking a click.)
+        let id = egui::Id::new("env-editor");
+        let area = egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, [0.0, 60.0]);
+        egui::Modal::new(id).area(area).show(ctx, |ui| {
             ui.set_width(620.0);
             match &ed.env {
                 Some(name) => ui.heading(tf("Environment: {}", &[&name])),
@@ -7032,7 +7164,27 @@ impl App {
             if ed.env.is_none() {
                 ui.weak(t("Available in every environment; an environment or folder variable with the same name wins."));
             }
-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let n = (ed.shared.iter().chain(&ed.secret))
+                    .filter(|v| v.enabled && !v.key.is_empty())
+                    .count();
+                sub_tab(ui, &mut ed.tab, FolderTab::Vars, counted(n, t("Variables")), false);
+                scope_tabs(ui, &mut ed.tab, &ed.scope);
+            });
+            ui.separator();
+            let scroll = egui::ScrollArea::vertical().max_height(420.0);
+            scroll.show(ui, |ui| {
+                if ed.tab != FolderTab::Vars {
+                    // What `{{…}}` is in this environment, not in the active one.
+                    let mut vars = self.globals.clone();
+                    let own = (ed.shared.iter().chain(&ed.secret)).filter(|v| v.enabled);
+                    vars.extend(own.map(|v| (v.key.clone(), v.value.clone())));
+                    let vars = &vars;
+                    let (scope, parent, tab) = (&mut ed.scope, &ed.parent, ed.tab);
+                    let script_tab = &mut self.script_tab;
+                    let timeout = self.network.timeout_secs;
+                    return scope_editor(ui, "env", tab, scope, parent, vars, script_tab, timeout);
+                }
                 ui.label(RichText::new(t("Shared")).strong());
                 ui.weak(tf("Written to {} in the workspace folder, for git.", &[&file]));
                 kv_table(ui, "env-shared", &mut ed.shared, &HashMap::new(), false);
@@ -7108,7 +7260,10 @@ impl App {
         let Some(ed) = &mut self.env_editor else {
             return false;
         };
-        match self.ws.save_env(ed.env.as_deref(), &ed.shared, &ed.secret) {
+        let env = ed.env.as_deref();
+        let saved = (self.ws.save_env(env, &ed.shared, &ed.secret))
+            .and_then(|()| self.ws.save_scope(env, &ed.scope));
+        match saved {
             Ok(()) => {
                 let name = ed.env.clone().unwrap_or_else(|| t("Globals").into());
                 self.status = tf("Saved {}", &[&name]);
@@ -7123,132 +7278,137 @@ impl App {
         }
     }
 
+    /// Shows the folder's page; one with unsaved edits stays until they're saved or
+    /// discarded.
     fn open_folder_editor(&mut self, dir: PathBuf) {
+        (self.runner_shown, self.capture_shown) = (false, false);
+        if let Some(ed) = &self.folder_editor
+            && ed.dir != dir
+            && ed.folder != ed.saved
+        {
+            self.folder_shown = true;
+            self.status = tf("Save or discard the changes to {} first", &[&ed.name]);
+            return;
+        }
+        if self.folder_editor.as_ref().is_some_and(|ed| ed.dir == dir) {
+            self.folder_shown = true;
+            return;
+        }
         // A folder inherits from its parents exactly like a request in it would.
         let loaded = self.ws.load_folder(&dir);
-        match loaded.and_then(|f| Ok((f, self.ws.inherited(&dir)?))) {
+        let env = self.active_env.clone();
+        match loaded.and_then(|f| Ok((f, self.ws.inherited(&dir, env.as_deref())?))) {
             Ok((folder, parent)) => {
-                // Ready to type into the blank row, like the environment editor.
-                self.focus_request = Some(egui::Id::new(("folder-vars", folder.vars.len(), 0)));
+                let tab = (self.folder_editor.as_ref()).map_or(FolderTab::Vars, |ed| ed.tab);
                 self.folder_editor = Some(FolderEditor {
                     name: store::folder_name(&self.ws.collections(), &dir),
                     dir,
                     saved: folder.clone(),
                     folder,
                     parent,
-                    tab: FolderTab::Vars,
+                    tab,
                     error: String::new(),
                     confirm_discard: false,
-                })
+                });
+                self.folder_shown = true;
             }
             Err(e) => self.fail(e),
         }
     }
 
-    fn folder_editor_ui(&mut self, ctx: &egui::Context) {
+    /// The folder page, in the main area: what every request in the folder shares.
+    fn folder_page(&mut self, ui: &mut egui::Ui) {
         let collections = self.ws.collections();
         let Some(ed) = &mut self.folder_editor else {
             return;
         };
-        let (mut save, mut close) = (false, false);
+        let (mut save, mut discard) = (false, false);
         let mut vars = self.globals.clone();
+        vars.extend(self.vars.clone());
         vars.extend(ed.parent.vars.clone());
         let own = ed.folder.vars.iter().filter(|v| v.enabled);
         vars.extend(own.map(|v| (v.key.clone(), v.value.clone())));
-        vars.extend(self.vars.clone());
-        // Like the environment editor: only explicit buttons close it.
-        egui::Modal::new(egui::Id::new("folder-editor")).show(ctx, |ui| {
-            ui.set_width(620.0);
-            ui.heading(match ed.dir.parent() == Some(&collections) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let collection = ed.dir.parent() == Some(&collections);
+            if collection {
+                icon_label(ui, icon::LAYERS, Some(ui.visuals().weak_text_color()));
+            }
+            ui.heading(match collection {
                 true => tf("Collection: {}", &[&ed.name]),
                 false => tf("Folder: {}", &[&ed.name]),
             });
-            ui.weak(t(
-                "Shared by every request in this folder and its subfolders. \
-                 Written to its .folder.toml, for git.",
-            ));
-            ui.horizontal(|ui| {
-                let f = &ed.folder;
-                let n = f
-                    .vars
-                    .iter()
-                    .filter(|v| v.enabled && !v.key.is_empty())
-                    .count();
-                let vars_label = match n {
-                    0 => t("Variables").to_owned(),
-                    n => tf("Variables ({})", &[&n]),
-                };
-                let scripts = !f.pre_request.trim().is_empty() || !f.tests.trim().is_empty();
-                let auth = !f.auth.is_unset();
-                let docs = !f.description.trim().is_empty();
-                sub_tab(ui, &mut ed.tab, FolderTab::Vars, vars_label, false);
-                sub_tab(ui, &mut ed.tab, FolderTab::Auth, t("Auth"), auth);
-                sub_tab(ui, &mut ed.tab, FolderTab::Scripts, t("Scripts"), scripts);
-                sub_tab(ui, &mut ed.tab, FolderTab::Docs, t("Docs"), docs);
-            });
-            ui.separator();
-            // One height for every tab: centred, a shorter one moved the whole window and
-            // its tabs out from under the pointer.
-            egui::ScrollArea::vertical()
-                .max_height(420.0)
-                .auto_shrink(false)
-                .show(ui, |ui| match ed.tab {
-                    FolderTab::Vars => {
-                        ui.weak(t(
-                            "Above environments: a folder variable wins over an environment \
-                             variable with the same name, an inner folder's over an outer \
-                             one's. Keep secrets in a secret environment.",
-                        ));
-                        kv_table(
-                            ui,
-                            "folder-vars",
-                            &mut ed.folder.vars,
-                            &HashMap::new(),
-                            false,
-                        );
-                    }
-                    FolderTab::Auth => {
-                        let parent = ed.parent.auth.as_ref();
-                        auth_editor(ui, &mut ed.folder.auth, &vars, parent, "");
-                        ui.weak(t("Requests set to \"Inherit from parent\" use this."));
-                    }
-                    FolderTab::Scripts => scripts_editor(
-                        ui,
-                        &mut self.script_tab,
-                        &mut ed.folder.pre_request,
-                        &mut ed.folder.tests,
-                        &ed.parent,
-                        // A folder's tests run on many responses, not the one shown.
-                        None,
-                    ),
-                    FolderTab::Docs => docs_editor(ui, &mut ed.folder.description),
-                });
+        });
+        ui.weak(t(
+            "Shared by every request in this folder and its subfolders. \
+             Written to its .folder.toml, for git.",
+        ));
+        ui.horizontal(|ui| {
+            let f = &ed.folder;
+            let n = (f.vars.iter())
+                .filter(|v| v.enabled && !v.key.is_empty())
+                .count();
+            sub_tab(
+                ui,
+                &mut ed.tab,
+                FolderTab::Vars,
+                counted(n, t("Variables")),
+                false,
+            );
+            scope_tabs(ui, &mut ed.tab, &f.scope);
+            let docs = !f.description.trim().is_empty();
+            sub_tab(ui, &mut ed.tab, FolderTab::Docs, t("Docs").to_owned(), docs);
+        });
+        ui.separator();
+        egui::Panel::bottom("folder-actions").show(ui, |ui| {
             if !ed.error.is_empty() {
                 ui.colored_label(RED, ed.error.as_str());
             }
-            ui.separator();
             ui.horizontal(|ui| {
+                let dirty = ed.folder != ed.saved;
                 save = ui
-                    .add(primary(t("Save")))
+                    .add_enabled(dirty, primary(t("Save")))
                     .on_hover_text(shortcut_label(ui.ctx(), &SAVE))
-                    .clicked()
-                    || enter_pressed(ui);
-                let close_label = if ed.confirm_discard {
-                    RichText::new(t("Discard changes")).color(RED)
+                    .clicked();
+                let label = RichText::new(t("Discard changes"));
+                let label = if ed.confirm_discard {
+                    label.color(RED)
                 } else {
-                    RichText::new(t("Close"))
+                    label
                 };
-                close = ui.button(close_label).clicked() || escape_pressed(ui);
+                discard = dirty && ui.button(label).clicked();
             });
         });
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| match ed.tab {
+                FolderTab::Vars => {
+                    ui.weak(t(
+                        "Above environments: a folder variable wins over an environment \
+                         variable with the same name, an inner folder's over an outer \
+                         one's. Keep secrets in a secret environment.",
+                    ));
+                    kv_table(
+                        ui,
+                        "folder-vars",
+                        &mut ed.folder.vars,
+                        &HashMap::new(),
+                        false,
+                    );
+                }
+                FolderTab::Docs => docs_editor(ui, &mut ed.folder.description),
+                tab => {
+                    let (scope, parent) = (&mut ed.folder.scope, &ed.parent);
+                    let script_tab = &mut self.script_tab;
+                    let timeout = self.network.timeout_secs;
+                    scope_editor(ui, "folder", tab, scope, parent, &vars, script_tab, timeout)
+                }
+            });
         if save {
             self.save_folder_editor();
-        } else if close {
-            if ed.folder != ed.saved && !ed.confirm_discard {
-                ed.confirm_discard = true;
-            } else {
-                self.folder_editor = None;
-            }
+        } else if discard && let Some(ed) = &mut self.folder_editor {
+            ed.folder = ed.saved.clone();
+            ed.confirm_discard = false;
         }
     }
 
@@ -7259,11 +7419,29 @@ impl App {
         match self.ws.save_folder(&ed.dir, &ed.folder) {
             Ok(()) => {
                 self.status = tf("Saved {}", &[&ed.name]);
-                self.folder_editor = None;
+                (ed.saved, ed.error) = (ed.folder.clone(), String::new());
                 self.refresh_inherited();
             }
             Err(e) => ed.error = e,
         }
+    }
+
+    /// Closing the folder page throws its edits away: the first click asks, by turning
+    /// its Discard red.
+    fn close_folder_page(&mut self) {
+        let Some(ed) = &mut self.folder_editor else {
+            return;
+        };
+        if ed.folder != ed.saved && !ed.confirm_discard {
+            ed.confirm_discard = true;
+            self.folder_shown = true;
+            self.status = tf(
+                "{} has unsaved changes: close again to discard them",
+                &[&ed.name],
+            );
+            return;
+        }
+        (self.folder_editor, self.folder_shown) = (None, false);
     }
 
     fn cookie_manager_ui(&mut self, ctx: &egui::Context) {
@@ -7609,7 +7787,7 @@ impl App {
             .is_some_and(RunState::running)
         {
             self.status = t("The collection runner is already running.").into();
-            (self.runner_shown, self.capture_shown) = (true, false);
+            (self.runner_shown, self.capture_shown, self.folder_shown) = (true, false, false);
             return;
         }
         let title = if scope == self.ws.collections() {
@@ -7642,7 +7820,7 @@ impl App {
             error: String::new(),
             run: None,
         });
-        (self.runner_shown, self.capture_shown) = (true, false);
+        (self.runner_shown, self.capture_shown, self.folder_shown) = (true, false, false);
     }
 
     /// "Folder/Request" relative to the collections root, without the extension.
@@ -7651,7 +7829,7 @@ impl App {
         let mut requests = Vec::new();
         let mut error = String::new();
         for path in &setup.paths {
-            match self.ws.load_request(path) {
+            match self.ws.load_request_in(path, self.active_env.as_deref()) {
                 Ok(req) => requests.push((self.ws.display_name(path), req)),
                 Err(e) => error = e,
             }
@@ -9027,7 +9205,9 @@ impl App {
             Action::NewEnv => self.dialog = Some(Dialog::name(NameKind::NewEnv, "")),
             Action::Globals => self.open_env_editor(None, &[]),
             Action::RunCollection => self.open_runner(root),
-            Action::Capture => (self.capture_shown, self.runner_shown) = (true, false),
+            Action::Capture => {
+                (self.capture_shown, self.runner_shown, self.folder_shown) = (true, false, false)
+            }
             Action::ImportAny => {
                 self.dialog = Some(Dialog::Paste {
                     text: String::new(),
@@ -9249,6 +9429,8 @@ fn tree_ui(
                         false => {
                             state.toggle(ui);
                             actions.push(TreeAction::Folder(path.clone()));
+                            // Its page, where what it gives its requests is edited.
+                            actions.push(TreeAction::FolderPage(path.clone()));
                         }
                     }
                 }
@@ -11041,7 +11223,40 @@ fn code_editor(
 /// A Settings row's name and checkbox, the box named after the row for screen readers:
 /// bare, it read as "checkbox" and nothing more.
 fn check_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Response {
-    ui.label(label);
+    setting_check(ui, label, on, &[], &mut |_, _| {})
+}
+
+/// What goes after a settings row's name: where its value comes from (see
+/// `inherited_settings`), given the fields the row edits.
+type Mark<'a> = dyn FnMut(&mut egui::Ui, &[&str]) + 'a;
+
+/// A settings row's name, with its `mark`.
+fn setting_label(
+    ui: &mut egui::Ui,
+    text: &str,
+    fields: &[&str],
+    mark: &mut Mark,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let r = ui.label(text);
+        mark(ui, fields);
+        r
+    })
+    .inner
+}
+
+/// `check_row` with a settings row's `mark`.
+fn setting_check(
+    ui: &mut egui::Ui,
+    label: &str,
+    on: &mut bool,
+    fields: &[&str],
+    mark: &mut Mark,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        mark(ui, fields);
+    });
     let r = ui.checkbox(on, "");
     let (enabled, ticked) = (r.enabled(), *on);
     r.widget_info(|| {
@@ -11057,14 +11272,57 @@ fn fill_rows(ui: &egui::Ui, style: egui::TextStyle) -> usize {
     ((ui.available_height() - 12.0) / row).max(4.0) as usize
 }
 
-/// `inherited`: what "Inherit from parent" currently resolves to, and from which folder.
+/// Where an inherited value is set, in the app's words: a top folder is a collection.
+fn source_label(from: &Source) -> String {
+    match from {
+        Source::Globals => t("the globals").to_owned(),
+        Source::Environment(name) => tf("environment \"{}\"", &[name]),
+        Source::Folder(name) if !name.contains('/') => tf("collection \"{}\"", &[name]),
+        Source::Folder(name) => tf("folder \"{}\"", &[name]),
+    }
+}
+
+/// Rows from above, greyed under the table they add to and in its columns, as
+/// `auto_headers_ui` has Send's. Returns the one whose Override was clicked, to copy into
+/// the table.
+fn inherited_rows(ui: &mut egui::Ui, rows: &[&(Source, KeyValue)]) -> Option<KeyValue> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut copy = None;
+    ui.add_space(6.0);
+    ui.weak(tf("{} inherited", &[&rows.len()]));
+    let key_width = (ui.available_width() * 0.25).clamp(100.0, 200.0);
+    let rest = (ui.available_width() - key_width - 90.0).max(120.0);
+    for (from, row) in rows.iter().map(|r| (&r.0, &r.1)) {
+        ui.horizontal(|ui| {
+            ui.add_visible(false, egui::Checkbox::new(&mut true, ""));
+            ui.add_enabled_ui(false, |ui| {
+                let (mut key, mut value) = (row.key.as_str(), row.value.as_str());
+                ui.add(egui::TextEdit::singleline(&mut key).desired_width(key_width));
+                let field = egui::TextEdit::singleline(&mut value).desired_width(rest * 0.6);
+                ui.add(field).on_disabled_hover_text(&row.value);
+            });
+            ui.weak(tf("from {}", &[&source_label(from)]));
+            let over = ui.small_button(t("Override")).on_hover_text(t(
+                "Copies it into the table above: change it there, or uncheck it to leave it out",
+            ));
+            if over.clicked() {
+                copy = Some(KeyValue::new(row.key.clone(), row.value.clone()));
+            }
+        });
+    }
+    copy
+}
+
+/// `inherited`: what "Inherit from parent" currently resolves to, and where it's set.
 /// `method` narrows the types offered to what that kind of request can send ("" for a
-/// folder: any). True when that folder's settings were asked for.
+/// folder or an environment: any). True when where it's set was asked for.
 fn auth_editor(
     ui: &mut egui::Ui,
     auth: &mut Auth,
     vars: &HashMap<String, String>,
-    inherited: Option<&(String, Auth)>,
+    inherited: Option<&(Source, Auth)>,
     method: &str,
 ) -> bool {
     let (user, pass) = (String::new, String::new);
@@ -11517,26 +11775,26 @@ fn auth_editor(
     let mut follow = false;
     match auth {
         Auth::Inherit => match inherited {
-            Some((folder, a)) => {
+            Some((from, a)) => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.weak(tf("Uses {} from folder \"{}\".", &[&label_of(a), &folder]));
-                    // From a request only: a folder's editor is a dialog of its own, with
-                    // edits that going to its parent would leave behind.
-                    let settings = match folder.contains('/') {
-                        true => t("Folder settings…"),
-                        false => t("Collection settings…"),
+                    ui.weak(tf("Uses {} from {}.", &[&label_of(a), &source_label(from)]));
+                    // From a request only: a folder's or an environment's has edits of its
+                    // own that going to where its parent's is set would leave behind.
+                    let settings = match from {
+                        Source::Folder(f) if f.contains('/') => t("Folder settings…"),
+                        Source::Folder(_) => t("Collection settings…"),
+                        Source::Environment(_) => t("Environment settings…"),
+                        Source::Globals => t("Globals…"),
                     };
                     follow = !method.is_empty() && ui.link(settings).clicked();
                 });
             }
             None => {
-                ui.weak(t("No folder above sets auth, so none is sent."));
+                ui.weak(t("Nothing above sets auth, so none is sent."));
             }
         },
         Auth::None => {
-            ui.weak(t(
-                "Sent without credentials, whatever the folders above set.",
-            ));
+            ui.weak(t("Sent without credentials, whatever is set above."));
         }
         Auth::OAuth2(o) if o.grant == model::Grant::AuthorizationCode => {
             ui.weak(t(
@@ -11757,6 +12015,7 @@ fn mqtt_settings(
     ui: &mut egui::Ui,
     m: &mut model::Mqtt,
     s: &mut model::Settings,
+    inherited: &Inherited,
     default_timeout_secs: u64,
 ) {
     egui::Grid::new("mqtt-settings")
@@ -11849,11 +12108,13 @@ fn mqtt_settings(
             );
             ui.end_row();
 
-            connection_rows(ui, s, "MQTT", default_timeout_secs);
+            inherited_settings(ui, s, inherited, |ui, s, mark| {
+                connection_rows(ui, s, "MQTT", default_timeout_secs, mark)
+            });
         });
     // As every other kind's Settings tab has; topics and what to publish stay.
     let reset = m.with_default_connection();
-    if reset_button(ui, s.is_default() && reset == *m) {
+    if reset_button(ui, s.is_default() && reset == *m, inherited) {
         (*m, *s) = (reset, model::Settings::default());
     }
     ui.add_space(8.0);
@@ -11898,6 +12159,7 @@ fn socketio_settings(
     ui: &mut egui::Ui,
     s: &mut model::SocketIo,
     settings: &mut model::Settings,
+    inherited: &Inherited,
     default_timeout_secs: u64,
 ) {
     egui::Grid::new("socketio-settings")
@@ -11937,16 +12199,20 @@ fn socketio_settings(
             );
             ui.end_row();
 
-            connection_rows(ui, settings, "SOCKETIO", default_timeout_secs);
+            inherited_settings(ui, settings, inherited, |ui, s, mark| {
+                connection_rows(ui, s, "SOCKETIO", default_timeout_secs, mark)
+            });
         });
-    if reset_button(ui, s.is_default() && settings.is_default()) {
+    if reset_button(ui, s.is_default() && settings.is_default(), inherited) {
         (*s, *settings) = Default::default();
     }
 }
 
+/// For a request, a folder or an environment ("*").
 fn settings_editor(
     ui: &mut egui::Ui,
     s: &mut model::Settings,
+    inherited: &Inherited,
     method: &str,
     default_timeout_secs: u64,
 ) {
@@ -11954,17 +12220,68 @@ fn settings_editor(
         .num_columns(3)
         .spacing([16.0, 10.0])
         .show(ui, |ui| {
-            connection_rows(ui, s, method, default_timeout_secs)
+            inherited_settings(ui, s, inherited, |ui, s, mark| {
+                connection_rows(ui, s, method, default_timeout_secs, mark)
+            })
         });
-    if reset_button(ui, s.is_default()) {
+    if reset_button(ui, s.is_default(), inherited) {
         *s = model::Settings::default();
     }
 }
 
-/// Under a Settings tab; true when pressed. Greyed when there's nothing to reset.
-fn reset_button(ui: &mut egui::Ui, default: bool) -> bool {
+/// Settings `rows` editing `own` as the settings in effect, the inherited ones under
+/// it: a value changed is set here. Each row's mark names the level above that set its
+/// value, or, set here, goes back to that one (or the default).
+fn inherited_settings(
+    ui: &mut egui::Ui,
+    own: &mut model::Settings,
+    inherited: &Inherited,
+    rows: impl FnOnce(&mut egui::Ui, &mut model::Settings, &mut Mark),
+) {
+    let mut before = inherited.settings.clone();
+    before.overlay(own);
+    let mut edited = before.clone();
+    let mut unset: Vec<String> = Vec::new();
+    {
+        let own = &*own;
+        let mut mark = |ui: &mut egui::Ui, fields: &[&str]| {
+            let from = (fields.iter()).find_map(|f| inherited.settings_from.get(*f));
+            if fields.iter().any(|f| own.owns(f)) {
+                let back = match from {
+                    Some(from) => tf("Set here. Use the value from {}", &[&source_label(from)]),
+                    None => t("Set here. Reset to the default").to_owned(),
+                };
+                if icon_button(ui, icon::RESET, &back, None)
+                    .on_hover_text(&back)
+                    .clicked()
+                {
+                    unset.extend(fields.iter().map(|f| f.to_string()));
+                }
+            } else if let Some(from) = from {
+                ui.weak(tf("from {}", &[&source_label(from)]));
+            }
+        };
+        rows(ui, &mut edited, &mut mark);
+    }
+    for f in model::Settings::FIELDS {
+        if !edited.same(&before, f) {
+            own.set(&edited, f, &inherited.settings);
+        }
+    }
+    for f in unset {
+        own.unset(&f);
+    }
+}
+
+/// Under a Settings tab; true when pressed. Greyed when there's nothing to reset. With
+/// settings from above, what's set here goes and theirs apply.
+fn reset_button(ui: &mut egui::Ui, default: bool, inherited: &Inherited) -> bool {
     ui.add_space(8.0);
-    (ui.add_enabled(!default, egui::Button::new(t("Reset to defaults")))).clicked()
+    let label = match inherited.settings_from.is_empty() {
+        true => t("Reset to defaults"),
+        false => t("Use the inherited settings"),
+    };
+    (ui.add_enabled(!default, egui::Button::new(label))).clicked()
 }
 
 /// A settings grid's third column. Wrapped: a Grid doesn't wrap by itself, so a long
@@ -11975,19 +12292,24 @@ fn grid_hint(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 /// The Settings tab's rows for how a `method` request connects, in a 3-column grid: each
 /// kind gets what its client uses and no more.
+/// `method` "*" has every kind's rows, for a folder or an environment. `mark` goes after
+/// each row's name, with the fields the row edits.
 fn connection_rows(
     ui: &mut egui::Ui,
     s: &mut model::Settings,
     method: &str,
     default_timeout_secs: u64,
+    mark: &mut Mark,
 ) {
     use model::HttpVersion;
+    let all = method == "*";
     let (sse, grpc, mqtt) = (method == "SSE", method == "GRPC", method == "MQTT");
+    let (sse, grpc, mqtt) = (all || sse, all || grpc, all || mqtt);
     // A WebSocket handshake is HTTP/1.1, as gRPC is HTTP/2, whatever is picked.
-    let ws = matches!(method, "WS" | "SOCKETIO");
-    let http = !(sse || grpc || mqtt || ws);
+    let ws = all || matches!(method, "WS" | "SOCKETIO");
+    let http = all || !(sse || grpc || mqtt || ws);
     if http || sse {
-        ui.label(t("HTTP version"));
+        setting_label(ui, t("HTTP version"), &["http_version"], mark);
         let name = |v: HttpVersion| match v {
             HttpVersion::Auto => t("Auto"),
             HttpVersion::Http1 => "HTTP/1.1",
@@ -12003,11 +12325,18 @@ fn connection_rows(
         grid_hint(ui, t("Auto uses HTTP/2 when an https server offers it"));
         ui.end_row();
 
-        check_row(ui, t("Follow redirects"), &mut s.follow_redirects);
+        let fields = &["follow_redirects"];
+        setting_check(
+            ui,
+            t("Follow redirects"),
+            &mut s.follow_redirects,
+            fields,
+            mark,
+        );
         grid_hint(ui, t("Off shows the 3xx response itself"));
         ui.end_row();
 
-        ui.label(t("Maximum redirects"));
+        setting_label(ui, t("Maximum redirects"), &["max_redirects"], mark);
         ui.add_enabled(
             s.follow_redirects,
             egui::DragValue::new(&mut s.max_redirects).range(1..=50),
@@ -12018,7 +12347,12 @@ fn connection_rows(
     // apitool follows these redirects itself (`http::follow`), which a stream doesn't.
     if http {
         let follows = s.follow_redirects;
-        ui.label(t("Follow original HTTP method"));
+        setting_label(
+            ui,
+            t("Follow original HTTP method"),
+            &["follow_original_method"],
+            mark,
+        );
         ui.add_enabled(
             follows,
             egui::Checkbox::new(&mut s.follow_original_method, ""),
@@ -12026,27 +12360,50 @@ fn connection_rows(
         grid_hint(ui, t("Keep the method and body on a 301, 302 or 303"));
         ui.end_row();
 
-        ui.label(t("Follow Authorization header"));
+        setting_label(
+            ui,
+            t("Follow Authorization header"),
+            &["follow_auth_header"],
+            mark,
+        );
         ui.add_enabled(follows, egui::Checkbox::new(&mut s.follow_auth_header, ""));
         grid_hint(ui, t("Keep it when a redirect goes to another host"));
         ui.end_row();
 
-        ui.label(t("Remove referer header on redirect"));
+        setting_label(
+            ui,
+            t("Remove referer header on redirect"),
+            &["remove_referer"],
+            mark,
+        );
         ui.add_enabled(follows, egui::Checkbox::new(&mut s.remove_referer, ""));
         grid_hint(ui, t("Don't tell the next host which URL redirected"));
         ui.end_row();
     }
 
-    check_row(ui, t("Verify TLS certificate"), &mut s.verify_tls);
+    let fields = &["verify_tls"];
+    setting_check(
+        ui,
+        t("Verify TLS certificate"),
+        &mut s.verify_tls,
+        fields,
+        mark,
+    );
     if s.verify_tls {
-        grid_hint(ui, t("Off accepts any certificate, for this request only"));
+        grid_hint(
+            ui,
+            match all {
+                true => t("Off accepts any certificate, for every request below"),
+                false => t("Off accepts any certificate, for this request only"),
+            },
+        );
     } else {
         ui.colored_label(RED, t("Any server certificate is accepted"));
     }
     ui.end_row();
 
-    if !(grpc || mqtt) {
-        check_row(ui, t("Cookie jar"), &mut s.cookies);
+    if http || sse || ws {
+        setting_check(ui, t("Cookie jar"), &mut s.cookies, &["cookies"], mark);
         grid_hint(
             ui,
             t("Send stored cookies and keep the ones the server sets"),
@@ -12054,7 +12411,7 @@ fn connection_rows(
         ui.end_row();
     }
 
-    let (label, hint) = match method {
+    let (name, hint) = match method {
         "WS" | "SOCKETIO" => (
             t("Handshake timeout"),
             t("How long connecting may take; 0 uses the network settings' timeout"),
@@ -12073,8 +12430,8 @@ fn connection_rows(
         ),
         _ => (t("Timeout"), t("0 uses the network settings' timeout")),
     };
-    ui.label(label);
-    let default = match sse {
+    setting_label(ui, name, &["timeout_ms"], mark);
+    let default = match sse && !all {
         true => t("None").to_owned(),
         false => tf("Default ({} s)", &[&default_timeout_secs]),
     };
@@ -12093,7 +12450,12 @@ fn connection_rows(
 
     // A connection that stays open, which a request/response or a gRPC call doesn't.
     if ws || sse || mqtt {
-        ui.label(t("Reconnection attempts"));
+        setting_label(
+            ui,
+            t("Reconnection attempts"),
+            &["reconnect_attempts"],
+            mark,
+        );
         ui.add(
             egui::DragValue::new(&mut s.reconnect_attempts)
                 .range(0..=100)
@@ -12108,7 +12470,12 @@ fn connection_rows(
         );
         ui.end_row();
 
-        ui.label(t("Reconnection interval"));
+        setting_label(
+            ui,
+            t("Reconnection interval"),
+            &["reconnect_interval_ms"],
+            mark,
+        );
         let default = tf("Default ({} s)", &[&(model::RECONNECT_EVERY_MS / 1000)]);
         ui.add_enabled(
             s.reconnect_attempts > 0,
@@ -12125,9 +12492,10 @@ fn connection_rows(
     }
 
     // MQTT's TLS is the network settings' as they are.
-    if !mqtt {
+    if http || sse || ws || grpc {
         // Rarely needed, so below the ones that are.
-        ui.label(t("Disabled TLS versions")).on_hover_text(t(
+        let fields = &["disable_tls12", "disable_tls13"];
+        setting_label(ui, t("Disabled TLS versions"), fields, mark).on_hover_text(t(
             "apitool's TLS (rustls) has only TLS 1.2 and 1.3: SSL, TLS 1.0 and 1.1 are never offered and can't be turned on.",
         ));
         ui.horizontal(|ui| {
@@ -12141,7 +12509,7 @@ fn connection_rows(
         }
         ui.end_row();
 
-        ui.label(t("Cipher suites"));
+        setting_label(ui, t("Cipher suites"), &["ciphers"], mark);
         cipher_picker(ui, &mut s.ciphers);
         let unknown: Vec<&str> = (s.ciphers.iter())
             .filter(|c| net::cipher(c).is_none())
@@ -12160,9 +12528,18 @@ fn connection_rows(
     }
 
     // HTTP/2 headers can't be malformed the way HTTP/1.1's can.
-    if !(grpc || mqtt) {
+    if http || sse || ws {
         let mut strict = !s.insecure_parser;
-        if check_row(ui, t("Enable strict HTTP parser"), &mut strict).changed() {
+        let fields = &["insecure_parser"];
+        if setting_check(
+            ui,
+            t("Enable strict HTTP parser"),
+            &mut strict,
+            fields,
+            mark,
+        )
+        .changed()
+        {
             s.insecure_parser = !strict;
         }
         grid_hint(ui, t("Off accepts responses with malformed headers"));
@@ -12170,13 +12547,17 @@ fn connection_rows(
     }
 
     if ws || grpc || mqtt {
-        ui.label(t("Maximum message size"));
+        setting_label(ui, t("Maximum message size"), &["max_message_mb"], mark);
         let own = match method {
             "GRPC" => crate::http::MAX_BODY,
             "MQTT" => crate::mqtt::MAX_PACKET,
             _ => crate::stream::WS_MAX_MESSAGE,
         };
-        let default = tf("Default ({} MB)", &[&(own >> 20)]);
+        // Each kind has its own; a folder's applies to all of them.
+        let default = match all {
+            true => t("Default").to_owned(),
+            false => tf("Default ({} MB)", &[&(own >> 20)]),
+        };
         // MQTT's own ceiling is 256 MB.
         ui.add(
             egui::DragValue::new(&mut s.max_message_mb)
@@ -12192,14 +12573,21 @@ fn connection_rows(
     }
 
     if grpc {
-        check_row(ui, t("Include default values"), &mut s.include_defaults);
+        let fields = &["include_defaults"];
+        setting_check(
+            ui,
+            t("Include default values"),
+            &mut s.include_defaults,
+            fields,
+            mark,
+        );
         grid_hint(
             ui,
             t("Show the fields proto3 leaves out at 0, \"\" or false"),
         );
         ui.end_row();
 
-        ui.label(t("TLS server name"));
+        setting_label(ui, t("TLS server name"), &["tls_server_name"], mark);
         ui.add(
             egui::TextEdit::singleline(&mut s.tls_server_name)
                 .hint_text(t("The URL's host"))
@@ -12213,7 +12601,7 @@ fn connection_rows(
         );
         ui.end_row();
 
-        ui.label(t("Import paths"));
+        setting_label(ui, t("Import paths"), &["import_paths"], mark);
         // Split on every line end, the last one too: a line just begun stays to type in.
         let mut paths = s.import_paths.join("\n");
         let typed = ui.add(
@@ -12459,7 +12847,127 @@ const POST_SNIPPETS: &[(&str, &str)] = &[
     ),
 ];
 
-/// For a request or a folder; `inherited` lists the folder scripts that run first.
+/// "Name (n)", or the name alone for none, as the request's tabs count their rows.
+fn counted(n: usize, name: &str) -> String {
+    match n {
+        0 => name.to_owned(),
+        n => format!("{name} ({n})"),
+    }
+}
+
+/// The tabs a folder and an environment share, after their Variables.
+fn scope_tabs(ui: &mut egui::Ui, tab: &mut FolderTab, scope: &Scope) {
+    let rows = |list: &[KeyValue]| {
+        (list.iter())
+            .filter(|r| r.enabled && !r.key.is_empty())
+            .count()
+    };
+    let scripts = !scope.pre_request.trim().is_empty() || !scope.tests.trim().is_empty();
+    let settings = (model::Settings::FIELDS.iter()).any(|f| scope.settings.owns(f));
+    let params = counted(rows(&scope.params), t("Params"));
+    sub_tab(ui, tab, FolderTab::Params, params, false);
+    let headers = counted(rows(&scope.headers), t("Headers"));
+    sub_tab(ui, tab, FolderTab::Headers, headers, false);
+    sub_tab(
+        ui,
+        tab,
+        FolderTab::Auth,
+        t("Auth").to_owned(),
+        !scope.auth.is_unset(),
+    );
+    sub_tab(
+        ui,
+        tab,
+        FolderTab::Scripts,
+        t("Scripts").to_owned(),
+        scripts,
+    );
+    sub_tab(
+        ui,
+        tab,
+        FolderTab::Settings,
+        t("Settings").to_owned(),
+        settings,
+    );
+}
+
+/// What a folder or an environment gives every request below it, on `tab` (not
+/// Variables or Docs: those are their own). `parent` is what it gets from above.
+#[allow(clippy::too_many_arguments)]
+fn scope_editor(
+    ui: &mut egui::Ui,
+    id: &str,
+    tab: FolderTab,
+    scope: &mut Scope,
+    parent: &Inherited,
+    vars: &HashMap<String, String>,
+    script_tab: &mut ScriptTab,
+    default_timeout_secs: u64,
+) {
+    // Rows from above that this level doesn't replace (a row of the same name does).
+    fn above<'a>(
+        rows: &'a [(Source, KeyValue)],
+        own: &[KeyValue],
+        same: fn(&str, &str) -> bool,
+    ) -> Vec<&'a (Source, KeyValue)> {
+        let mine = |key: &str| own.iter().any(|o| same(o.key.trim(), key.trim()));
+        rows.iter().filter(|(_, r)| !mine(&r.key)).collect()
+    }
+    match tab {
+        FolderTab::Params => {
+            kv_table(ui, &format!("{id}-params"), &mut scope.params, vars, true);
+            let rows = above(&parent.params, &scope.params, |a, b| a == b);
+            if let Some(row) = inherited_rows(ui, &rows) {
+                scope.params.push(row);
+            }
+            ui.add_space(8.0);
+            ui.weak(t(
+                "Added to the query of every request below, unless it has a param of the \
+                 same name. Not for gRPC or MQTT.",
+            ));
+        }
+        FolderTab::Headers => {
+            kv_table(ui, &format!("{id}-headers"), &mut scope.headers, vars, true);
+            let rows = above(&parent.headers, &scope.headers, |a, b| {
+                a.eq_ignore_ascii_case(b)
+            });
+            if let Some(row) = inherited_rows(ui, &rows) {
+                scope.headers.push(row);
+            }
+            ui.add_space(8.0);
+            ui.weak(t(
+                "Sent with every request below, unless it has a header of the same name; an \
+                 unchecked one keeps it out. Its auth's header and a form's Content-Type win \
+                 too. Not for MQTT.",
+            ));
+        }
+        FolderTab::Auth => {
+            auth_editor(ui, &mut scope.auth, vars, parent.auth.as_ref(), "");
+            ui.weak(t("Requests set to \"Inherit from parent\" use this."));
+        }
+        FolderTab::Scripts => scripts_editor(
+            ui,
+            script_tab,
+            &mut scope.pre_request,
+            &mut scope.tests,
+            parent,
+            // Its tests run on many responses, not the one shown.
+            None,
+        ),
+        FolderTab::Settings => {
+            ui.weak(t(
+                "For every request below that doesn't set its own; each kind of request \
+                 uses the ones that apply to it.",
+            ));
+            ui.add_space(6.0);
+            settings_editor(ui, &mut scope.settings, parent, "*", default_timeout_secs);
+        }
+        FolderTab::Vars | FolderTab::Docs => {}
+    }
+}
+
+/// For a request, a folder or an environment; `inherited` lists the scripts that run
+/// first.
 fn scripts_editor(
     ui: &mut egui::Ui,
     tab: &mut ScriptTab,
@@ -12518,8 +13026,8 @@ fn scripts_editor(
         ScriptTab::Post => &inherited.tests,
     };
     if !above.is_empty() {
-        let folders: Vec<&str> = above.iter().map(|(f, _)| f.as_str()).collect();
-        ui.weak(tf("Folder scripts run first: {}", &[&folders.join(", ")]));
+        let from: Vec<String> = above.iter().map(|(f, _)| source_label(f)).collect();
+        ui.weak(tf("These run first: {}", &[&from.join(", ")]));
     }
     let (text, id) = match tab {
         ScriptTab::Pre => (pre_request, "pre-request-script"),
@@ -16271,7 +16779,10 @@ mod ui_tests {
         h.key_press_modifiers(Modifiers::COMMAND, Key::S);
         h.run();
 
-        assert!(h.state().folder_editor.is_none());
+        let ed = h.state().folder_editor.as_ref().unwrap();
+        assert!(ed.folder == ed.saved, "saved, and the page stays");
+        h.get_by_label("Close the folder settings").click();
+        h.run();
         assert!(h.query_by_label_contains("Undefined").is_none());
         let open = h.state().open.as_ref().unwrap();
         assert!(open.draft.headers.contains(&draft), "unsaved edits kept");
@@ -16831,7 +17342,7 @@ mod ui_tests {
         h.run();
         let app = h.state();
         let shop = app.ws.collections().join("Shop");
-        assert_eq!(app.ws.load_requests_in(&shop).unwrap().len(), 2);
+        assert_eq!(app.ws.load_requests_in(&shop, None).unwrap().len(), 2);
         let Some(Dialog::Paste { note, .. }) = &app.dialog else {
             panic!("the dialog stays to say what didn't come over");
         };
@@ -16914,7 +17425,7 @@ mod ui_tests {
         let app = h.state();
         assert!(app.dialog.is_none(), "everything came over");
         let orders = app.ws.collections().join("Orders");
-        assert_eq!(app.ws.load_requests_in(&orders).unwrap().len(), 1);
+        assert_eq!(app.ws.load_requests_in(&orders, None).unwrap().len(), 1);
         assert!(app.envs.contains(&"Stage".to_owned()), "{:?}", app.envs);
         let (globals, _) = app.ws.load_env(None).unwrap();
         assert!(
@@ -18232,13 +18743,95 @@ mod ui_tests {
     }
 
     /// An inherited auth names its folder and opens it: where to change it, not just what.
+    /// Clicking a folder shows its page in place of the request. What it sets there
+    /// reaches the requests inside at once, listed in their tabs with where it's from;
+    /// a request takes a row over to change it. An environment's settings and params
+    /// arrive the same way, named.
+    #[test]
+    fn a_folder_page_sets_what_its_requests_inherit() {
+        let ws = workspace("folder-page");
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let r = ws.create_request(&api, "r").unwrap();
+        ws.save_env(Some("dev"), &[], &[]).unwrap();
+        let slow = Scope {
+            settings: model::Settings {
+                timeout_ms: 30_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        ws.save_scope(Some("dev"), &slow).unwrap();
+        let mut h = harness(ws);
+        h.state_mut().set_env(Some("dev".into()));
+        h.state_mut().activate(r, true);
+        h.run();
+        // The tree's "api", drawn before the breadcrumb's.
+        h.get_all_by_label("api").next().unwrap().click();
+        h.run();
+        assert!(h.state().folder_shown);
+        assert!(
+            h.query_by_label("Send request").is_none(),
+            "in place of the request"
+        );
+        h.get_by_label("Headers").click();
+        h.run();
+        type_into(&mut h, 0, "X-Team");
+        type_into(&mut h, 1, "red");
+        shot(&mut h, "80-folder-page");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        h.run();
+        let saved = h.state().ws.load_folder(&api).unwrap();
+        assert_eq!(saved.scope.headers, [KeyValue::new("X-Team", "red")]);
+        h.get_by_label("Settings").click();
+        h.run();
+        shot(&mut h, "80-folder-settings");
+
+        h.get_by_label("Close the folder settings").click();
+        h.run();
+        h.state_mut().req_tab = ReqTab::Headers;
+        h.run();
+        let from = "from collection \"api\"";
+        assert!(h.query_by_label(from).is_some());
+        shot(&mut h, "81-inherited-headers");
+        h.get_by_label("Override").click();
+        h.run();
+        assert_eq!(draft(&h).headers, [KeyValue::new("X-Team", "red")]);
+        assert!(h.query_by_label(from).is_none(), "its own now");
+
+        h.state_mut().req_tab = ReqTab::Settings;
+        h.run();
+        shot(&mut h, "82-inherited-settings");
+        assert!(h.query_by_label("from environment \"dev\"").is_some());
+        assert_eq!(draft(&h).effective_settings().timeout_ms, 30_000);
+
+        // Saved in the environment's editor, its params reach the open request.
+        let app = h.state_mut();
+        app.open_env_editor(Some("dev".into()), &[]);
+        let ed = app.env_editor.as_mut().unwrap();
+        ed.scope.params.push(KeyValue::new("region", "eu"));
+        // Not the Variables tab's blank row: it isn't drawn on this one.
+        (ed.tab, app.focus_request) = (FolderTab::Params, None);
+        h.run();
+        shot(&mut h, "83-env-editor-params");
+        modal_save(&mut h);
+        assert!(h.state().env_editor.is_none());
+        h.state_mut().req_tab = ReqTab::Params;
+        h.run();
+        assert!(h.query_by_label("from environment \"dev\"").is_some());
+        let all = h.state().all_vars();
+        assert!(draft(&h).resolved(&all).0.url.ends_with("region=eu"));
+    }
+
     #[test]
     fn inherited_auth_opens_the_folder_that_sets_it() {
         let ws = workspace("inherit-link");
         let api = ws.create_folder(&ws.collections(), "api").unwrap();
         let users = ws.create_folder(&api, "users").unwrap();
         let folder = crate::model::Folder {
-            auth: Auth::Bearer { token: "t".into() },
+            scope: Scope {
+                auth: Auth::Bearer { token: "t".into() },
+                ..Default::default()
+            },
             ..Default::default()
         };
         ws.save_folder(&api, &folder).unwrap();
@@ -18248,20 +18841,26 @@ mod ui_tests {
         h.state_mut().activate(r, true);
         h.state_mut().req_tab = ReqTab::Auth;
         h.run();
-        assert!(h.query_by_label_contains("from folder \"api\"").is_some());
+        assert!(
+            h.query_by_label_contains("from collection \"api\"")
+                .is_some()
+        );
         // The nearest folder that sets it, a collection, not the request's own folder.
         h.get_by_label("Collection settings…").click();
         h.run();
         let ed = h.state().folder_editor.as_ref().unwrap();
         assert!(ed.dir == api && ed.tab == FolderTab::Auth);
-        // Not from a folder's own editor, a dialog with edits of its own. (The request
-        // behind it off its Auth tab, so only the dialog says it.)
+        // Not from a folder's own page, with edits of its own. (The request behind it off
+        // its Auth tab, so only the page says it.)
         let app = h.state_mut();
         app.req_tab = ReqTab::Params;
         app.open_folder_editor(users);
         (app.folder_editor.as_mut().unwrap().tab, app.focus_request) = (FolderTab::Auth, None);
         h.run();
-        assert!(h.query_by_label_contains("from folder \"api\"").is_some());
+        assert!(
+            h.query_by_label_contains("from collection \"api\"")
+                .is_some()
+        );
         assert!(h.query_by_label("Collection settings…").is_none());
     }
 
@@ -22510,7 +23109,10 @@ mod ui_tests {
         h.key_press(Key::Escape);
         h.run();
 
-        // A click outside the tree: F2 is the open request's again, Delete nobody's.
+        // A click outside the tree: F2 is the open request's again, Delete nobody's. (The
+        // folder's page, which the click opened, out of the way first.)
+        h.get_by_label("Close the folder settings").click();
+        h.run();
         h.get_by_label("Send request").click();
         h.run();
         assert!(press(&mut h, delete).is_none(), "a stray Delete");
@@ -24316,7 +24918,7 @@ mod ui_tests {
         h.state_mut().req_tab = ReqTab::Auth;
         h.state_mut().open.as_mut().unwrap().draft.auth = Auth::None;
         h.run();
-        let none = "Sent without credentials, whatever the folders above set.";
+        let none = "Sent without credentials, whatever is set above.";
         assert!(h.query_by_label(none).is_some());
     }
 

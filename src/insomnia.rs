@@ -10,7 +10,7 @@ use regex::{Captures, Regex};
 use serde_json::{Value, json};
 
 use crate::model::{
-    Auth, AwsV4, Body, Folder, Grant, Hawk, KeyValue, Ntlm, OAuth1, OAuth2, Request,
+    Auth, AwsV4, Body, Folder, Grant, Hawk, KeyValue, Ntlm, OAuth1, OAuth2, Request, Scope,
 };
 use crate::postman::Import;
 use crate::store::{Node, Workspace, escape_name, folder_name, safe_name, unescape_name};
@@ -150,19 +150,16 @@ impl Reader {
         let mut folder = Folder {
             description: description_of(v),
             vars: vars(&v["environment"]),
-            auth: self.auth(key, &v["authentication"]),
-            pre_request: script(v, "preRequestScript", "preRequest"),
-            tests: script(v, "afterResponseScript", "afterResponse"),
+            scope: Scope {
+                auth: self.auth(key, &v["authentication"]),
+                pre_request: script(v, "preRequestScript", "preRequest"),
+                tests: script(v, "afterResponseScript", "afterResponse"),
+                headers: headers(&v["headers"]),
+                ..Default::default()
+            },
             order: Vec::new(),
             ..Default::default()
         };
-        // Insomnia folders can carry headers for their requests; apitool's don't.
-        if headers(&v["headers"]).iter().any(|h| h.enabled) {
-            self.warn(
-                key,
-                "folder headers aren't supported; add them to its requests",
-            );
-        }
         folder.vars.retain(|v| !v.key.is_empty());
         let at = self.folders.len();
         self.folders.push((key.to_owned(), folder));
@@ -558,15 +555,17 @@ impl Out {
                 } => {
                     let mut f = ws.load_folder(path)?;
                     if let Some(top) = top {
-                        adopt(top, &mut f.auth, &mut f.pre_request, &mut f.tests);
+                        let s = &mut f.scope;
+                        adopt(top, &mut s.auth, &mut s.pre_request, &mut s.tests);
                     }
                     let id = format!("fld_{}", self.resources.len());
                     self.resources.push(json!({
                         "_id": id, "_type": "request_group", "parentId": parent, "name": name,
                         "description": f.description, "environment": data(&f.vars),
-                        "authentication": auth_out(&f.auth),
-                        "preRequestScript": script_out(&f.pre_request),
-                        "afterResponseScript": script_out(&f.tests), "metaSortKey": order,
+                        "authentication": auth_out(&f.scope.auth),
+                        "preRequestScript": script_out(&f.scope.pre_request),
+                        "afterResponseScript": script_out(&f.scope.tests), "metaSortKey": order,
+                        "headers": rows_out(&f.scope.headers),
                     }));
                     self.walk(ws, children, &id, None)?;
                 }
@@ -594,9 +593,10 @@ impl Out {
 /// inherited, and its scripts, run before the item's own as a folder's are.
 fn adopt(top: &Folder, auth: &mut Auth, pre_request: &mut String, tests: &mut String) {
     if *auth == Auth::Inherit {
-        *auth = top.auth.clone();
+        *auth = top.scope.auth.clone();
     }
-    for (outer, own) in [(&top.pre_request, pre_request), (&top.tests, tests)] {
+    let outer = (&top.scope.pre_request, &top.scope.tests);
+    for (outer, own) in [(outer.0, pre_request), (outer.1, tests)] {
         if outer.trim().is_empty() {
             continue;
         }
@@ -890,7 +890,7 @@ mod tests {
         );
         assert_eq!(folders[1].0, "Top Level");
         assert_eq!(folders[1].1.vars, [KeyValue::new("TOKEN", "t")]);
-        assert!(matches!(folders[1].1.auth, Auth::Basic { .. }));
+        assert!(matches!(folders[1].1.scope.auth, Auth::Basic { .. }));
         let keys: Vec<_> = requests.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -1077,18 +1077,24 @@ environments:
                 KeyValue::new("base", "https://x.test"),
                 KeyValue::new("user id", "7"),
             ],
-            auth: Auth::Bearer {
-                token: "{{token}}".into(),
+            scope: Scope {
+                auth: Auth::Bearer {
+                    token: "{{token}}".into(),
+                },
+                pre_request: "pm.environment.set('a', 1);".into(),
+                ..Default::default()
             },
-            pre_request: "pm.environment.set('a', 1);".into(),
             ..Default::default()
         };
         ws.save_folder(&api, &top).unwrap();
         let sub = Folder {
             vars: vec![KeyValue::new("role", "admin")],
-            auth: Auth::Basic {
-                username: "u".into(),
-                password: "{{pw}}".into(),
+            scope: Scope {
+                auth: Auth::Basic {
+                    username: "u".into(),
+                    password: "{{pw}}".into(),
+                },
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1222,20 +1228,20 @@ environments:
         let mut sub_out = sub.clone();
         adopt(
             &top,
-            &mut sub_out.auth,
-            &mut sub_out.pre_request,
-            &mut sub_out.tests,
+            &mut sub_out.scope.auth,
+            &mut sub_out.scope.pre_request,
+            &mut sub_out.scope.tests,
         );
         assert_eq!(folders["admin"], sub_out);
         let back: HashMap<_, _> = back.into_iter().collect();
         assert_eq!(back.len(), 6);
         // As the folder's, not through `adopt` alone: inherited auth, its script before theirs.
-        assert_eq!(back["list"].auth, top.auth);
+        assert_eq!(back["list"].auth, top.scope.auth);
         assert_eq!(
             back["note"].pre_request,
             "pm.environment.set('a', 1);\nconsole.log(2);"
         );
-        assert_eq!(folders["admin"].pre_request, top.pre_request);
+        assert_eq!(folders["admin"].scope.pre_request, top.scope.pre_request);
         for (name, _) in requests.iter().filter(|(n, _)| *n != "api/feed") {
             let mut want = ws.load_request(&ws.request_path(name).unwrap()).unwrap();
             (want.inherited, want.updated) = Default::default();

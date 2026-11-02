@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::model::{Body, KeyValue, Request};
+use crate::model::{Body, KeyValue, Request, Source};
 use crate::script::{self, Changes, Output, ScriptResponse, TestResult, WireRequest};
 use crate::{grpc, http, net};
 
@@ -66,19 +66,19 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
     let mut out = Outcome::failed(String::new());
     let mut locals = HashMap::new();
     let collection = req.inherited.vars.clone();
-    // Postman's order: outermost folder first, the request's own script last.
-    let scripts = |inherited: &[(String, String)], own: &str| -> Vec<(String, String)> {
-        let own = (String::new(), own.to_owned());
-        let all = inherited.iter().cloned().chain(std::iter::once(own));
+    // Postman's order: outermost first, the request's own script last. Each with whose it
+    // is, for an error: empty for the request's own.
+    let scripts = |inherited: &[(Source, String)], own: &str| -> Vec<(String, String)> {
+        let inherited = (inherited.iter()).map(|(from, s)| (format!(" of {from}"), s.clone()));
+        let all = inherited.chain(std::iter::once((String::new(), own.to_owned())));
         all.filter(|(_, s)| !s.trim().is_empty()).collect()
     };
-    let whose = |folder: &str| match folder {
-        "" => String::new(),
-        f => format!(" of folder \"{f}\""),
-    };
+    // The scripts see, and may change or remove, the inherited headers and params as the
+    // request's own.
+    req.adopt_inherited();
 
-    let jar = req.settings.cookies.then_some(&client.jar);
-    for (folder, code) in scripts(&req.inherited.pre_request, &req.pre_request) {
+    let jar = req.effective_settings().cookies.then_some(&client.jar);
+    for (whose, code) in scripts(&req.inherited.pre_request, &req.pre_request) {
         // What the request would go to now: scripts before this one may have changed it.
         let cookie_url = http::wire_url(&req.resolved(&merge(&vars, &collection, &locals)).0.url);
         let wire = WireRequest {
@@ -111,14 +111,12 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
         let error = result.error.clone();
         let edited = absorb(&mut out, &mut vars, &mut locals, result);
         if let Some(e) = error {
-            let whose = whose(&folder);
             out.response = Err(format!(
                 "Pre-request script{whose} failed, request not sent:\n{e}"
             ));
             return out;
         }
         if out.skipped {
-            let whose = whose(&folder);
             out.response = Err(format!(
                 "Skipped by pm.execution.skipRequest() in the pre-request script{whose}"
             ));
@@ -172,7 +170,7 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
                 format!("__asserts({});", serde_json::json!(asserts)),
             ));
         }
-        for (folder, code) in tests {
+        for (whose, code) in tests {
             let wire = WireRequest {
                 method: req.method.clone(),
                 url: req.url.clone(),
@@ -206,7 +204,7 @@ pub async fn run(client: net::Clients, info: &Info, mut req: Request, mut vars: 
             absorb(&mut out, &mut vars, &mut locals, result);
             if let Some(e) = error {
                 out.tests.push(TestResult {
-                    name: format!("Script error{}", whose(&folder)),
+                    name: format!("Script error{whose}"),
                     passed: false,
                     error: Some(e),
                 });
@@ -1503,6 +1501,7 @@ mod tests {
                 .into(),
             ..Default::default()
         };
+        let folder = |f: &str| Source::Folder(f.into());
         req.inherited = crate::model::Inherited {
             vars: HashMap::from([
                 (s("base"), crate::http::tests::echo_server()),
@@ -1510,20 +1509,27 @@ mod tests {
                 (s("tier"), s("folder")),
             ]),
             auth: Some((
-                s("api"),
+                folder("api"),
                 crate::model::Auth::Bearer {
                     token: s("{{token}}"),
                 },
             )),
             pre_request: vec![
-                (s("api"), s("console.log('outer');")),
+                (Source::Environment(s("dev")), s("console.log('outer');")),
                 (
-                    s("api/admin"),
+                    folder("api/admin"),
                     s("console.log('inner'); \
-                       pm.request.headers.upsert({ key: 'X-Stage', value: pm.variables.get('stage') });"),
+                       pm.request.headers.upsert({ key: 'X-Stage', value: pm.variables.get('stage') }); \
+                       pm.request.headers.remove('X-Gone');"),
                 ),
             ],
-            tests: vec![(s("api"), s("pm.collectionVariables.set('x', 1);"))],
+            tests: vec![(folder("api"), s("pm.collectionVariables.set('x', 1);"))],
+            headers: vec![
+                (Source::Globals, KeyValue::new("X-Team", "{{stage}}")),
+                (folder("api"), KeyValue::new("X-Gone", "1")),
+            ],
+            params: vec![(Source::Globals, KeyValue::new("lang", "en"))],
+            ..Default::default()
         };
         let vars = Vars {
             env: HashMap::from([
@@ -1539,7 +1545,13 @@ mod tests {
         let wire = out.response.unwrap().body.to_lowercase();
         // Set where the request lives, a value is meant for it: the folder's wins over the
         // environment's, in the URL as in a script's pm.variables.
-        assert!(wire.starts_with("get /users/x?tier=folder "), "{wire}");
+        assert!(
+            wire.starts_with("get /users/x?tier=folder&lang=en "),
+            "{wire}"
+        );
+        // Inherited headers are the request's own to its scripts: one removed stays out.
+        assert!(wire.contains("x-team: folder"), "{wire}");
+        assert!(!wire.contains("x-gone"), "{wire}");
         assert!(wire.contains("authorization: bearer s3cret"), "{wire}");
         assert!(
             wire.contains("x-stage: folder"),

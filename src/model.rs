@@ -144,7 +144,69 @@ pub struct Settings {
     /// The wait before each of those; 0 is 5 s (see `reconnect_every`).
     #[serde(skip_serializing_if = "is_zero")]
     pub reconnect_interval_ms: u32,
+    /// Fields set here at their default, over another value from a folder or environment
+    /// above. Any other field at its default is left to them: a value alone can't say
+    /// "set to the default", and a request saved before inheritance wrote its first six
+    /// fields whatever they were.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<String>,
 }
+
+macro_rules! setting_fields {
+    ($($f:ident),* $(,)?) => {
+        impl Settings {
+            /// Every field but `pinned`, by the name it's saved under.
+            pub const FIELDS: &[&str] = &[$(stringify!($f)),*];
+
+            /// Whether this level sets `field`: away from its default, or pinned at it.
+            pub fn owns(&self, field: &str) -> bool {
+                let d = Settings::default();
+                self.pinned.iter().any(|p| p == field)
+                    || match field {
+                        $(stringify!($f) => self.$f != d.$f,)*
+                        _ => false,
+                    }
+            }
+
+            /// Copies `field`'s value from `from`.
+            pub fn take(&mut self, from: &Settings, field: &str) {
+                match field {
+                    $(stringify!($f) => self.$f = from.$f.clone(),)*
+                    _ => {}
+                }
+            }
+
+            pub fn same(&self, other: &Settings, field: &str) -> bool {
+                match field {
+                    $(stringify!($f) => self.$f == other.$f,)*
+                    _ => true,
+                }
+            }
+        }
+    };
+}
+
+setting_fields!(
+    http_version,
+    follow_redirects,
+    max_redirects,
+    verify_tls,
+    cookies,
+    timeout_ms,
+    follow_original_method,
+    follow_auth_header,
+    remove_referer,
+    disable_tls12,
+    disable_tls13,
+    ciphers,
+    insecure_parser,
+    max_message_mb,
+    include_defaults,
+    tls_server_name,
+    import_paths,
+    reconnect_attempts,
+    reconnect_interval_ms,
+);
 
 impl Default for Settings {
     fn default() -> Self {
@@ -168,6 +230,7 @@ impl Default for Settings {
             import_paths: Vec::new(),
             reconnect_attempts: 0,
             reconnect_interval_ms: 0,
+            pinned: Vec::new(),
         }
     }
 }
@@ -178,6 +241,29 @@ pub const RECONNECT_EVERY_MS: u64 = 5000;
 impl Settings {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// Takes every field `over` sets.
+    pub fn overlay(&mut self, over: &Settings) {
+        for f in Self::FIELDS.iter().filter(|f| over.owns(f)) {
+            self.take(over, f);
+        }
+    }
+
+    /// `field` as `edited` has it, set at this level: pinned when that is the default
+    /// but `inherited` sets another value, so it still wins over it.
+    pub fn set(&mut self, edited: &Settings, field: &str, inherited: &Settings) {
+        self.take(edited, field);
+        self.pinned.retain(|p| p != field);
+        if !self.owns(field) && inherited.owns(field) {
+            self.pinned.push(field.to_owned());
+        }
+    }
+
+    /// Leaves `field` to the levels above again.
+    pub fn unset(&mut self, field: &str) {
+        self.take(&Settings::default(), field);
+        self.pinned.retain(|p| p != field);
     }
 
     /// The largest message taken in, in bytes; `default` when none is set.
@@ -371,15 +457,8 @@ pub struct Folder {
     pub description: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vars: Vec<KeyValue>,
-    /// Used by requests (and subfolders) whose auth is `inherit`.
-    #[serde(skip_serializing_if = "Auth::is_unset")]
-    pub auth: Auth,
-    /// Runs before the request's own pre-request script.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub pre_request: String,
-    /// Runs before the request's own tests.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub tests: String,
+    #[serde(flatten)]
+    pub scope: Scope,
     /// The children as arranged by dragging: request names, and folder names ending in
     /// `/` (a folder and a request may share a name). Unlisted children follow in the
     /// default order, so a new or renamed-elsewhere item never vanishes.
@@ -452,16 +531,119 @@ impl Folder {
     }
 }
 
-/// A request's folders folded together, outermost first. Scripts carry their folder's
-/// name so an error says where it came from.
+/// What a folder, an environment or the globals give every request below them, around
+/// the request's own: their headers and params go along unless the request has a row
+/// of the same name, their auth is used by `inherit`, their scripts run before its own,
+/// and their settings apply unless it sets its own.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Scope {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<KeyValue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<KeyValue>,
+    /// Used by requests (and folders) whose auth is `inherit`.
+    #[serde(skip_serializing_if = "Auth::is_unset")]
+    pub auth: Auth,
+    /// Runs before the request's own pre-request script.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub pre_request: String,
+    /// Runs before the request's own tests.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tests: String,
+    #[serde(skip_serializing_if = "Settings::is_default")]
+    pub settings: Settings,
+}
+
+impl Scope {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Where something a request inherits is set.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Source {
+    Globals,
+    Environment(String),
+    /// By `store::folder_name`.
+    Folder(String),
+}
+
+/// For errors, which are in English; the app names them in its own words.
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Source::Globals => write!(f, "the globals"),
+            Source::Environment(name) => write!(f, "environment \"{name}\""),
+            Source::Folder(name) => write!(f, "folder \"{name}\""),
+        }
+    }
+}
+
+/// What a request gets from above it, outermost first: the globals, the active
+/// environment, then its folders. Each part carries where it's from, so an error or the
+/// app can say.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Inherited {
-    /// Inner folders override outer ones.
+    /// The folders' variables; inner folders override outer ones. The environment's and
+    /// the globals' are `runner::Vars`.
     pub vars: HashMap<String, String>,
-    /// From the nearest folder that sets one, with that folder's name.
-    pub auth: Option<(String, Auth)>,
-    pub pre_request: Vec<(String, String)>,
-    pub tests: Vec<(String, String)>,
+    /// From the nearest level that sets one.
+    pub auth: Option<(Source, Auth)>,
+    pub pre_request: Vec<(Source, String)>,
+    pub tests: Vec<(Source, String)>,
+    /// Enabled rows only; a row of the same name lower down replaces one from above
+    /// (case aside for headers), a disabled one removes it.
+    pub headers: Vec<(Source, KeyValue)>,
+    pub params: Vec<(Source, KeyValue)>,
+    /// Every level's settings over the defaults, and which level set each field.
+    pub settings: Settings,
+    pub settings_from: HashMap<String, Source>,
+}
+
+impl Inherited {
+    /// Adds a level below the ones already in.
+    pub fn absorb(&mut self, from: Source, scope: &Scope) {
+        fn rows(
+            list: &mut Vec<(Source, KeyValue)>,
+            from: &Source,
+            rows: &[KeyValue],
+            same: fn(&str, &str) -> bool,
+        ) {
+            for row in rows.iter().filter(|r| !r.key.trim().is_empty()) {
+                list.retain(|(_, r)| !same(r.key.trim(), row.key.trim()));
+                if row.enabled {
+                    list.push((from.clone(), row.clone()));
+                }
+            }
+        }
+        rows(&mut self.headers, &from, &scope.headers, |a, b| {
+            a.eq_ignore_ascii_case(b)
+        });
+        rows(&mut self.params, &from, &scope.params, |a, b| a == b);
+        if !scope.auth.is_unset() {
+            self.auth = Some((from.clone(), scope.auth.clone()));
+        }
+        if !scope.pre_request.trim().is_empty() {
+            self.pre_request
+                .push((from.clone(), scope.pre_request.clone()));
+        }
+        if !scope.tests.trim().is_empty() {
+            self.tests.push((from.clone(), scope.tests.clone()));
+        }
+        for f in Settings::FIELDS.iter().filter(|f| scope.settings.owns(f)) {
+            self.settings.take(&scope.settings, f);
+            self.settings_from.insert(f.to_string(), from.clone());
+        }
+    }
+
+    /// `self` with `scope` added below it: what a level passes down.
+    pub fn under(&self, from: Source, scope: &Scope) -> Inherited {
+        let mut out = self.clone();
+        out.absorb(from, scope);
+        out
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -1161,8 +1343,85 @@ impl Request {
         self.path_vars_from_url();
     }
 
+    /// Its settings over the inherited ones.
+    pub fn effective_settings(&self) -> Settings {
+        let mut s = self.inherited.settings.clone();
+        s.overlay(&self.settings);
+        s.pinned.clear();
+        s
+    }
+
+    /// Takes the inherited headers and params in as its own rows, which the scripts see
+    /// as the request's: one a script removes stays removed. A row of its own with the
+    /// same name, checked or not, keeps one out; so does its auth for the header the auth
+    /// sets, and a form for Content-Type, which carries the form's boundary. MQTT has
+    /// neither; a gRPC call has no query.
+    pub fn adopt_inherited(&mut self) {
+        let headers = std::mem::take(&mut self.inherited.headers);
+        let params = std::mem::take(&mut self.inherited.params);
+        if self.method == "MQTT" {
+            return;
+        }
+        let auth_header = match self.effective_auth() {
+            Auth::None | Auth::Inherit => None,
+            Auth::ApiKey { in_query: true, .. } => None,
+            Auth::ApiKey { key, .. } => Some(key.trim().to_owned()),
+            Auth::Jwt(j) if j.in_query => None,
+            _ => Some("authorization".to_owned()),
+        };
+        let form = matches!(self.body, Body::Form { .. } | Body::Multipart { .. });
+        for (_, h) in headers {
+            let name = h.key.trim();
+            let kept_out = (self.headers.iter()).any(|o| o.key.trim().eq_ignore_ascii_case(name))
+                || auth_header
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(name))
+                || form && name.eq_ignore_ascii_case("content-type");
+            if !kept_out {
+                self.headers.push(h);
+            }
+        }
+        if self.method == "GRPC" {
+            return;
+        }
+        // Onto the URL as typed, not rebuilt from the table: a request made in code or by
+        // an MCP client may have a query its table doesn't.
+        let (base, query, fragment) = split_url(&self.url);
+        let in_url: Vec<&str> = (query.split('&'))
+            .map(|kv| kv.split_once('=').map_or(kv, |(k, _)| k).trim())
+            .collect();
+        let mut added = Vec::new();
+        for (_, p) in params {
+            let key = p.key.trim();
+            if !in_url.contains(&key) && !self.params.iter().any(|o| o.key.trim() == key) {
+                added.push(p);
+            }
+        }
+        if added.is_empty() {
+            return;
+        }
+        let more = added.iter().map(|p| match p.value.as_str() {
+            "" => p.key.clone(),
+            v => format!("{}={v}", p.key),
+        });
+        let query = (query
+            .split('&')
+            .filter(|q| !q.is_empty())
+            .map(str::to_owned))
+        .chain(more)
+        .collect::<Vec<_>>()
+        .join("&");
+        self.url = format!("{base}?{query}{fragment}");
+        self.params.extend(added);
+    }
+
     /// A copy with variables substituted and disabled rows dropped: exactly what goes on the wire.
     pub fn resolved(&self, vars: &HashMap<String, String>) -> (Request, Vec<String>) {
+        if !self.inherited.headers.is_empty() || !self.inherited.params.is_empty() {
+            let mut own = self.clone();
+            own.adopt_inherited();
+            return own.resolved(vars);
+        }
         fn kv(list: &[KeyValue], r: &mut dyn FnMut(&str) -> String) -> Vec<KeyValue> {
             list.iter()
                 .filter(|p| p.enabled && !p.key.is_empty())
@@ -1288,7 +1547,7 @@ impl Request {
             // Scripts have already run by the time a request is resolved for the wire.
             pre_request: String::new(),
             tests: String::new(),
-            settings: self.settings.clone(),
+            settings: self.effective_settings(),
             mqtt: Mqtt {
                 client_id: r(&self.mqtt.client_id),
                 topics: (self.mqtt.topics.iter())
@@ -1395,6 +1654,158 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settings inherit field by field: a level sets only what it changed, so a timeout set
+    /// for an environment and a TLS check turned off for a folder both reach a request
+    /// that sets neither. A request can still ask for a default back (pinned), and one
+    /// saved before inheritance, which wrote its first six fields whatever they were,
+    /// doesn't undo what's set above with them.
+    #[test]
+    fn settings_inherit_by_field_and_a_pinned_default_wins() {
+        let env = Scope {
+            settings: Settings {
+                timeout_ms: 30_000,
+                follow_redirects: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let folder = Scope {
+            settings: Settings {
+                verify_tls: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let above = Inherited::default()
+            .under(Source::Environment("dev".into()), &env)
+            .under(Source::Folder("api".into()), &folder);
+        assert_eq!(
+            above.settings_from.get("verify_tls"),
+            Some(&Source::Folder("api".into()))
+        );
+        let mut req = Request {
+            inherited: above.clone(),
+            ..Default::default()
+        };
+        let s = req.effective_settings();
+        assert_eq!(
+            (s.timeout_ms, s.follow_redirects, s.verify_tls),
+            (30_000, false, false)
+        );
+
+        // Edited to the default where something above sets another value: pinned.
+        let mut edited = req.effective_settings();
+        edited.follow_redirects = true;
+        req.settings
+            .set(&edited, "follow_redirects", &above.settings);
+        assert_eq!(req.settings.pinned, ["follow_redirects"]);
+        assert!(req.effective_settings().follow_redirects);
+        // Nothing above sets it: the default needs no pin.
+        req.settings.set(&edited, "max_redirects", &above.settings);
+        assert_eq!(req.settings.pinned, ["follow_redirects"]);
+        // Saved and read back, the pin stays.
+        let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert!(back.settings.owns("follow_redirects"));
+        req.settings.unset("follow_redirects");
+        assert!(
+            !req.effective_settings().follow_redirects,
+            "the environment's again"
+        );
+
+        let legacy: Request = serde_json::from_str(
+            r#"{"settings": {"http_version": "auto", "follow_redirects": true,
+                "max_redirects": 10, "verify_tls": true, "cookies": true, "timeout_ms": 5000}}"#,
+        )
+        .unwrap();
+        let legacy = Request {
+            inherited: above,
+            ..legacy
+        };
+        let s = legacy.effective_settings();
+        assert_eq!(
+            (s.timeout_ms, s.follow_redirects, s.verify_tls),
+            (5000, false, false)
+        );
+    }
+
+    /// Headers and params from above go out with the request, an inner level's over an
+    /// outer one's, unless the request has a row of that name: checked to change it,
+    /// unchecked to leave it out. Its auth's header and a form's boundary aren't
+    /// overridden from above; MQTT has no headers, gRPC no query.
+    #[test]
+    fn inherited_headers_and_params_give_way_to_the_request() {
+        let row = KeyValue::new;
+        let off = |k: &str| KeyValue {
+            enabled: false,
+            ..KeyValue::new(k, "")
+        };
+        let above = Inherited::default()
+            .under(
+                Source::Globals,
+                &Scope {
+                    headers: vec![row("X-Team", "g"), row("X-Gone", "1"), row("Accept", "*/*")],
+                    params: vec![row("lang", "en"), row("debug", "1")],
+                    ..Default::default()
+                },
+            )
+            .under(
+                Source::Folder("api".into()),
+                &Scope {
+                    headers: vec![
+                        row("x-team", "{{team}}"),
+                        off("X-Gone"),
+                        row("Authorization", "Bearer folder"),
+                        row("Content-Type", "application/json"),
+                    ],
+                    ..Default::default()
+                },
+            );
+        let names: Vec<_> = above.headers.iter().map(|(_, h)| h.key.as_str()).collect();
+        assert_eq!(names, ["Accept", "x-team", "Authorization", "Content-Type"]);
+
+        let vars = HashMap::from([("team".to_owned(), "red".to_owned())]);
+        let req = Request {
+            url: "http://x/a?page=2".into(),
+            headers: vec![off("Accept")],
+            params: vec![off("debug")],
+            auth: Auth::Bearer {
+                token: "own".into(),
+            },
+            body: Body::Form {
+                fields: vec![row("a", "1")],
+            },
+            inherited: above.clone(),
+            ..Default::default()
+        };
+        // The params table out of step with the URL, as a request made in code has it.
+        let (wire, _) = req.resolved(&vars);
+        assert_eq!(wire.url, "http://x/a?page=2&lang=en");
+        let sent: Vec<_> = wire
+            .headers
+            .iter()
+            .map(|h| (h.key.as_str(), h.value.as_str()))
+            .collect();
+        assert_eq!(sent, [("x-team", "red")]);
+
+        let mqtt = Request {
+            method: "MQTT".into(),
+            url: "mqtt://x".into(),
+            inherited: above.clone(),
+            ..Default::default()
+        };
+        let wire = mqtt.resolved(&vars).0;
+        assert!(wire.headers.is_empty() && wire.url == "mqtt://x");
+        let grpc = Request {
+            method: "GRPC".into(),
+            url: "grpc://x".into(),
+            inherited: above,
+            ..Default::default()
+        };
+        let wire = grpc.resolved(&vars).0;
+        assert_eq!(wire.url, "grpc://x");
+        assert_eq!(wire.headers.len(), 4, "metadata goes along");
+    }
 
     /// Switching a GraphQL request to POST shows the JSON that went out, and back gives the
     /// same query and variables: nothing typed is lost either way.
@@ -1956,7 +2367,7 @@ mod tests {
         let folder = Auth::Bearer {
             token: "folder".into(),
         };
-        req.inherited.auth = Some(("api".into(), folder.clone()));
+        req.inherited.auth = Some((Source::Folder("api".into()), folder.clone()));
         assert_eq!(req.effective_auth(), &folder);
     }
 

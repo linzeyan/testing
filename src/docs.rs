@@ -82,6 +82,10 @@ fn walk(ws: &Workspace, nodes: &[Node], level: usize, out: &mut String) -> Resul
 }
 
 fn request(out: &mut String, h: &str, name: &str, req: &Request) {
+    // As sent: with the headers and params its folders and the globals add.
+    let mut req = req.clone();
+    req.adopt_inherited();
+    let req = &req;
     let _ = write!(out, "{h} {name}\n\n`{} {}`", req.method, req.url);
     if !req.rpc.is_empty() {
         let _ = write!(out, " `{}` (proto `{}`)", req.rpc, req.proto);
@@ -134,7 +138,7 @@ fn request(out: &mut String, h: &str, name: &str, req: &Request) {
     };
     if let Some(kind) = kind {
         let from = match (&req.auth, &req.inherited.auth) {
-            (Auth::Inherit, Some((folder, _))) => format!(" (from folder \"{folder}\")"),
+            (Auth::Inherit, Some((from, _))) => format!(" (from {from})"),
             _ => String::new(),
         };
         let _ = write!(out, "**Auth:** {kind}{from}\n\n");
@@ -236,8 +240,11 @@ mod tests {
             &api,
             &Folder {
                 description: "The public API.".into(),
-                auth: Auth::Bearer {
-                    token: "s3cret-token".into(),
+                scope: crate::model::Scope {
+                    auth: Auth::Bearer {
+                        token: "s3cret-token".into(),
+                    },
+                    ..Default::default()
                 },
                 ..Default::default()
             },

@@ -45,7 +45,7 @@ pub fn import(root: &Value) -> Import {
         ..Default::default()
     };
     if let Some(auth) = s.security(&root["security"], "") {
-        top.auth = auth;
+        top.scope.auth = auth;
     }
     let mut folders = vec![(String::new(), top)];
     let mut tags = HashSet::new();
@@ -1192,7 +1192,7 @@ components:
             [KeyValue::new("baseUrl", "https://eu.pets.test/v1")]
         );
         assert_eq!(
-            top.auth,
+            top.scope.auth,
             Auth::Bearer {
                 token: "{{bearerToken}}".into()
             }
@@ -1315,8 +1315,11 @@ components:
         let folder = Folder {
             description: "The shop.".into(),
             vars: vec![KeyValue::new("baseUrl", "https://shop.test/v1")],
-            auth: Auth::Bearer {
-                token: "s3cret".into(),
+            scope: crate::model::Scope {
+                auth: Auth::Bearer {
+                    token: "s3cret".into(),
+                },
+                ..Default::default()
             },
             ..Default::default()
         };
