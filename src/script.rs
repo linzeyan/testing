@@ -800,7 +800,7 @@ fn run_inner(script: &str, input: &Input<'_>, timeout: Duration) -> Result<Outpu
             .map_err(caught)?;
         let mut not_ts = None;
         if not_js.is_some() {
-            match typescript(&ctx, script) {
+            match typescript(script) {
                 Ok(js) => (source, shift) = wrap(&js),
                 Err(e) => not_ts = Some(e),
             }
@@ -837,31 +837,50 @@ static TRANSPILED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, String>>
 
 /// `script` as JavaScript, its types stripped (and enums made objects), or sucrase's
 /// complaint.
-fn typescript(ctx: &rquickjs::Ctx<'_>, script: &str) -> Result<String, String> {
+fn typescript(script: &str) -> Result<String, String> {
     if let Some(js) = TRANSPILED.lock().unwrap().get(script) {
         return Ok(js.clone());
     }
-    let failed = |e: rquickjs::Error| match e {
-        rquickjs::Error::Exception => {
-            let thrown: rquickjs::Value = ctx.catch();
-            (thrown.as_object())
-                .and_then(|o| o.get::<_, String>("message").ok())
-                .unwrap_or_else(|| "can't be read".into())
-        }
-        e => e.to_string(),
-    };
-    ctx.eval::<(), _>(SUCRASE).map_err(failed)?;
-    ctx.globals().set("__ts", script).map_err(failed)?;
-    // ES syntax stays as written: QuickJS runs it all, and lines stay put.
-    let js: String = ctx
-        .eval("__sucrase(__ts, { transforms: ['typescript'], disableESTransforms: true }).code")
-        .map_err(failed)?;
+    // Sucrase's parser recurses deeply: in a Windows debug build a seven-line script ran
+    // out of QuickJS's default 1 MB of stack. It gets a thread of its own with room to
+    // spare, and a runtime of its own, which keeps its globals out of the script's.
+    let owned = script.to_owned();
+    let js = std::thread::Builder::new()
+        .stack_size(16 << 20)
+        .spawn(move || strip_types(&owned))
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "the TypeScript stripper crashed".to_owned())??;
     let mut cache = TRANSPILED.lock().unwrap();
     if cache.len() >= 64 {
         cache.clear();
     }
     cache.insert(script.to_owned(), js.clone());
     Ok(js)
+}
+
+/// Sucrase run on `script`, in a runtime made for it on the calling thread, whose stack
+/// must be larger than the 8 MB QuickJS is allowed.
+fn strip_types(script: &str) -> Result<String, String> {
+    let rt = rquickjs::Runtime::new().map_err(|e| e.to_string())?;
+    rt.set_max_stack_size(8 << 20);
+    let ctx = rquickjs::Context::full(&rt).map_err(|e| e.to_string())?;
+    ctx.with(|ctx| {
+        let failed = |e: rquickjs::Error| match e {
+            rquickjs::Error::Exception => {
+                let thrown: rquickjs::Value = ctx.catch();
+                (thrown.as_object())
+                    .and_then(|o| o.get::<_, String>("message").ok())
+                    .unwrap_or_else(|| "can't be read".into())
+            }
+            e => e.to_string(),
+        };
+        ctx.eval::<(), _>(SUCRASE).map_err(failed)?;
+        ctx.globals().set("__ts", script).map_err(failed)?;
+        // ES syntax stays as written: QuickJS runs it all, and lines stay put.
+        ctx.eval("__sucrase(__ts, { transforms: ['typescript'], disableESTransforms: true }).code")
+            .map_err(failed)
+    })
 }
 
 /// js-beautify, for the code editors' Format: loaded only when asked.
