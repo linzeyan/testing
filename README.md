@@ -345,6 +345,24 @@ lists the everyday ones and `Ctrl+/` for the rest.
 | Default text size | `Ctrl+0` |
 | Keyboard shortcuts | `Ctrl+/` |
 
+In the code editors (JSON and other bodies, scripts, GraphQL queries and variables, JWT
+parts), VS Code's keys, ahead of the app's own while the editor has the focus:
+
+| Action | Keys |
+|---|---|
+| Find, replace (a box at the editor's top right: match case, whole word, regular expression with `$1` in the replacement; `Enter` / `Shift+Enter` step through) | `Ctrl+F`, `Ctrl+H` (`⌥⌘F` on macOS) |
+| Toggle line comment / block comment | `Ctrl+/` / `Shift+Alt+A` |
+| Format (JSON, XML, GraphQL; JavaScript and TypeScript with js-beautify) | `Shift+Alt+F` |
+| Move lines up / down | `Alt+↑` / `Alt+↓` |
+| Copy lines up / down | `Shift+Alt+↑` / `Shift+Alt+↓` |
+| Delete lines | `Ctrl+Shift+K` |
+| Indent / outdent (Tab and `Shift+Tab` too, over several lines) | `Ctrl+]` / `Ctrl+[` |
+| Copy or cut the line, with nothing selected | `Ctrl+C` / `Ctrl+X` |
+
+Enter keeps the line's indent, one level deeper after `{`, `[` or `(`; Tab indents with the
+text's own unit (spaces unless it uses tabs). There are no multiple cursors: egui's text
+field has one selection.
+
 Ctrl+K finds a request by folder and name (letters in order are enough) or by part of its URL, a folder (its
 settings) or an environment, and does what a button does (new request, network settings,
 cookies, side by side…). With nothing typed it lists the open tabs, then environments and
@@ -590,3 +608,5 @@ Other files in the repository are left alone.
 
 Interface icons are from [Lucide](https://lucide.dev) (ISC licence, in
 `assets/icons/LICENSE`).
+Bundled JavaScript, each with its licence in `vendor/`: chai, crypto-js, lodash, moment,
+tweetnacl, @noble/ed25519, sucrase (TypeScript) and js-beautify (Format).

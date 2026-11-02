@@ -6,6 +6,7 @@ mod auth;
 mod binary;
 mod capture;
 pub mod cli;
+mod codeedit;
 mod codegen;
 mod conns;
 mod cookies;

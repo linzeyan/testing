@@ -8,6 +8,7 @@ use eframe::egui::gui_zoom::kb_shortcuts::{ZOOM_IN, ZOOM_IN_SECONDARY, ZOOM_OUT,
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
 
 use crate::appearance::Appearance;
+use crate::codeedit::MAX_HITS;
 use crate::cookies::Jar;
 use crate::graphql::{self, Operation};
 use crate::http;
@@ -3683,6 +3684,8 @@ impl eframe::App for App {
                 self.refresh_from_disk();
             }
         }
+        // A code editor's keys first: ⌘/ comments there, ⌘F finds there.
+        crate::codeedit::take_keys(ui.ctx());
         // Consume shortcuts before widgets see them, so Ctrl+Enter doesn't also insert a newline.
         self.shortcuts(ui);
         if ui.input_mut(|i| i.consume_shortcut(&SAVE)) {
@@ -3856,6 +3859,9 @@ impl eframe::App for App {
             }
         };
         varedit::offer(ui.ctx(), scopes);
+        if let Some(e) = crate::codeedit::status(ui.ctx()) {
+            self.fail(e);
+        }
         self.status_bar(ui);
         if !self.hide_sidebar {
             // Never narrower than its buttons: dragged to egui's 96 px, the environment's
@@ -12287,6 +12293,16 @@ fn shortcut_list(ui: &mut egui::Ui, all: bool) {
         (label, key(&keys))
     };
     let first = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
+    let shift_alt = Modifiers::SHIFT.plus(Modifiers::ALT);
+    let pair = |m: Modifiers| {
+        let (up, down) = (
+            KeyboardShortcut::new(m, Key::ArrowUp),
+            KeyboardShortcut::new(m, Key::ArrowDown),
+        );
+        format!("{}  {}", key(&up), key(&down))
+    };
+    let (mods, k) = crate::codeedit::replace_key(ui.ctx());
+    let replace = KeyboardShortcut::new(mods, k);
     let rows = [
         (t("Send request"), key(&SEND)),
         (t("Save changes"), key(&SAVE)),
@@ -12313,6 +12329,36 @@ fn shortcut_list(ui: &mut egui::Ui, all: bool) {
         (t("Larger text"), key(&ZOOM_IN)),
         (t("Smaller text"), key(&ZOOM_OUT)),
         (t("Default text size"), key(&ZOOM_RESET)),
+        // In the code editors (bodies, scripts, queries), as in VS Code.
+        (
+            t("Editor: find, replace"),
+            format!("{}  {}", key(&FIND), key(&replace)),
+        ),
+        (
+            t("Editor: toggle comment"),
+            key(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Slash)),
+        ),
+        (
+            t("Editor: format"),
+            key(&KeyboardShortcut::new(shift_alt, Key::F)),
+        ),
+        (t("Editor: move lines"), pair(Modifiers::ALT)),
+        (t("Editor: copy lines"), pair(shift_alt)),
+        (
+            t("Editor: delete lines"),
+            key(&KeyboardShortcut::new(SHIFT_COMMAND, Key::K)),
+        ),
+        (
+            t("Editor: indent, outdent"),
+            format!(
+                "{}  {}",
+                key(&KeyboardShortcut::new(
+                    Modifiers::COMMAND,
+                    Key::CloseBracket
+                )),
+                key(&KeyboardShortcut::new(Modifiers::COMMAND, Key::OpenBracket))
+            ),
+        ),
         keyed(4),
     ];
     let few: Vec<_> = rows[..7].iter().chain(rows.last()).cloned().collect();
@@ -12493,15 +12539,25 @@ fn scripts_editor(
     if crate::varedit::too_big(ui, id, text).is_some() {
         return;
     }
-    let mut layouter = crate::syntax::layouter(Some(Lang::JavaScript));
-    ui.add(
-        egui::TextEdit::multiline(text)
-            .id(id)
-            .code_editor()
-            .layouter(&mut layouter)
-            .desired_rows(fill_rows(ui, egui::TextStyle::Monospace))
-            .desired_width(f32::INFINITY),
-    );
+    crate::codeedit::before(ui, id, text, Some(Lang::JavaScript));
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+        let text = buf.as_str();
+        let mut colors = vec![ui.visuals().text_color(); text.len()];
+        crate::syntax::paint(&mut colors, text, Lang::JavaScript, ui.visuals());
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let mut job = crate::syntax::job(text, &colors, &font);
+        crate::codeedit::mark(&mut job, ui, id, text);
+        job.wrap.max_width = wrap_width;
+        ui.painter().layout_job(job)
+    };
+    let output = egui::TextEdit::multiline(text)
+        .id(id)
+        .code_editor()
+        .layouter(&mut layouter)
+        .desired_rows(fill_rows(ui, egui::TextStyle::Monospace))
+        .desired_width(f32::INFINITY)
+        .show(ui);
+    crate::codeedit::after(ui, id, text, &output);
 }
 
 fn schema_snippet(body: &str) -> String {
@@ -14873,10 +14929,6 @@ fn examples_editor(ui: &mut egui::Ui, examples: &mut Vec<Example>) {
     }
 }
 
-/// Enough to step through: one letter in a 16 MiB body would otherwise keep millions of
-/// 8-byte offsets.
-const MAX_HITS: usize = 10_000;
-
 /// The find row: query, options, count, stepping, close.
 fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     let ResponseView { text, find, .. } = view;
@@ -14893,52 +14945,15 @@ fn find_bar(ui: &mut egui::Ui, view: &mut ResponseView) {
     if enter || std::mem::take(&mut find.focus) {
         edit.request_focus(); // keep typing / pressing Enter for the next hit
     }
-    for (on, glyph, hover) in [
-        (&mut find.case, t("Aa"), t("Match case")),
-        (&mut find.word, "W", t("Whole word")),
-        (&mut find.regex, ".*", t("Regular expression")),
-    ] {
-        let r = square_button(ui, glyph, Some(*on));
-        let color = ui.style().interact_selectable(&r, *on).text_color();
-        let font = egui::TextStyle::Button.resolve(ui.style());
-        (ui.painter()).text(
-            r.rect.center(),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            font,
-            color,
-        );
-        if r.on_hover_text(hover).clicked() {
-            *on = !*on;
-        }
-    }
+    find_options(ui, &mut find.case, &mut find.word, &mut find.regex);
     let wanted = (find.query.clone(), find.case, find.word, find.regex);
     if wanted != find.searched {
         // Searched in place: lowercasing a copy of a 16 MiB body per keystroke was a
         // 16 MiB allocation each time.
-        let pattern = match find.regex {
-            true => find.query.clone(),
-            false => regex::escape(&find.query),
-        };
-        // ASCII word boundaries: Unicode ones push the regex crate off its fast engine
-        // for any non-ASCII body.
-        let pattern = match find.word {
-            true => format!(r"(?-u:\b)(?:{pattern})(?-u:\b)"),
-            false => pattern,
-        };
-        let built = regex::RegexBuilder::new(&pattern)
-            .case_insensitive(!find.case)
-            .build();
+        let built = crate::codeedit::pattern(&find.query, find.case, find.word, find.regex);
         (find.hits, find.error) = match built {
             _ if find.query.is_empty() => (Vec::new(), None),
-            // Empty matches (`a*`) would mark every position and highlight nothing.
-            Ok(re) => (
-                (re.find_iter(text).filter(|m| !m.is_empty()))
-                    .map(|m| m.range())
-                    .take(MAX_HITS)
-                    .collect(),
-                None,
-            ),
+            Ok(re) => (crate::codeedit::hits(&re, text), None),
             Err(e) => (Vec::new(), Some(e.to_string())),
         };
         find.searched = wanted;
@@ -15250,7 +15265,12 @@ fn button_height(ui: &egui::Ui) -> f32 {
 /// Every icon button is this one square with its background, so icons side by side are
 /// the same size and height (small_button, menu_button and toggle_value each had their
 /// own padding). `on` makes it a toggle, drawn selected while on.
-fn icon_button(ui: &mut egui::Ui, icon: Icon, label: &str, on: Option<bool>) -> egui::Response {
+pub(crate) fn icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    on: Option<bool>,
+) -> egui::Response {
     let r = square_button(ui, label, on);
     if ui.is_rect_visible(r.rect) {
         let v = match on {
@@ -15260,6 +15280,37 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, label: &str, on: Option<bool>) -> 
         icon.paint(ui, r.rect, icon_size(ui), v.text_color());
     }
     r
+}
+
+/// A find row's Aa, W and .* toggles; true when one was clicked.
+pub(crate) fn find_options(
+    ui: &mut egui::Ui,
+    case: &mut bool,
+    word: &mut bool,
+    regex: &mut bool,
+) -> bool {
+    let mut clicked = false;
+    for (on, glyph, hover) in [
+        (case, t("Aa"), t("Match case")),
+        (word, "W", t("Whole word")),
+        (regex, ".*", t("Regular expression")),
+    ] {
+        let r = square_button(ui, glyph, Some(*on));
+        let color = ui.style().interact_selectable(&r, *on).text_color();
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        (ui.painter()).text(
+            r.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            font,
+            color,
+        );
+        if r.on_hover_text(hover).clicked() {
+            *on = !*on;
+            clicked = true;
+        }
+    }
+    clicked
 }
 
 /// `icon_button`'s square and background, for something else painted on it.
@@ -16596,6 +16647,48 @@ mod ui_tests {
 
     fn draft<'h>(h: &'h Harness<'_, App>) -> &'h Request {
         &h.state().open.as_ref().unwrap().draft
+    }
+
+    /// 11-02: in a script, VS Code's keys act on the script, ahead of the app's own that
+    /// share them: ⌘/ comments instead of listing shortcuts, ⇧⌘K deletes the line
+    /// instead of opening Switch (which ⌘K is, and egui matches ignoring Shift), ⌘F finds
+    /// in the script. Out of the editor they are the app's again.
+    #[test]
+    fn script_editor_keys_come_before_the_apps() {
+        let mut h = with_request("editor-keys");
+        (h.state_mut().req_tab, h.state_mut().script_tab) = (ReqTab::Scripts, ScriptTab::Post);
+        h.state_mut().open.as_mut().unwrap().draft.tests = "a\nb".into();
+        h.run();
+        let id = egui::Id::new("tests-script");
+        h.ctx.memory_mut(|m| m.request_focus(id));
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Slash);
+        h.run();
+        assert_eq!(draft(&h).tests, "a\n// b");
+        assert!(h.state().dialog.is_none(), "⌘/ in a script isn't Shortcuts");
+        h.key_press_modifiers(SHIFT_COMMAND, Key::K);
+        h.run();
+        assert_eq!(draft(&h).tests, "a");
+        assert!(h.state().dialog.is_none(), "⇧⌘K in a script isn't Switch");
+        h.key_press_modifiers(Modifiers::ALT.plus(Modifiers::SHIFT), Key::ArrowUp);
+        h.run();
+        assert_eq!(draft(&h).tests, "a\na");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F);
+        h.run();
+        assert!(h.ctx.memory(|m| m.has_focus(id.with("find-query"))));
+        h.get_by_label("Toggle replace").click();
+        h.run();
+        h.get_by_label("Replace all");
+        shot(&mut h, "editor-find");
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(h.query_by_label("Toggle replace").is_none());
+        // Focus elsewhere: ⌘/ is the app's again.
+        h.ctx.memory_mut(|m| m.surrender_focus(id));
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Slash);
+        h.run();
+        assert!(matches!(h.state().dialog, Some(Dialog::Shortcuts)));
     }
 
     /// A newer release is pointed at from the status bar and offered in Settings; the
@@ -22327,8 +22420,9 @@ mod ui_tests {
         assert!(h.query_by_label(known).is_some());
         let key = |k: &KeyboardShortcut| shortcut_label(&h.ctx, k);
         assert!(h.query_by_label(&key(&SWITCH)).is_some(), "with its key");
+        // Twice since 11-02: the code editors' toggle comment has the same key.
         assert!(
-            h.query_by_label(&key(&help)).is_some(),
+            h.query_all_by_label(&key(&help)).next().is_some(),
             "its own key listed too"
         );
         // Called what Ctrl+K calls it: "Sidebar" there read as another thing.

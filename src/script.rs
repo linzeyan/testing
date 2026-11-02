@@ -864,6 +864,59 @@ fn typescript(ctx: &rquickjs::Ctx<'_>, script: &str) -> Result<String, String> {
     Ok(js)
 }
 
+/// js-beautify, for the code editors' Format: loaded only when asked.
+const BEAUTIFY: &str = include_str!("../vendor/js-beautify.js");
+
+/// `code` (JavaScript or TypeScript) laid out by js-beautify, indented by `unit`.
+/// `{{variables}}` stand in as names while it runs: js-beautify takes `{{` for two
+/// blocks and spreads them over five lines.
+pub fn beautify(code: &str, unit: &str) -> Result<String, String> {
+    let mut vars = Vec::new();
+    let mut held = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(open) = rest.find("{{") {
+        let Some(close) = rest[open..].find("}}").map(|n| open + n + 2) else {
+            break;
+        };
+        held.push_str(&rest[..open]);
+        held.push_str(&format!("__apitoolVar{}__", vars.len()));
+        vars.push(&rest[open..close]);
+        rest = &rest[close..];
+    }
+    held.push_str(rest);
+    let rt = rquickjs::Runtime::new().map_err(|e| e.to_string())?;
+    let ctx = rquickjs::Context::full(&rt).map_err(|e| e.to_string())?;
+    let laid_out = ctx.with(|ctx| {
+        let failed = |e: rquickjs::Error| match e {
+            rquickjs::Error::Exception => {
+                let thrown: rquickjs::Value = ctx.catch();
+                (thrown.as_object())
+                    .and_then(|o| o.get::<_, String>("message").ok())
+                    .unwrap_or_else(|| "can't be read".into())
+            }
+            e => e.to_string(),
+        };
+        // Its UMD wrapper sets `window.js_beautify` when there's no module system.
+        ctx.eval::<(), _>("var window = globalThis;")
+            .map_err(failed)?;
+        ctx.eval::<(), _>(BEAUTIFY).map_err(failed)?;
+        ctx.globals().set("__code", held).map_err(failed)?;
+        let (size, ch) = match unit {
+            "\t" => (1, "\t"),
+            u => (u.len(), " "),
+        };
+        ctx.eval::<String, _>(format!(
+            "js_beautify(__code, {{ indent_size: {size}, indent_char: {ch:?}, preserve_newlines: true, max_preserve_newlines: 2 }})"
+        ))
+        .map_err(failed)
+    })?;
+    let mut out = laid_out;
+    for (n, var) in vars.iter().enumerate().rev() {
+        out = out.replace(&format!("__apitoolVar{n}__"), var);
+    }
+    Ok(out)
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

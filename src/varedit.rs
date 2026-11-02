@@ -172,9 +172,16 @@ pub fn var_edit(
         });
     }
 
+    // A multi-line field is code (a body, a query, a key): VS Code's keys, find and replace.
+    // After the popup took its keys, so Enter still picks a suggestion.
+    let typed = multiline && crate::codeedit::before(ui, id, text, lang);
+
     let font = style.resolve(ui.style());
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let mut job = highlight(buf.as_str(), vars, &font, lang, ui.visuals());
+        if multiline {
+            crate::codeedit::mark(&mut job, ui, id, buf.as_str());
+        }
         job.wrap.max_width = wrap_width;
         ui.painter().layout_job(job)
     };
@@ -193,7 +200,11 @@ pub fn var_edit(
         egui::TextEdit::singleline(text)
     };
     let output = configure(edit.id(id).layouter(&mut layouter)).show(ui);
-    let mut response = output.response.response;
+    let replaced = multiline && crate::codeedit::after(ui, id, text, &output);
+    let mut response = output.response.response.clone();
+    if typed || replaced {
+        response.mark_changed();
+    }
     let focused = focused_before || response.has_focus();
 
     // egui moves the cursor to a right-click as to a left one, dropping the selection the

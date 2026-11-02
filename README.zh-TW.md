@@ -292,6 +292,23 @@ macOS 上 Ctrl 換成 ⌘（切換分頁除外）。尚未傳送任何請求前�
 | 預設文字大小 | `Ctrl+0` |
 | 鍵盤快捷鍵 | `Ctrl+/` |
 
+程式碼編輯器（JSON 等本文、指令碼、GraphQL 查詢與變數、JWT 各段）有 VSCode 的按鍵；焦點在編輯器時，
+這些按鍵優先給編輯器：
+
+| 動作 | 按鍵 |
+|---|---|
+| 尋找、取代（編輯器右上角的浮動框：大小寫相符、全字相符、規則運算式，取代可用 `$1`；`Enter` / `Shift+Enter` 逐一跳） | `Ctrl+F`、`Ctrl+H`（macOS 為 `⌥⌘F`） |
+| 切換行註解 / 區塊註解 | `Ctrl+/` / `Shift+Alt+A` |
+| 格式化（JSON、XML、GraphQL；JavaScript 與 TypeScript 用 js-beautify） | `Shift+Alt+F` |
+| 上下移動行 | `Alt+↑` / `Alt+↓` |
+| 向上 / 向下複製行 | `Shift+Alt+↑` / `Shift+Alt+↓` |
+| 刪除行 | `Ctrl+Shift+K` |
+| 增加 / 減少縮排（選取多行時 Tab 與 `Shift+Tab` 也可以） | `Ctrl+]` / `Ctrl+[` |
+| 沒有選取時複製或剪下整行 | `Ctrl+C` / `Ctrl+X` |
+
+Enter 會沿用該行的縮排，在 `{`、`[`、`(` 之後再多一層；Tab 依文字本身的縮排單位（除非文字用 tab，否則是空格）。
+不支援多游標：egui 的文字欄位只有一個選取範圍。
+
 Ctrl+K 可依資料夾與名稱（依序打出其中幾個字母即可）或 URL 的片段找請求、找資料夾（開啟其設定）或環境，也能
 執行按鈕的功能（新增請求、網路設定、Cookie、左右並排…）。什麼都沒輸入時，會先列出開啟中的分頁，
 接著是環境與動作。
@@ -503,3 +520,5 @@ DPAPI、macOS 用登入鑰匙圈中的金鑰；Linux 上不加密），因此資
 ## 致謝
 
 介面圖示來自 [Lucide](https://lucide.dev)（ISC 授權，見 `assets/icons/LICENSE`）。
+內建的 JavaScript 函式庫（授權各附在 `vendor/`）：chai、crypto-js、lodash、moment、tweetnacl、@noble/ed25519、
+sucrase（TypeScript）與 js-beautify（格式化）。
