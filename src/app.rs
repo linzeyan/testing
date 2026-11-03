@@ -1253,8 +1253,12 @@ pub struct App {
     slow_frames: (u32, f32, Option<Instant>),
     dialog: Option<Dialog>,
     env_editor: Option<EnvEditor>,
-    folder_editor: Option<FolderEditor>,
-    /// The folder page is in front, as `runner_shown`.
+    /// Open folder and collection pages, in their chips' order: each its own tab, as a
+    /// request is, so comparing two folders doesn't mean closing one.
+    folders: Vec<FolderEditor>,
+    /// Which of `folders` is shown while `folder_shown`, or was last.
+    folder_at: usize,
+    /// A folder page is in front, as `runner_shown`.
     folder_shown: bool,
     runner: Option<RunnerView>,
     /// `status` as it was set by `fail`: red, and kept until dismissed or replaced, while
@@ -1383,7 +1387,8 @@ impl App {
             slow_frames: (0, 0.0, None),
             dialog: None,
             env_editor: None,
-            folder_editor: None,
+            folders: Vec::new(),
+            folder_at: 0,
             folder_shown: false,
             runner: None,
             failed: String::new(),
@@ -1474,11 +1479,14 @@ impl App {
                 self.act(action);
             }
         }
-        if pressed(&SAVE_AS) && free {
+        // The request's own keys do nothing while a folder page hides it.
+        let request = !self.folder_shown;
+        if pressed(&SAVE_AS) && free && request {
             self.ask_save_as();
         }
         if pressed(&SEND_DOWNLOAD)
             && free
+            && request
             && let Some(open) = &self.open
             && !streams(&open.draft, &self.grpc_methods)
             && open.draft.method != "GRPC"
@@ -1536,11 +1544,12 @@ impl App {
             return;
         }
         let (last, len) = (self.tabs.len() - 1, self.tabs.len());
-        // The runner's chip comes first: from it, next is the first tab.
+        // The chips come first: from one, next is the first tab and ⌘1 the first too.
         let runner = self.runner.is_some() && self.runner_shown;
+        let page = runner || self.capture_shown || self.folder_shown;
         let at = (self.open.as_ref())
             .and_then(|o| self.tab_index(&o.path))
-            .filter(|_| !runner);
+            .filter(|_| !page);
         let to = match (numbered, at) {
             (Some((8, _)), _) => Some(last),
             (Some((n, _)), _) => Some(n.min(last)),
@@ -2071,8 +2080,11 @@ impl App {
 
     fn reload(&mut self) {
         // A folder deleted, here or on disk, takes its page along.
-        if (self.folder_editor.as_ref()).is_some_and(|ed| !self.ws.exists(&ed.dir)) {
-            (self.folder_editor, self.folder_shown) = (None, false);
+        let shown = self.folder_editor().map(|ed| ed.dir.clone());
+        self.folders.retain(|ed| self.ws.exists(&ed.dir));
+        match shown.and_then(|dir| self.folders.iter().position(|ed| ed.dir == dir)) {
+            Some(i) => self.folder_at = i,
+            None => (self.folder_at, self.folder_shown) = (0, false),
         }
         self.set_tree(self.ws.tree());
         self.statuses = self.ws.last_statuses();
@@ -2205,9 +2217,10 @@ impl App {
     /// or not: they aren't part of its file.
     fn refresh_inherited(&mut self) {
         let env = self.active_env.clone();
-        if let Some(ed) = &mut self.folder_editor {
+        for ed in &mut self.folders {
             match self.ws.inherited(&ed.dir, env.as_deref()) {
-                Ok(parent) => ed.parent = parent,
+                // A folder above that read badly once (a git conflict) and is fixed now.
+                Ok(parent) => (ed.parent, ed.error) = (parent, String::new()),
                 Err(e) => ed.error = e,
             }
         }
@@ -3038,7 +3051,7 @@ impl App {
         // The same request still: it keeps its undo history.
         self.editing.iter_mut().for_each(moved);
         self.tree_folder.iter_mut().for_each(moved);
-        if let Some(ed) = &mut self.folder_editor {
+        for ed in &mut self.folders {
             moved(&mut ed.dir);
             ed.name = store::folder_name(&self.ws.collections(), &ed.dir);
         }
@@ -3132,6 +3145,18 @@ impl App {
                 let old = old.clone();
                 self.ws.rename(&old, &name).map(|new| {
                     self.follow_move(&old, &new);
+                    // A request's name is a field of it: its tab saves what it holds, so
+                    // a tab still holding the old name put it back on the next Ctrl+S.
+                    if store::is_request(&new)
+                        && let Ok(stored) = self.ws.load_request(&new)
+                    {
+                        let parked = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut());
+                        let opens = self.open.iter_mut().chain(parked.map(|p| &mut p.open));
+                        for o in opens.filter(|o| o.path == new) {
+                            o.saved.name.clone_from(&stored.name);
+                            o.draft.name.clone_from(&stored.name);
+                        }
+                    }
                     None
                 })
             }
@@ -3747,7 +3772,7 @@ impl eframe::App for App {
             // Save what the user is looking at, not the request hidden behind the editor.
             if self.env_editor.is_some() {
                 self.save_env_editor();
-            } else if self.folder_shown && self.folder_editor.is_some() {
+            } else if self.folder_shown && self.folder_editor().is_some() {
                 self.save_folder_editor();
             } else {
                 self.save();
@@ -3763,7 +3788,7 @@ impl eframe::App for App {
                 (view.find.open, view.find.focus) = (true, true);
             }
         }
-        if ui.input_mut(|i| i.consume_shortcut(&SEND)) {
+        if ui.input_mut(|i| i.consume_shortcut(&SEND)) && !self.folder_shown {
             let vars = self.all_vars();
             let mqtt = self.open.as_ref().map(|o| &o.draft.mqtt);
             match self.stream.as_mut().filter(|s| s.live) {
@@ -3777,9 +3802,13 @@ impl eframe::App for App {
         if ui.input_mut(|i| i.consume_shortcut(&CLOSE_TAB))
             && self.dialog.is_none()
             && self.env_editor.is_none()
-            && let Some(path) = self.open.as_ref().map(|o| o.path.clone())
         {
-            self.close_tab(&path);
+            // The tab in front, which may be a folder page's.
+            if self.folder_shown && self.folder_editor().is_some() {
+                self.close_folder_page(self.folder_at);
+            } else if let Some(path) = self.open.as_ref().map(|o| o.path.clone()) {
+                self.close_tab(&path);
+            }
         }
         if ui.input_mut(|i| i.consume_shortcut(&REOPEN_TAB))
             && self.dialog.is_none()
@@ -3790,6 +3819,7 @@ impl eframe::App for App {
         if ui.input_mut(|i| i.consume_shortcut(&DUPLICATE))
             && self.dialog.is_none()
             && self.env_editor.is_none()
+            && !self.folder_shown
             && let Some(path) = self.open.as_ref().map(|o| o.path.clone())
         {
             self.duplicate(&path);
@@ -3835,6 +3865,7 @@ impl eframe::App for App {
             self.dialog = Some(Dialog::Delete(doomed));
         }
         if ui.input_mut(|i| i.consume_shortcut(&FOCUS_URL))
+            && !self.folder_shown
             && let Some(open) = &self.open
         {
             // Selected, as in a browser's address bar, so typing replaces it.
@@ -3858,8 +3889,19 @@ impl eframe::App for App {
             }
         }
         if ui.input(|i| i.viewport().close_requested()) {
-            self.keep_drafts();
-            self.sync();
+            // A request's unsaved edits are kept for the next start; a folder page's aren't,
+            // so quitting asks about them as closing the page does, and again quits.
+            let unsaved =
+                (self.folders.iter()).position(|ed| ed.folder != ed.saved && !ed.confirm_discard);
+            if let Some(i) = unsaved {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                (self.runner_shown, self.capture_shown) = (false, false);
+                self.close_folder_page(i);
+            } else {
+                self.keep_drafts();
+                self.sync();
+            }
         }
 
         // egui keeps a text field's undo history under its id, and the editor's fields have
@@ -4491,7 +4533,7 @@ impl App {
                 TreeAction::FolderSettings(dir) => {
                     self.open_folder_editor(dir.clone());
                     // Ready to type into the blank row, like the environment editor.
-                    if let Some(ed) = &mut self.folder_editor
+                    if let Some(ed) = self.folders.get_mut(self.folder_at)
                         && ed.dir == dir
                     {
                         ed.tab = FolderTab::Vars;
@@ -5283,11 +5325,7 @@ impl App {
         }
         // No request tab is lit while the runner's, the capture's or a folder's chip is.
         let runner = self.runner.as_ref().filter(|_| self.runner_shown).is_some();
-        let folder = self
-            .folder_editor
-            .as_ref()
-            .filter(|_| self.folder_shown)
-            .is_some();
+        let folder = self.folder_shown && self.folder_editor().is_some();
         let active = self
             .open
             .as_ref()
@@ -5296,20 +5334,24 @@ impl App {
         let (mut show, mut close, mut menu) = (None, None, None);
         let (mut show_runner, mut close_runner) = (false, false);
         let (mut show_capture, mut close_capture) = (false, false);
-        let (mut show_folder, mut close_folder) = (false, false);
+        let (mut show_folder, mut close_folder) = (None, None);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
-                if let Some(ed) = &self.folder_editor {
+                for (i, ed) in self.folders.iter().enumerate() {
                     let unsaved = (ed.folder != ed.saved).then_some(ORANGE);
-                    let lit = folder && !runner && !self.capture_shown;
+                    let lit = folder && i == self.folder_at && !runner && !self.capture_shown;
                     // As its page's heading, as the runner's chip is "Run: …".
                     let name = match ed.dir.parent() == Some(&self.ws.collections()) {
                         true => tf("Collection: {}", &[&ed.name]),
                         false => tf("Folder: {}", &[&ed.name]),
                     };
-                    show_folder = tab_label(ui, lit, name, unsaved).clicked();
-                    close_folder =
-                        icon_button(ui, icon::X, t("Close the folder settings"), None).clicked();
+                    if tab_label(ui, lit, name, unsaved).clicked() {
+                        show_folder = Some(i);
+                    }
+                    let x = icon_button(ui, icon::X, t("Close the folder settings"), None);
+                    if x.clicked() {
+                        close_folder = Some(i);
+                    }
                     ui.separator();
                 }
                 if self.capture_shown || self.capture.is_some() {
@@ -5428,10 +5470,13 @@ impl App {
             self.close_runner();
         } else if show_capture {
             (self.capture_shown, self.runner_shown, self.folder_shown) = (true, false, false);
-        } else if show_folder {
+        } else if let Some(i) = show_folder {
+            // The tree follows, as it does to a request tab clicked: F2 renames this one.
+            self.tree_folder = Some(self.folders[i].dir.clone());
+            self.folder_at = i;
             (self.folder_shown, self.runner_shown, self.capture_shown) = (true, false, false);
-        } else if close_folder {
-            self.close_folder_page();
+        } else if let Some(i) = close_folder {
+            self.close_folder_page(i);
         } else if close_capture {
             self.restore_system_proxy();
             (self.capture, self.capture_shown) = (None, false);
@@ -5440,7 +5485,7 @@ impl App {
 
     fn main_area(&mut self, ui: &mut egui::Ui) {
         let capture = self.capture_shown || self.capture.is_some();
-        let folder = self.folder_editor.is_some();
+        let folder = !self.folders.is_empty();
         if !self.tabs.is_empty() || self.runner.is_some() || capture || folder || self.hide_sidebar
         {
             egui::Panel::top("tabs").show(ui, |ui| {
@@ -5464,7 +5509,7 @@ impl App {
             self.runner_ui(ui);
             return;
         }
-        if self.folder_shown && self.folder_editor.is_some() {
+        if self.folder_shown && self.folder_editor().is_some() {
             self.folder_page(ui);
             return;
         }
@@ -6032,7 +6077,7 @@ impl App {
                     ReqTab::Auth => {
                         let d = &mut open.draft;
                         let inherited = d.inherited.auth.as_ref();
-                        if auth_editor(ui, &mut d.auth, &all_vars, inherited, &d.method)
+                        if auth_editor(ui, &mut d.auth, &all_vars, inherited, &d.method, "")
                             && let Some((from, _)) = inherited
                         {
                             match from {
@@ -6065,6 +6110,7 @@ impl App {
                             &mut open.draft.tests,
                             &open.draft.inherited,
                             json_response,
+                            "",
                         )
                     }
                     ReqTab::Vars => {
@@ -6389,8 +6435,11 @@ impl App {
         }
         if let Some(dir) = folder_clicked {
             self.reveal = Some(dir.clone());
-            self.open_folder_editor(dir);
-            if folder_auth && let Some(ed) = &mut self.folder_editor {
+            self.open_folder_editor(dir.clone());
+            if folder_auth
+                && let Some(ed) = self.folders.get_mut(self.folder_at)
+                && ed.dir == dir
+            {
                 ed.tab = FolderTab::Auth;
             }
         }
@@ -7145,8 +7194,12 @@ impl App {
             return;
         };
         let (mut save, mut delete, mut close, mut duplicate) = (false, false, false, false);
-        // Under the delete question: its Escape is that dialog's.
-        let asking = self.dialog.is_some();
+        // Under the delete question: its Escape is that dialog's. And a field's while one
+        // was being typed in: Escape leaves the field (or a script's find box) first. As of
+        // the last frame: egui lets go of the focus on Escape before anything is drawn.
+        let typing = egui::Id::new("env-editor-typing");
+        let was_typing = ctx.data(|d| d.get_temp(typing)).unwrap_or(false);
+        let asking = self.dialog.is_some() || was_typing;
         let file =
             (ed.env.as_ref()).map_or("globals.toml".into(), |n| format!("environments/{n}.toml"));
         // Only explicit buttons close this one: a stray click outside must not drop edits.
@@ -7174,12 +7227,13 @@ impl App {
             ui.separator();
             let scroll = egui::ScrollArea::vertical().max_height(420.0);
             scroll.show(ui, |ui| {
+                // What `{{…}}` is in this environment, not in the active one: a value made of
+                // another variable is red only when that one is nowhere.
+                let mut vars = self.globals.clone();
+                let own = (ed.shared.iter().chain(&ed.secret)).filter(|v| v.enabled);
+                vars.extend(own.map(|v| (v.key.clone(), v.value.clone())));
+                let vars = &vars;
                 if ed.tab != FolderTab::Vars {
-                    // What `{{…}}` is in this environment, not in the active one.
-                    let mut vars = self.globals.clone();
-                    let own = (ed.shared.iter().chain(&ed.secret)).filter(|v| v.enabled);
-                    vars.extend(own.map(|v| (v.key.clone(), v.value.clone())));
-                    let vars = &vars;
                     let (scope, parent, tab) = (&mut ed.scope, &ed.parent, ed.tab);
                     let script_tab = &mut self.script_tab;
                     let timeout = self.network.timeout_secs;
@@ -7187,7 +7241,7 @@ impl App {
                 }
                 ui.label(RichText::new(t("Shared")).strong());
                 ui.weak(tf("Written to {} in the workspace folder, for git.", &[&file]));
-                kv_table(ui, "env-shared", &mut ed.shared, &HashMap::new(), false);
+                kv_table(ui, "env-shared", &mut ed.shared, vars, false);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(t("Secret")).strong());
@@ -7195,7 +7249,7 @@ impl App {
                 });
                 ui.weak(t("Kept on this machine only (in apitool.db), never written to the files. \
                      Overrides shared values; values set by scripts land here."));
-                kv_table(ui, "env-secret", &mut ed.secret, &HashMap::new(), false);
+                kv_table(ui, "env-secret", &mut ed.secret, vars, false);
             });
             if !ed.error.is_empty() {
                 ui.colored_label(RED, ed.error.as_str());
@@ -7235,6 +7289,8 @@ impl App {
                 }
             });
         });
+        let typing_now = ctx.text_edit_focused();
+        ctx.data_mut(|d| d.insert_temp(typing, typing_now));
         if save || duplicate {
             let from = ed.env.clone();
             if self.save_env_editor()
@@ -7278,20 +7334,17 @@ impl App {
         }
     }
 
-    /// Shows the folder's page; one with unsaved edits stays until they're saved or
-    /// discarded.
+    /// The folder page in front, or last in front.
+    fn folder_editor(&self) -> Option<&FolderEditor> {
+        self.folders.get(self.folder_at)
+    }
+
+    /// Shows the folder's page: its tab if one is open, else a new tab after the one in
+    /// front, as Open in new tab puts a request's.
     fn open_folder_editor(&mut self, dir: PathBuf) {
         (self.runner_shown, self.capture_shown) = (false, false);
-        if let Some(ed) = &self.folder_editor
-            && ed.dir != dir
-            && ed.folder != ed.saved
-        {
-            self.folder_shown = true;
-            self.status = tf("Save or discard the changes to {} first", &[&ed.name]);
-            return;
-        }
-        if self.folder_editor.as_ref().is_some_and(|ed| ed.dir == dir) {
-            self.folder_shown = true;
+        if let Some(i) = self.folders.iter().position(|ed| ed.dir == dir) {
+            (self.folder_at, self.folder_shown) = (i, true);
             return;
         }
         // A folder inherits from its parents exactly like a request in it would.
@@ -7299,18 +7352,25 @@ impl App {
         let env = self.active_env.clone();
         match loaded.and_then(|f| Ok((f, self.ws.inherited(&dir, env.as_deref())?))) {
             Ok((folder, parent)) => {
-                let tab = (self.folder_editor.as_ref()).map_or(FolderTab::Vars, |ed| ed.tab);
-                self.folder_editor = Some(FolderEditor {
-                    name: store::folder_name(&self.ws.collections(), &dir),
-                    dir,
-                    saved: folder.clone(),
-                    folder,
-                    parent,
-                    tab,
-                    error: String::new(),
-                    confirm_discard: false,
-                });
-                self.folder_shown = true;
+                let tab = self.folder_editor().map_or(FolderTab::Vars, |ed| ed.tab);
+                let at = match self.folders.is_empty() {
+                    true => 0,
+                    false => self.folder_at + 1,
+                };
+                self.folders.insert(
+                    at,
+                    FolderEditor {
+                        name: store::folder_name(&self.ws.collections(), &dir),
+                        dir,
+                        saved: folder.clone(),
+                        folder,
+                        parent,
+                        tab,
+                        error: String::new(),
+                        confirm_discard: false,
+                    },
+                );
+                (self.folder_at, self.folder_shown) = (at, true);
             }
             Err(e) => self.fail(e),
         }
@@ -7319,7 +7379,7 @@ impl App {
     /// The folder page, in the main area: what every request in the folder shares.
     fn folder_page(&mut self, ui: &mut egui::Ui) {
         let collections = self.ws.collections();
-        let Some(ed) = &mut self.folder_editor else {
+        let Some(ed) = self.folders.get_mut(self.folder_at) else {
             return;
         };
         let (mut save, mut discard) = (false, false);
@@ -7388,13 +7448,7 @@ impl App {
                          variable with the same name, an inner folder's over an outer \
                          one's. Keep secrets in a secret environment.",
                     ));
-                    kv_table(
-                        ui,
-                        "folder-vars",
-                        &mut ed.folder.vars,
-                        &HashMap::new(),
-                        false,
-                    );
+                    kv_table(ui, "folder-vars", &mut ed.folder.vars, &vars, false);
                 }
                 FolderTab::Docs => docs_editor(ui, &mut ed.folder.description),
                 tab => {
@@ -7406,42 +7460,57 @@ impl App {
             });
         if save {
             self.save_folder_editor();
-        } else if discard && let Some(ed) = &mut self.folder_editor {
+        } else if discard && let Some(ed) = self.folders.get_mut(self.folder_at) {
             ed.folder = ed.saved.clone();
             ed.confirm_discard = false;
         }
     }
 
     fn save_folder_editor(&mut self) {
-        let Some(ed) = &mut self.folder_editor else {
+        let Some(ed) = self.folders.get_mut(self.folder_at) else {
             return;
         };
+        // The page edits what requests share; the order and sort are the tree's, changed
+        // there (a drag, Sort requests, a rename) while the page stayed open: the copy the
+        // page loaded would put them back.
+        if let Ok(disk) = self.ws.load_folder(&ed.dir) {
+            for f in [&mut ed.folder, &mut ed.saved] {
+                (f.order, f.sort, f.descending) = (disk.order.clone(), disk.sort, disk.descending);
+            }
+        }
         match self.ws.save_folder(&ed.dir, &ed.folder) {
             Ok(()) => {
                 self.status = tf("Saved {}", &[&ed.name]);
                 (ed.saved, ed.error) = (ed.folder.clone(), String::new());
+                // Asked about the edits just saved: later ones are asked about again.
+                ed.confirm_discard = false;
                 self.refresh_inherited();
             }
             Err(e) => ed.error = e,
         }
     }
 
-    /// Closing the folder page throws its edits away: the first click asks, by turning
-    /// its Discard red.
-    fn close_folder_page(&mut self) {
-        let Some(ed) = &mut self.folder_editor else {
+    /// Closing a folder page throws its edits away: the first click shows it and asks, by
+    /// turning its Discard red. The page beside it comes forward, as with request tabs.
+    fn close_folder_page(&mut self, i: usize) {
+        let Some(ed) = self.folders.get_mut(i) else {
             return;
         };
         if ed.folder != ed.saved && !ed.confirm_discard {
             ed.confirm_discard = true;
-            self.folder_shown = true;
+            (self.folder_at, self.folder_shown) = (i, true);
             self.status = tf(
                 "{} has unsaved changes: close again to discard them",
                 &[&ed.name],
             );
             return;
         }
-        (self.folder_editor, self.folder_shown) = (None, false);
+        self.folders.remove(i);
+        if self.folders.is_empty() {
+            (self.folder_at, self.folder_shown) = (0, false);
+        } else if i < self.folder_at || self.folder_at == self.folders.len() {
+            self.folder_at -= 1;
+        }
     }
 
     fn cookie_manager_ui(&mut self, ctx: &egui::Context) {
@@ -9193,7 +9262,11 @@ impl App {
     /// else the open request.
     fn tree_target(&self) -> Option<PathBuf> {
         let folder = self.tree_folder.clone().filter(|_| self.tree_focused());
-        folder.or_else(|| self.open.as_ref().map(|o| o.path.clone()))
+        // Else what's in front: the folder page shown, not the request behind it.
+        let page = self.folder_editor().filter(|_| self.folder_shown);
+        folder
+            .or_else(|| page.map(|ed| ed.dir.clone()))
+            .or_else(|| self.open.as_ref().map(|o| o.path.clone()))
     }
 
     fn act(&mut self, action: Action) {
@@ -9959,9 +10032,6 @@ fn auto_headers_ui(ui: &mut egui::Ui, auto: Vec<(String, String, &str)>) -> bool
     change
 }
 
-/// Key/value grid with a trailing blank row: typing into it creates a new row, like Postman.
-/// `describe` marks a request table: it gets a Description column (variables have none,
-/// as in Postman) and Bulk Edit. Returns whether any row changed.
 /// Whether secret variable values show, for the session; with `button`, the eye that
 /// flips it, in the environment editor and the Variables panel.
 fn secrets_eye(ui: &mut egui::Ui, button: bool) -> bool {
@@ -9978,6 +10048,10 @@ fn secrets_eye(ui: &mut egui::Ui, button: bool) -> bool {
     shown
 }
 
+/// Key/value grid with a trailing blank row: typing into it creates a new row, like Postman.
+/// `describe` marks a request table: it gets a Description column (variables have none,
+/// as in Postman). Every table but hidden secrets has Bulk Edit: pasting a list of
+/// variables is as common as pasting headers. Returns whether any row changed.
 fn kv_table(
     ui: &mut egui::Ui,
     id: &str,
@@ -9988,8 +10062,11 @@ fn kv_table(
     let before = rows.clone();
     // The request's own headers table: other tables (params, form, folder headers…) get
     // no header names.
-    let headers = id == "headers";
-    if describe {
+    let headers = id.ends_with("headers");
+    // An environment's secrets stay hidden until the eye by its title shows them, as an
+    // auth secret does; the screen may be shared. The bulk text would show them too.
+    let masked = id == "env-secret" && !secrets_eye(ui, false);
+    if !masked {
         // The text lives in egui's memory while editing, so a half-typed line isn't
         // rewritten from the rows under the cursor.
         let bulk_id = egui::Id::new((id, "bulk"));
@@ -10054,9 +10131,6 @@ fn kv_table(
         true => (rest * 0.6, rest * 0.4 - ui.spacing().item_spacing.x),
         false => (rest, 0.0),
     };
-    // An environment's secrets stay hidden until the eye by its title shows them, as an
-    // auth secret does; the screen may be shared.
-    let masked = id == "env-secret" && !secrets_eye(ui, false);
     let mut remove = None;
     let mut blank = KeyValue::new("", "");
     let existing = rows.len();
@@ -11318,12 +11392,15 @@ fn inherited_rows(ui: &mut egui::Ui, rows: &[&(Source, KeyValue)]) -> Option<Key
 /// `inherited`: what "Inherit from parent" currently resolves to, and where it's set.
 /// `method` narrows the types offered to what that kind of request can send ("" for a
 /// folder or an environment: any). True when where it's set was asked for.
+/// `salt` is "" for a request, else the page's ("env", "folder"): the environment editor
+/// sits over a request or folder page, and fields sharing an id both took its keys.
 fn auth_editor(
     ui: &mut egui::Ui,
     auth: &mut Auth,
     vars: &HashMap<String, String>,
     inherited: Option<&(Source, Auth)>,
     method: &str,
+    salt: &str,
 ) -> bool {
     let (user, pass) = (String::new, String::new);
     let kinds = [
@@ -11418,7 +11495,7 @@ fn auth_editor(
         ui.label(label);
         var_edit(
             ui,
-            egui::Id::new(("auth", label)),
+            egui::Id::new((salt, "auth", label)),
             value,
             vars,
             egui::TextStyle::Body,
@@ -11435,7 +11512,7 @@ fn auth_editor(
     // keeps the focus and the cursor.
     let secret = |ui: &mut egui::Ui, label: &str, value: &mut String| {
         ui.label(label);
-        let id = egui::Id::new(("auth", label));
+        let id = egui::Id::new((salt, "auth", label));
         let shown = id.with("shown");
         let reveal = ui.data(|d| d.get_temp(shown)).unwrap_or(false);
         let reference = value.trim_start().starts_with("{{");
@@ -11541,7 +11618,7 @@ fn auth_editor(
                     ui.label(t("Private key"));
                     var_edit(
                         ui,
-                        egui::Id::new(("auth", "jwt-key")),
+                        egui::Id::new((salt, "auth", "jwt-key")),
                         &mut j.secret,
                         vars,
                         egui::TextStyle::Monospace,
@@ -11560,7 +11637,7 @@ fn auth_editor(
                 ui.label(t("Header"));
                 var_edit(
                     ui,
-                    egui::Id::new(("auth", "jwt-header")),
+                    egui::Id::new((salt, "auth", "jwt-header")),
                     &mut j.header,
                     vars,
                     egui::TextStyle::Monospace,
@@ -11577,7 +11654,7 @@ fn auth_editor(
                 ui.label(t("Payload"));
                 var_edit(
                     ui,
-                    egui::Id::new(("auth", "jwt-payload")),
+                    egui::Id::new((salt, "auth", "jwt-payload")),
                     &mut j.payload,
                     vars,
                     egui::TextStyle::Monospace,
@@ -12942,7 +13019,7 @@ fn scope_editor(
             ));
         }
         FolderTab::Auth => {
-            auth_editor(ui, &mut scope.auth, vars, parent.auth.as_ref(), "");
+            auth_editor(ui, &mut scope.auth, vars, parent.auth.as_ref(), "", id);
             ui.weak(t("Requests set to \"Inherit from parent\" use this."));
         }
         FolderTab::Scripts => scripts_editor(
@@ -12953,6 +13030,7 @@ fn scope_editor(
             parent,
             // Its tests run on many responses, not the one shown.
             None,
+            id,
         ),
         FolderTab::Settings => {
             ui.weak(t(
@@ -12967,7 +13045,7 @@ fn scope_editor(
 }
 
 /// For a request, a folder or an environment; `inherited` lists the scripts that run
-/// first.
+/// first. `salt` as `auth_editor`'s.
 fn scripts_editor(
     ui: &mut egui::Ui,
     tab: &mut ScriptTab,
@@ -12975,6 +13053,7 @@ fn scripts_editor(
     tests: &mut String,
     inherited: &Inherited,
     json_response: Option<&str>,
+    salt: &str,
 ) {
     let mut insert: Option<String> = None;
     ui.horizontal(|ui| {
@@ -13043,7 +13122,10 @@ fn scripts_editor(
         text.push_str(&code);
     }
     // A pasted library (lodash, moment) can be past MAX_EDIT.
-    let id = egui::Id::new(id);
+    let id = match salt {
+        "" => egui::Id::new(id),
+        salt => egui::Id::new((salt, id)),
+    };
     if crate::varedit::too_big(ui, id, text).is_some() {
         return;
     }
@@ -16779,7 +16861,7 @@ mod ui_tests {
         h.key_press_modifiers(Modifiers::COMMAND, Key::S);
         h.run();
 
-        let ed = h.state().folder_editor.as_ref().unwrap();
+        let ed = h.state().folder_editor().unwrap();
         assert!(ed.folder == ed.saved, "saved, and the page stays");
         h.get_by_label("Close the folder settings").click();
         h.run();
@@ -17573,6 +17655,234 @@ mod ui_tests {
         h.get_by_label("Key-Value Edit").click();
         h.run();
         assert_eq!(editor(&h), None, "back to the table");
+    }
+
+    /// A rename is the name from then on: the tab open on that request holds it too, so
+    /// saving the tab, unsaved edits and all, doesn't put the old name back.
+    #[test]
+    fn a_renamed_request_keeps_its_name_when_its_tab_is_saved() {
+        let ws = workspace("rename-save");
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let r = ws.create_request(&api, "old").unwrap();
+        let mut h = harness(ws);
+        h.state_mut().activate(r.clone(), true);
+        h.run();
+        h.state_mut().open.as_mut().unwrap().draft.url = "http://edited.test".into();
+        h.state_mut().dialog = Some(Dialog::name(NameKind::Rename(r.clone()), "old"));
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(egui::Event::Text("new".into()));
+        h.key_press(Key::Enter);
+        h.run();
+        assert!(h.state().dialog.is_none(), "renamed");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        h.run();
+        let saved = h.state().ws.load_request(&r).unwrap();
+        assert_eq!(
+            (saved.name.as_str(), saved.url.as_str()),
+            ("new", "http://edited.test")
+        );
+        assert_eq!(h.state().open.as_ref().unwrap().name(), "new");
+    }
+
+    /// A folder's variable may be made of its collection's, and an environment's of a
+    /// global: neither is red as if it were nowhere. Variables paste in bulk as headers
+    /// do; hidden secrets don't, the text would show them.
+    #[test]
+    fn scope_variables_see_the_scopes_above_and_edit_in_bulk() {
+        let ws = workspace("scope-vars");
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let users = ws.create_folder(&api, "users").unwrap();
+        for (dir, var) in [
+            (&api, KeyValue::new("base", "http://x.test")),
+            (&users, KeyValue::new("url", "{{base}}/users")),
+        ] {
+            let mut f = ws.load_folder(dir).unwrap();
+            f.vars = vec![var];
+            ws.save_folder(dir, &f).unwrap();
+        }
+        ws.save_env(None, &[KeyValue::new("g", "1")], &[]).unwrap();
+        let secret = [KeyValue::new("s", "hidden")];
+        ws.save_env(Some("dev"), &[KeyValue::new("e", "{{g}}+1")], &secret)
+            .unwrap();
+        let mut h = harness(ws);
+        h.state_mut().open_folder_editor(users);
+        h.run();
+        assert_eq!(painted_color(&h, "{{base}}/users"), Some(varedit::DEFINED));
+        h.get_by_label("Bulk Edit").click();
+        h.run();
+        h.get_by_role(Role::MultilineTextInput).click();
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+        h.event(egui::Event::Paste("url: {{base}}/v2\n//debug: 1".into()));
+        h.run();
+        let debug = KeyValue {
+            enabled: false,
+            ..KeyValue::new("debug", "1")
+        };
+        let vars = &h.state().folder_editor().unwrap().folder.vars;
+        assert_eq!(*vars, [KeyValue::new("url", "{{base}}/v2"), debug]);
+
+        h.state_mut().open_env_editor(Some("dev".into()), &[]);
+        h.run();
+        assert_eq!(painted_color(&h, "{{g}}+1"), Some(varedit::DEFINED));
+        // The folder page's says Key-Value Edit now; the secrets are hidden.
+        assert_eq!(h.get_all_by_label("Bulk Edit").count(), 1, "shared only");
+    }
+
+    /// Each folder or collection page is a tab of its own: opening another keeps the
+    /// first, unsaved edits included; its chip brings it back; opening it again doesn't
+    /// add a second; closing the one in front shows its neighbour.
+    #[test]
+    fn folder_pages_open_side_by_side() {
+        let ws = workspace("folder-tabs");
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let users = ws.create_folder(&api, "users").unwrap();
+        let mut h = harness(ws);
+        h.state_mut().open_folder_editor(api.clone());
+        (h.state_mut().folders[0].folder.vars).push(KeyValue::new("edited", "1"));
+        h.state_mut().open_folder_editor(users.clone());
+        h.run();
+        let dirs = |h: &Harness<'_, App>| {
+            let folders = h.state().folders.iter();
+            folders.map(|f| f.dir.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(dirs(&h), [api.clone(), users.clone()]);
+        assert_eq!(h.state().folder_editor().unwrap().dir, users);
+        h.get_by_label("Collection: api").click();
+        h.run();
+        let ed = h.state().folder_editor().unwrap();
+        assert!(ed.dir == api && ed.folder != ed.saved, "its edits kept");
+        h.state_mut().open_folder_editor(users.clone());
+        h.run();
+        assert_eq!(dirs(&h).len(), 2, "one tab per folder");
+        h.get_all_by_label("Close the folder settings")
+            .nth(1)
+            .unwrap()
+            .click();
+        h.run();
+        assert_eq!(dirs(&h), std::slice::from_ref(&api));
+        assert!(h.state().folder_shown);
+        assert_eq!(h.state().folder_editor().unwrap().dir, api);
+    }
+
+    /// A folder page stays open beside the tree: saving it writes what it edits and
+    /// leaves the tree's sort and order as the tree last set them. A page asked about
+    /// and then saved asks again about later edits, on its X and on quitting.
+    #[test]
+    fn a_folder_page_saves_its_own_parts_and_asks_before_dropping_edits() {
+        let ws = workspace("folder-save-parts");
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let mut h = harness(ws);
+        h.state_mut().open_folder_editor(api.clone());
+        h.run();
+        // Sort requests, from the tree's menu, while the page is open.
+        let mut sorted = h.state().ws.load_folder(&api).unwrap();
+        (sorted.sort, sorted.descending) = (model::SortBy::Name, true);
+        h.state().ws.save_folder(&api, &sorted).unwrap();
+        let edit = |h: &mut Harness<'_, App>, key: &str| {
+            let app = h.state_mut();
+            (app.folders[0].folder.vars).push(KeyValue::new(key, "1"));
+            h.run();
+        };
+        edit(&mut h, "a");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        h.run();
+        let saved = h.state().ws.load_folder(&api).unwrap();
+        assert_eq!(saved.vars, [KeyValue::new("a", "1")]);
+        assert_eq!((saved.sort, saved.descending), (model::SortBy::Name, true));
+
+        edit(&mut h, "b");
+        h.get_by_label("Close the folder settings").click();
+        h.run();
+        assert!(h.state().folders[0].confirm_discard, "asked");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        h.run();
+        edit(&mut h, "c");
+        h.get_by_label("Close the folder settings").click();
+        h.run();
+        assert_eq!(h.state().folders.len(), 1, "asked again, not closed");
+
+        // Quitting asks the same, with the page brought to the front.
+        h.key_press_modifiers(Modifiers::COMMAND, Key::S);
+        h.run();
+        edit(&mut h, "d");
+        h.state_mut().folder_shown = false;
+        let views = &mut h.input_mut().viewports;
+        let root_view = views.entry(egui::ViewportId::ROOT).or_default();
+        root_view.events.push(egui::ViewportEvent::Close);
+        h.run();
+        assert!(h.state().folder_shown && h.state().folders[0].confirm_discard);
+    }
+
+    /// While a folder page is in front, the keys act on it, not on the request hidden
+    /// behind: ⌘W closes the page, F2 renames the folder, ⌘Enter sends nothing, and ⌘1
+    /// goes to the first request tab.
+    #[test]
+    fn keys_act_on_the_folder_page_in_front() {
+        let ws = workspace("folder-keys");
+        let api = ws.create_folder(&ws.collections(), "api").unwrap();
+        let r = ws.create_request(&api, "r").unwrap();
+        let mut h = harness(ws);
+        h.state_mut().activate(r.clone(), true);
+        h.state_mut().open_folder_editor(api.clone());
+        h.run();
+        h.key_press(Key::F2);
+        h.run();
+        let renaming = match &h.state().dialog {
+            Some(Dialog::Name {
+                kind: NameKind::Rename(p),
+                ..
+            }) => p.clone(),
+            _ => panic!("no Rename dialog"),
+        };
+        assert_eq!(renaming, api);
+        h.state_mut().dialog = None;
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Enter);
+        h.run();
+        assert!(h.state().pending.is_empty(), "nothing sent");
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Num1);
+        h.run();
+        assert!(!h.state().folder_shown, "at the request's tab");
+        h.state_mut().open_folder_editor(api.clone());
+        h.run();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::W);
+        h.run();
+        assert!(h.state().folders.is_empty(), "the page closed");
+        assert_eq!(h.state().tabs.len(), 1, "the request's tab stays");
+    }
+
+    /// The environment editor sits over a request: typing into its script goes into the
+    /// environment's, not also into the request's behind it, and Escape leaves the
+    /// field before it closes the editor.
+    #[test]
+    fn the_environment_editor_keeps_its_fields_and_escape_to_itself() {
+        let mut h = with_request("env-over-request");
+        (h.state_mut().req_tab, h.state_mut().script_tab) = (ReqTab::Scripts, ScriptTab::Pre);
+        h.state_mut().open_env_editor(Some("dev".into()), &[]);
+        // Not the Variables tab's blank row: it isn't drawn on this one.
+        h.state_mut().env_editor.as_mut().unwrap().tab = FolderTab::Scripts;
+        h.state_mut().focus_request = None;
+        h.run();
+        let id = egui::Id::new(("env", "pre-request-script"));
+        h.ctx.memory_mut(|m| m.request_focus(id));
+        h.run();
+        h.event(egui::Event::Text("x".into()));
+        h.key_press(Key::Enter);
+        h.run();
+        let ed = h.state().env_editor.as_ref().unwrap();
+        assert_eq!(ed.scope.pre_request, "x\n");
+        assert_eq!(draft(&h).pre_request, "", "the request's untouched");
+        h.key_press(Key::Escape);
+        h.run();
+        assert!(
+            h.state().env_editor.is_some(),
+            "Escape left the script only"
+        );
+        h.key_press(Key::Escape);
+        h.run();
+        let ed = h.state().env_editor.as_ref().unwrap();
+        assert!(ed.confirm_discard, "then asks before dropping the edit");
     }
 
     #[test]
@@ -18848,14 +19158,14 @@ mod ui_tests {
         // The nearest folder that sets it, a collection, not the request's own folder.
         h.get_by_label("Collection settings…").click();
         h.run();
-        let ed = h.state().folder_editor.as_ref().unwrap();
+        let ed = h.state().folder_editor().unwrap();
         assert!(ed.dir == api && ed.tab == FolderTab::Auth);
         // Not from a folder's own page, with edits of its own. (The request behind it off
         // its Auth tab, so only the page says it.)
         let app = h.state_mut();
         app.req_tab = ReqTab::Params;
         app.open_folder_editor(users);
-        (app.folder_editor.as_mut().unwrap().tab, app.focus_request) = (FolderTab::Auth, None);
+        (app.folders[app.folder_at].tab, app.focus_request) = (FolderTab::Auth, None);
         h.run();
         assert!(
             h.query_by_label_contains("from collection \"api\"")
@@ -19830,9 +20140,9 @@ mod ui_tests {
         h.state_mut().dialog = None;
         // A folder opens its settings; it ranks above the longer "users/get user".
         switch(&mut h, "users", 0);
-        let editing = h.state().folder_editor.as_ref().map(|f| f.dir.clone());
+        let editing = h.state().folder_editor().map(|f| f.dir.clone());
         assert_eq!(editing, Some(top.join("users")));
-        h.state_mut().folder_editor = None;
+        h.state_mut().folders.clear();
         assert!(!switch(&mut h, "", 0), "nothing typed lists no URLs");
         // Scattered letters would find most URLs.
         assert!(!switch(&mut h, "rdr:i", 0));
@@ -20396,7 +20706,7 @@ mod ui_tests {
         h.get_by_label("users").click();
         h.run();
         assert_eq!(
-            h.state().folder_editor.as_ref().map(|e| e.dir.clone()),
+            h.state().folder_editor().map(|e| e.dir.clone()),
             Some(users)
         );
     }
@@ -23110,9 +23420,14 @@ mod ui_tests {
         h.run();
 
         // A click outside the tree: F2 is the open request's again, Delete nobody's. (The
-        // folder's page, which the click opened, out of the way first.)
-        h.get_by_label("Close the folder settings").click();
-        h.run();
+        // folder pages, which the clicks opened, out of the way first.)
+        for _ in 0..h.state().folders.len() {
+            h.get_all_by_label("Close the folder settings")
+                .next()
+                .unwrap()
+                .click();
+            h.run();
+        }
         h.get_by_label("Send request").click();
         h.run();
         assert!(press(&mut h, delete).is_none(), "a stray Delete");
@@ -25557,7 +25872,8 @@ mod ui_tests {
 
         let close = |h: &mut Harness<'_, App>| {
             let app = h.state_mut();
-            (app.dialog, app.env_editor, app.folder_editor, app.runner) = (None, None, None, None);
+            (app.dialog, app.env_editor, app.runner) = (None, None, None);
+            app.folders.clear();
             (app.settings, app.cookie_manager, app.code, app.show_history) =
                 (false, false, false, false);
             app.load = None;
@@ -25605,7 +25921,8 @@ mod ui_tests {
             (FolderTab::Scripts, "scripts"),
             (FolderTab::Docs, "docs"),
         ] {
-            h.state_mut().folder_editor.as_mut().unwrap().tab = tab;
+            let app = h.state_mut();
+            app.folders[app.folder_at].tab = tab;
             h.run();
             shot(&mut h, &format!("t-folder-{name}"));
         }

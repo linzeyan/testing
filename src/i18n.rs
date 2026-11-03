@@ -2211,10 +2211,6 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Override", "覆寫"),
     (
-        "Save or discard the changes to {} first",
-        "請先儲存或捨棄「{}」的變更",
-    ),
-    (
         "Sent with every request below, unless it has a header of the same name; an unchecked one keeps it out. Its auth's header and a form's Content-Type win too. Not for MQTT.",
         "隨底下每個請求送出，除非該請求有同名標頭；同名但未勾選的會把它擋下。請求驗證產生的標頭與表單的 Content-Type 也優先。不適用於 MQTT。",
     ),
