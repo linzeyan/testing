@@ -21122,6 +21122,47 @@ mod ui_tests {
         shot(&mut h, "12-highlight");
     }
 
+    /// 11-04: a click between U and R of `{{URL_Middleware}}` and a pick of URL_Member gave
+    /// `{{URL_Member}}RL_Middleware}}`, and the list held only names starting with the text
+    /// before the click: none but itself at the end of the name.
+    #[test]
+    fn a_variable_in_place_is_swapped_for_another_whole() {
+        let ws = workspace("swap-var");
+        ws.create_request(&ws.collections(), "r").unwrap();
+        let vars = [
+            KeyValue::new("URL_Middleware", "http://m"),
+            KeyValue::new("URL_Member", "http://a"),
+        ];
+        ws.save_env(Some("dev"), &vars, &[]).unwrap();
+        ws.save_state(&State {
+            active_env: Some("dev".into()),
+            ..Default::default()
+        });
+        let mut h = harness(ws);
+        h.run();
+        h.get_by_label("r").click();
+        h.run();
+        type_into(&mut h, 0, "{{URL_Middleware}}/x");
+        for _ in 0..4 {
+            h.key_press(Key::ArrowLeft);
+        }
+        h.run();
+        assert!(
+            h.query_by_label("URL_Member").is_some(),
+            "at the end of the name, the others are offered too"
+        );
+        h.key_press(Key::Home);
+        for _ in 0..3 {
+            h.key_press(Key::ArrowRight);
+        }
+        h.run();
+        // The list started on URL_Middleware, the one there; URL_Member sorts above it.
+        h.key_press(Key::ArrowUp);
+        h.key_press(Key::Enter);
+        h.run();
+        assert_eq!(draft(&h).url, "{{URL_Member}}/x");
+    }
+
     #[test]
     fn undefined_variable_is_defined_from_the_request_in_one_step() {
         let mut h = with_request("define");

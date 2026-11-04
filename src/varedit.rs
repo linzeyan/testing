@@ -157,13 +157,16 @@ pub fn var_edit(
     let mut popup: Popup = ui.data(|d| d.get_temp(popup_id)).unwrap_or_default();
     // Keys must be taken before the TextEdit sees them, or Enter would end editing.
     let mut accept = false;
+    let mut moved = false;
     if focused_before && popup.visible {
         ui.input_mut(|i| {
             if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
                 popup.selected += 1;
+                moved = true;
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
                 popup.selected = popup.selected.saturating_sub(1);
+                moved = true;
             }
             accept = i.consume_key(Modifiers::NONE, Key::Enter);
             if i.consume_key(Modifiers::NONE, Key::Escape) {
@@ -250,6 +253,8 @@ pub fn var_edit(
         _ => None,
     };
     let mut suggestions = Vec::new();
+    // A list just opening starts on the variable already there, scrolled to it.
+    let mut opening = false;
     if let Some(start) = start {
         if popup.start != start {
             popup = Popup {
@@ -258,12 +263,21 @@ pub fn var_edit(
             };
         }
         if !popup.dismissed {
+            let mut current = None;
             suggestions = match (&context, &word, &complete) {
-                (Some((_, _, prefix)), ..) => suggest(prefix, vars),
+                (Some((open, _, end, prefix)), ..) => {
+                    let list;
+                    (list, current) = var_suggestions(text, (*open, *end, prefix), vars);
+                    list
+                }
                 (None, Some((_, _, list)), _) => list.clone(),
                 (None, None, Complete::Words(w)) => suggest_words(text, w),
                 _ => Vec::new(),
             };
+            opening = !popup.visible;
+            if let Some(i) = current.filter(|_| opening) {
+                popup.selected = i;
+            }
         }
     }
     let showing = !suggestions.is_empty();
@@ -284,20 +298,29 @@ pub fn var_edit(
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(240.0);
-                    for (i, (name, value)) in suggestions.iter().enumerate() {
-                        let item = ui.horizontal(|ui| {
-                            let r = ui.selectable_label(
-                                i == popup.selected,
-                                RichText::new(name).monospace(),
-                            );
-                            ui.weak(clip(value, 40));
-                            r
+                    // Every variable, when picking another one, can be more than fit.
+                    let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+                    egui::ScrollArea::vertical()
+                        .max_height(row * MAX_SUGGESTIONS as f32)
+                        .show(ui, |ui| {
+                            for (i, (name, value)) in suggestions.iter().enumerate() {
+                                let item = ui.horizontal(|ui| {
+                                    let r = ui.selectable_label(
+                                        i == popup.selected,
+                                        RichText::new(name).monospace(),
+                                    );
+                                    ui.weak(clip(value, 40));
+                                    r
+                                });
+                                if i == popup.selected && (moved || opening) {
+                                    item.inner.scroll_to_me(None);
+                                }
+                                if item.inner.clicked() {
+                                    popup.selected = i;
+                                    accept = true;
+                                }
+                            }
                         });
-                        if item.inner.clicked() {
-                            popup.selected = i;
-                            accept = true;
-                        }
-                    }
                 });
             });
     }
@@ -305,7 +328,7 @@ pub fn var_edit(
     if accept && showing {
         let pick = &suggestions[popup.selected].0;
         let index = match (context, word) {
-            (Some((start, cursor_byte, _)), _) => insert(text, start, cursor_byte, pick),
+            (Some((start, _, end, _)), _) => insert(text, start, end, pick),
             (None, Some((start, cursor_byte, _))) => {
                 text.replace_range(start..cursor_byte, pick);
                 text[..start + pick.len()].chars().count()
@@ -630,9 +653,16 @@ fn highlight(
     syntax::job(text, &colors, font)
 }
 
-/// When the cursor (a char index) sits inside an unfinished `{{name`, returns
-/// (byte offset of `{{`, byte offset of the cursor, typed prefix).
-fn completion_context(text: &str, cursor: usize) -> Option<(usize, usize, String)> {
+fn name_char(c: char) -> bool {
+    c.is_alphanumeric() || "_-.$".contains(c)
+}
+
+/// When the cursor (a char index) sits inside a `{{name`, returns (byte offset of `{{`,
+/// byte offset of the cursor, end of the name, typed prefix). Inside a closed `{{name}}`
+/// the end is the name's, so a pick replaces all of it rather than splicing in before the
+/// rest (`{{URL_Member}}RL_Middleware}}`). In an unclosed `{{` it's the cursor: the text
+/// after it (`{{|api.example.com`) isn't a name being typed.
+fn completion_context(text: &str, cursor: usize) -> Option<(usize, usize, usize, String)> {
     let byte = text
         .char_indices()
         .nth(cursor)
@@ -640,15 +670,40 @@ fn completion_context(text: &str, cursor: usize) -> Option<(usize, usize, String
     let before = &text[..byte];
     let open = before.rfind("{{")?;
     let prefix = &before[open + 2..];
-    let valid = prefix
-        .chars()
-        .all(|c| c.is_alphanumeric() || "_-.$".contains(c));
-    valid.then(|| (open, byte, prefix.to_owned()))
+    if !prefix.chars().all(name_char) {
+        return None;
+    }
+    let rest = &text[byte..];
+    let tail = rest.find(|c| !name_char(c)).unwrap_or(rest.len());
+    let end = if rest[tail..].starts_with("}}") {
+        byte + tail
+    } else {
+        byte
+    };
+    Some((open, byte, end, prefix.to_owned()))
+}
+
+/// What a `{{` at `open` offers, and which entry is the variable already there. Typing
+/// filters by what's before the cursor. A click into a finished `{{name}}` of a known
+/// variable is a pick of another one: every variable is offered, not only those sharing
+/// the part before the click, with the current one selected.
+fn var_suggestions(
+    text: &str,
+    (open, end, prefix): (usize, usize, &str),
+    vars: &HashMap<String, String>,
+) -> (Vec<(String, String)>, Option<usize>) {
+    let name = &text[open + 2..end];
+    if text[end..].starts_with("}}") && is_known(name, vars) {
+        let all = suggest("", vars, usize::MAX);
+        let current = all.iter().position(|(n, _)| n == name);
+        return (all, current);
+    }
+    (suggest(prefix, vars, MAX_SUGGESTIONS), None)
 }
 
 /// Defined variables first, then dynamic ones; within each, prefix matches rank above
 /// substring matches.
-fn suggest(prefix: &str, vars: &HashMap<String, String>) -> Vec<(String, String)> {
+fn suggest(prefix: &str, vars: &HashMap<String, String>, limit: usize) -> Vec<(String, String)> {
     let prefix = prefix.to_lowercase();
     let mut out: Vec<(String, String)> = vars
         .iter()
@@ -667,7 +722,7 @@ fn suggest(prefix: &str, vars: &HashMap<String, String>) -> Vec<(String, String)
         // The user's own names come first: one of them is what's meant far more often.
         (n.starts_with('$'), !starts, lower)
     });
-    out.truncate(MAX_SUGGESTIONS);
+    out.truncate(limit);
     out
 }
 
@@ -688,15 +743,15 @@ fn suggest_words(text: &str, words: &[(&str, &'static str)]) -> Vec<(String, Str
     out
 }
 
-/// Replaces the typed prefix with `name}}` (reusing a `}}` already after the cursor) and
-/// returns the char index just past the closing braces.
-fn insert(text: &mut String, open: usize, cursor: usize, name: &str) -> usize {
-    let close = if text[cursor..].starts_with("}}") {
+/// Replaces what's between `{{` and `end` with `name}}` (reusing a `}}` already at `end`)
+/// and returns the char index just past the closing braces.
+fn insert(text: &mut String, open: usize, end: usize, name: &str) -> usize {
+    let close = if text[end..].starts_with("}}") {
         ""
     } else {
         "}}"
     };
-    text.replace_range(open + 2..cursor, &format!("{name}{close}"));
+    text.replace_range(open + 2..end, &format!("{name}{close}"));
     text[..open + 2 + name.len() + 2].chars().count()
 }
 
@@ -716,15 +771,63 @@ mod tests {
         let text = "https://{{ho";
         assert_eq!(
             completion_context(text, text.chars().count()),
-            Some((8, 12, "ho".into()))
+            Some((8, 12, 12, "ho".into()))
         );
         assert_eq!(completion_context("{{host}}/x", 10), None);
         assert_eq!(completion_context("{{a b", 5), None);
         // Char index, not byte index: CJK before the placeholder must not shift it.
         assert_eq!(
             completion_context("名稱{{to", 6),
-            Some((6, 10, "to".into()))
+            Some((6, 10, 10, "to".into()))
         );
+    }
+
+    /// The reported case: a click between U and R of `{{URL_Middleware}}` and a pick of
+    /// URL_Member gave `{{URL_Member}}RL_Middleware}}`. Inside a closed placeholder the
+    /// whole name goes; in an unclosed one the text after the cursor isn't the name's.
+    #[test]
+    fn a_pick_inside_a_placeholder_replaces_the_whole_name() {
+        let mut t = "{{URL_Middleware}}/v1".to_owned();
+        let (open, _, end, prefix) = completion_context(&t, 3).unwrap();
+        assert_eq!((open, end, prefix.as_str()), (0, 16, "U"));
+        let at = insert(&mut t, open, end, "URL_Member");
+        assert_eq!((t.as_str(), at), ("{{URL_Member}}/v1", 14));
+
+        let t = "https://{{api.example.com/v1";
+        let (_, cursor, end, _) = completion_context(t, 10).unwrap();
+        assert_eq!(end, cursor, "no `}}`: nothing after the cursor is replaced");
+    }
+
+    /// Clicking into a defined `{{name}}` is picking another variable: all of them are
+    /// offered, wherever the click was, not only those sharing the text before it.
+    #[test]
+    fn a_click_into_a_known_placeholder_offers_every_variable() {
+        let vars = HashMap::from([
+            ("URL_Middleware".to_owned(), "m".to_owned()),
+            ("URL_Member".to_owned(), "a".to_owned()),
+            ("token".to_owned(), "t".to_owned()),
+        ]);
+        let text = "{{URL_Middleware}}";
+        for click in [3, 10, 16] {
+            let (open, _, end, prefix) = completion_context(text, click).unwrap();
+            let (list, current) = var_suggestions(text, (open, end, &prefix), &vars);
+            let names: Vec<_> = list.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names[..3], ["token", "URL_Member", "URL_Middleware"]);
+            assert_eq!(
+                current,
+                Some(2),
+                "the one there is selected, click at {click}"
+            );
+            assert!(
+                names.len() > MAX_SUGGESTIONS,
+                "dynamic ones too, scrolled to"
+            );
+        }
+        // An undefined name is still being typed: filtered by what's before the cursor.
+        let text = "{{URL_Mx}}";
+        let (open, _, end, prefix) = completion_context(text, 7).unwrap();
+        let (list, current) = var_suggestions(text, (open, end, &prefix), &vars);
+        assert_eq!((list[0].0.as_str(), current), ("URL_Member", None));
     }
 
     /// A variable inside a JSON string shows as a variable, defined or not, with the
@@ -798,10 +901,12 @@ mod tests {
             ("token".to_owned(), "abc".to_owned()),
             ("authToken".to_owned(), "x".to_owned()),
         ]);
-        let names: Vec<_> = suggest("t", &vars).into_iter().map(|(n, _)| n).collect();
+        let names: Vec<_> = (suggest("t", &vars, MAX_SUGGESTIONS).into_iter())
+            .map(|(n, _)| n)
+            .collect();
         assert_eq!(names[..2], ["token".to_owned(), "authToken".to_owned()]);
         assert!(names.contains(&"$timestamp".to_owned()));
-        let names: Vec<_> = suggest("email", &vars)
+        let names: Vec<_> = suggest("email", &vars, MAX_SUGGESTIONS)
             .into_iter()
             .map(|(n, _)| n)
             .collect();
