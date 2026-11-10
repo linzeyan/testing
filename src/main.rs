@@ -52,6 +52,22 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
     };
+    // Restored maximized, the window is made at the maximized size rather than its saved
+    // one. Windows reports the size it was made at in a message that winit hands on only
+    // after eframe has set up, and eframe then sizes its surface to it and draws at once:
+    // a frame laid out for the maximized window went into a surface the saved size and was
+    // stretched to fill it, the tree in its corner enlarged and blurred for a moment (VM,
+    // 175%; on a 100% VDI, 1200×800 stretched to 1920×1017). The saved size comes back as
+    // where it un-maximizes to once it's shown (`appearance::set_restored_rect`).
+    #[cfg(windows)]
+    {
+        options.window_builder = Some(Box::new(|b: egui::ViewportBuilder| {
+            match (b.maximized, maximized_inner_size()) {
+                (Some(true), Some(size)) => b.with_inner_size(size),
+                _ => b,
+            }
+        }));
+    }
     let logs = store::state_dir().unwrap_or_else(|| ws.root.clone());
     logfile::init(Some(logs.join("apitool.log")));
     // Beside the log rather than eframe's %APPDATA%: on Windows the tool is portable.
@@ -89,6 +105,7 @@ fn main() -> eframe::Result {
             let mut app = app::App::new(ws, renderer);
             app.auto_update();
             app.restore_window(cc.storage);
+            app.apply_appearance(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
     );
@@ -114,6 +131,34 @@ fn renderer_info(cc: &eframe::CreationContext<'_>) -> String {
         })
     } else {
         "unknown renderer".into()
+    }
+}
+
+/// The client area of a window maximized on the primary monitor, in points: its work area
+/// less the title bar.
+#[cfg(windows)]
+fn maximized_inner_size() -> Option<egui::Vec2> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SM_CYCAPTION, SPI_GETWORKAREA, SystemParametersInfoW,
+    };
+    let mut work = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: SPI_GETWORKAREA writes one RECT into the pointer given.
+    unsafe {
+        if SystemParametersInfoW(SPI_GETWORKAREA, 0, (&raw mut work).cast(), 0) == 0 {
+            return None;
+        }
+        let dpi = GetDpiForSystem();
+        let caption = GetSystemMetricsForDpi(SM_CYCAPTION, dpi);
+        let scale = dpi as f32 / 96.0;
+        let (w, h) = (work.right - work.left, work.bottom - work.top - caption);
+        Some(egui::vec2(w as f32 / scale, h as f32 / scale))
     }
 }
 

@@ -148,6 +148,73 @@ pub fn title_bar(frame: &eframe::Frame, dark: bool) {
     }
 }
 
+/// Where the window goes when un-maximized: `outer_pos` (physical pixels, else where the
+/// system put it) and `inner` points of client area at `scale`. Only on a visible window,
+/// as `SetWindowPlacement` shows a hidden one; false while it isn't yet, to try again.
+#[cfg(windows)]
+pub fn set_restored_rect(
+    frame: &eframe::Frame,
+    outer_pos: Option<egui::Pos2>,
+    inner: egui::Vec2,
+    scale: f32,
+) -> bool {
+    use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, GetWindowPlacement, IsWindowVisible,
+        SW_SHOWMAXIMIZED, SetWindowPlacement, WINDOWPLACEMENT, WS_MAXIMIZE,
+    };
+    let Ok(handle) = frame.window_handle() else {
+        return true;
+    };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return true;
+    };
+    let hwnd = h.hwnd.get() as HWND;
+    // SAFETY: eframe's live window; the structs are sized and filled as the calls expect.
+    unsafe {
+        if IsWindowVisible(hwnd) == 0 {
+            return false;
+        }
+        let mut place: WINDOWPLACEMENT = std::mem::zeroed();
+        place.length = size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(hwnd, &mut place) == 0 {
+            return true;
+        }
+        let (w, h) = (
+            (inner.x * scale).round() as i32,
+            (inner.y * scale).round() as i32,
+        );
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32 & !WS_MAXIMIZE;
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        AdjustWindowRectExForDpi(&mut r, style, 0, ex, GetDpiForWindow(hwnd));
+        let normal = place.rcNormalPosition;
+        let (x, y) = outer_pos.map_or((normal.left, normal.top), |p| (p.x as i32, p.y as i32));
+        place.rcNormalPosition = RECT {
+            left: x,
+            top: y,
+            right: x + r.right - r.left,
+            bottom: y + r.bottom - r.top,
+        };
+        // Still maximized: only where it goes afterwards changes, nothing on screen.
+        place.showCmd = SW_SHOWMAXIMIZED as u32;
+        SetWindowPlacement(hwnd, &place);
+    }
+    true
+}
+
+#[cfg(not(windows))]
+pub fn set_restored_rect(_: &eframe::Frame, _: Option<egui::Pos2>, _: egui::Vec2, _: f32) -> bool {
+    true
+}
+
 /// Elsewhere egui's `sync_window_theme` keeps the title bar in step.
 #[cfg(not(windows))]
 pub fn title_bar(_: &eframe::Frame, _: bool) {}

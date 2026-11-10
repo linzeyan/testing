@@ -2098,6 +2098,17 @@ impl App {
         self.auto_update = true;
     }
 
+    /// The fonts and style chosen in Settings, when they changed. Called before the first
+    /// frame too, which egui would otherwise draw in its own and then redraw in these.
+    pub fn apply_appearance(&mut self, ctx: &egui::Context) {
+        if self.applied.as_ref() != Some(&self.appearance) {
+            if let Err(e) = crate::appearance::apply(ctx, &self.appearance) {
+                self.fail(e);
+            }
+            self.applied = Some(self.appearance.clone());
+        }
+    }
+
     /// For the real app: the window as saved last time, which `save` keeps un-maximized.
     pub fn restore_window(&mut self, storage: Option<&dyn eframe::Storage>) {
         self.window = storage.and_then(|s| eframe::get_value(s, WINDOW_KEY));
@@ -3713,20 +3724,35 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         crate::i18n::set(self.appearance.language);
         self.log_frame(frame.info().cpu_usage);
-        if self.applied.as_ref() != Some(&self.appearance) {
-            if let Err(e) = crate::appearance::apply(ui.ctx(), &self.appearance) {
-                self.fail(e);
-            }
-            self.applied = Some(self.appearance.clone());
-        }
+        self.apply_appearance(ui.ctx());
         let dark = ui.ctx().theme() == egui::Theme::Dark;
         let title_bar = Some((dark, ui.input(|i| i.raw.system_theme)));
         if self.title_bar != title_bar {
             crate::appearance::title_bar(frame, dark);
             self.title_bar = title_bar;
         }
+        // Restored maximized, the window was made without its saved size (main.rs): it would
+        // un-maximize to winit's default. Placed once it's shown, as placing a hidden window
+        // shows it unpainted.
+        let placed = egui::Id::new("restored-rect");
+        if let Some(w) = self.window.filter(|w| w.maximized)
+            && let Some(size) = w.inner_size_points
+            && !ui.data(|d| d.get_temp::<bool>(placed).unwrap_or(false))
+        {
+            let scale = ui.ctx().pixels_per_point();
+            // As eframe clamps a saved size: never wider or taller than the monitor.
+            let size = ui
+                .input(|i| i.viewport().monitor_size)
+                .map_or(size, |m| size.min(m));
+            if crate::appearance::set_restored_rect(frame, w.outer_position_pixels, size, scale) {
+                ui.data_mut(|d| d.insert_temp(placed, true));
+            }
+        }
         // The default size suits a desktop monitor, but at 150–175% on a laptop it ran under
-        // the taskbar, hiding the status bar. Once: un-maximizing is the user's to do.
+        // the taskbar, hiding the status bar. Only on the first start: a window saved
+        // un-maximized is the size the user left it. Maximizing comes after the window is
+        // shown, and Windows zooms its first frame up to the full screen on the way: done
+        // on every start, that was a blurred, enlarged tree flashing each time (VM, 175%).
         if !self.fitted
             && let Some((outer, screen)) =
                 ui.input(|i| Some((i.viewport().outer_rect?, i.viewport().monitor_size?)))
@@ -3736,8 +3762,29 @@ impl eframe::App for App {
             // or dock plus where the system puts a new window (Windows cascades it ~120 points
             // down).
             let fits = outer.width() <= screen.x && outer.height() + 160.0 <= screen.y;
-            if !fits && ui.input(|i| i.viewport().maximized) != Some(true) {
+            let maximized = ui.input(|i| i.viewport().maximized);
+            let (saved, scale) = (self.window, ui.ctx().pixels_per_point());
+            log::info!(
+                "window: saved {saved:?}, outer {outer:?}, screen {screen:?}, scale {scale}, \
+                 maximized {maximized:?}, fits {fits}"
+            );
+            if saved.is_none() && !fits && maximized != Some(true) {
                 (ui.ctx()).send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+        }
+        // A start-up flash is gone before anyone can describe it: the window's first sizes
+        // say whether it was drawn at one size and shown at another.
+        if ui.ctx().cumulative_pass_nr() < 30 {
+            let id = egui::Id::new("startup-size");
+            let now = ui.input(|i| (i.viewport().inner_rect, i.viewport().maximized));
+            if ui.data(|d| d.get_temp(id)) != Some(now) {
+                let pass = ui.ctx().cumulative_pass_nr();
+                log::info!(
+                    "window at pass {pass}: inner {:?}, maximized {:?}",
+                    now.0,
+                    now.1
+                );
+                ui.data_mut(|d| d.insert_temp(id, now));
             }
         }
         self.receive(ui.ctx());
@@ -9066,12 +9113,7 @@ fn run_order_ui(
         .show(ui, |ui| {
             for (i, (path, on)) in order.iter_mut().enumerate() {
                 let row = ui.horizontal(|ui| {
-                    let size = egui::vec2(icon_size(ui), button_height(ui));
-                    let (rect, grip) = ui.allocate_exact_size(size, egui::Sense::drag());
-                    icon::GRIP.paint(ui, rect, size.x, ui.visuals().weak_text_color());
-                    let grip = named(grip, t("Drag to change the order"), None)
-                        .on_hover_cursor(egui::CursorIcon::Grab)
-                        .on_hover_text(t("Drag to change the order"));
+                    let grip = drag_grip(ui);
                     let name = ws.display_name(path);
                     let r = ui.checkbox(on, "");
                     let (enabled, ticked) = (r.enabled(), *on);
@@ -9091,34 +9133,69 @@ fn run_order_ui(
                 }
                 rows.push(row.response.rect);
             }
-            // Where the row would go: before the first row whose middle is below the pointer.
-            let y = ui.ctx().pointer_interact_pos().map(|p| p.y);
-            let to = |y: f32| {
-                rows.iter()
-                    .position(|r| y < r.center().y)
-                    .unwrap_or(rows.len())
-            };
-            match (dragged, dropped, y) {
-                (Some(_), _, Some(y)) => {
-                    let at = match rows.get(to(y)) {
-                        Some(r) => r.top() - ui.spacing().item_spacing.y / 2.0,
-                        None => rows.last().map_or(0.0, |r| r.bottom() + 1.0),
-                    };
-                    // Above the first row is outside the scroll area, which would clip it.
-                    let at = at.max(ui.clip_rect().top() + 1.0);
-                    let stroke = egui::Stroke::new(2.0, ui.visuals().selection.bg_fill);
-                    ui.painter().hline(ui.max_rect().x_range(), at, stroke);
-                }
-                (_, Some(from), Some(y)) => {
-                    let to = to(y);
-                    let item = order.remove(from);
-                    order.insert(if to > from { to - 1 } else { to }, item);
-                    changed |= to != from && to != from + 1;
-                }
-                _ => {}
-            }
+            changed |= drag_reorder(ui, order, &rows, dragged, dropped);
         });
     changed
+}
+
+/// A row's handle for `drag_reorder`: rows move by it, as their fields take the clicks.
+fn drag_grip(ui: &mut egui::Ui) -> egui::Response {
+    let size = egui::vec2(icon_size(ui), button_height(ui));
+    let (rect, grip) = ui.allocate_exact_size(size, egui::Sense::drag());
+    icon::GRIP.paint(ui, rect, size.x, ui.visuals().weak_text_color());
+    named(grip, t("Drag to change the order"), None)
+        .on_hover_cursor(egui::CursorIcon::Grab)
+        .on_hover_text(t("Drag to change the order"))
+}
+
+/// The room `drag_grip` takes, for rows that have none (a table's titles, its blank row,
+/// rows shown under it), so their columns line up with the ones that do.
+fn no_grip(ui: &mut egui::Ui) {
+    let size = egui::vec2(icon_size(ui), button_height(ui));
+    ui.allocate_exact_size(size, egui::Sense::hover());
+}
+
+/// How much of a row `drag_grip` takes, its spacing included.
+fn grip_width(ui: &egui::Ui) -> f32 {
+    icon_size(ui) + ui.spacing().item_spacing.x
+}
+
+/// Draws where the row whose grip is `dragged` would land and moves it there when it's
+/// `dropped`: before the first row whose middle is below the pointer. `rows` are the
+/// rows' rects, one per item. True when the order changed.
+fn drag_reorder<T>(
+    ui: &egui::Ui,
+    items: &mut Vec<T>,
+    rows: &[egui::Rect],
+    dragged: Option<usize>,
+    dropped: Option<usize>,
+) -> bool {
+    let y = ui.ctx().pointer_interact_pos().map(|p| p.y);
+    let to = |y: f32| {
+        rows.iter()
+            .position(|r| y < r.center().y)
+            .unwrap_or(rows.len())
+    };
+    match (dragged, dropped, y) {
+        (Some(_), _, Some(y)) => {
+            let at = match rows.get(to(y)) {
+                Some(r) => r.top() - ui.spacing().item_spacing.y / 2.0,
+                None => rows.last().map_or(0.0, |r| r.bottom() + 1.0),
+            };
+            // Above the first row is outside a scroll area, which would clip it.
+            let at = at.max(ui.clip_rect().top() + 1.0);
+            let stroke = egui::Stroke::new(2.0, ui.visuals().selection.bg_fill);
+            ui.painter().hline(ui.max_rect().x_range(), at, stroke);
+            false
+        }
+        (_, Some(from), Some(y)) => {
+            let to = to(y);
+            let item = items.remove(from);
+            items.insert(if to > from { to - 1 } else { to }, item);
+            to != from && to != from + 1
+        }
+        _ => false,
+    }
 }
 
 /// One row of the runner's results, its saved response under it when `open`; true when
@@ -10002,9 +10079,10 @@ fn auto_headers_ui(ui: &mut egui::Ui, auto: Vec<(String, String, &str)>) -> bool
             // In the columns of the table above, as `kv_table` sizes them, greyed: more rows
             // of it that Send fills in.
             let key_width = (ui.available_width() * 0.25).clamp(100.0, 200.0);
-            let rest = (ui.available_width() - key_width - 90.0).max(120.0);
+            let rest = (ui.available_width() - key_width - 90.0 - grip_width(ui)).max(120.0);
             for (name, value, from) in auto {
                 ui.horizontal(|ui| {
+                    no_grip(ui);
                     ui.add_visible(false, egui::Checkbox::new(&mut true, ""));
                     ui.add_enabled_ui(false, |ui| {
                         let mut name = name.as_str();
@@ -10125,7 +10203,7 @@ fn kv_table(
     };
     // A multipart value `@path` is a file: each part picks one, as Postman's rows do.
     let files = id == "multipart";
-    let buttons = if files { 118.0 } else { 90.0 };
+    let buttons = if files { 118.0 } else { 90.0 } + grip_width(ui);
     let rest = (ui.available_width() - key_width - buttons).max(120.0);
     let (value_width, desc_width) = match describe {
         true => (rest * 0.6, rest * 0.4 - ui.spacing().item_spacing.x),
@@ -10138,6 +10216,7 @@ fn kv_table(
     // is filled. Each starts where its fields' text does.
     if existing > 0 {
         ui.horizontal(|ui| {
+            no_grip(ui);
             ui.add_visible(false, egui::Checkbox::new(&mut true, ""));
             // As wide as the field below, item spacing included; 4 is a TextEdit's margin.
             let mut title = |text: &str, width: f32| {
@@ -10153,6 +10232,7 @@ fn kv_table(
             }
         });
     }
+    let (mut rects, mut dragged, mut dropped) = (Vec::with_capacity(existing), None, None);
     // Plain rows, not egui::Grid: Grid clamps a cell to last frame's column width, so
     // text fields that start narrow stay narrow forever.
     for (i, row) in rows
@@ -10160,14 +10240,18 @@ fn kv_table(
         .chain(std::iter::once(&mut blank))
         .enumerate()
     {
-        ui.horizontal(|ui| {
+        let line = ui.horizontal(|ui| {
             let real = i < existing;
-            if real {
+            let grip = if real {
+                let grip = drag_grip(ui);
                 ui.checkbox(&mut row.enabled, "");
+                Some(grip)
             } else {
-                // Invisible twin keeps the blank row aligned with real rows.
+                // Invisible twins keep the blank row aligned with real rows.
+                no_grip(ui);
                 ui.add_visible(false, egui::Checkbox::new(&mut true, ""));
-            }
+                None
+            };
             // Ids are by row index, so the blank row's editor becomes row `existing` after it's
             // promoted and keeps keyboard focus mid-typing.
             let style = egui::TextStyle::Body;
@@ -10231,10 +10315,25 @@ fn kv_table(
             {
                 remove = Some(i);
             }
+            grip
         });
+        if let Some(grip) = line.inner {
+            if grip.dragged() {
+                dragged = Some(i);
+            } else if grip.drag_stopped() {
+                dropped = Some(i);
+            }
+            rects.push(line.response.rect);
+        }
     }
-    if let Some(i) = remove {
-        rows.remove(i);
+    match remove {
+        Some(i) => {
+            rows.remove(i);
+        }
+        // The blank row isn't among `rects`: a row dropped past the end stays above it.
+        None => {
+            drag_reorder(ui, rows, &rects, dragged, dropped);
+        }
     }
     if blank != KeyValue::new("", "") {
         rows.push(blank);
@@ -10252,9 +10351,11 @@ fn path_vars_table(ui: &mut egui::Ui, rows: &mut [KeyValue], vars: &HashMap<Stri
     ui.strong(t("Path Variables"));
     // Narrower in a side-by-side pane, so the value keeps most of the room.
     let key_width = (ui.available_width() * 0.25).clamp(100.0, 200.0);
-    let rest = (ui.available_width() - key_width - 90.0).max(120.0);
+    let rest = (ui.available_width() - key_width - 90.0 - grip_width(ui)).max(120.0);
     for (i, row) in rows.iter_mut().enumerate() {
         ui.horizontal(|ui| {
+            // In the URL's order: there is nothing to drag.
+            no_grip(ui);
             ui.add_visible(false, egui::Checkbox::new(&mut true, ""));
             // A `&str` buffer is read-only but looks like the key fields above.
             ui.add(egui::TextEdit::singleline(&mut row.key.as_str()).desired_width(key_width));
@@ -11367,9 +11468,10 @@ fn inherited_rows(ui: &mut egui::Ui, rows: &[&(Source, KeyValue)]) -> Option<Key
     ui.add_space(6.0);
     ui.weak(tf("{} inherited", &[&rows.len()]));
     let key_width = (ui.available_width() * 0.25).clamp(100.0, 200.0);
-    let rest = (ui.available_width() - key_width - 90.0).max(120.0);
+    let rest = (ui.available_width() - key_width - 90.0 - grip_width(ui)).max(120.0);
     for (from, row) in rows.iter().map(|r| (&r.0, &r.1)) {
         ui.horizontal(|ui| {
+            no_grip(ui);
             ui.add_visible(false, egui::Checkbox::new(&mut true, ""));
             ui.add_enabled_ui(false, |ui| {
                 let (mut key, mut value) = (row.key.as_str(), row.value.as_str());
@@ -16302,6 +16404,18 @@ mod ui_tests {
             h.step();
             assert!(!maximize(&h), "{screen:?}");
         }
+        // Started again with that un-maximized window saved: it comes back as it was, not
+        // maximized (and zoomed up from its first frame) on every start.
+        let mut h = harness(workspace("fit-saved"));
+        h.state_mut().window = Some(WindowSettings {
+            inner_size_points: Some(WINDOW_SIZE.into()),
+            ..Default::default()
+        });
+        let root = h.input_mut().viewports.get_mut(&ViewportId::ROOT).unwrap();
+        (root.outer_rect, root.monitor_size) = (Some(outer), Some([1164.0, 907.0].into()));
+        h.step();
+        let out = &h.output().viewport_output[&ViewportId::ROOT];
+        assert!(!out.commands.contains(&ViewportCommand::Maximized(true)));
     }
 
     /// `.window.ron` in memory.
@@ -19699,6 +19813,74 @@ mod ui_tests {
         let kept = [(p("b"), false), (p("gone"), true), (p("a"), true)];
         let want = [(p("b"), false), (p("a"), true), (p("new"), true)];
         assert_eq!(run_order(&tree, &kept), want);
+    }
+
+    /// Variables, headers and every other key/value table reorder by dragging a row's grip,
+    /// as Postman's do: the order is what a later variable overrides and what's sent. The
+    /// row moves whole (ticked or not, its description), never below the blank row, and the
+    /// columns still line up with rows that have no grip.
+    #[test]
+    fn a_key_value_row_is_dragged_to_a_new_place() {
+        let kv = |k: &str, on: bool| KeyValue {
+            enabled: on,
+            description: format!("about {k}"),
+            ..KeyValue::new(k, "v")
+        };
+        let inherited = (Source::Globals, KeyValue::new("base", "v"));
+        let rows = vec![kv("a", true), kv("b", false), kv("c", true)];
+        let mut h = Harness::new_ui_state(
+            |ui, rows: &mut Vec<KeyValue>| {
+                ui.set_width(700.0);
+                kv_table(ui, "env-shared", rows, &HashMap::new(), true);
+                inherited_rows(ui, &[&inherited]);
+            },
+            rows,
+        );
+        h.run();
+        let keys = |h: &Harness<'_, Vec<KeyValue>>| -> Vec<(String, bool, String)> {
+            let row = |r: &KeyValue| (r.key.clone(), r.enabled, r.description.clone());
+            h.state().iter().map(row).collect()
+        };
+        let want = |order: [(&str, bool); 3]| -> Vec<(String, bool, String)> {
+            let row = |(k, on): (&str, bool)| (k.to_owned(), on, format!("about {k}"));
+            order.into_iter().map(row).collect()
+        };
+        // One grip per real row: the blank row and the inherited one have none.
+        let grips = |h: &Harness<'_, Vec<KeyValue>>| -> Vec<egui::Pos2> {
+            (h.get_all_by_label("Drag to change the order"))
+                .map(|n| n.rect().center())
+                .collect()
+        };
+        assert_eq!(grips(&h).len(), 3);
+        let drag = |h: &mut Harness<'_, Vec<KeyValue>>, from: usize, to: egui::Pos2| {
+            let from = grips(h)[from];
+            h.drag_at(from);
+            h.run();
+            h.hover_at(from + egui::vec2(0.0, (to.y - from.y).signum() * 12.0));
+            h.run();
+            h.hover_at(to);
+            h.run();
+            h.drop_at(to);
+            h.run();
+        };
+        // The first row to just past the middle of the second: down one.
+        let to = grips(&h)[1] + egui::vec2(0.0, 4.0);
+        drag(&mut h, 0, to);
+        assert_eq!(keys(&h), want([("b", false), ("a", true), ("c", true)]));
+        // The last to above the first.
+        let to = grips(&h)[0] - egui::vec2(0.0, 4.0);
+        drag(&mut h, 2, to);
+        assert_eq!(keys(&h), want([("c", true), ("b", false), ("a", true)]));
+        // Far below the table, onto the inherited row: last, the blank row still after it.
+        let below = h.get_by_label("Override").rect().center();
+        drag(&mut h, 0, below);
+        assert_eq!(keys(&h), want([("b", false), ("a", true), ("c", true)]));
+        // The inherited row's key starts where the table's keys do.
+        let left = |text: &str| -> f32 {
+            let texts = painted_texts(&h);
+            texts.iter().find(|(s, ..)| s == text).unwrap().1.left()
+        };
+        assert_eq!(left("a"), left("base"));
     }
 
     /// The runner runs what's ticked in the order dragged to, stops at the first failure
