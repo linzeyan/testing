@@ -2163,8 +2163,13 @@ impl App {
 
     /// The workspace folder's files and the database into step (`Workspace::sync`): on
     /// start, on leaving the window (about to commit) and coming back (maybe pulled), on
-    /// close.
+    /// close. Not while a remote sync pulls: it writes the tree file by file, and a look
+    /// meanwhile pruned the files written after it read the folder, which the sync then
+    /// pushed as deletions. It brings the two into step itself when it is done.
     fn sync(&mut self) {
+        if self.syncing {
+            return;
+        }
         match self.ws.sync() {
             Ok(Synced::Imported) => {
                 self.status = t("Read the changed workspace files").into();
@@ -23397,6 +23402,42 @@ mod ui_tests {
         h.state().tx.send(Msg::Synced(Ok(unchanged))).unwrap();
         h.run();
         assert_eq!(h.state().status, "Tests: 1/1 passed");
+    }
+
+    // fb20261116a: a first sync pulled 501 files one by one for ~4 minutes; each focus
+    // change meanwhile brought the tree and the database into step, pruned files the pull
+    // had just written, and the sync then pushed them as deletions: two requests vanished
+    // from the repository every machine shares. Until the pull is done, the tree is the
+    // sync's alone.
+    #[test]
+    fn regression_fb20261116a_focus_leaves_a_pulling_tree_alone() {
+        let ws = workspace("pulling");
+        ws.create_request(&ws.collections(), "kept").unwrap();
+        ws.sync().unwrap();
+        let mut h = harness(ws.clone());
+        let id = crate::store::new_id();
+        let pulled = format!("collections/{id}.toml");
+        std::fs::write(
+            ws.root.join(&pulled),
+            "name = \"pulled\"\nmethod = \"GET\"\nurl = \"http://x\"\n",
+        )
+        .unwrap();
+        let in_db = |ws: &Workspace| ws.tree_files().unwrap().iter().any(|(p, _)| *p == pulled);
+
+        h.state_mut().syncing = true;
+        h.state_mut().sync();
+        assert!(
+            !in_db(&ws),
+            "the window read the tree in while a remote sync was still writing it"
+        );
+        assert!(ws.root.join(&pulled).exists());
+
+        h.state_mut().syncing = false;
+        h.state_mut().sync();
+        assert!(
+            in_db(&ws),
+            "once the sync is done, focus reads the tree in again"
+        );
     }
 
     #[test]
