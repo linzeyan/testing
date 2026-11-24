@@ -352,6 +352,9 @@ end, until its × dismisses it. A send that fails is there too, named, until the
 Ctrl is ⌘ on macOS, except for switching tabs. Until something is sent, the response pane
 lists the everyday ones and `Ctrl+/` for the rest.
 
+On macOS the shortcuts are also in the menu bar (File, Edit, Request, View), the tabs sit
+in the title bar's row, and its empty stretch moves the window.
+
 | Action | Keys |
 |---|---|
 | Send request | `Ctrl+Enter` |
