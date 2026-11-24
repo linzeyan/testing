@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 /// QUERY is the safe, body-carrying GET of draft-ietf-httpbis-safe-method-w-body.
 pub const METHODS: &[&str] = &[
     "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY", "TRACE", "CONNECT",
-    "GRAPHQL", "WS", "SSE", "GRPC", "MQTT", "SOCKETIO",
+    "GRAPHQL", "WS", "SSE", "GRPC", "MQTT", "SOCKETIO", "NATS",
 ];
 
 /// Methods whose response is a stream of messages rather than one body.
 pub fn is_streaming(method: &str) -> bool {
-    matches!(method, "WS" | "SSE" | "MQTT" | "SOCKETIO")
+    matches!(method, "WS" | "SSE" | "MQTT" | "SOCKETIO" | "NATS")
 }
 
 /// One request per file on disk, so field order and `skip_serializing_if` matter:
@@ -71,6 +71,8 @@ pub struct Request {
     pub mqtt: Mqtt,
     #[serde(skip_serializing_if = "SocketIo::is_default")]
     pub socketio: SocketIo,
+    #[serde(skip_serializing_if = "Nats::is_default")]
+    pub nats: Nats,
     /// Messages kept to send again on a stream (WebSocket, Socket.IO, MQTT, gRPC), as
     /// Postman's saved messages.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -417,6 +419,80 @@ impl SocketIo {
     }
 }
 
+/// A NATS request: one connection that subscribes to subjects, publishes, and asks for a
+/// reply. The message's headers are the request's own Headers tab.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Nats {
+    /// Subscribed to on Connect, and kept in step while connected.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<NatsSubject>,
+    /// Where Send publishes.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub subject: String,
+    /// Where a receiver should answer a plain publish; a Request makes its own inbox.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reply: String,
+    pub send: NatsSend,
+    /// The connection's name in the server's monitoring; empty: "apitool".
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// A .creds file (a user's JWT and NKey seed), as `nats context` and NGS hand out.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub creds: String,
+    /// An NKey seed (SU…): signs the server's nonce instead of sending a password.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub nkey: String,
+}
+
+impl Nats {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A copy with the Settings tab's fields (how it connects) as a new request has them.
+    pub fn with_default_connection(&self) -> Nats {
+        Nats {
+            name: String::new(),
+            creds: String::new(),
+            nkey: String::new(),
+            ..self.clone()
+        }
+    }
+}
+
+/// What Send does with the composer's message.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NatsSend {
+    #[default]
+    Publish,
+    /// Publishes with an inbox of its own and waits for the first reply.
+    Request,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct NatsSubject {
+    /// `*` matches one token, `>` everything after.
+    pub subject: String,
+    /// Subscribers sharing a queue group get each message once between them.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub queue: String,
+    #[serde(skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for NatsSubject {
+    fn default() -> Self {
+        Self {
+            subject: String::new(),
+            queue: String::new(),
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Topic {
@@ -679,6 +755,7 @@ impl Default for Request {
             settings: Settings::default(),
             mqtt: Mqtt::default(),
             socketio: SocketIo::default(),
+            nats: Nats::default(),
             asserts: Vec::new(),
             response_vars: Vec::new(),
             messages: Vec::new(),
@@ -1565,6 +1642,22 @@ impl Request {
                 will_content_type: r(self.mqtt.will_content_type.trim()),
                 ..self.mqtt.clone()
             },
+            nats: Nats {
+                subjects: (self.nats.subjects.iter())
+                    .filter(|s| s.enabled && !s.subject.trim().is_empty())
+                    .map(|s| NatsSubject {
+                        subject: r(s.subject.trim()),
+                        queue: r(s.queue.trim()),
+                        enabled: true,
+                    })
+                    .collect(),
+                subject: r(self.nats.subject.trim()),
+                reply: r(self.nats.reply.trim()),
+                name: r(self.nats.name.trim()),
+                creds: r(self.nats.creds.trim()),
+                nkey: r(self.nats.nkey.trim()),
+                send: self.nats.send,
+            },
             socketio: SocketIo {
                 path: r(&self.socketio.path),
                 ..self.socketio.clone()
@@ -1633,6 +1726,7 @@ impl Request {
             settings,
             mqtt,
             socketio,
+            nats,
             messages,
             examples,
             inherited: _,
@@ -1646,6 +1740,7 @@ impl Request {
             && (asserts, settings, mqtt) == (&other.asserts, &other.settings, &other.mqtt)
             && (examples, response_vars) == (&other.examples, &other.response_vars)
             && (messages, socketio) == (&other.messages, &other.socketio)
+            && nats == &other.nats
             && (body == &other.body || body.is_empty() && other.body.is_empty())
             && (auth == &other.auth || auth.is_unset() && other.auth.is_unset())
     }
@@ -2231,6 +2326,19 @@ mod tests {
             socketio: SocketIo {
                 path: "/{{prefix}}/rt".into(),
                 v2: true,
+            },
+            nats: Nats {
+                subjects: vec![NatsSubject {
+                    subject: "orders.>".into(),
+                    queue: "workers".into(),
+                    enabled: false,
+                }],
+                subject: "orders.{{id}}".into(),
+                reply: "answers".into(),
+                send: NatsSend::Request,
+                name: "probe".into(),
+                creds: "/tmp/u.creds".into(),
+                nkey: "SUAC".into(),
             },
             examples: vec![Example {
                 name: "found".into(),

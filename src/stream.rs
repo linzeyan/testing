@@ -39,7 +39,7 @@ impl Frame {
 }
 
 /// A binary message as the log shows it: its size, then its bytes in hex.
-fn binary(b: &[u8]) -> String {
+pub(crate) fn binary(b: &[u8]) -> String {
     // The app keeps 64 KiB of an event's text; spelling out more is wasted work.
     let shown = crate::model::encode_hex(&b[..b.len().min(32 << 10)]);
     format!("<binary, {} bytes> {shown}", b.len())
@@ -63,7 +63,7 @@ pub fn subscribes(req: &Request) -> bool {
 
 /// Connects a resolved stream request of any kind and runs it until either side ends it.
 /// `text` carries what is sent on WebSocket, Socket.IO and gRPC streams, `mqtt` an MQTT
-/// session's publishes; dropping a sender disconnects gracefully. A connection that ends
+/// session's publishes and `nats` a NATS one's; dropping a sender disconnects gracefully. A connection that ends
 /// otherwise opens again as many times in a row as the request's settings say.
 pub async fn connect(
     clients: &crate::net::Clients,
@@ -71,6 +71,7 @@ pub async fn connect(
     req: Request,
     text: mpsc::UnboundedReceiver<Frame>,
     mqtt: mpsc::UnboundedReceiver<crate::mqtt::Command>,
+    nats: mpsc::UnboundedReceiver<crate::nats::Command>,
     emit: impl Fn(Event),
 ) {
     // Sizes only: what a message says is the user's. The app logs opening, closing and
@@ -92,6 +93,7 @@ pub async fn connect(
     match req.method.as_str() {
         // MQTT isn't HTTP, but it takes the client's proxy choice (maybe from PAC).
         "MQTT" => crate::mqtt::session(req, net, clients.route.clone(), mqtt, emit).await,
+        "NATS" => crate::nats::session(req, net, nats, emit).await,
         "GRPC" => crate::grpc::stream(clients, req, text, emit).await,
         method => {
             let (ws, sio) = (method.eq_ignore_ascii_case("WS"), method == "SOCKETIO");
@@ -1102,14 +1104,23 @@ pub mod tests {
         let events = |req: Request| {
             let (tx, rx) = mpsc::unbounded_channel::<Frame>();
             let (_mqtt, mqtt_rx) = mpsc::unbounded_channel();
+            let (_nats, nats_rx) = mpsc::unbounded_channel();
             let tx = std::sync::Mutex::new(Some(tx));
             let events = std::sync::Mutex::new(Vec::new());
-            rt.block_on(connect(&clients, net.clone(), req, rx, mqtt_rx, |e| {
-                if matches!(&e, Event::In(t) if t == "two") {
-                    drop(tx.lock().unwrap().take());
-                }
-                events.lock().unwrap().push(e);
-            }));
+            rt.block_on(connect(
+                &clients,
+                net.clone(),
+                req,
+                rx,
+                mqtt_rx,
+                nats_rx,
+                |e| {
+                    if matches!(&e, Event::In(t) if t == "two") {
+                        drop(tx.lock().unwrap().take());
+                    }
+                    events.lock().unwrap().push(e);
+                },
+            ));
             events.into_inner().unwrap()
         };
         let again = |t: &str| t.ends_with("; reconnecting in 0.1 s (1 of 1)");
@@ -1204,14 +1215,23 @@ pub mod tests {
         let events = |req: Request| {
             let (tx, rx) = mpsc::unbounded_channel::<Frame>();
             let (_mqtt, mqtt_rx) = mpsc::unbounded_channel();
+            let (_nats, nats_rx) = mpsc::unbounded_channel();
             let tx = std::sync::Mutex::new(Some(tx));
             let events = std::sync::Mutex::new(Vec::new());
-            rt.block_on(connect(&clients, net.clone(), req, rx, mqtt_rx, |e| {
-                if matches!(e, Event::In(_)) {
-                    drop(tx.lock().unwrap().take());
-                }
-                events.lock().unwrap().push(e);
-            }));
+            rt.block_on(connect(
+                &clients,
+                net.clone(),
+                req,
+                rx,
+                mqtt_rx,
+                nats_rx,
+                |e| {
+                    if matches!(e, Event::In(_)) {
+                        drop(tx.lock().unwrap().take());
+                    }
+                    events.lock().unwrap().push(e);
+                },
+            ));
             events.into_inner().unwrap()
         };
         let ws = |settings: crate::model::Settings| Request {

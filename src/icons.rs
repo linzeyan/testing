@@ -76,6 +76,7 @@ icons! {
     LIGHTNING "zap",
     RADIO "radio",
     RSS "rss",
+    SEND "send",
 }
 
 /// Textures by (icon, pixels), kept in the context: an icon is drawn once per size.

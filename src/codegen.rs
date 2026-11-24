@@ -1730,6 +1730,9 @@ const MQTT: &[(&str, StreamGenerator)] = &[
     ("Go (paho.mqtt.golang)", mqtt_go),
 ];
 
+// ponytail: the nats CLI only; nats.py, nats.js and nats.go snippets when asked for.
+const NATS: &[(&str, StreamGenerator)] = &[("nats CLI", nats_cli)];
+
 const GRPC: &[(&str, StreamGenerator)] = &[
     ("grpcurl", grpc_grpcurl),
     ("Node.js (@grpc/grpc-js)", grpc_node),
@@ -1742,6 +1745,7 @@ fn stream_targets(method: &str) -> Option<&'static [(&'static str, StreamGenerat
         "WS" => WEBSOCKET,
         "SOCKETIO" => SOCKETIO,
         "MQTT" => MQTT,
+        "NATS" => NATS,
         "GRPC" => GRPC,
         _ => return None,
     })
@@ -1765,8 +1769,9 @@ impl Stream {
             req.auth = fetched_token(o);
         }
         let headers = match req.method.as_str() {
-            // MQTT has no headers; it signs in with Basic auth's name and password.
-            "MQTT" => Vec::new(),
+            // MQTT has no headers; it signs in with Basic auth's name and password. NATS's
+            // are its messages', read from the request as they are.
+            "MQTT" | "NATS" => Vec::new(),
             _ => {
                 let handshake = Request {
                     body: Body::None,
@@ -2288,6 +2293,85 @@ fn mqtt_mosquitto(s: &Stream) -> String {
     }
     if out.is_empty() {
         out.push_str("# Add a topic to subscribe to, or one to publish to.\n");
+    }
+    out
+}
+
+/// The `nats` CLI (natscli): a `sub` per subject, then a `pub` or `request` for what the
+/// composer sends.
+fn nats_cli(s: &Stream) -> String {
+    let n = &s.req.nats;
+    let mut common = format!("nats --server {}", sh(s.req.url.trim()));
+    match &s.req.auth {
+        Auth::Basic { username, password } => {
+            let _ = write!(
+                common,
+                " --user {} --password {}",
+                sh(username),
+                sh(password)
+            );
+        }
+        Auth::Bearer { token } => {
+            let _ = write!(common, " --token {}", sh(token));
+        }
+        _ => {}
+    }
+    if !n.creds.trim().is_empty() {
+        let _ = write!(common, " --creds {}", sh(n.creds.trim()));
+    } else if !n.nkey.trim().is_empty() {
+        // The CLI reads the seed from a file; a seed on the command line would end up
+        // in the shell's history.
+        common.push_str(" --nkey seed.nk");
+    }
+    if !n.name.trim().is_empty() {
+        let _ = write!(common, " --connection-name {}", sh(n.name.trim()));
+    }
+    let mut out = String::new();
+    let subjects = n
+        .subjects
+        .iter()
+        .filter(|s| s.enabled && !s.subject.trim().is_empty());
+    for (i, subject) in subjects.enumerate() {
+        if i == 0 {
+            out.push_str("# Subscribe, printing each message with its subject and headers.\n");
+        }
+        let _ = write!(out, "{common} sub {}", sh(subject.subject.trim()));
+        if !subject.queue.trim().is_empty() {
+            let _ = write!(out, " --queue {}", sh(subject.queue.trim()));
+        }
+        out.push('\n');
+    }
+    if !n.subject.trim().is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let request = n.send == crate::model::NatsSend::Request;
+        out.push_str(match request {
+            true => "# Ask, and print the first reply.\n",
+            false => "# Publish one message.\n",
+        });
+        let verb = if request { "request" } else { "pub" };
+        let _ = write!(
+            out,
+            "{common} {verb} {} {}",
+            sh(n.subject.trim()),
+            sh(MESSAGE)
+        );
+        for h in s
+            .req
+            .headers
+            .iter()
+            .filter(|h| h.enabled && !h.key.trim().is_empty())
+        {
+            let _ = write!(out, " -H {}", sh(&format!("{}:{}", h.key.trim(), h.value)));
+        }
+        if !request && !n.reply.trim().is_empty() {
+            let _ = write!(out, " --reply {}", sh(n.reply.trim()));
+        }
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out.push_str("# Add a subject to subscribe to, or one to publish to.\n");
     }
     out
 }
@@ -3407,7 +3491,7 @@ mod tests {
                 assert!(!code.contains("muted"), "{target}:\n{code}");
                 if let Some(dir) = &dump {
                     let ext = match target.split(' ').next().unwrap() {
-                        "cURL" | "websocat" | "mosquitto" | "grpcurl" => "sh",
+                        "cURL" | "websocat" | "mosquitto" | "nats" | "grpcurl" => "sh",
                         "Python" => "py",
                         "JavaScript" | "Node.js" => "mjs",
                         "Go" => "go",
@@ -3527,6 +3611,52 @@ mod tests {
         );
     }
 
+    /// What the window does, as commands to paste: each ticked subject subscribed with its
+    /// queue group, then the composer's publish with its headers, or a request.
+    #[test]
+    fn nats_cli_subscribes_and_publishes_as_the_request_does() {
+        use crate::model::{Nats, NatsSend, NatsSubject};
+        let subject = |subject: &str, queue: &str, enabled| NatsSubject {
+            subject: subject.into(),
+            queue: queue.into(),
+            enabled,
+        };
+        let mut req = Request {
+            method: "NATS".into(),
+            url: "nats://h:4222".into(),
+            auth: Auth::Basic {
+                username: "u".into(),
+                password: "p w".into(),
+            },
+            headers: vec![KeyValue::new("Trace", "a b")],
+            nats: Nats {
+                subjects: vec![
+                    subject("orders.>", "workers", true),
+                    subject("off", "", false),
+                ],
+                subject: "orders.new".into(),
+                reply: "answers".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let common = "nats --server 'nats://h:4222' --user 'u' --password 'p w'";
+        let out = generate("nats CLI", req.clone()).unwrap();
+        assert!(
+            out.contains(&format!("{common} sub 'orders.>' --queue 'workers'\n")),
+            "{out}"
+        );
+        assert!(!out.contains("off"), "{out}");
+        let publish =
+            format!("{common} pub 'orders.new' 'hello' -H 'Trace:a b' --reply 'answers'\n");
+        assert!(out.contains(&publish), "{out}");
+        // A request has its own inbox: the reply subject isn't sent.
+        req.nats.send = NatsSend::Request;
+        let out = generate("nats CLI", req).unwrap();
+        let ask = format!("{common} request 'orders.new' 'hello' -H 'Trace:a b'\n");
+        assert!(out.contains(&ask), "{out}");
+    }
+
     /// The picker keeps the language last picked as requests of other kinds are opened.
     #[test]
     fn the_last_picked_language_carries_across_kinds() {
@@ -3534,6 +3664,7 @@ mod tests {
         assert_eq!(pick("GET", "Python (websockets)"), "Python (requests)");
         assert_eq!(pick("SSE", "cURL"), "cURL");
         assert_eq!(pick("MQTT", "cURL"), "mosquitto");
+        assert_eq!(pick("NATS", "cURL"), "nats CLI");
         assert_eq!(pick("POST", "Go (gorilla/websocket)"), "Go (net/http)");
         assert_eq!(pick("GET", ""), "cURL");
         assert!(

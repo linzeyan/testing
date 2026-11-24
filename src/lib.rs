@@ -31,6 +31,7 @@ mod mcp;
 mod mock;
 mod model;
 mod mqtt;
+mod nats;
 mod net;
 mod ntlm;
 mod oauth1;

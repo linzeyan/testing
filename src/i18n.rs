@@ -61,6 +61,51 @@ pub const fn n_(en: &'static str) -> &'static str {
 static ZH_TW_MAP: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| ZH_TW.iter().copied().collect());
 
 const ZH_TW: &[(&str, &str)] = &[
+    (
+        "* and > are for subscribing; publish to one subject",
+        "* 與 > 是訂閱用的；請發佈到單一 subject",
+    ),
+    (
+        "A .creds file: the user's JWT and NKey seed",
+        ".creds 檔：使用者的 JWT 與 NKey seed",
+    ),
+    ("Connection name", "連線名稱"),
+    ("Credentials file", "憑證檔（.creds）"),
+    (
+        "How the server's monitoring lists this client",
+        "伺服器監控頁面顯示此用戶端的名稱",
+    ),
+    ("NKey seed", "NKey seed"),
+    (
+        "Press Connect to reach the server; it subscribes to the subjects in the Subjects tab. Scripts don't run for NATS.",
+        "按「連線」連到伺服器，並訂閱「Subjects」分頁中的 subject。NATS 不會執行指令碼。",
+    ),
+    ("Publish", "發佈"),
+    ("Publish needs a subject", "發佈需要一個 subject"),
+    ("Queue group", "Queue group"),
+    ("Reply subject (optional)", "回覆 subject（選填）"),
+    (
+        "Request waits for the first reply, on an inbox of its own",
+        "「請求」會用自己的 inbox 等待第一個回覆",
+    ),
+    (
+        "Signs the server's challenge; the credentials file wins",
+        "用來簽署伺服器的 challenge；有憑證檔時以憑證檔為準",
+    ),
+    ("Subject", "Subject"),
+    ("Subjects", "Subjects"),
+    (
+        "Subscribed to on Connect. * matches one token, > everything after.",
+        "連線時訂閱。* 符合一個 token，> 符合之後的全部。",
+    ),
+    (
+        "Subscribers sharing a queue group get each message once between them",
+        "同一個 queue group 的訂閱者之間，每則訊息只會有一個收到",
+    ),
+    (
+        "Username and password go in Auth (Basic), a token in Auth (Bearer). tls:// requires TLS, with the network settings' certificates; nats:// upgrades when the server asks. NATS connects directly: the proxy settings don't apply.",
+        "使用者名稱與密碼請填在「驗證」（Basic），token 填在「驗證」（Bearer）。tls:// 一律使用 TLS，憑證取自網路設定；nats:// 在伺服器要求時才升級為 TLS。NATS 一律直接連線，不套用 proxy 設定。",
+    ),
     ("  · bidi stream", "  · 雙向串流"),
     ("  · client stream", "  · 用戶端串流"),
     ("  · server stream", "  · 伺服器串流"),

@@ -97,6 +97,10 @@ brotli-decompressor = "5"
 # The Docs tab's preview: egui draws no Markdown of its own. No images or syntax
 # highlighting, so it brings only pulldown-cmark and two small crates of its own.
 egui_commonmark = { version = "0.25", default-features = false, features = ["pulldown_cmark"] }
+# The NATS client (nats.rs): reconnects, NKey and .creds sign-in, headers, JetStream and
+# KV, which by hand would be a protocol and an ed25519 signer of our own. ring only, as
+# everywhere: aws-lc doesn't cross-build for Windows. No websockets or object store.
+async-nats = { version = "0.53", default-features = false, features = ["ring", "jetstream", "kv", "nkeys", "nuid", "server_2_10", "server_2_11", "server_2_12"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux has no dialog of its own: ask the desktop portal.

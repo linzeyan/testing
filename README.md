@@ -46,7 +46,21 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | SSE | |
 | Socket.IO 2, 3 and 4 | The URL's path is the namespace and a JSON body the auth payload (v2 has none: Params go on the handshake's query); Settings sets the handshake path (`/socket.io/` if empty) and the client version; send `event {"json": "arg"}` or a `["event", …]` array, or name the event in the Event field and type only its argument; Ack asks the server to acknowledge a message, and its answer shows as `ack` with the same number |
 | MQTT 3.1.1 and 5 | Over TCP, TLS or WebSocket (`mqtt://`, `mqtts://`, `ws://`, `wss://`), see below |
+| NATS | Subjects, publish and request-reply over `nats://` or `tls://`, see below |
 | gRPC | Methods from a `.proto` loaded at run time or, with none set, from server reflection (v1 or v1alpha, asked on ↻ or the first send). Streaming methods connect like a WebSocket; a JSON array body sends several messages |
+
+NATS:
+
+- Subscribes to the request's subjects on Connect (`*` and `>` wildcards, an optional queue
+  group each) and follows changes to them while connected.
+- Publishes from the message panel to one subject, with the Headers tab's rows as the
+  message's headers and an optional reply subject; Request publishes with an inbox of its
+  own and shows the first reply, or says nobody answered.
+- Signs in with Auth's Basic (user and password) or Bearer (token), or with a `.creds` file
+  or an NKey seed in Settings.
+- `tls://` requires TLS and `nats://` upgrades when the server asks, with the network
+  settings' CA file, client certificate and "accept any certificate". The connection is
+  always direct: the proxy settings don't apply.
 
 MQTT:
 
@@ -422,6 +436,7 @@ last carries over between kinds. Long lines scroll sideways rather than wrap.
 | WebSocket | websocat, browser, ws, websockets, gorilla |
 | Socket.IO | socket.io-client, python-socketio |
 | MQTT | mosquitto, paho-mqtt, mqtt.js, paho Go |
+| NATS | the `nats` CLI |
 | gRPC | grpcurl, grpc-js, grpcio, by the method's streaming shape |
 
 Descriptions are Markdown, written in a request's or folder's Docs tab; Preview there shows

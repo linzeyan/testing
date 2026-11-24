@@ -165,6 +165,8 @@ enum ReqTab {
     Topics,
     /// MQTT only: user properties.
     Properties,
+    /// NATS only: what it subscribes to.
+    Subjects,
 }
 
 impl ReqTab {
@@ -181,6 +183,8 @@ impl ReqTab {
             "WS" | "SSE" => &[Params, Headers, Auth, Settings, Docs],
             "SOCKETIO" => &[Params, Headers, Body, Auth, Settings, Docs],
             "MQTT" => &[Topics, Properties, Auth, Settings, Docs],
+            // Headers are the message's, sent with each publish.
+            "NATS" => &[Subjects, Headers, Auth, Settings, Docs],
             // The URL is the server: params would end up in the method's path.
             "GRPC" => &[Body, Headers, Auth, Scripts, Vars, Asserts, Settings, Docs],
             _ => &[
@@ -463,6 +467,7 @@ impl LogFilter {
 enum Outgoing {
     Text(tokio::sync::mpsc::UnboundedSender<stream::Frame>),
     Mqtt(tokio::sync::mpsc::UnboundedSender<crate::mqtt::Command>),
+    Nats(tokio::sync::mpsc::UnboundedSender<crate::nats::Command>),
 }
 
 #[derive(Default)]
@@ -1880,7 +1885,7 @@ impl App {
                         text: message.to_owned(),
                         ..Default::default()
                     };
-                    s.send_compose(&message, Some(&open.draft.mqtt), &vars)?;
+                    s.send_compose(&message, Some(&open.draft), &vars)?;
                     return Ok(json!({ "stream": true }));
                 }
                 if live.is_some() {
@@ -2688,7 +2693,6 @@ impl App {
         log::info!("connect {method} {url}");
         let (req, _) = open.draft.resolved(&self.all_vars());
         let socketio = req.method == "SOCKETIO";
-        let is_mqtt = req.method == "MQTT";
         let grpc = (req.method == "GRPC").then(|| {
             (
                 crate::grpc::source(&req.proto, &req.url, &req.settings.import_paths),
@@ -2698,10 +2702,12 @@ impl App {
         let sends = composes(&open.draft, &self.grpc_methods);
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
         let (pub_tx, pub_rx) = tokio::sync::mpsc::unbounded_channel();
-        let outgoing = match (is_mqtt, sends) {
-            (true, _) => Some(Outgoing::Mqtt(pub_tx)),
-            (false, true) => Some(Outgoing::Text(out_tx)),
-            (false, false) => None,
+        let (nats_tx, nats_rx) = tokio::sync::mpsc::unbounded_channel();
+        let outgoing = match (req.method.as_str(), sends) {
+            ("MQTT", _) => Some(Outgoing::Mqtt(pub_tx)),
+            ("NATS", _) => Some(Outgoing::Nats(nats_tx)),
+            (_, true) => Some(Outgoing::Text(out_tx)),
+            (_, false) => None,
         };
         let started = Instant::now();
         let log = Arc::new(std::sync::Mutex::new(Log::default()));
@@ -2728,7 +2734,9 @@ impl App {
                 .get_or_init(|| net::build_client_with_jar(net.0, net.1))
                 .await
             {
-                Ok(client) => stream::connect(client, tls, req, out_rx, pub_rx, emit).await,
+                Ok(client) => {
+                    stream::connect(client, tls, req, out_rx, pub_rx, nats_rx, emit).await
+                }
                 Err(e) => emit(Event::Error(fill(failed, &[&e]))),
             }
         });
@@ -3843,10 +3851,10 @@ impl eframe::App for App {
         }
         if ui.input_mut(|i| i.consume_shortcut(&SEND)) && !self.folder_shown {
             let vars = self.all_vars();
-            let mqtt = self.open.as_ref().map(|o| &o.draft.mqtt);
+            let draft = self.open.as_ref().map(|o| &o.draft);
             match self.stream.as_mut().filter(|s| s.live) {
                 Some(s) => {
-                    let sent = s.send_compose(&self.compose, mqtt, &vars);
+                    let sent = s.send_compose(&self.compose, draft, &vars);
                     self.compose.error = sent.err().unwrap_or_default();
                 }
                 None => self.send(ui.ctx(), None),
@@ -5833,6 +5841,7 @@ impl App {
                 let width = ui.available_width() - button[0] - 8.0 - more;
                 let hint = match open.draft.method.as_str() {
                     "MQTT" => "mqtt://{{broker}}:1883",
+                    "NATS" => "nats://{{server}}:4222",
                     "SOCKETIO" => "http://{{host}}:3000/namespace",
                     "WS" => "wss://{{host}}/socket",
                     // The server only: the method comes from the picker.
@@ -6013,6 +6022,7 @@ impl App {
                             let default = d.settings.is_default()
                                 && match method {
                                     "MQTT" => d.mqtt.with_default_connection() == d.mqtt,
+                                    "NATS" => d.nats.with_default_connection() == d.nats,
                                     "SOCKETIO" => d.socketio.is_default(),
                                     _ => true,
                                 };
@@ -6034,6 +6044,11 @@ impl App {
                             let n = count(&m.user_properties)
                                 + extras.into_iter().filter(|&set| set).count();
                             (tab(n, t("Properties")), false)
+                        }
+                        ReqTab::Subjects => {
+                            let subjects = d.nats.subjects.iter();
+                            let on = subjects.filter(|s| s.enabled && !s.subject.is_empty()).count();
+                            (tab(on, t("Subjects")), false)
                         }
                         ReqTab::Examples => (tab(examples, t("Examples")), false),
                     };
@@ -6070,6 +6085,13 @@ impl App {
                             d.url_from_params();
                         }
                         path_vars_table(ui, &mut open.draft.path_vars, &all_vars);
+                    }
+                    // The message's own, with nothing added or inherited: a folder's HTTP
+                    // headers aren't for a broker's subscribers.
+                    ReqTab::Headers if open.draft.method == "NATS" => {
+                        kv_table(ui, "headers", &mut open.draft.headers, &all_vars, true);
+                        ui.add_space(8.0);
+                        ui.weak(t("Sent with every message you publish."));
                     }
                     ReqTab::Headers => {
                         kv_table(ui, "headers", &mut open.draft.headers, &all_vars, true);
@@ -6186,12 +6208,20 @@ impl App {
                         let (s, above) = (&mut d.settings, &d.inherited);
                         match d.method.as_str() {
                             "MQTT" => mqtt_settings(ui, &mut d.mqtt, s, above, timeout),
+                            "NATS" => nats_settings(ui, &mut d.nats, s, above, timeout),
                             "SOCKETIO" => socketio_settings(ui, &mut d.socketio, s, above, timeout),
                             method => settings_editor(ui, s, above, method, timeout),
                         }
                     }
                     ReqTab::Topics => {
                         if topics_editor(ui, &mut open.draft.mqtt.topics, live)
+                            && let Some(s) = session.as_deref()
+                        {
+                            s.resubscribe(&open.draft, &all_vars);
+                        }
+                    }
+                    ReqTab::Subjects => {
+                        if subjects_editor(ui, &mut open.draft.nats.subjects, live)
                             && let Some(s) = session.as_deref()
                         {
                             s.resubscribe(&open.draft, &all_vars);
@@ -6324,6 +6354,7 @@ impl App {
                     None => {
                         ui.weak(match open.draft.method.as_str() {
                             "MQTT" => t("Press Connect to reach the broker; it subscribes to the topics in the Topics tab. Scripts don't run for MQTT."),
+                            "NATS" => t("Press Connect to reach the server; it subscribes to the subjects in the Subjects tab. Scripts don't run for NATS."),
                             "GRPC" => t("Press Connect to start the call. The body is the first message (for a client stream, an array is several, empty is none). Scripts don't run for streams."),
                             "SOCKETIO" => t("Press Connect to join the namespace, then send events: a name, then its argument. Scripts don't run for Socket.IO."),
                             "GRAPHQL" => t("A subscription: press Connect to start it; each event shows here. Scripts don't run for subscriptions."),
@@ -11587,6 +11618,11 @@ fn auth_editor(
     // answer an HTTP challenge, which a stream or a gRPC call never gets to see.
     let offered = |kind: &Auth| match method {
         "MQTT" => matches!(kind, Auth::Inherit | Auth::None | Auth::Basic { .. }),
+        // A token too; a credentials file or an NKey is in its Settings.
+        "NATS" => matches!(
+            kind,
+            Auth::Inherit | Auth::None | Auth::Basic { .. } | Auth::Bearer { .. }
+        ),
         m if model::is_streaming(m) || m == "GRPC" => {
             !matches!(kind, Auth::Digest { .. } | Auth::Ntlm(_))
         }
@@ -12202,6 +12238,129 @@ fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) 
     done
 }
 
+/// NATS's rows of the Subjects tab; true when a change is finished, for a live connection
+/// to follow.
+fn subjects_editor(ui: &mut egui::Ui, subjects: &mut Vec<model::NatsSubject>, live: bool) -> bool {
+    ui.weak(match live {
+        true => t("Connected: a change is (un)subscribed as soon as you finish it."),
+        false => t("Subscribed to on Connect. * matches one token, > everything after."),
+    });
+    let mut done = false;
+    let mut remove = None;
+    // Rows rather than a Grid, as the topics are: a grid cell is last frame's width.
+    for (i, s) in subjects.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            done |= ui.checkbox(&mut s.enabled, "").changed();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, icon::TRASH, crate::i18n::t("Remove"), None)
+                    .on_hover_text(crate::i18n::t("Remove"))
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+                done |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut s.queue)
+                            .hint_text(crate::i18n::t("Queue group"))
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(140.0),
+                    )
+                    .on_hover_text(crate::i18n::t(
+                        "Subscribers sharing a queue group get each message once between them",
+                    ))
+                    .lost_focus();
+                done |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut s.subject)
+                            .hint_text("orders.*.created")
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .lost_focus();
+            });
+        });
+    }
+    if let Some(i) = remove {
+        subjects.remove(i);
+        done = true;
+    }
+    if ui
+        .add(icon_text(ui, icon::PLUS, t("Subject")).small())
+        .clicked()
+    {
+        subjects.push(model::NatsSubject::default());
+    }
+    done
+}
+
+fn nats_settings(
+    ui: &mut egui::Ui,
+    n: &mut model::Nats,
+    s: &mut model::Settings,
+    inherited: &Inherited,
+    default_timeout_secs: u64,
+) {
+    egui::Grid::new("nats-settings")
+        .num_columns(3)
+        .spacing([16.0, 10.0])
+        .show(ui, |ui| {
+            ui.label(t("Connection name"));
+            ui.add(
+                egui::TextEdit::singleline(&mut n.name)
+                    .hint_text("apitool")
+                    .desired_width(240.0),
+            );
+            grid_hint(ui, t("How the server's monitoring lists this client"));
+            ui.end_row();
+
+            ui.label(t("Credentials file"));
+            // A cell of its own width: `horizontal` in a middle column takes all that's
+            // left, and the hint beside it then wraps differently every frame.
+            let (side, gap) = (button_height(ui), ui.spacing().item_spacing.x);
+            let cell = egui::vec2(240.0 + 2.0 * ui.spacing().button_padding.x, side);
+            let across = egui::Layout::left_to_right(egui::Align::Center);
+            ui.allocate_ui_with_layout(cell, across, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut n.creds)
+                        .hint_text("~/.nkeys/creds/user.creds")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(240.0 - side - gap),
+                );
+                browse(ui, &mut n.creds, &[("NATS credentials", &["creds"])], false);
+            });
+            grid_hint(ui, t("A .creds file: the user's JWT and NKey seed"));
+            ui.end_row();
+
+            ui.label(t("NKey seed"));
+            ui.add_enabled(
+                n.creds.trim().is_empty(),
+                egui::TextEdit::singleline(&mut n.nkey)
+                    .hint_text("SUAC…")
+                    .password(true)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(240.0),
+            );
+            grid_hint(
+                ui,
+                t("Signs the server's challenge; the credentials file wins"),
+            );
+            ui.end_row();
+
+            inherited_settings(ui, s, inherited, |ui, s, mark| {
+                connection_rows(ui, s, "NATS", default_timeout_secs, mark)
+            });
+        });
+    if reset_button(
+        ui,
+        n.with_default_connection() == *n && s.is_default(),
+        inherited,
+    ) {
+        (*n, *s) = (n.with_default_connection(), Default::default());
+    }
+    ui.add_space(8.0);
+    ui.weak(t("Username and password go in Auth (Basic), a token in Auth (Bearer). tls:// requires TLS, with the network settings' certificates; nats:// upgrades when the server asks. NATS connects directly: the proxy settings don't apply."));
+}
+
 fn mqtt_settings(
     ui: &mut egui::Ui,
     m: &mut model::Mqtt,
@@ -12495,7 +12654,9 @@ fn connection_rows(
     use model::HttpVersion;
     let all = method == "*";
     let (sse, grpc, mqtt) = (method == "SSE", method == "GRPC", method == "MQTT");
-    let (sse, grpc, mqtt) = (all || sse, all || grpc, all || mqtt);
+    // A NATS connection has MQTT's rows less the message size, which its server sets.
+    let nats = method == "NATS";
+    let (sse, grpc, mqtt) = (all || sse, all || grpc, all || mqtt || nats);
     // A WebSocket handshake is HTTP/1.1, as gRPC is HTTP/2, whatever is picked.
     let ws = all || matches!(method, "WS" | "SOCKETIO");
     let http = all || !(sse || grpc || mqtt || ws);
@@ -12607,7 +12768,7 @@ fn connection_rows(
             t("Handshake timeout"),
             t("How long connecting may take; 0 uses the network settings' timeout"),
         ),
-        "MQTT" => (
+        "MQTT" | "NATS" => (
             t("Connect timeout"),
             t("How long connecting may take; 0 uses the network settings' timeout"),
         ),
@@ -12737,7 +12898,7 @@ fn connection_rows(
         ui.end_row();
     }
 
-    if ws || grpc || mqtt {
+    if ws || grpc || (mqtt && !nats) {
         setting_label(ui, t("Maximum message size"), &["max_message_mb"], mark);
         let own = match method {
             "GRPC" => crate::http::MAX_BODY,
@@ -13325,7 +13486,7 @@ fn rpc_of<'a>(req: &Request, rpcs: &'a Rpcs) -> Option<&'a crate::grpc::Rpc> {
 /// Kinds whose messages are typed in the composer: WebSocket, Socket.IO, MQTT and a gRPC
 /// client stream.
 fn composes(req: &Request, rpcs: &Rpcs) -> bool {
-    matches!(req.method.as_str(), "WS" | "SOCKETIO" | "MQTT")
+    matches!(req.method.as_str(), "WS" | "SOCKETIO" | "MQTT" | "NATS")
         || rpc_of(req, rpcs).is_some_and(|r| r.client_streaming)
 }
 
@@ -13528,7 +13689,7 @@ impl StreamSession {
     fn send_compose(
         &self,
         c: &Compose,
-        mqtt: Option<&model::Mqtt>,
+        draft: Option<&Request>,
         vars: &HashMap<String, String>,
     ) -> Result<(), String> {
         let event = c.event.trim();
@@ -13561,7 +13722,7 @@ impl StreamSession {
             }
             // An empty message is fine: retained, it clears what the broker keeps.
             Some(Outgoing::Mqtt(tx)) => {
-                let m = mqtt.ok_or(t("no request is open"))?;
+                let m = &draft.ok_or(t("no request is open"))?.mqtt;
                 let topic = model::resolve(m.topic.trim(), vars, &mut Vec::new());
                 if topic.is_empty() {
                     return Err(t("Publish needs a topic").into());
@@ -13594,6 +13755,30 @@ impl StreamSession {
                 }
                 let _ = tx.send(crate::mqtt::Command::Publish(publish));
             }
+            Some(Outgoing::Nats(tx)) => {
+                let d = draft.ok_or(t("no request is open"))?;
+                let r = |s: &str| model::resolve(s, vars, &mut Vec::new());
+                let subject = r(d.nats.subject.trim());
+                if subject.is_empty() {
+                    return Err(t("Publish needs a subject").into());
+                }
+                if subject.contains(['*', '>', ' ']) {
+                    return Err(t("* and > are for subscribing; publish to one subject").into());
+                }
+                // The request's own rows only: a folder's are HTTP's.
+                let headers = (d.headers.iter())
+                    .filter(|h| h.enabled && !h.key.trim().is_empty())
+                    .map(|h| (r(h.key.trim()), r(&h.value)))
+                    .collect();
+                let publish = crate::nats::Publish {
+                    subject,
+                    reply: r(d.nats.reply.trim()),
+                    headers,
+                    payload: c.text.clone(),
+                    request: d.nats.send == model::NatsSend::Request,
+                };
+                let _ = tx.send(crate::nats::Command::Publish(publish));
+            }
         }
         Ok(())
     }
@@ -13603,12 +13788,20 @@ impl StreamSession {
         self.log.lock().unwrap().events.iter().cloned().collect()
     }
 
-    /// MQTT: has the live connection follow the request's topics.
+    /// MQTT and NATS: has the live connection follow the request's topics or subjects.
     fn resubscribe(&self, req: &Request, vars: &HashMap<String, String>) {
-        if let Some(Outgoing::Mqtt(tx)) = &self.outgoing {
-            let (req, _) = req.resolved(vars);
-            let want = req.mqtt.topics.into_iter().map(|t| (t.filter, t.qos));
-            let _ = tx.send(crate::mqtt::Command::Topics(want.collect()));
+        match &self.outgoing {
+            Some(Outgoing::Mqtt(tx)) => {
+                let (req, _) = req.resolved(vars);
+                let want = req.mqtt.topics.into_iter().map(|t| (t.filter, t.qos));
+                let _ = tx.send(crate::mqtt::Command::Topics(want.collect()));
+            }
+            Some(Outgoing::Nats(tx)) => {
+                let (req, _) = req.resolved(vars);
+                let want = req.nats.subjects.into_iter().map(|s| (s.subject, s.queue));
+                let _ = tx.send(crate::nats::Command::Subjects(want.collect()));
+            }
+            _ => {}
         }
     }
 }
@@ -14535,7 +14728,7 @@ fn stream_ui(
         });
     });
     if composes && composer(ui, c, draft, s.outgoing.is_some()) {
-        let sent = s.send_compose(c, Some(&draft.mqtt), vars);
+        let sent = s.send_compose(c, Some(draft), vars);
         c.error = sent.err().unwrap_or_default();
     }
     ui.separator();
@@ -14658,7 +14851,43 @@ fn stream_ui(
 /// was pressed.
 fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: bool) -> bool {
     let method = draft.method.as_str();
-    let (mqtt, saved) = (&mut draft.mqtt, &mut draft.messages);
+    let (mqtt, nats, saved) = (&mut draft.mqtt, &mut draft.nats, &mut draft.messages);
+    if method == "NATS" {
+        // Part of the request, as MQTT's topic is.
+        ui.horizontal(|ui| {
+            ui.label(t("Publish to"));
+            ui.add(
+                egui::TextEdit::singleline(&mut nats.subject)
+                    .hint_text("orders.new")
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(240.0),
+            );
+            let names = |s: model::NatsSend| match s {
+                model::NatsSend::Publish => t("Publish"),
+                model::NatsSend::Request => t("Request"),
+            };
+            egui::ComboBox::from_id_salt("nats-send")
+                .selected_text(names(nats.send))
+                .show_ui(ui, |ui| {
+                    for s in [model::NatsSend::Publish, model::NatsSend::Request] {
+                        ui.selectable_value(&mut nats.send, s, names(s));
+                    }
+                })
+                .response
+                .on_hover_text(t(
+                    "Request waits for the first reply, on an inbox of its own",
+                ));
+            // A request answers on its own inbox.
+            if nats.send == model::NatsSend::Publish {
+                ui.add(
+                    egui::TextEdit::singleline(&mut nats.reply)
+                        .hint_text(t("Reply subject (optional)"))
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(200.0),
+                );
+            }
+        });
+    }
     if method == "MQTT" {
         // Part of the request, as in Postman, so it's there next time.
         ui.horizontal(|ui| {
@@ -16146,6 +16375,7 @@ fn method_icon(m: &str) -> Option<Icon> {
         "WS" => icon::BOTH_WAYS,
         "SOCKETIO" => icon::LIGHTNING,
         "MQTT" => icon::RADIO,
+        "NATS" => icon::SEND,
         "SSE" => icon::RSS,
         "GRAPHQL" => icon::GRAPH,
         // A remote procedure call.
@@ -16159,6 +16389,8 @@ fn method_name(m: &str) -> &str {
         "WS" => "WebSocket",
         "SOCKETIO" => "Socket.IO",
         "GRAPHQL" => "GraphQL",
+        // As its project writes it.
+        "NATS" => "NATS",
         "GRPC" => "gRPC",
         m => m,
     }
@@ -21602,7 +21834,7 @@ mod ui_tests {
     #[test]
     fn every_kind_of_request_has_the_settings_its_client_uses() {
         let mut h = with_request("kinds");
-        const ROWS: [&str; 17] = [
+        const ROWS: [&str; 18] = [
             "HTTP version",
             "Follow original HTTP method",
             "Verify TLS certificate",
@@ -21620,6 +21852,7 @@ mod ui_tests {
             "Import paths",
             "Client ID",
             "Handshake path",
+            "Credentials file",
         ];
         for (method, want) in [
             (
@@ -21687,6 +21920,16 @@ mod ui_tests {
                     "Reconnection attempts",
                     "Maximum message size",
                     "Client ID",
+                ],
+            ),
+            // MQTT's connection rows less the message size, which a NATS server sets.
+            (
+                "NATS",
+                vec![
+                    "Verify TLS certificate",
+                    "Connect timeout",
+                    "Reconnection attempts",
+                    "Credentials file",
                 ],
             ),
         ] {
@@ -21787,6 +22030,79 @@ mod ui_tests {
         h.get_by_label("Disconnect").click();
         // Not `!live`: that flips on the click, before the session has said how it ended,
         // and a slow runner (CI's macOS) then sees the events without the close.
+        wait(&mut h, |app| {
+            let events = app.stream.as_ref().unwrap().events();
+            matches!(events.last(), Some((_, Event::Closed(_))))
+        });
+        let events = h.state().stream.as_ref().unwrap().events();
+        let (_, last) = events.last().unwrap();
+        assert_eq!(*last, Event::Closed("disconnected".into()), "{events:?}");
+    }
+
+    /// NATS end to end in the window: its own tabs, subjects subscribed on Connect, a
+    /// publish refused beside the box until it names one subject, headers and variables
+    /// sent with it, a request answered, and a subject unticked while connected.
+    #[test]
+    fn nats_subscribes_publishes_asks_and_disconnects() {
+        let mut h = with_request("nats");
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        d.method = "NATS".into();
+        d.url = format!("nats://127.0.0.1:{}", crate::nats::tests::server());
+        let subject = |subject: &str| model::NatsSubject {
+            subject: subject.into(),
+            ..Default::default()
+        };
+        d.nats.subjects = vec![subject("orders.>"), subject("audit")];
+        d.headers = vec![KeyValue::new("Trace", "{{host}}")];
+        h.run();
+        assert!(h.query_by_label("Params").is_none(), "NATS has no query");
+        assert!(
+            h.query_by_label("Scripts").is_none(),
+            "nothing runs scripts"
+        );
+        h.get_by_label("Subjects (2)").click();
+        h.run();
+        h.get_by_label("Connect").click();
+        wait_live(&mut h, |app| {
+            let events = app.stream.as_ref().unwrap().events();
+            (events.iter()).any(|(_, e)| *e == Event::Info("subscribed: audit".into()))
+        });
+
+        h.state_mut().compose.text = "ping".into();
+        for (subject, why) in [("", "needs a subject"), ("orders.*", "subscribing")] {
+            h.state_mut().open.as_mut().unwrap().draft.nats.subject = subject.into();
+            h.get_by_label("Send").click();
+            h.run_steps(2);
+            assert!(
+                h.state().compose.error.contains(why),
+                "{}",
+                h.state().compose.error
+            );
+        }
+        h.state_mut().open.as_mut().unwrap().draft.nats.subject = "orders.new".into();
+        h.get_by_label("Send").click();
+        // The header's variable is filled in; it comes back on orders.>.
+        wait_live(&mut h, |app| {
+            got(app, "[orders.new · Trace=127.0.0.1:1] ping")
+        });
+        shot(&mut h, "66-nats");
+
+        let n = &mut h.state_mut().open.as_mut().unwrap().draft.nats;
+        (n.subject, n.send) = ("svc.echo".into(), model::NatsSend::Request);
+        h.get_by_label("Send").click();
+        wait_live(&mut h, |app| {
+            got(app, "[reply to svc.echo · Trace=127.0.0.1:1] ping")
+        });
+
+        // Unticking a subject while connected unsubscribes it then and there.
+        let ticks: Vec<_> = h.get_all_by_role(Role::CheckBox).collect();
+        ticks[1].click();
+        wait_live(&mut h, |app| {
+            let events = app.stream.as_ref().unwrap().events();
+            (events.iter()).any(|(_, e)| *e == Event::Info("unsubscribed: audit".into()))
+        });
+
+        h.get_by_label("Disconnect").click();
         wait(&mut h, |app| {
             let events = app.stream.as_ref().unwrap().events();
             matches!(events.last(), Some((_, Event::Closed(_))))
@@ -26000,6 +26316,7 @@ mod ui_tests {
             ("SSE", "https://{{host}}/events"),
             ("SOCKETIO", "http://{{host}}"),
             ("MQTT", "mqtt://{{host}}"),
+            ("NATS", "nats://{{host}}"),
             ("GRPC", "{{host}}"),
         ];
         let tabs = [
@@ -26007,6 +26324,7 @@ mod ui_tests {
             (ReqTab::Headers, "headers"),
             (ReqTab::Body, "body"),
             (ReqTab::Topics, "topics"),
+            (ReqTab::Subjects, "subjects"),
             (ReqTab::Properties, "properties"),
             (ReqTab::Auth, "auth"),
             (ReqTab::Scripts, "scripts"),

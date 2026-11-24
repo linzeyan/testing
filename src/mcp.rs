@@ -438,7 +438,29 @@ impl Server {
         }
         let (text_tx, text_rx) = tokio::sync::mpsc::unbounded_channel();
         let (mqtt_tx, mqtt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (nats_tx, nats_rx) = tokio::sync::mpsc::unbounded_channel();
         for payload in messages {
+            if req.method == "NATS" {
+                let n = &req.nats;
+                if n.subject.is_empty() || n.subject.contains(['*', '>', ' ']) {
+                    return Err(
+                        "NATS publishes to the request's nats.subject: set one subject".into(),
+                    );
+                }
+                let headers = (req.headers.iter())
+                    .filter(|h| h.enabled && !h.key.trim().is_empty())
+                    .map(|h| (h.key.trim().to_owned(), h.value.clone()))
+                    .collect();
+                let publish = crate::nats::Publish {
+                    subject: n.subject.clone(),
+                    reply: n.reply.clone(),
+                    headers,
+                    payload,
+                    request: n.send == model::NatsSend::Request,
+                };
+                let _ = nats_tx.send(crate::nats::Command::Publish(publish));
+                continue;
+            }
             if req.method != "MQTT" {
                 let _ = text_tx.send(crate::stream::Frame::Text(payload));
                 continue;
@@ -475,7 +497,7 @@ impl Server {
                 task_log.lock().unwrap().push((started.elapsed(), e));
                 task_opened.notify_one();
             };
-            crate::stream::connect(&client, net, req, text_rx, mqtt_rx, emit).await
+            crate::stream::connect(&client, net, req, text_rx, mqtt_rx, nats_rx, emit).await
         });
         self.rt.block_on(async {
             // Connecting (the first TLS setup alone can take a second) isn't listening time.
@@ -488,7 +510,7 @@ impl Server {
             let listen = Duration::from_secs_f64(seconds);
             if !done && tokio::time::timeout(listen, &mut task).await.is_err() {
                 // Dropping the senders closes WebSocket, Socket.IO and MQTT gracefully.
-                drop((text_tx, mqtt_tx));
+                drop((text_tx, mqtt_tx, nats_tx));
                 if tokio::time::timeout(Duration::from_secs(1), &mut task)
                     .await
                     .is_err()
