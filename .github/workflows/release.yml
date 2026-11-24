@@ -47,6 +47,36 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # The JetStream and key-value tests run against the real server (src/nats.rs, REAL
+      # there is this version); without it on PATH they fail rather than skip.
+      - name: nats-server
+        if: matrix.check
+        shell: bash
+        env:
+          VERSION: v2.15.3
+        run: |
+          case "$RUNNER_OS" in
+            Windows) file=windows-amd64.zip sum=b202c46689a56b17e88939b6c53a25294021b000b9c7225209bcb1bbda347bad ;;
+            macOS) file=darwin-arm64.tar.gz sum=a7e25e32247024449e32dcb7129ff416dca3a2cd569fe3c205603ecf8fe5f810 ;;
+            *) file=linux-amd64.tar.gz sum=32e18c1e78d7ef4f86e483070eef3abb2647c3d4d67e29668077c7ad81da0797 ;;
+          esac
+          name=nats-server-$VERSION-$file
+          curl -fsSL --retry 3 -o "$name" "https://github.com/nats-io/nats-server/releases/download/$VERSION/$name"
+          case "$RUNNER_OS" in
+            macOS) got=$(shasum -a 256 "$name" | cut -d' ' -f1) ;;
+            *) got=$(sha256sum "$name" | cut -d' ' -f1) ;;
+          esac
+          [ "$got" = "$sum" ] || { echo "::error::$name has sha256 $got"; exit 1; }
+          mkdir nats-server-bin
+          case "$file" in
+            *.zip) unzip -q "$name" -d nats-server-bin ;;
+            *) tar -xzf "$name" -C nats-server-bin ;;
+          esac
+          rm "$name"
+          dir=$PWD/nats-server-bin/nats-server-$VERSION-${file%%.*}
+          [ "$RUNNER_OS" = Windows ] && dir=$(cygpath -w "$dir")
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/nats-server" --version
       - name: Clippy
         if: matrix.check
         run: cargo clippy --locked --all-targets -- -D warnings

@@ -46,7 +46,7 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | SSE | |
 | Socket.IO 2, 3 and 4 | The URL's path is the namespace and a JSON body the auth payload (v2 has none: Params go on the handshake's query); Settings sets the handshake path (`/socket.io/` if empty) and the client version; send `event {"json": "arg"}` or a `["event", …]` array, or name the event in the Event field and type only its argument; Ack asks the server to acknowledge a message, and its answer shows as `ack` with the same number |
 | MQTT 3.1.1 and 5 | Over TCP, TLS or WebSocket (`mqtt://`, `mqtts://`, `ws://`, `wss://`), see below |
-| NATS | Subjects, publish and request-reply over `nats://` or `tls://`, see below |
+| NATS | Subjects, publish and request-reply, JetStream streams and key-value buckets over `nats://` or `tls://`, see below |
 | gRPC | Methods from a `.proto` loaded at run time or, with none set, from server reflection (v1 or v1alpha, asked on ↻ or the first send). Streaming methods connect like a WebSocket; a JSON array body sends several messages |
 
 NATS:
@@ -56,6 +56,12 @@ NATS:
 - Publishes from the message panel to one subject, with the Headers tab's rows as the
   message's headers and an optional reply subject; Request publishes with an inbox of its
   own and shows the first reply, or says nobody answered.
+- JetStream: a subject row that names a stream reads what the stream has stored (new
+  messages, from the first, or from the last one) through an ephemeral ordered consumer,
+  each message shown with its sequence number; "JetStream publish" waits for the stream's
+  answer and says which stream stored it and where; List streams shows the server's.
+- Key-value: the Key-value tab gets, puts and deletes a key of a bucket, lists the keys,
+  and watches a key or pattern for changes. Results go to the log with the messages.
 - Signs in with Auth's Basic (user and password) or Bearer (token), or with a `.creds` file
   or an NKey seed in Settings.
 - `tls://` requires TLS and `nats://` upgrades when the server asks, with the network

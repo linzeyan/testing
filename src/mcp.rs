@@ -456,7 +456,7 @@ impl Server {
                     reply: n.reply.clone(),
                     headers,
                     payload,
-                    request: n.send == model::NatsSend::Request,
+                    send: n.send,
                 };
                 let _ = nats_tx.send(crate::nats::Command::Publish(publish));
                 continue;

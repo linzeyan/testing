@@ -2336,7 +2336,15 @@ fn nats_cli(s: &Stream) -> String {
             out.push_str("# Subscribe, printing each message with its subject and headers.\n");
         }
         let _ = write!(out, "{common} sub {}", sh(subject.subject.trim()));
-        if !subject.queue.trim().is_empty() {
+        let stream = subject.stream.trim();
+        if !stream.is_empty() {
+            let from = match subject.from {
+                crate::model::NatsFrom::New => "new",
+                crate::model::NatsFrom::All => "all",
+                crate::model::NatsFrom::Last => "last",
+            };
+            let _ = write!(out, " --stream {} --{from}", sh(stream));
+        } else if !subject.queue.trim().is_empty() {
             let _ = write!(out, " --queue {}", sh(subject.queue.trim()));
         }
         out.push('\n');
@@ -2346,9 +2354,13 @@ fn nats_cli(s: &Stream) -> String {
             out.push('\n');
         }
         let request = n.send == crate::model::NatsSend::Request;
-        out.push_str(match request {
-            true => "# Ask, and print the first reply.\n",
-            false => "# Publish one message.\n",
+        out.push_str(match n.send {
+            crate::model::NatsSend::Request => "# Ask, and print the first reply.\n",
+            crate::model::NatsSend::Publish => "# Publish one message.\n",
+            // The CLI's pub doesn't wait for the stream's answer.
+            crate::model::NatsSend::JetStream => {
+                "# Publish one message; a stream that takes the subject stores it.\n"
+            }
         });
         let verb = if request { "request" } else { "pub" };
         let _ = write!(
@@ -2369,6 +2381,30 @@ fn nats_cli(s: &Stream) -> String {
             let _ = write!(out, " --reply {}", sh(n.reply.trim()));
         }
         out.push('\n');
+    }
+    let (bucket, key) = (n.bucket.trim(), n.key.trim());
+    if !bucket.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("# The key-value bucket.\n");
+        match key.is_empty() {
+            true => {
+                let _ = writeln!(out, "{common} kv ls {}", sh(bucket));
+            }
+            false => {
+                let _ = writeln!(out, "{common} kv get {} {}", sh(bucket), sh(key));
+                if !n.value.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "{common} kv put {} {} {}",
+                        sh(bucket),
+                        sh(key),
+                        sh(&n.value)
+                    );
+                }
+            }
+        }
     }
     if out.is_empty() {
         out.push_str("# Add a subject to subscribe to, or one to publish to.\n");
@@ -3620,6 +3656,7 @@ mod tests {
             subject: subject.into(),
             queue: queue.into(),
             enabled,
+            ..Default::default()
         };
         let mut req = Request {
             method: "NATS".into(),
@@ -3655,6 +3692,42 @@ mod tests {
         let out = generate("nats CLI", req).unwrap();
         let ask = format!("{common} request 'orders.new' 'hello' -H 'Trace:a b'\n");
         assert!(out.contains(&ask), "{out}");
+    }
+
+    /// A stream row reads the stream from where the row says, and the Key-value tab's
+    /// bucket and key become the CLI's kv commands.
+    #[test]
+    fn nats_cli_reads_streams_and_buckets() {
+        use crate::model::{Nats, NatsFrom, NatsSubject};
+        let req = Request {
+            method: "NATS".into(),
+            url: "nats://h:4222".into(),
+            nats: Nats {
+                subjects: vec![NatsSubject {
+                    subject: "orders.>".into(),
+                    stream: "ORDERS".into(),
+                    from: NatsFrom::All,
+                    // A stream is read by an ordered consumer: the group isn't used.
+                    queue: "ignored".into(),
+                    enabled: true,
+                }],
+                bucket: "config".into(),
+                key: "mode".into(),
+                value: "dark".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let common = "nats --server 'nats://h:4222'";
+        let out = generate("nats CLI", req).unwrap();
+        for line in [
+            "sub 'orders.>' --stream 'ORDERS' --all\n",
+            "kv get 'config' 'mode'\n",
+            "kv put 'config' 'mode' 'dark'\n",
+        ] {
+            assert!(out.contains(&format!("{common} {line}")), "{out}");
+        }
+        assert!(!out.contains("ignored"), "{out}");
     }
 
     /// The picker keeps the language last picked as requests of other kinds are opened.

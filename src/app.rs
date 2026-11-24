@@ -167,6 +167,8 @@ enum ReqTab {
     Properties,
     /// NATS only: what it subscribes to.
     Subjects,
+    /// NATS only: a key-value bucket's keys.
+    Kv,
 }
 
 impl ReqTab {
@@ -184,7 +186,7 @@ impl ReqTab {
             "SOCKETIO" => &[Params, Headers, Body, Auth, Settings, Docs],
             "MQTT" => &[Topics, Properties, Auth, Settings, Docs],
             // Headers are the message's, sent with each publish.
-            "NATS" => &[Subjects, Headers, Auth, Settings, Docs],
+            "NATS" => &[Subjects, Kv, Headers, Auth, Settings, Docs],
             // The URL is the server: params would end up in the method's path.
             "GRPC" => &[Body, Headers, Auth, Scripts, Vars, Asserts, Settings, Docs],
             _ => &[
@@ -6050,6 +6052,7 @@ impl App {
                             let on = subjects.filter(|s| s.enabled && !s.subject.is_empty()).count();
                             (tab(on, t("Subjects")), false)
                         }
+                        ReqTab::Kv => (t("Key-value").to_owned(), !d.nats.bucket.is_empty()),
                         ReqTab::Examples => (tab(examples, t("Examples")), false),
                     };
                     sub_tab(ui, current, kind, label, set);
@@ -6221,10 +6224,23 @@ impl App {
                         }
                     }
                     ReqTab::Subjects => {
-                        if subjects_editor(ui, &mut open.draft.nats.subjects, live)
+                        let (done, list) = subjects_editor(ui, &mut open.draft.nats.subjects, live);
+                        if let Some(s) = session.as_deref() {
+                            if done {
+                                s.resubscribe(&open.draft, &all_vars);
+                            }
+                            if list {
+                                s.nats(crate::nats::Command::Streams);
+                            }
+                        }
+                    }
+                    ReqTab::Kv => {
+                        let r = |s: &str| model::resolve(s, &all_vars, &mut Vec::new());
+                        if let Some(op) = kv_editor(ui, &mut open.draft.nats, live, &r)
                             && let Some(s) = session.as_deref()
                         {
-                            s.resubscribe(&open.draft, &all_vars);
+                            let bucket = r(open.draft.nats.bucket.trim());
+                            s.nats(crate::nats::Command::Kv { bucket, op });
                         }
                     }
                     ReqTab::Properties => {
@@ -12238,13 +12254,22 @@ fn topics_editor(ui: &mut egui::Ui, topics: &mut Vec<model::Topic>, live: bool) 
     done
 }
 
-/// NATS's rows of the Subjects tab; true when a change is finished, for a live connection
-/// to follow.
-fn subjects_editor(ui: &mut egui::Ui, subjects: &mut Vec<model::NatsSubject>, live: bool) -> bool {
+/// NATS's rows of the Subjects tab. First: a change is finished, for a live connection to
+/// follow; second: the streams are asked for.
+fn subjects_editor(
+    ui: &mut egui::Ui,
+    subjects: &mut Vec<model::NatsSubject>,
+    live: bool,
+) -> (bool, bool) {
     ui.weak(match live {
         true => t("Connected: a change is (un)subscribed as soon as you finish it."),
         false => t("Subscribed to on Connect. * matches one token, > everything after."),
     });
+    let from = |f: model::NatsFrom| match f {
+        model::NatsFrom::New => t("New messages"),
+        model::NatsFrom::All => t("From the first"),
+        model::NatsFrom::Last => t("The last one on"),
+    };
     let mut done = false;
     let mut remove = None;
     // Rows rather than a Grid, as the topics are: a grid cell is last frame's width.
@@ -12258,15 +12283,42 @@ fn subjects_editor(ui: &mut egui::Ui, subjects: &mut Vec<model::NatsSubject>, li
                 {
                     remove = Some(i);
                 }
+                // A stream is read from a place in it; a queue group is a plain
+                // subscription's. The same width, so naming a stream moves nothing.
+                if s.stream.trim().is_empty() {
+                    done |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut s.queue)
+                                .hint_text(crate::i18n::t("Queue group"))
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(140.0),
+                        )
+                        .on_hover_text(crate::i18n::t(
+                            "Subscribers sharing a queue group get each message once between them",
+                        ))
+                        .lost_focus();
+                } else {
+                    let before = s.from;
+                    egui::ComboBox::from_id_salt(("nats-from", i))
+                        .width(140.0 + 2.0 * ui.spacing().button_padding.x)
+                        .selected_text(from(s.from))
+                        .show_ui(ui, |ui| {
+                            use model::NatsFrom::*;
+                            for f in [New, All, Last] {
+                                ui.selectable_value(&mut s.from, f, from(f));
+                            }
+                        });
+                    done |= s.from != before;
+                }
                 done |= ui
                     .add(
-                        egui::TextEdit::singleline(&mut s.queue)
-                            .hint_text(crate::i18n::t("Queue group"))
+                        egui::TextEdit::singleline(&mut s.stream)
+                            .hint_text(crate::i18n::t("Stream (JetStream)"))
                             .font(egui::TextStyle::Monospace)
                             .desired_width(140.0),
                     )
                     .on_hover_text(crate::i18n::t(
-                        "Subscribers sharing a queue group get each message once between them",
+                        "Reads what this stream has stored, in order; empty: a plain subscription",
                     ))
                     .lost_focus();
                 done |= ui
@@ -12284,13 +12336,102 @@ fn subjects_editor(ui: &mut egui::Ui, subjects: &mut Vec<model::NatsSubject>, li
         subjects.remove(i);
         done = true;
     }
-    if ui
-        .add(icon_text(ui, icon::PLUS, t("Subject")).small())
-        .clicked()
-    {
-        subjects.push(model::NatsSubject::default());
-    }
-    done
+    let mut list = false;
+    ui.horizontal(|ui| {
+        if ui
+            .add(icon_text(ui, icon::PLUS, t("Subject")).small())
+            .clicked()
+        {
+            subjects.push(model::NatsSubject::default());
+        }
+        list = ui
+            .add_enabled(live, icon_text(ui, icon::LIST, t("List streams")).small())
+            .on_hover_text(t("Lists the server's streams in the log"))
+            .on_disabled_hover_text(t("Connect first"))
+            .clicked();
+    });
+    (done, list)
+}
+
+/// NATS's Key-value tab: one bucket of the live connection, read and written a key at a
+/// time. Returns what was asked for; `resolve` fills in the variables.
+fn kv_editor(
+    ui: &mut egui::Ui,
+    n: &mut model::Nats,
+    live: bool,
+    resolve: &dyn Fn(&str) -> String,
+) -> Option<crate::nats::KvOp> {
+    use crate::nats::KvOp;
+    ui.weak(match live {
+        true => t("Results go to the log, with the messages."),
+        false => t("Connect first: these act on the live connection."),
+    });
+    egui::Grid::new("nats-kv").num_columns(2).show(ui, |ui| {
+        let row = |ui: &mut egui::Ui, name: &str, text: &mut String, hint: &str| {
+            ui.label(name);
+            ui.add(
+                egui::TextEdit::singleline(text)
+                    .hint_text(hint)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(360.0),
+            );
+            ui.end_row();
+        };
+        row(ui, t("Bucket"), &mut n.bucket, "config");
+        row(ui, t("Key"), &mut n.key, "feature.dark-mode");
+        row(ui, t("Value"), &mut n.value, "");
+    });
+    let (bucket, key) = (!n.bucket.trim().is_empty(), !n.key.trim().is_empty());
+    let mut op = None;
+    ui.horizontal(|ui| {
+        let button = |ui: &mut egui::Ui, on: bool, name: &str, hint: &str| {
+            ui.add_enabled(live && on, egui::Button::new(name))
+                .on_hover_text(hint)
+                .clicked()
+        };
+        if button(
+            ui,
+            bucket && key,
+            t("Get"),
+            t("The key's value and revision"),
+        ) {
+            op = Some(KvOp::Get(resolve(n.key.trim())));
+        }
+        if button(
+            ui,
+            bucket && key,
+            t("Put"),
+            t("Stores the value under the key"),
+        ) {
+            // The value as typed: spaces around it may be meant.
+            op = Some(KvOp::Put(resolve(n.key.trim()), resolve(&n.value)));
+        }
+        if button(
+            ui,
+            bucket && key,
+            t("Delete"),
+            t("Deletes the key; its history stays"),
+        ) {
+            op = Some(KvOp::Delete(resolve(n.key.trim())));
+        }
+        ui.separator();
+        if button(ui, bucket, t("Keys"), t("Lists the bucket's keys")) {
+            op = Some(KvOp::Keys);
+        }
+        let hint = t("Shows each change from now on; Key may be a pattern (app.>), empty: all");
+        if button(ui, bucket, t("Watch"), hint) {
+            op = Some(KvOp::Watch(resolve(n.key.trim())));
+        }
+        if button(
+            ui,
+            bucket,
+            t("Stop watching"),
+            t("Ends this bucket's watches"),
+        ) {
+            op = Some(KvOp::Unwatch);
+        }
+    });
+    op
 }
 
 fn nats_settings(
@@ -13775,7 +13916,7 @@ impl StreamSession {
                     reply: r(d.nats.reply.trim()),
                     headers,
                     payload: c.text.clone(),
-                    request: d.nats.send == model::NatsSend::Request,
+                    send: d.nats.send,
                 };
                 let _ = tx.send(crate::nats::Command::Publish(publish));
             }
@@ -13788,6 +13929,13 @@ impl StreamSession {
         self.log.lock().unwrap().events.iter().cloned().collect()
     }
 
+    /// NATS's Subjects and Key-value tabs: something for the live connection to do.
+    fn nats(&self, command: crate::nats::Command) {
+        if let Some(Outgoing::Nats(tx)) = &self.outgoing {
+            let _ = tx.send(command);
+        }
+    }
+
     /// MQTT and NATS: has the live connection follow the request's topics or subjects.
     fn resubscribe(&self, req: &Request, vars: &HashMap<String, String>) {
         match &self.outgoing {
@@ -13798,7 +13946,12 @@ impl StreamSession {
             }
             Some(Outgoing::Nats(tx)) => {
                 let (req, _) = req.resolved(vars);
-                let want = req.nats.subjects.into_iter().map(|s| (s.subject, s.queue));
+                let want = req.nats.subjects.into_iter().map(|s| crate::nats::Sub {
+                    subject: s.subject,
+                    queue: s.queue,
+                    stream: s.stream,
+                    from: s.from,
+                });
                 let _ = tx.send(crate::nats::Command::Subjects(want.collect()));
             }
             _ => {}
@@ -14862,21 +15015,30 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
                     .font(egui::TextStyle::Monospace)
                     .desired_width(240.0),
             );
+            use model::NatsSend::*;
             let names = |s: model::NatsSend| match s {
-                model::NatsSend::Publish => t("Publish"),
-                model::NatsSend::Request => t("Request"),
+                Publish => (
+                    t("Publish"),
+                    t("Sends it; nothing says whether anyone got it"),
+                ),
+                Request => (
+                    t("Request"),
+                    t("Request waits for the first reply, on an inbox of its own"),
+                ),
+                JetStream => (
+                    t("JetStream publish"),
+                    t("Waits for a stream to store it, and says which and where"),
+                ),
             };
             egui::ComboBox::from_id_salt("nats-send")
-                .selected_text(names(nats.send))
+                .selected_text(names(nats.send).0)
                 .show_ui(ui, |ui| {
-                    for s in [model::NatsSend::Publish, model::NatsSend::Request] {
-                        ui.selectable_value(&mut nats.send, s, names(s));
+                    for s in [Publish, Request, JetStream] {
+                        let (name, hint) = names(s);
+                        ui.selectable_value(&mut nats.send, s, name)
+                            .on_hover_text(hint);
                     }
-                })
-                .response
-                .on_hover_text(t(
-                    "Request waits for the first reply, on an inbox of its own",
-                ));
+                });
             // A request answers on its own inbox.
             if nats.send == model::NatsSend::Publish {
                 ui.add(
@@ -22112,6 +22274,64 @@ mod ui_tests {
         assert_eq!(*last, Event::Closed("disconnected".into()), "{events:?}");
     }
 
+    /// JetStream and a key-value bucket in the window, against a real server: a row
+    /// naming a stream reads it, a JetStream publish says where it was stored, the
+    /// streams are listed, and the Key-value tab puts a value and gets it back.
+    #[test]
+    fn nats_reads_a_stream_and_a_bucket() {
+        let server = crate::nats::tests::real(&[("ORDERS", "orders.>")], &["config"]);
+        let mut h = with_request("nats-js");
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        d.method = "NATS".into();
+        d.url = format!("nats://127.0.0.1:{}", server.port);
+        d.nats.subjects = vec![model::NatsSubject {
+            subject: "orders.>".into(),
+            stream: "ORDERS".into(),
+            ..Default::default()
+        }];
+        (d.nats.subject, d.nats.send) = ("orders.new".into(), model::NatsSend::JetStream);
+        h.run();
+        h.get_by_label("Subjects (1)").click();
+        h.run();
+        // Nothing to ask of a server that isn't connected.
+        assert!(
+            h.get_by_label("List streams")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.get_by_label("Connect").click();
+        let said = |app: &App, start: &str| {
+            let events = app.stream.as_ref().unwrap().events();
+            (events.iter()).any(|(_, e)| matches!(e, Event::Info(s) if s.starts_with(start)))
+        };
+        wait_live(&mut h, |app| {
+            said(app, "subscribed: orders.> in ORDERS (new)")
+        });
+        h.state_mut().compose.text = "ping".into();
+        h.get_by_label("Send").click();
+        wait_live(&mut h, |app| got(app, "[orders.new · ORDERS #1] ping"));
+        assert!(said(h.state(), "orders.new: stored in ORDERS as #1"));
+        h.get_by_label("List streams").click();
+        wait_live(&mut h, |app| said(app, "stream ORDERS: orders.>"));
+        shot(&mut h, "67-nats-jetstream");
+
+        h.get_by_label("Key-value").click();
+        h.run();
+        // No bucket named yet.
+        assert!(h.get_by_label("Keys").accesskit_node().is_disabled());
+        let n = &mut h.state_mut().open.as_mut().unwrap().draft.nats;
+        (n.bucket, n.key, n.value) = ("config".into(), "mode".into(), "{{host}}".into());
+        h.run();
+        h.get_by_label("Put").click();
+        wait_live(&mut h, |app| said(app, "kv config: put mode, revision 1"));
+        h.get_by_label("Get").click();
+        // The value's variable was filled in.
+        wait_live(&mut h, |app| {
+            got(app, "[kv config · mode · rev 1] 127.0.0.1:1")
+        });
+        shot(&mut h, "68-nats-kv");
+    }
+
     /// MQTT 5 properties go out with each publish, variables filled in; the broker
     /// echoes them back.
     #[test]
@@ -26325,6 +26545,7 @@ mod ui_tests {
             (ReqTab::Body, "body"),
             (ReqTab::Topics, "topics"),
             (ReqTab::Subjects, "subjects"),
+            (ReqTab::Kv, "kv"),
             (ReqTab::Properties, "properties"),
             (ReqTab::Auth, "auth"),
             (ReqTab::Scripts, "scripts"),

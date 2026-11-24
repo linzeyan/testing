@@ -419,8 +419,9 @@ impl SocketIo {
     }
 }
 
-/// A NATS request: one connection that subscribes to subjects, publishes, and asks for a
-/// reply. The message's headers are the request's own Headers tab.
+/// A NATS request: one connection that subscribes to subjects (or reads a JetStream
+/// stream), publishes, asks for a reply, and reads and writes a key-value bucket. The
+/// message's headers are the request's own Headers tab.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[serde(default)]
 pub struct Nats {
@@ -443,6 +444,13 @@ pub struct Nats {
     /// An NKey seed (SU…): signs the server's nonce instead of sending a password.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub nkey: String,
+    /// The KV tab: the bucket, the key (a pattern when watching) and what Put stores.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub bucket: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub value: String,
 }
 
 impl Nats {
@@ -469,6 +477,27 @@ pub enum NatsSend {
     Publish,
     /// Publishes with an inbox of its own and waits for the first reply.
     Request,
+    /// Publishes and waits for a stream to say it stored the message.
+    JetStream,
+}
+
+/// Where a JetStream subscription starts reading its stream.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NatsFrom {
+    /// Only what's stored from now on, as a plain subscription sees.
+    #[default]
+    New,
+    /// Everything the stream holds, oldest first.
+    All,
+    /// The last message stored, then what follows.
+    Last,
+}
+
+impl NatsFrom {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -479,6 +508,12 @@ pub struct NatsSubject {
     /// Subscribers sharing a queue group get each message once between them.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub queue: String,
+    /// A JetStream stream to read instead of subscribing: its stored messages on this
+    /// subject (all of them when the subject is empty), from `from` on. No queue group.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stream: String,
+    #[serde(skip_serializing_if = "NatsFrom::is_default")]
+    pub from: NatsFrom,
     #[serde(skip_serializing_if = "is_enabled")]
     pub enabled: bool,
 }
@@ -488,6 +523,8 @@ impl Default for NatsSubject {
         Self {
             subject: String::new(),
             queue: String::new(),
+            stream: String::new(),
+            from: NatsFrom::New,
             enabled: true,
         }
     }
@@ -1644,10 +1681,15 @@ impl Request {
             },
             nats: Nats {
                 subjects: (self.nats.subjects.iter())
-                    .filter(|s| s.enabled && !s.subject.trim().is_empty())
+                    // A stream alone reads all of it.
+                    .filter(|s| {
+                        s.enabled && !(s.subject.trim().is_empty() && s.stream.trim().is_empty())
+                    })
                     .map(|s| NatsSubject {
                         subject: r(s.subject.trim()),
                         queue: r(s.queue.trim()),
+                        stream: r(s.stream.trim()),
+                        from: s.from,
                         enabled: true,
                     })
                     .collect(),
@@ -1656,6 +1698,9 @@ impl Request {
                 name: r(self.nats.name.trim()),
                 creds: r(self.nats.creds.trim()),
                 nkey: r(self.nats.nkey.trim()),
+                bucket: r(self.nats.bucket.trim()),
+                key: r(self.nats.key.trim()),
+                value: r(&self.nats.value),
                 send: self.nats.send,
             },
             socketio: SocketIo {
@@ -2331,6 +2376,8 @@ mod tests {
                 subjects: vec![NatsSubject {
                     subject: "orders.>".into(),
                     queue: "workers".into(),
+                    stream: "ORDERS".into(),
+                    from: NatsFrom::All,
                     enabled: false,
                 }],
                 subject: "orders.{{id}}".into(),
@@ -2339,6 +2386,9 @@ mod tests {
                 name: "probe".into(),
                 creds: "/tmp/u.creds".into(),
                 nkey: "SUAC".into(),
+                bucket: "config".into(),
+                key: "{{id}}".into(),
+                value: "on".into(),
             },
             examples: vec![Example {
                 name: "found".into(),

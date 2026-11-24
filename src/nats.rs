@@ -1,5 +1,6 @@
 //! NATS sessions: connect to a server, keep its subscriptions in step with the request's
-//! subjects, publish or ask what the user sends, and show what arrives.
+//! subjects, publish or ask what the user sends, read JetStream streams and key-value
+//! buckets, and show what arrives.
 //!
 //! Always a direct connection: async-nats dials the server itself, so the app's proxy
 //! settings don't apply, as they do for MQTT. TLS is the network settings' as for https.
@@ -7,29 +8,55 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use async_nats::jetstream::{self, consumer, kv};
 use async_nats::{Client, ConnectOptions, HeaderMap};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::model::{Auth, Request};
+use crate::model::{Auth, NatsFrom, NatsSend, Request};
 use crate::net::Network;
 use crate::stream::Event;
 
 pub struct Publish {
     pub subject: String,
-    /// Where a receiver should answer; unused by a request, which has its own inbox.
+    /// Where a receiver should answer a plain publish; a request has its own inbox.
     pub reply: String,
     pub headers: Vec<(String, String)>,
     pub payload: String,
-    /// Wait for the first reply instead of only publishing.
-    pub request: bool,
+    pub send: NatsSend,
+}
+
+/// One row of the Subjects tab: a subscription, or with `stream` a read of that stream.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Sub {
+    pub subject: String,
+    pub queue: String,
+    pub stream: String,
+    pub from: NatsFrom,
+}
+
+pub enum KvOp {
+    Get(String),
+    Put(String, String),
+    Delete(String),
+    Keys,
+    /// Every change to the keys matching this pattern, from now on.
+    Watch(String),
+    /// Ends this bucket's watches.
+    Unwatch,
 }
 
 /// What the app asks of a live session.
 pub enum Command {
     Publish(Publish),
-    /// The (subject, queue group) pairs to be subscribed to from now on.
-    Subjects(Vec<(String, String)>),
+    /// The rows to be subscribed to from now on.
+    Subjects(Vec<Sub>),
+    /// Lists the account's streams in the log.
+    Streams,
+    Kv {
+        bucket: String,
+        op: KvOp,
+    },
 }
 
 /// What the tasks reading the connection hand to the session's one loop, which alone
@@ -37,8 +64,6 @@ pub enum Command {
 enum Got {
     Message(String),
     Info(String),
-    /// A subscription the server ended (no permission, or the connection closed).
-    Ended(String),
 }
 
 /// `req` is resolved. `net` gives a TLS connection its settings. Dropping the sender of
@@ -61,8 +86,14 @@ pub async fn session(
     )));
     let (got_tx, mut got) = mpsc::unbounded_channel();
     let mut subs = Subscriptions::default();
+    let mut watches = Tasks::default();
     let want = (req.nats.subjects.iter())
-        .map(|s| (s.subject.clone(), s.queue.clone()))
+        .map(|s| Sub {
+            subject: s.subject.clone(),
+            queue: s.queue.clone(),
+            stream: s.stream.clone(),
+            from: s.from,
+        })
         .collect();
     subs.update(&client, want, &got_tx, &emit).await;
     let tries = req.settings.reconnect_attempts;
@@ -77,6 +108,12 @@ pub async fn session(
                     }
                 }
                 Some(Command::Subjects(want)) => subs.update(&client, want, &got_tx, &emit).await,
+                Some(Command::Streams) => {
+                    tokio::spawn(streams(client.clone(), got_tx.clone()));
+                }
+                Some(Command::Kv { bucket, op }) => {
+                    key_value(&client, bucket, op, &mut watches, &got_tx, &emit);
+                }
                 None => {
                     // What's queued goes out before the goodbye.
                     let _ = client.flush().await;
@@ -85,7 +122,7 @@ pub async fn session(
             },
             Some(g) = got.recv() => match g {
                 Got::Message(text) => emit(Event::In(text)),
-                Got::Info(text) | Got::Ended(text) => emit(Event::Info(text)),
+                Got::Info(text) => emit(Event::Info(text)),
             },
             Some(event) = events.recv() => match event {
                 async_nats::Event::Connected if !connected => {
@@ -187,10 +224,28 @@ async fn connect(
     (options.connect(url).await).map_err(|e| e.to_string())
 }
 
-/// The live subscriptions, each read by its own task; dropping one unsubscribes it.
+/// Tasks reading the connection, by what they read; one dropped or replaced is aborted,
+/// which ends its subscription, consumer or watch.
+struct Tasks<K>(HashMap<K, tokio::task::AbortHandle>);
+
+impl<K> Default for Tasks<K> {
+    fn default() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl<K> Drop for Tasks<K> {
+    fn drop(&mut self) {
+        for task in self.0.values() {
+            task.abort();
+        }
+    }
+}
+
+/// The live subscriptions and stream reads.
 #[derive(Default)]
 struct Subscriptions {
-    live: HashMap<(String, String), tokio::task::AbortHandle>,
+    live: Tasks<Sub>,
 }
 
 impl Subscriptions {
@@ -199,64 +254,124 @@ impl Subscriptions {
     async fn update(
         &mut self,
         client: &Client,
-        want: Vec<(String, String)>,
+        want: Vec<Sub>,
         got: &mpsc::UnboundedSender<Got>,
         emit: &impl Fn(Event),
     ) {
-        let gone: Vec<_> = (self.live.keys())
-            .filter(|k| !want.contains(k))
-            .cloned()
-            .collect();
-        for key in gone {
-            if let Some(task) = self.live.remove(&key) {
+        let live = &mut self.live.0;
+        let gone: Vec<_> = live.keys().filter(|k| !want.contains(k)).cloned().collect();
+        for sub in gone {
+            if let Some(task) = live.remove(&sub) {
                 task.abort();
-                emit(Event::Info(format!("unsubscribed: {}", named(&key))));
+                emit(Event::Info(format!("unsubscribed: {}", named(&sub))));
             }
         }
-        for key in want {
-            if self.live.contains_key(&key) {
+        for sub in want {
+            if live.contains_key(&sub) {
                 continue;
             }
-            let (subject, queue) = key.clone();
-            let sub = match queue.is_empty() {
-                true => client.subscribe(subject).await,
-                false => client.queue_subscribe(subject, queue).await,
+            let name = named(&sub);
+            let task = match sub.stream.is_empty() {
+                true => subscribe(client, &sub, got.clone()).await,
+                false => read_stream(client, &sub, got.clone()).await,
             };
-            let mut sub = match sub {
-                Ok(sub) => sub,
-                Err(e) => {
-                    emit(Event::Info(format!("{}: {e}", named(&key))));
-                    continue;
+            match task {
+                Ok(task) => {
+                    emit(Event::Info(format!("subscribed: {name}")));
+                    live.insert(sub, task);
                 }
-            };
-            emit(Event::Info(format!("subscribed: {}", named(&key))));
-            let (got, name) = (got.clone(), named(&key));
-            let task = tokio::spawn(async move {
-                while let Some(m) = sub.next().await {
-                    if got.send(Got::Message(shown(&m, None))).is_err() {
-                        return;
-                    }
-                }
-                let _ = got.send(Got::Ended(format!("subscription ended: {name}")));
-            });
-            self.live.insert(key, task.abort_handle());
+                Err(e) => emit(Event::Info(format!("{name}: {e}"))),
+            }
         }
     }
 }
 
-impl Drop for Subscriptions {
-    fn drop(&mut self) {
-        for task in self.live.values() {
-            task.abort();
+async fn subscribe(
+    client: &Client,
+    sub: &Sub,
+    got: mpsc::UnboundedSender<Got>,
+) -> Result<tokio::task::AbortHandle, String> {
+    let subject = sub.subject.clone();
+    let subscriber = match sub.queue.is_empty() {
+        true => client.subscribe(subject).await,
+        false => client.queue_subscribe(subject, sub.queue.clone()).await,
+    };
+    let mut subscriber = subscriber.map_err(|e| e.to_string())?;
+    let name = named(sub);
+    let task = tokio::spawn(async move {
+        while let Some(m) = subscriber.next().await {
+            if got.send(Got::Message(shown(&m, None, ""))).is_err() {
+                return;
+            }
         }
-    }
+        // No permission, or the connection closed.
+        let _ = got.send(Got::Info(format!("subscription ended: {name}")));
+    });
+    Ok(task.abort_handle())
 }
 
-/// "orders.> (queue workers)"
-fn named((subject, queue): &(String, String)) -> String {
-    match queue.is_empty() {
-        true => subject.clone(),
-        false => format!("{subject} (queue {queue})"),
+/// A stream's stored messages in order, through an ephemeral ordered consumer: nothing
+/// to acknowledge, and it's gone with the connection.
+async fn read_stream(
+    client: &Client,
+    sub: &Sub,
+    got: mpsc::UnboundedSender<Got>,
+) -> Result<tokio::task::AbortHandle, String> {
+    let stream = (jetstream::new(client.clone()).get_stream(&sub.stream).await)
+        .map_err(|e| e.to_string())?;
+    let config = consumer::push::OrderedConfig {
+        deliver_subject: client.new_inbox(),
+        filter_subject: sub.subject.clone(),
+        deliver_policy: match sub.from {
+            NatsFrom::New => consumer::DeliverPolicy::New,
+            NatsFrom::All => consumer::DeliverPolicy::All,
+            NatsFrom::Last => consumer::DeliverPolicy::Last,
+        },
+        ..Default::default()
+    };
+    let consumer = (stream.create_consumer(config).await).map_err(|e| e.to_string())?;
+    let mut messages = consumer.messages().await.map_err(|e| e.to_string())?;
+    let name = named(sub);
+    let stream = sub.stream.clone();
+    let task = tokio::spawn(async move {
+        while let Some(m) = messages.next().await {
+            let line = match m {
+                Ok(m) => {
+                    let seq = m.info().map_or(0, |i| i.stream_sequence);
+                    // Its reply subject is the consumer's ack address: noise here.
+                    let mut plain = m.message.clone();
+                    plain.reply = None;
+                    Got::Message(shown(&plain, None, &format!(" · {stream} #{seq}")))
+                }
+                Err(e) => Got::Info(format!("{name}: {e}")),
+            };
+            if got.send(line).is_err() {
+                return;
+            }
+        }
+        let _ = got.send(Got::Info(format!("subscription ended: {name}")));
+    });
+    Ok(task.abort_handle())
+}
+
+/// "orders.> (queue workers)", "orders.> in ORDERS (all)"
+fn named(sub: &Sub) -> String {
+    let subject = if sub.subject.is_empty() {
+        ">"
+    } else {
+        &sub.subject
+    };
+    if !sub.stream.is_empty() {
+        let from = match sub.from {
+            NatsFrom::New => "new",
+            NatsFrom::All => "all",
+            NatsFrom::Last => "last",
+        };
+        return format!("{subject} in {} ({from})", sub.stream);
+    }
+    match sub.queue.is_empty() {
+        true => subject.to_owned(),
+        false => format!("{subject} (queue {})", sub.queue),
     }
 }
 
@@ -273,51 +388,250 @@ async fn publish(
         headers.append(k.as_str(), v.as_str());
     }
     let mut tags = String::new();
-    if p.request {
-        tags += " · request";
-    } else if !p.reply.is_empty() {
-        tags += &format!(" · reply={}", p.reply);
+    match p.send {
+        NatsSend::Request => tags += " · request",
+        NatsSend::JetStream => tags += " · jetstream",
+        NatsSend::Publish if !p.reply.is_empty() => tags += &format!(" · reply={}", p.reply),
+        NatsSend::Publish => {}
     }
     for (k, v) in &p.headers {
         tags += &format!(" · {k}={v}");
     }
     let shown = format!("[{}{tags}] {}", p.subject, p.payload);
     let payload = bytes::Bytes::from(p.payload.into_bytes());
-    if p.request {
-        let mut request = async_nats::Request::new().payload(payload);
-        if !headers.is_empty() {
-            request = request.headers(headers);
+    let (got, subject) = (got.clone(), p.subject);
+    match p.send {
+        NatsSend::Request => {
+            let mut request = async_nats::Request::new().payload(payload);
+            if !headers.is_empty() {
+                request = request.headers(headers);
+            }
+            let client = client.clone();
+            emit(Event::Out(shown));
+            // On its own task: the reply may take the whole timeout, and messages arrive
+            // meanwhile.
+            tokio::spawn(async move {
+                let answer = match client.send_request(subject.clone(), request).await {
+                    // A request's answer arrives on a random inbox: named for what was
+                    // asked instead.
+                    Ok(m) => Got::Message(shown_as(&m, &format!("reply to {subject}"))),
+                    Err(e) => Got::Info(format!("request to {subject}: {e}")),
+                };
+                let _ = got.send(answer);
+            });
         }
-        let (client, got, subject) = (client.clone(), got.clone(), p.subject);
-        emit(Event::Out(shown));
-        // On its own task: the reply may take the whole timeout, and messages arrive
-        // meanwhile.
-        tokio::spawn(async move {
-            let answer = match client.send_request(subject.clone(), request).await {
-                Ok(m) => Got::Message(shown_reply(&m, &subject)),
-                Err(e) => Got::Info(format!("request to {subject}: {e}")),
+        NatsSend::JetStream => {
+            let js = jetstream::new(client.clone());
+            emit(Event::Out(shown));
+            tokio::spawn(async move {
+                let ack = match js
+                    .publish_with_headers(subject.clone(), headers, payload)
+                    .await
+                {
+                    Ok(ack) => ack.await,
+                    Err(e) => Err(e),
+                };
+                let said = match ack {
+                    Ok(a) if a.duplicate => {
+                        format!("{subject}: {} already has it as #{}", a.stream, a.sequence)
+                    }
+                    Ok(a) => format!("{subject}: stored in {} as #{}", a.stream, a.sequence),
+                    // No stream takes the subject: nobody answers the publish.
+                    Err(e) => format!("{subject}: not stored: {e}"),
+                };
+                let _ = got.send(Got::Info(said));
+            });
+        }
+        NatsSend::Publish => {
+            let sent = match (p.reply.is_empty(), headers.is_empty()) {
+                (true, true) => client.publish(subject, payload).await,
+                (true, false) => (client.publish_with_headers(subject, headers, payload)).await,
+                (false, true) => (client.publish_with_reply(subject, p.reply, payload)).await,
+                (false, false) => {
+                    (client.publish_with_reply_and_headers(subject, p.reply, headers, payload))
+                        .await
+                }
             };
-            let _ = got.send(answer);
-        });
-        return Ok(());
-    }
-    let sent = match (p.reply.is_empty(), headers.is_empty()) {
-        (true, true) => client.publish(p.subject, payload).await,
-        (true, false) => (client.publish_with_headers(p.subject, headers, payload)).await,
-        (false, true) => (client.publish_with_reply(p.subject, p.reply, payload)).await,
-        (false, false) => {
-            (client.publish_with_reply_and_headers(p.subject, p.reply, headers, payload)).await
+            sent.map_err(|e| format!("publish: {e}"))?;
+            emit(Event::Out(shown));
         }
-    };
-    sent.map_err(|e| format!("publish: {e}"))?;
-    emit(Event::Out(shown));
+    }
     Ok(())
 }
 
+/// The account's streams, a line each: what the Subjects tab's Stream field can name.
+async fn streams(client: Client, got: mpsc::UnboundedSender<Got>) {
+    let js = jetstream::new(client);
+    let mut all = js.streams();
+    let mut count = 0;
+    while let Some(stream) = all.next().await {
+        let line = match stream {
+            Ok(info) => {
+                count += 1;
+                format!(
+                    "stream {}: {} · {} messages · {} bytes · #{} to #{}",
+                    info.config.name,
+                    info.config.subjects.join(", "),
+                    info.state.messages,
+                    info.state.bytes,
+                    info.state.first_sequence,
+                    info.state.last_sequence
+                )
+            }
+            // JetStream off on the server, or no permission.
+            Err(e) => format!("streams: {e}"),
+        };
+        if got.send(Got::Info(line)).is_err() {
+            return;
+        }
+    }
+    if count == 0 {
+        let _ = got.send(Got::Info("streams: none".into()));
+    }
+}
+
+/// One KV tab action; its result goes to the log. Each on a task of its own, so a slow
+/// bucket doesn't hold up messages; a watch lives until Unwatch or the session's end.
+fn key_value(
+    client: &Client,
+    bucket: String,
+    op: KvOp,
+    watches: &mut Tasks<(String, String)>,
+    got: &mpsc::UnboundedSender<Got>,
+    emit: &impl Fn(Event),
+) {
+    let (js, got) = (jetstream::new(client.clone()), got.clone());
+    let pattern = match &op {
+        KvOp::Unwatch => {
+            let ended: Vec<_> = (watches.0.keys())
+                .filter(|(b, _)| *b == bucket)
+                .cloned()
+                .collect();
+            for key in ended {
+                if let Some(task) = watches.0.remove(&key) {
+                    task.abort();
+                    emit(Event::Info(format!(
+                        "kv {bucket}: stopped watching {}",
+                        key.1
+                    )));
+                }
+            }
+            return;
+        }
+        KvOp::Watch(key) => {
+            let pattern = if key.is_empty() { ">" } else { key.as_str() };
+            if watches
+                .0
+                .contains_key(&(bucket.clone(), pattern.to_owned()))
+            {
+                return emit(Event::Info(format!(
+                    "kv {bucket}: already watching {pattern}"
+                )));
+            }
+            Some(pattern.to_owned())
+        }
+        _ => None,
+    };
+    let name = bucket.clone();
+    let task = tokio::spawn(async move {
+        let said = match js.get_key_value(bucket.clone()).await {
+            Ok(store) => key_value_op(&store, &bucket, op, &got).await,
+            Err(e) => Err(e.to_string()),
+        };
+        let line = match said {
+            Ok(Some(line)) => line,
+            Ok(None) => return,
+            Err(e) => Got::Info(format!("kv {bucket}: {e}")),
+        };
+        let _ = got.send(line);
+    });
+    if let Some(pattern) = pattern {
+        watches.0.insert((name, pattern), task.abort_handle());
+    }
+}
+
+async fn key_value_op(
+    store: &kv::Store,
+    bucket: &str,
+    op: KvOp,
+    got: &mpsc::UnboundedSender<Got>,
+) -> Result<Option<Got>, String> {
+    let e = |e: &dyn std::fmt::Display| e.to_string();
+    Ok(Some(match op {
+        KvOp::Get(key) => match store.entry(key.clone()).await.map_err(|x| e(&x))? {
+            Some(entry) if entry.operation == kv::Operation::Put => {
+                Got::Message(entry_shown(&entry))
+            }
+            // Deleted keeps a marker as its last revision.
+            _ => Got::Info(format!("kv {bucket}: {key} has no value")),
+        },
+        KvOp::Put(key, value) => {
+            let revision = (store.put(&key, value.into_bytes().into()).await).map_err(|x| e(&x))?;
+            Got::Info(format!("kv {bucket}: put {key}, revision {revision}"))
+        }
+        KvOp::Delete(key) => {
+            store.delete(&key).await.map_err(|x| e(&x))?;
+            Got::Info(format!("kv {bucket}: deleted {key}"))
+        }
+        KvOp::Keys => {
+            let mut keys = store.keys().await.map_err(|x| e(&x))?;
+            let mut all = Vec::new();
+            while let Some(key) = keys.next().await {
+                all.push(key.map_err(|x| e(&x))?);
+            }
+            all.sort();
+            match all.is_empty() {
+                true => Got::Info(format!("kv {bucket}: no keys")),
+                false => Got::Info(format!("kv {bucket}: keys: {}", all.join(", "))),
+            }
+        }
+        KvOp::Watch(key) => {
+            let pattern = if key.is_empty() { ">" } else { key.as_str() };
+            let mut entries = store.watch(pattern).await.map_err(|x| e(&x))?;
+            let _ = got.send(Got::Info(format!("kv {bucket}: watching {pattern}")));
+            while let Some(entry) = entries.next().await {
+                let line = match entry {
+                    Ok(entry) => Got::Message(entry_shown(&entry)),
+                    Err(x) => Got::Info(format!("kv {bucket}: {x}")),
+                };
+                if got.send(line).is_err() {
+                    break;
+                }
+            }
+            return Ok(None);
+        }
+        KvOp::Unwatch => return Ok(None),
+    }))
+}
+
+/// "[kv config · feature.x · rev 3] on", a delete as "· deleted".
+fn entry_shown(entry: &kv::Entry) -> String {
+    let what = match entry.operation {
+        kv::Operation::Put => "",
+        kv::Operation::Delete => " · deleted",
+        kv::Operation::Purge => " · purged",
+    };
+    format!(
+        "[kv {} · {} · rev {}{what}] {}",
+        entry.bucket,
+        entry.key,
+        entry.revision,
+        text(&entry.value)
+    )
+}
+
+fn text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => crate::stream::binary(bytes),
+    }
+}
+
 /// A message as the log shows it: "[subject · reply=inbox · key=value] payload", the
-/// prefix the log's pretty-printer splits off (as MQTT's).
-fn shown(m: &async_nats::Message, subject: Option<&str>) -> String {
-    let mut tags = String::new();
+/// prefix the log's pretty-printer splits off (as MQTT's). `subject` stands in for the
+/// message's own, and `more` follows it.
+fn shown(m: &async_nats::Message, subject: Option<&str>, more: &str) -> String {
+    let mut tags = String::from(more);
     if let Some(reply) = &m.reply {
         tags += &format!(" · reply={reply}");
     }
@@ -335,16 +649,11 @@ fn shown(m: &async_nats::Message, subject: Option<&str>) -> String {
         }
     }
     let subject = subject.map_or_else(|| m.subject.to_string(), str::to_owned);
-    let body = match std::str::from_utf8(&m.payload) {
-        Ok(text) => text.to_owned(),
-        Err(_) => crate::stream::binary(&m.payload),
-    };
-    format!("[{subject}{tags}] {body}")
+    format!("[{subject}{tags}] {}", text(&m.payload))
 }
 
-/// A request's answer arrives on a random inbox: named for what was asked instead.
-fn shown_reply(m: &async_nats::Message, asked: &str) -> String {
-    shown(m, Some(&format!("reply to {asked}")))
+fn shown_as(m: &async_nats::Message, subject: &str) -> String {
+    shown(m, Some(subject), "")
 }
 
 #[cfg(test)]
@@ -465,6 +774,133 @@ pub(crate) mod tests {
         }
     }
 
+    /// The nats-server the JetStream and key-value tests run against: the fake above
+    /// would be a second implementation of both. The CI workflow installs the same.
+    const REAL: &str = "2.15.3";
+
+    /// A real nats-server with JetStream, gone when dropped.
+    pub(crate) struct Real {
+        pub port: u16,
+        child: Option<std::process::Child>,
+        container: Option<String>,
+        store: std::path::PathBuf,
+    }
+
+    impl Drop for Real {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(name) = &self.container {
+                let _ = std::process::Command::new("docker")
+                    .args(["rm", "-f", name])
+                    .output();
+            }
+            let _ = std::fs::remove_dir_all(&self.store);
+        }
+    }
+
+    /// Starts one with these streams (name, subjects) and key-value buckets: the
+    /// `nats-server` on PATH (CI), else the official image in docker (a dev machine).
+    /// Neither is a failure, not a skip: the tests would pass having checked nothing.
+    pub(crate) fn real(streams: &[(&str, &str)], buckets: &[&str]) -> Real {
+        use std::process::{Command as Process, Stdio};
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let store =
+            std::env::temp_dir().join(format!("apitool-nats-{}-{port}", std::process::id()));
+        let mut server = Real {
+            port,
+            child: None,
+            container: None,
+            store,
+        };
+        let binary = Process::new("nats-server")
+            .args(["-js", "-a", "127.0.0.1", "-p", &port.to_string(), "-sd"])
+            .arg(&server.store)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match binary {
+            Ok(child) => server.child = Some(child),
+            Err(_) => {
+                let name = format!("apitool-nats-{}-{port}", std::process::id());
+                let publish = format!("127.0.0.1:{port}:4222");
+                let image = format!("nats:{REAL}");
+                let run = Process::new("docker")
+                    .args([
+                        "run", "--rm", "-d", "--name", &name, "-p", &publish, &image, "-js",
+                    ])
+                    .output();
+                match run {
+                    Ok(out) if out.status.success() => server.container = Some(name),
+                    Ok(out) => panic!(
+                        "no nats-server on PATH, and docker couldn't run {image}: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    ),
+                    Err(e) => panic!(
+                        "the JetStream tests need nats-server {REAL} on PATH, or docker: {e}"
+                    ),
+                }
+            }
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let url = format!("nats://127.0.0.1:{port}");
+        let ready = async {
+            let client = async_nats::connect(&url).await.map_err(|e| e.to_string())?;
+            let js = jetstream::new(client.clone());
+            for (name, subjects) in streams {
+                let config = jetstream::stream::Config {
+                    name: (*name).into(),
+                    subjects: vec![(*subjects).into()],
+                    ..Default::default()
+                };
+                (js.get_or_create_stream(config).await).map_err(|e| e.to_string())?;
+            }
+            for bucket in buckets {
+                let config = kv::Config {
+                    bucket: (*bucket).into(),
+                    history: 5,
+                    ..Default::default()
+                };
+                (js.create_key_value(config).await).map_err(|e| e.to_string())?;
+            }
+            client.flush().await.map_err(|e| e.to_string())
+        };
+        // docker's port answers before the server inside does, and JetStream comes up a
+        // moment after the server: the whole setup is tried again until it holds.
+        let setup = async {
+            let started = std::time::Instant::now();
+            loop {
+                let again = async {
+                    let client = async_nats::connect(&url).await.map_err(|e| e.to_string())?;
+                    let js = jetstream::new(client.clone());
+                    (js.query_account().await).map_err(|e| e.to_string())?;
+                    Ok::<_, String>(())
+                };
+                match again.await {
+                    Ok(()) => break,
+                    Err(e) if started.elapsed() > Duration::from_secs(60) => {
+                        panic!("nats-server on {port} didn't come up: {e}")
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            }
+            ready.await
+        };
+        if let Err(e) = rt.block_on(setup) {
+            panic!("setting up nats-server on {port}: {e}");
+        }
+        server
+    }
+
     /// Runs a session on its own runtime thread; returns the command sender and the
     /// events as they come.
     fn start(
@@ -497,7 +933,7 @@ pub(crate) mod tests {
             reply: String::new(),
             headers: Vec::new(),
             payload: payload.into(),
-            request: false,
+            send: NatsSend::Publish,
         }
     }
 
@@ -532,7 +968,7 @@ pub(crate) mod tests {
         let (tx, events) = start(request(server(), &[]));
         assert!(matches!(next(&events), Event::Open(_)));
         let p = Publish {
-            request: true,
+            send: NatsSend::Request,
             ..publish("svc.echo", "ping")
         };
         tx.send(Command::Publish(p)).unwrap();
@@ -549,7 +985,11 @@ pub(crate) mod tests {
         let (tx, events) = start(request(server(), &["a"]));
         assert!(matches!(next(&events), Event::Open(_)));
         assert_eq!(next(&events), Event::Info("subscribed: a".into()));
-        let want = vec![("b".to_owned(), "workers".to_owned())];
+        let want = vec![Sub {
+            subject: "b".into(),
+            queue: "workers".into(),
+            ..Default::default()
+        }];
         tx.send(Command::Subjects(want)).unwrap();
         assert_eq!(next(&events), Event::Info("unsubscribed: a".into()));
         let subscribed = "subscribed: b (queue workers)";
@@ -559,6 +999,114 @@ pub(crate) mod tests {
         assert_eq!(next(&events), Event::Out("[a] dropped".into()));
         assert_eq!(next(&events), Event::Out("[b] kept".into()));
         assert_eq!(next(&events), Event::In("[b] kept".into()));
+    }
+
+    /// JetStream against a real server: a publish says where it was stored, or that no
+    /// stream took it; a stream row reads what's stored from its start, numbered; the
+    /// streams can be listed; a stream that isn't there is a line in the log.
+    #[test]
+    fn a_stream_stores_a_publish_and_is_read_back() {
+        let server = real(&[("ORDERS", "orders.>")], &[]);
+        let (tx, events) = start(request(server.port, &[]));
+        assert!(matches!(next(&events), Event::Open(_)));
+        let stored = |subject: &str| Publish {
+            send: NatsSend::JetStream,
+            ..publish(subject, "one")
+        };
+        tx.send(Command::Publish(stored("orders.new"))).unwrap();
+        let out = Event::Out("[orders.new · jetstream] one".into());
+        assert_eq!(next(&events), out);
+        let said = "orders.new: stored in ORDERS as #1";
+        assert_eq!(next(&events), Event::Info(said.into()));
+        tx.send(Command::Publish(stored("nobody"))).unwrap();
+        assert!(matches!(next(&events), Event::Out(_)));
+        let lost = next(&events);
+        assert!(
+            matches!(&lost, Event::Info(s) if s.starts_with("nobody: not stored: ")),
+            "{lost:?}"
+        );
+
+        let row = |stream: &str| Sub {
+            subject: "orders.>".into(),
+            stream: stream.into(),
+            from: NatsFrom::All,
+            ..Default::default()
+        };
+        tx.send(Command::Subjects(vec![row("ORDERS")])).unwrap();
+        let subscribed = "subscribed: orders.> in ORDERS (all)";
+        assert_eq!(next(&events), Event::Info(subscribed.into()));
+        // Stored before this session read the stream: what a subscription never sees.
+        let read = "[orders.new · ORDERS #1] one";
+        assert_eq!(next(&events), Event::In(read.into()));
+
+        tx.send(Command::Streams).unwrap();
+        let listed = next(&events);
+        assert!(
+            matches!(&listed, Event::Info(s) if s.starts_with("stream ORDERS: orders.> · 1 messages")),
+            "{listed:?}"
+        );
+        tx.send(Command::Subjects(vec![row("ORDERS"), row("NOPE")]))
+            .unwrap();
+        let missing = next(&events);
+        assert!(
+            matches!(&missing, Event::Info(s) if s.starts_with("orders.> in NOPE (all): ")),
+            "{missing:?}"
+        );
+    }
+
+    /// A bucket against a real server: put, get, keys and delete say what they did, a
+    /// watch shows each change as it happens until it's stopped, and a bucket that isn't
+    /// there is a line in the log.
+    #[test]
+    fn a_bucket_is_written_read_and_watched() {
+        let server = real(&[], &["config"]);
+        let (tx, events) = start(request(server.port, &[]));
+        assert!(matches!(next(&events), Event::Open(_)));
+        let kv = |bucket: &str, op| {
+            let bucket = bucket.to_owned();
+            tx.send(Command::Kv { bucket, op }).unwrap();
+        };
+        let info = |s: &str| Event::Info(s.into());
+        kv("config", KvOp::Watch(String::new()));
+        assert_eq!(next(&events), info("kv config: watching >"));
+        kv("config", KvOp::Watch(String::new()));
+        assert_eq!(next(&events), info("kv config: already watching >"));
+
+        // The put's answer and the watch's line race: both, in either order.
+        kv("config", KvOp::Put("mode".into(), "dark".into()));
+        let two = [next(&events), next(&events)];
+        assert!(
+            two.contains(&info("kv config: put mode, revision 1")),
+            "{two:?}"
+        );
+        let entry = Event::In("[kv config · mode · rev 1] dark".into());
+        assert!(two.contains(&entry), "{two:?}");
+        kv("config", KvOp::Get("mode".into()));
+        assert_eq!(next(&events), entry);
+        kv("config", KvOp::Keys);
+        assert_eq!(next(&events), info("kv config: keys: mode"));
+
+        kv("config", KvOp::Delete("mode".into()));
+        let two = [next(&events), next(&events)];
+        assert!(two.contains(&info("kv config: deleted mode")), "{two:?}");
+        let gone = Event::In("[kv config · mode · rev 2 · deleted] ".into());
+        assert!(two.contains(&gone), "{two:?}");
+        kv("config", KvOp::Get("mode".into()));
+        assert_eq!(next(&events), info("kv config: mode has no value"));
+        kv("config", KvOp::Keys);
+        assert_eq!(next(&events), info("kv config: no keys"));
+
+        kv("config", KvOp::Unwatch);
+        assert_eq!(next(&events), info("kv config: stopped watching >"));
+        kv("config", KvOp::Put("mode".into(), "light".into()));
+        // Only the put's answer: the watch is over.
+        assert_eq!(next(&events), info("kv config: put mode, revision 3"));
+        kv("nope", KvOp::Keys);
+        let missing = next(&events);
+        assert!(
+            matches!(&missing, Event::Info(s) if s.starts_with("kv nope: ")),
+            "{missing:?}"
+        );
     }
 
     /// Nobody listening is an error to read, not the end of the session.
