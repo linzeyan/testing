@@ -4238,7 +4238,7 @@ impl App {
                         ui.ctx().copy_text(m.url.clone());
                         self.status = t("Copied the mock server URL").into();
                     }
-                    stop_mock = ui.button(t("Stop")).clicked();
+                    stop_mock = ui.add(icon_text(ui, icon::STOP, t("Stop"))).clicked();
                     ui.separator();
                 }
                 if stop_mock {
@@ -4983,7 +4983,7 @@ impl App {
                     {
                         ui.ctx().copy_text(addr.to_string());
                     }
-                    stop = ui.button(t("Stop")).clicked();
+                    stop = ui.add(icon_text(ui, icon::STOP, t("Stop"))).clicked();
                 }
                 None => start = ui.add(primary(t("Start capturing"))).clicked(),
             }
@@ -5831,7 +5831,7 @@ impl App {
                                 .clicked();
                         });
                     save = ui
-                        .add_enabled(open.dirty(), egui::Button::new(t("Save")))
+                        .add_enabled(open.dirty(), icon_text(ui, icon::SAVE, t("Save")))
                         .on_hover_text(shortcut_label(ui.ctx(), &SAVE))
                         .clicked();
                     if !streaming {
@@ -5986,7 +5986,16 @@ impl App {
                     let key = shortcut_label(ui.ctx(), &SEND);
                     send |= (ui.add_enabled_ui(ready, |ui| {
                         let fill = Color32::from_rgb(40, 110, 200);
-                        ui.add_sized(button, egui::Button::new(label).fill(fill))
+                        // Connect has no picture that says it; Send's is the paper plane.
+                        let button_ = match streaming {
+                            true => egui::Button::new(label),
+                            false => {
+                                let plane = (icon::SEND.image(ui.ctx(), icon_size(ui)))
+                                    .tint(Color32::WHITE);
+                                egui::Button::new((plane, label))
+                            }
+                        };
+                        ui.add_sized(button, button_.fill(fill))
                     }))
                     .inner
                     .on_hover_text(key)
@@ -10544,7 +10553,7 @@ fn from_bulk(text: &str, old: &[KeyValue]) -> Vec<KeyValue> {
 /// Beautify, a hint while it isn't JSON, and the editor.
 fn json_editor(ui: &mut egui::Ui, text: &mut String, vars: &HashMap<String, String>) {
     ui.horizontal(|ui| {
-        if ui.small_button(t("Beautify")).clicked()
+        if beautify(ui).clicked()
             && let Some(pretty) = http::pretty_json(text)
         {
             *text = pretty;
@@ -10680,7 +10689,7 @@ fn body_editor(
                     .response
                     .on_hover_text(t("Sets the Content-Type header"));
                 if shown == "XML"
-                    && ui.small_button(t("Beautify")).clicked()
+                    && beautify(ui).clicked()
                     && let Some(pretty) = http::pretty_xml(text)
                 {
                     *text = pretty;
@@ -10978,7 +10987,7 @@ fn graphql_editor(
             }
             let hint = t("One field per line. A query with # comments is left as it is.");
             if !query.trim().is_empty()
-                && ui.small_button(t("Beautify")).on_hover_text(hint).clicked()
+                && beautify(ui).on_hover_text(hint).clicked()
                 && let Some(laid_out) = crate::graphql::pretty(query)
             {
                 *query = laid_out;
@@ -12072,7 +12081,10 @@ fn auth_editor(
                         ui.label(tf("Token {}, expires in {} min", &[&short, &mins]))
                     }
                 };
-                if ui.button(t("Copy")).clicked() {
+                if icon_button(ui, icon::COPY, t("Copy"), None)
+                    .on_hover_text(t("Copy"))
+                    .clicked()
+                {
                     ui.ctx().copy_text(token.clone());
                 }
                 let forget = ui.button(t("Forget"));
@@ -13673,6 +13685,11 @@ fn escape_pressed(ui: &egui::Ui) -> bool {
 }
 
 /// The button Enter presses, filled so it's clear which one that is.
+/// Beautify as the wand it is in every editor's row, named by its tooltip.
+fn beautify(ui: &mut egui::Ui) -> egui::Response {
+    icon_button(ui, icon::WAND, t("Beautify"), None).on_hover_text(t("Beautify"))
+}
+
 fn primary(text: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
         .fill(Color32::from_rgb(40, 110, 200))
@@ -13808,7 +13825,7 @@ fn load_ui(ui: &mut egui::Ui, view: &mut LoadView) -> (bool, bool) {
             ui.add(egui::DragValue::new(&mut view.secs).range(1..=3600));
         });
         if running {
-            if ui.button(t("Stop")).clicked()
+            if ui.add(icon_text(ui, icon::STOP, t("Stop"))).clicked()
                 && let Some(a) = view.abort.take()
             {
                 a.abort();
@@ -15189,7 +15206,7 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
         }
         ui.vertical(|ui| {
             let button = (ui.add_enabled_ui(can_send, |ui| {
-                ui.add_sized([send_w, 22.0], egui::Button::new(t("Send")))
+                ui.add_sized([send_w, 22.0], icon_text(ui, icon::SEND, t("Send")))
             }))
             .inner;
             send = button
@@ -15220,7 +15237,7 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
     // Only for what looks like JSON: parsing a big message every frame to know costs.
     if c.text.trim_start().starts_with(['{', '[']) {
         ui.horizontal(|ui| {
-            if ui.small_button(t("Beautify")).clicked()
+            if beautify(ui).clicked()
                 && let Some(pretty) = http::pretty_json(&c.text)
             {
                 c.text = pretty;
@@ -15837,7 +15854,10 @@ fn response_ui(
                 if ui.button(t("Show anyway")).clicked() {
                     view.reveal();
                 }
-                if ui.button(t("Save to file…")).clicked() {
+                if ui
+                    .add(icon_text(ui, icon::DOWNLOAD, t("Save to file…")))
+                    .clicked()
+                {
                     *save_file = true;
                 }
             });
@@ -16249,7 +16269,10 @@ fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView, save_file: &mut bool)
             let size = human_size(view.raw_size);
             ui.weak(tf("{} of binary data, not shown ({}).", &[&size, &e]));
             // A button that says it, rather than a note pointing at an icon in the bar.
-            if ui.button(t("Save to file…")).clicked() {
+            if ui
+                .add(icon_text(ui, icon::DOWNLOAD, t("Save to file…")))
+                .clicked()
+            {
                 *save_file = true;
             }
         }
