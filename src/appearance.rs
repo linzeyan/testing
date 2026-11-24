@@ -38,8 +38,25 @@ pub const DEFAULT_SIZE: f32 = 13.0;
 pub const SIZES: std::ops::RangeInclusive<f32> = 9.0..=24.0;
 
 /// Corners of buttons, and of what egui rounds with them (fields, tabs, rows, checkboxes):
-/// egui's 2 px read as square. Rounder makes a 14 px checkbox look like a radio button.
-const RADIUS: u8 = 4;
+/// macOS's push buttons and fields at 22 pt. Rounder makes a 14 px checkbox look like a
+/// radio button.
+const RADIUS: u8 = 5;
+/// macOS's regular control height: buttons, fields and pop-ups line up at it.
+const CONTROL_HEIGHT: f32 = 22.0;
+
+/// macOS's system blue, controlAccentColor's default, in each appearance.
+pub fn accent(dark: bool) -> egui::Color32 {
+    match dark {
+        true => egui::Color32::from_rgb(10, 132, 255),
+        false => egui::Color32::from_rgb(0, 122, 255),
+    }
+}
+
+/// A step off the content's fill, as the sidebars of Finder, Mail and Xcode are: lighter in
+/// dark, darker in light.
+pub fn sidebar_fill(dark: bool) -> egui::Color32 {
+    egui::Color32::from_gray(if dark { 42 } else { 234 })
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Theme {
@@ -68,38 +85,40 @@ pub fn apply(ctx: &egui::Context, a: &Appearance) -> Result<(), String> {
                 font.size = b.size * scale;
             }
         }
-        let w = &mut style.visuals.widgets;
-        for v in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
-            v.corner_radius = egui::CornerRadius::same(RADIUS);
-        }
         // egui's 200 px cut the 13 auth types off after the ninth, the rest only a scroll
         // away that nothing hints at. Scaled, so a larger text size gets as many rows.
         style.spacing.combo_height = 420.0 * scale;
+        style.spacing.interact_size.y = CONTROL_HEIGHT;
+        // Text plus 3 pt above and below makes the 22 pt; egui's 4 pt sides crowd a label.
+        style.spacing.button_padding = egui::vec2(8.0, 3.0);
+        style.spacing.menu_margin = egui::Margin::same(5);
     });
-    // egui's light fields are white on a near-white panel with no edge: a URL bar or a
-    // Key cell couldn't be told from the background. Postman and Hoppscotch outline them.
-    ctx.style_mut_of(egui::Theme::Light, |style| {
-        style.visuals.widgets.inactive.bg_stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_gray(205));
-    });
+    // Both themes always, so switching keeps the palette.
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        ctx.style_mut_of(theme, |style| mac_visuals(&mut style.visuals));
+    }
     let mut fonts = egui::FontDefinitions::default();
     let mut missing = Vec::new();
     for (name, family) in [
         (&a.ui_font, FontFamily::Proportional),
         (&a.code_font, FontFamily::Monospace),
     ] {
-        if name.is_empty() {
-            continue;
-        }
-        match system_font(name) {
-            Some(data) => {
-                fonts.font_data.insert(name.clone(), Arc::new(data));
-                // First, so it draws what it has; the built-in fonts fill in the rest.
-                let list = fonts.families.entry(family).or_default();
-                list.insert(0, name.clone());
-            }
-            None => missing.push(format!("Font \"{name}\" isn't installed")),
-        }
+        let (key, data) = match name.is_empty() {
+            true => match platform_font(&family) {
+                Some(found) => found,
+                None => continue,
+            },
+            false => match system_font(name) {
+                Some(data) => (name.clone(), data),
+                None => {
+                    missing.push(format!("Font \"{name}\" isn't installed"));
+                    continue;
+                }
+            },
+        };
+        fonts.font_data.insert(key.clone(), Arc::new(data));
+        // First, so it draws what it has; the built-in fonts fill in the rest.
+        fonts.families.entry(family).or_default().insert(0, key);
     }
     // egui's fonts have no CJK glyphs: the OS's go last, behind whatever was chosen.
     if let Some((_, bytes)) = cjk() {
@@ -114,6 +133,115 @@ pub fn apply(ctx: &egui::Context, a: &Appearance) -> Result<(), String> {
         true => Ok(()),
         false => Err(missing.join("; ")),
     }
+}
+
+/// macOS's system colours over egui's: labels near white (or black) with a dimmer secondary,
+/// separators at 10%, raised buttons, fields with an edge, the accent as a soft selection and
+/// a focus ring. On every platform: Windows 11's Fluent is close enough that one palette
+/// serves both, and one set of screenshots checks it.
+fn mac_visuals(v: &mut egui::Visuals) {
+    use egui::{Color32, CornerRadius, Shadow, Stroke};
+    let dark = v.dark_mode;
+    let gray = Color32::from_gray;
+    let pick = |d: u8, l: u8| gray(if dark { d } else { l });
+    let accent = accent(dark);
+    let content = pick(30, 246);
+    // Labels: labelColor is 85% white (black); secondary text comes from weak_text_alpha.
+    let label = pick(223, 34);
+    let edge = Stroke::new(1.0, pick(62, 200));
+
+    v.panel_fill = content;
+    v.window_fill = pick(44, 250);
+    v.window_stroke = Stroke::new(1.0, pick(70, 205));
+    v.extreme_bg_color = pick(38, 255);
+    v.code_bg_color = pick(52, 230);
+    v.hyperlink_color = match dark {
+        true => Color32::from_rgb(65, 156, 255),
+        false => Color32::from_rgb(0, 104, 218),
+    };
+    // systemOrange and systemRed.
+    (v.warn_fg_color, v.error_fg_color) = match dark {
+        true => (
+            Color32::from_rgb(255, 159, 10),
+            Color32::from_rgb(255, 69, 58),
+        ),
+        false => (
+            Color32::from_rgb(255, 149, 0),
+            Color32::from_rgb(255, 59, 48),
+        ),
+    };
+    v.window_corner_radius = CornerRadius::same(10);
+    v.menu_corner_radius = CornerRadius::same(8);
+    // Soft and straight down, as macOS lights its windows, not egui's long diagonal.
+    let alpha = if dark { 110 } else { 45 };
+    v.window_shadow = Shadow {
+        offset: [0, 10],
+        blur: 30,
+        spread: 0,
+        color: Color32::from_black_alpha(alpha),
+    };
+    v.popup_shadow = Shadow {
+        offset: [0, 4],
+        blur: 14,
+        spread: 0,
+        color: Color32::from_black_alpha(alpha),
+    };
+    v.text_cursor.stroke = Stroke::new(2.0, accent);
+
+    // A soft accent behind selected text, tabs and rows; the text and the focus ring in a
+    // deeper accent, readable on that fill (3:1 or better).
+    v.selection.bg_fill = blend(content, accent, if dark { 0.30 } else { 0.15 });
+    v.selection.stroke = Stroke::new(
+        2.0,
+        match dark {
+            true => Color32::from_rgb(100, 175, 255),
+            false => Color32::from_rgb(0, 100, 220),
+        },
+    );
+
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = content;
+    w.noninteractive.weak_bg_fill = content;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, pick(56, 218));
+    w.noninteractive.fg_stroke = Stroke::new(1.0, label);
+    w.noninteractive.corner_radius = CornerRadius::same(6);
+    // Buttons, pop-ups and checkboxes are raised: lighter than the panel in dark, white with
+    // an edge in light. Fields take the same edge on `extreme_bg_color`.
+    let raised = [(72, 255), (84, 252), (100, 228), (84, 240)];
+    for (state, (d, l)) in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open]
+        .into_iter()
+        .zip(raised)
+    {
+        state.weak_bg_fill = pick(d, l);
+        state.bg_fill = pick(d, l);
+        state.bg_stroke = edge;
+        state.fg_stroke = Stroke::new(1.0, label);
+        state.corner_radius = CornerRadius::same(RADIUS);
+        state.expansion = 0.0;
+    }
+    // Only a hovered field shows it is one: a stronger edge, no ring as egui's.
+    w.hovered.bg_stroke = Stroke::new(1.0, pick(90, 165));
+    w.active.fg_stroke.color = pick(255, 0);
+}
+
+/// `a` moved `t` of the way to `b`.
+fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let mix = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
+/// The OS's own interface and code fonts, when Settings names none: SF Pro and SF Mono on
+/// macOS. Elsewhere egui's built-in ones stay (the shared look stops at colours and sizes).
+fn platform_font(family: &FontFamily) -> Option<(String, egui::FontData)> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let (key, path) = match family {
+        FontFamily::Monospace => ("system-mono", "/System/Library/Fonts/SFNSMono.ttf"),
+        _ => ("system-ui", "/System/Library/Fonts/SFNS.ttf"),
+    };
+    let bytes = mapped(Path::new(path))?;
+    Some((key.into(), egui::FontData::from_static(bytes)))
 }
 
 /// Windows draws the title bar itself, and winit darkens it through an undocumented call
@@ -345,12 +473,50 @@ mod tests {
             // Every auth type in view at once (13 rows of about 20 px).
             assert!(style.spacing.combo_height >= 13.0 * 24.0);
         }
-        // Light fields have an edge; dark ones stand out by their fill already.
-        let edge = |theme| ctx.style_of(theme).visuals.widgets.inactive.bg_stroke.width;
-        assert_eq!(
-            (edge(egui::Theme::Light), edge(egui::Theme::Dark)),
-            (1.0, 0.0)
-        );
+        // Fields and buttons have an edge in both: a white field on a near-white panel (A3)
+        // couldn't be told from it.
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let v = ctx.style_of(theme).visuals.clone();
+            assert_eq!(v.widgets.inactive.bg_stroke.width, 1.0, "{theme:?}");
+            assert_ne!(v.extreme_bg_color, v.panel_fill, "{theme:?}");
+        }
+    }
+
+    /// macOS's palette: the accent marks selections and the focus ring, labels are near
+    /// white (black), and controls are the 22 pt the Mac lines them up at.
+    #[test]
+    fn the_palette_is_the_macs() {
+        let ctx = egui::Context::default();
+        apply(&ctx, &Appearance::default()).unwrap();
+        for (theme, dark) in [(egui::Theme::Dark, true), (egui::Theme::Light, false)] {
+            let style = ctx.style_of(theme);
+            let v = &style.visuals;
+            let label = v.widgets.noninteractive.fg_stroke.color;
+            let contrast = (i32::from(label.r()) - i32::from(v.panel_fill.r())).abs();
+            assert!(
+                contrast > 180,
+                "{theme:?}: labels read as bright as macOS's"
+            );
+            // Selected text and tabs: a soft accent, bluer than it is red.
+            let sel = v.selection.bg_fill;
+            assert!(sel.b() > sel.r() + 30, "{theme:?}: {sel:?}");
+            assert_eq!(v.text_cursor.stroke.color, accent(dark));
+            assert_ne!(sidebar_fill(dark), v.panel_fill);
+            assert_eq!(style.spacing.interact_size.y, CONTROL_HEIGHT);
+        }
+    }
+
+    /// With no font chosen, a Mac draws in SF Pro and SF Mono, ahead of egui's own.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mac_defaults_to_its_system_fonts() {
+        let ctx = egui::Context::default();
+        apply(&ctx, &Appearance::default()).unwrap();
+        let mut out = ctx.run_ui(Default::default(), |_| {});
+        out.textures_delta.clear();
+        let first = |f: FontFamily| ctx.fonts(|x| x.definitions().families[&f][0].clone());
+        assert_eq!(first(FontFamily::Proportional), "system-ui");
+        assert_eq!(first(FontFamily::Monospace), "system-mono");
     }
 
     /// A chosen font comes first in its family, ahead of the built-in one.

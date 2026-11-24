@@ -93,7 +93,8 @@ const RED: Color32 = Color32::from_rgb(220, 80, 80);
 const ORANGE: Color32 = Color32::from_rgb(200, 120, 0);
 /// A dot in this says something is set inside (a body, auth, scripts); ORANGE's says
 /// unsaved edits. The Send button's blue.
-const BLUE: Color32 = Color32::from_rgb(40, 110, 200);
+/// macOS's system blue (light), deep enough for white text on the dark theme too.
+const BLUE: Color32 = Color32::from_rgb(0, 122, 255);
 /// The raw body's languages and the Content-Type each sets; Text sends the default.
 const RAW_TYPES: [(&str, &str); 4] = [
     ("Text", ""),
@@ -4013,9 +4014,13 @@ impl eframe::App for App {
                 .total_margin()
                 .sum()
                 .x;
+            let dark = ui.visuals().dark_mode;
+            let frame =
+                egui::Frame::side_top_panel(ui.style()).fill(crate::appearance::sidebar_fill(dark));
             egui::Panel::left("sidebar")
                 .default_size(260.0)
                 .min_size(self.sidebar_min + margins)
+                .frame(frame)
                 .show(ui, |ui| self.sidebar(ui));
         }
         if self.quick_look {
@@ -9525,8 +9530,12 @@ struct TreeView<'a> {
     expand: &'a dyn Fn(&Path) -> bool,
 }
 
-/// Kept free at a row's right end for its "⋯", so the button never covers the name.
-const MORE_WIDTH: f32 = 26.0;
+/// Kept free at a row's right end for its "⋯", so the button never covers the name: the
+/// icon and the button's padding. A fixed 26 px fell short once controls grew to 22 pt, and
+/// the button outgrew it, widening the sidebar a few pixels every frame.
+fn more_width(ui: &egui::Ui) -> f32 {
+    icon_size(ui) + 2.0 * ui.spacing().button_padding.x
+}
 
 fn tree_ui(
     ui: &mut egui::Ui,
@@ -9686,7 +9695,8 @@ fn tree_row(
         let size = galley(text.clone(), wrap, f32::INFINITY, egui::TextStyle::Small).size();
         (text, hover, size)
     });
-    let room = MORE_WIDTH + right.as_ref().map_or(0.0, |(_, _, size)| size.x + pad);
+    let more = more_width(&content);
+    let room = more + right.as_ref().map_or(0.0, |(_, _, size)| size.x + pad);
     let width = (content.available_width() - room).max(0.0);
     let text = galley(
         name.into(),
@@ -9702,10 +9712,7 @@ fn tree_row(
     );
     // A label, unlike the name: it has its own tooltip, and takes no clicks from the row.
     if let Some((text, hover, size)) = right {
-        let min = egui::pos2(
-            rect.right() - MORE_WIDTH - size.x,
-            rect.center().y - size.y / 2.0,
-        );
+        let min = egui::pos2(rect.right() - more - size.x, rect.center().y - size.y / 2.0);
         let label = egui::Label::new(text).selectable(false);
         content
             .put(egui::Rect::from_min_size(min, size), label)
@@ -10011,8 +10018,7 @@ fn more_button(
     if !open && (dragging || !ui.rect_contains_pointer(row.rect)) {
         return;
     }
-    // Wide enough for the icon and the button's padding, or the button outgrows it.
-    let size = egui::vec2(MORE_WIDTH, row.rect.height());
+    let size = egui::vec2(more_width(ui), row.rect.height());
     let rect =
         egui::Rect::from_min_size(egui::pos2(row.rect.right() - size.x, row.rect.top()), size);
     let button = named(
@@ -10864,8 +10870,8 @@ fn graphql_editor(
         let schema = ex.schema.as_ref().and_then(|s| s.as_ref().ok());
         let fields = |text: &str, at: usize| schema?.complete(text, at);
         let query_h = (total - vars_h - 2.0 * row - 8.0).max(row);
-        // Down to the divider: 8 rows left the rest of its space empty.
-        let rows = (query_h / ui.text_style_height(&egui::TextStyle::Monospace)) as usize;
+        // Down to the divider: 8 rows left the rest of its space empty, and whole rows of
+        // text left up to two lines' gap once controls grew to 22 pt.
         egui::ScrollArea::vertical()
             .id_salt("gql-query-scroll")
             .auto_shrink(false)
@@ -10885,7 +10891,8 @@ fn graphql_editor(
                             .hint_text(t(
                                 "Fetch the schema and click a field →\nor type a query here: its fields complete as you type.",
                             ))
-                            .desired_rows(rows.saturating_sub(1).max(4))
+                            .desired_rows(4)
+                            .min_size(egui::vec2(0.0, query_h))
                             .desired_width(f32::INFINITY)
                     },
                 );
@@ -14125,6 +14132,8 @@ fn flow_list(
         .auto_shrink(false)
         .stick_to_bottom(true)
         .show_rows(ui, row_h, hits.len(), |ui, rows| {
+            // As the response body's rows: no taller than `row_h`.
+            ui.spacing_mut().interact_size.y = row_h;
             for f in &hits[rows] {
                 ui.horizontal(|ui| {
                     ui.set_height(row_h);
@@ -14587,6 +14596,8 @@ fn stream_ui(
             row_h,
             filtered.map_or(log.events.len(), VecDeque::len),
             |ui, rows| {
+                // As the response body's rows: no taller than `row_h`.
+                ui.spacing_mut().interact_size.y = row_h;
                 for row in rows {
                     let i = filtered.map_or(row, |hits| (hits[row] - log.dropped) as usize);
                     let (at, event) = &log.events[i];
@@ -15449,6 +15460,10 @@ fn response_ui(
             let pointer = ui.input(|i| i.pointer.hover_pos());
             crate::varedit::track_label_selection(ui);
             area.show_rows(ui, row_height, count, |ui, range| {
+                // A horizontal row is at least `interact_size.y` tall: as tall as a control
+                // (22 pt), it outgrew `show_rows`' row height, so lines spread apart and
+                // scrolling counted the wrong rows.
+                ui.spacing_mut().interact_size.y = row_height;
                 for i in range.map(|v| unhide(&hidden, v)) {
                     let (start, end, line, in_string) = match *wrap {
                         true => {
@@ -25966,12 +25981,17 @@ mod ui_tests {
 
     /// Not a check: every tab of every kind of request, each auth and body type, every
     /// dialog and settings page, as pictures for a UX review against Postman and Hoppscotch.
-    /// `APITOOL_SHOTS=1 cargo test ux_tour -- --ignored`, into /tmp/apitool-shots/t-*.png.
+    /// `APITOOL_SHOTS=1 cargo test ux_tour -- --ignored`, into /tmp/apitool-shots/t-*.png;
+    /// `APITOOL_SHOTS_LIGHT=1` takes them in the light theme.
     #[test]
     #[ignore = "screenshots for a UX review"]
     fn ux_tour() {
         use egui_kittest::kittest::By;
         let mut h = with_request("tour");
+        if std::env::var_os("APITOOL_SHOTS_LIGHT").is_some() {
+            h.state_mut().appearance.theme = crate::appearance::Theme::Light;
+            h.run();
+        }
         let kinds = [
             ("GET", "https://{{host}}/users/{id}?page=1"),
             ("POST", "https://{{host}}/users"),
