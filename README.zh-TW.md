@@ -44,7 +44,22 @@ cargo build --release --locked   # target/release/apitool and apitool-cli
 | SSE | |
 | Socket.IO 2、3 與 4 | URL 的路徑即 namespace，JSON 內容即 auth payload（v2 沒有 auth payload，「參數」會附在交握的查詢字串上）；「設定」可指定交握路徑（空白即 `/socket.io/`）與用戶端版本；以 `event {"json": "arg"}` 或 `["event", …]` 陣列送出，也可以在「事件」欄填事件名稱、輸入框只放參數；勾選「要求確認」會請伺服器確認收到，回覆會顯示為 `ack` 加上同一個編號 |
 | MQTT 3.1.1 與 5 | 透過 TCP、TLS 或 WebSocket（`mqtt://`、`mqtts://`、`ws://`、`wss://`），詳見下方 |
+| NATS | 透過 `nats://` 或 `tls://`：subject、發布與 request-reply、JetStream stream 與 key-value bucket，詳見下方 |
 | gRPC | 方法來自執行時載入的 `.proto`；未指定時改用伺服器反射（v1 或 v1alpha，按 ↻ 或第一次傳送時查詢）。串流方法像 WebSocket 一樣連線；JSON 陣列內容會送出多則訊息 |
+
+NATS：
+
+- 連線時訂閱請求的 subject（支援 `*` 與 `>` 萬用字元，每列可選 queue group），連線中修改會即時跟著訂閱或取消。
+- 從訊息面板發布到一個 subject，「標頭」分頁的列即訊息標頭，可選填回覆 subject；Request 會用自己的
+  inbox 發布並顯示第一則回覆，沒人回應時會說明。
+- JetStream：subject 列填了 stream 就改為讀取該 stream 已儲存的訊息（新訊息、從第一則、或從最後一則開始），
+  透過暫時性的 ordered consumer，每則訊息附上序號；「JetStream 發佈」會等 stream 回覆並顯示存進哪個
+  stream、第幾則；「列出 stream」顯示伺服器上的 stream。
+- Key-value：Key-value 分頁可讀取、寫入、刪除 bucket 裡的 key，列出所有 key，並監看某個 key 或樣式的變更。
+  結果與訊息一起出現在記錄中。
+- 登入方式：驗證分頁的 Basic（使用者與密碼）或 Bearer（token），或在「設定」指定 `.creds` 檔或 NKey seed。
+- `tls://` 一定使用 TLS，`nats://` 在伺服器要求時升級，採用網路設定的 CA 檔、用戶端憑證與「接受任何憑證」。
+  連線一律直連，不套用代理設定。
 
 MQTT：
 
@@ -358,6 +373,7 @@ Java、C#、PHP、Ruby、Rust、Swift 或 Kotlin。二進位內容會讀入對�
 | WebSocket | websocat、瀏覽器、ws、websockets、gorilla |
 | Socket.IO | socket.io-client、python-socketio |
 | MQTT | mosquitto、paho-mqtt、mqtt.js、paho Go |
+| NATS | `nats` CLI |
 | gRPC | grpcurl、grpc-js、grpcio，依方法的串流形式產生 |
 
 說明以 Markdown 撰寫在請求或資料夾的「文件」分頁；按「預覽」可看到排版後的樣子，其中的連結會在瀏覽器開啟。
