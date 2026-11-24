@@ -45,6 +45,12 @@ const RADIUS: u8 = 5;
 const CONTROL_HEIGHT: f32 = 22.0;
 
 /// macOS's system blue, controlAccentColor's default, in each appearance.
+/// macOS: the height of a standard window's title bar, and how far its traffic lights
+/// reach in from the left, in points. The row merged into the title bar is as tall, and
+/// starts clear of the lights.
+pub const TITLE_BAR: f32 = 28.0;
+pub const TRAFFIC_LIGHTS: f32 = 78.0;
+
 pub fn accent(dark: bool) -> egui::Color32 {
     match dark {
         true => egui::Color32::from_rgb(10, 132, 255),

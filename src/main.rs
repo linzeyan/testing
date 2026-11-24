@@ -45,6 +45,15 @@ fn main() -> eframe::Result {
         });
     }
 
+    // The Mac's way since Big Sur: no title, the tab strip in the title bar's row and the
+    // sidebar running to the top, under the traffic lights (`App::in_title_bar`).
+    if cfg!(target_os = "macos") {
+        options.viewport = (options.viewport)
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false);
+    }
+
     let ws = match store::open_workspace(None) {
         Ok(ws) => ws,
         Err(e) => {
@@ -103,6 +112,7 @@ fn main() -> eframe::Result {
             log::info!("{}", renderer.replace('\n', ", "));
             cc.egui_ctx.add_plugin(app::OpenLinks);
             let mut app = app::App::new(ws, renderer);
+            app.in_title_bar = cfg!(target_os = "macos");
             app.auto_update();
             app.restore_window(cc.storage);
             app.apply_appearance(&cc.egui_ctx);

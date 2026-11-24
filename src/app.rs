@@ -1188,6 +1188,9 @@ pub struct App {
     /// Set each frame: the workbench is too narrow for side by side.
     narrow: bool,
     hide_sidebar: bool,
+    /// macOS: the window's content runs under a transparent title bar, so the top row
+    /// keeps clear of the traffic lights and moves the window when dragged.
+    pub in_title_bar: bool,
     /// Measured each frame: the widest row of the sidebar's buttons, which its separator
     /// can't be dragged past.
     sidebar_min: f32,
@@ -1342,6 +1345,7 @@ impl App {
             side_by_side: !state.stacked,
             narrow: false,
             hide_sidebar: state.hide_sidebar,
+            in_title_bar: false,
             sidebar_min: 0.0,
             hide_response: state.hide_response,
             env_colors: state.env_colors.clone(),
@@ -3681,6 +3685,23 @@ fn json_tokens(row: &str, in_string: bool) -> Vec<(usize, Kind)> {
     out
 }
 
+/// An empty stretch of the Mac's merged title bar: dragging it moves the window and a
+/// double click zooms it, as a title bar's does.
+fn title_bar_drag(ui: &mut egui::Ui, rect: egui::Rect) {
+    let bar = ui.interact(
+        rect,
+        ui.id().with("title-bar"),
+        egui::Sense::click_and_drag(),
+    );
+    if bar.double_clicked() {
+        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    } else if bar.drag_started_by(egui::PointerButton::Primary) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
 /// The window's size on first start, and to un-maximize to when it was never seen otherwise.
 pub const WINDOW_SIZE: [f32; 2] = [1200.0, 800.0];
 
@@ -4292,8 +4313,23 @@ impl App {
         });
     }
 
+    /// Whether the top row is the window's title bar now: not in full screen, where the
+    /// Mac hides the traffic lights.
+    fn title_bar(&self, ctx: &egui::Context) -> bool {
+        self.in_title_bar && !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
+        // Under the traffic lights, as Finder's and Xcode's sidebars start.
+        let title_bar = self.title_bar(ui.ctx());
+        if title_bar {
+            title_bar_drag(ui, ui.max_rect().with_max_y(crate::appearance::TITLE_BAR));
+        }
+        ui.add_space(if title_bar {
+            crate::appearance::TITLE_BAR
+        } else {
+            6.0
+        });
         ui.horizontal(|ui| {
             ui.strong(t("Environment"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5553,11 +5589,45 @@ impl App {
     fn main_area(&mut self, ui: &mut egui::Ui) {
         let capture = self.capture_shown || self.capture.is_some();
         let folder = !self.folders.is_empty();
-        if !self.tabs.is_empty() || self.runner.is_some() || capture || folder || self.hide_sidebar
+        // As the title bar the row is always there: it's what the window is moved by.
+        let title_bar = self.title_bar(ui.ctx());
+        if !self.tabs.is_empty()
+            || self.runner.is_some()
+            || capture
+            || folder
+            || self.hide_sidebar
+            || title_bar
         {
-            egui::Panel::top("tabs").show(ui, |ui| {
+            let height = if title_bar {
+                crate::appearance::TITLE_BAR
+            } else {
+                0.0
+            };
+            egui::Panel::top("tabs").min_size(height).show(ui, |ui| {
+                if title_bar {
+                    // Before the tabs, so they are in front of it.
+                    title_bar_drag(ui, ui.max_rect());
+                }
                 if !self.hide_sidebar {
                     return self.tab_bar(ui);
+                }
+                if title_bar {
+                    // The traffic lights are over this corner without a sidebar under them.
+                    return ui
+                        .horizontal_centered(|ui| {
+                            ui.add_space(crate::appearance::TRAFFIC_LIGHTS);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    self.env_combo(ui);
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| self.tab_bar(ui),
+                                    );
+                                },
+                            );
+                        })
+                        .inner;
                 }
                 // With the sidebar hidden, the environment would be out of sight and reach.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -22199,6 +22269,30 @@ mod ui_tests {
         let events = h.state().stream.as_ref().unwrap().events();
         let (_, last) = events.last().unwrap();
         assert_eq!(*last, Event::Closed("disconnected".into()), "{events:?}");
+    }
+
+    /// On a Mac the content runs under the title bar: the sidebar starts below the
+    /// traffic lights, and with it hidden the tabs start to their right, or the first
+    /// tab would be under the close button.
+    #[test]
+    fn the_merged_title_bar_keeps_clear_of_the_traffic_lights() {
+        use crate::appearance::{TITLE_BAR, TRAFFIC_LIGHTS};
+        let mut h = with_request("title-bar");
+        let top = |h: &Harness<'_, App>| h.get_by_label("Environment").rect().top();
+        assert!(top(&h) < TITLE_BAR, "elsewhere the window has its own bar");
+        h.state_mut().in_title_bar = true;
+        h.run();
+        assert!(top(&h) >= TITLE_BAR, "{}", top(&h));
+        shot(&mut h, "69-title-bar");
+        h.state_mut().hide_sidebar = true;
+        h.run();
+        // The topmost "r" is the tab; the request's name below it is another.
+        let tab = (h.get_all_by_label("r").map(|n| n.rect()))
+            .min_by(|a, b| a.top().total_cmp(&b.top()))
+            .unwrap();
+        let left = tab.left();
+        assert!(left >= TRAFFIC_LIGHTS, "{left}");
+        shot(&mut h, "70-title-bar-no-sidebar");
     }
 
     /// NATS end to end in the window: its own tabs, subjects subscribed on Connect, a
