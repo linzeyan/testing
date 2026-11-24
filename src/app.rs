@@ -25817,8 +25817,11 @@ mod ui_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let app = h.state();
+        // A session's events say how far it got: without them a timeout on another
+        // platform's runner (Windows, v0.163.0) left only guesses.
+        let events = app.stream.as_ref().map(|s| s.events());
         panic!(
-            "timed out waiting for the app; status {:?}, open {:?}, pending {}",
+            "timed out waiting for the app; status {:?}, open {:?}, pending {}, stream {events:?}",
             app.status,
             app.open.as_ref().map(|o| (&o.path, &o.draft.url)),
             app.pending.len()

@@ -210,16 +210,25 @@ async fn connect(
         options = options.nkey(n.nkey.clone());
     }
     let insecure = net.insecure || !req.settings.verify_tls;
-    let ring = rustls::crypto::ring::default_provider();
-    let cert = net.cert_for(url);
-    let tls = crate::mqtt::tls_config(net, cert, insecure, ring, rustls::DEFAULT_VERSIONS)?;
-    options = options.tls_client_config(tls);
-    // tls:// insists on TLS; a plain nats:// upgrades only when the server's INFO asks,
-    // which giving a TLS config would otherwise turn into a demand.
-    options = match url.starts_with("tls://") {
-        true => options.require_tls(true),
-        false => options.tls_optional(),
-    };
+    let (cert, password) = net.cert_for(url);
+    let secure = url.starts_with("tls://");
+    // The network settings' TLS only where it will be used or says something of its own.
+    // A plain nats:// with nothing set leaves a server's request to upgrade to the
+    // client's defaults: building the system verifier for every connection took seconds
+    // on Windows (the window's NATS tests timed out there, v0.163.0), for a handshake
+    // that mostly never happens.
+    if secure || insecure || !net.ca_file.trim().is_empty() || !cert.trim().is_empty() {
+        let ring = rustls::crypto::ring::default_provider();
+        let versions = rustls::DEFAULT_VERSIONS;
+        let tls = crate::mqtt::tls_config(net, (cert, password), insecure, ring, versions)?;
+        options = options.tls_client_config(tls);
+        // tls:// insists on TLS; a plain nats:// upgrades only when the server's INFO
+        // asks, which giving a TLS config would otherwise turn into a demand.
+        options = match secure {
+            true => options.require_tls(true),
+            false => options.tls_optional(),
+        };
+    }
     // Its message already carries its cause.
     (options.connect(url).await).map_err(|e| e.to_string())
 }
