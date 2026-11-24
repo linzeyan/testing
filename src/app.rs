@@ -4443,13 +4443,13 @@ impl App {
                     Some((format, true)) => self.export_dialog(&root, format),
                     None => {}
                 }
-                if ui.button(t("Start mock server")).clicked() {
+                if (ui.add(menu_item(ui, Some(icon::SERVER), t("Start mock server")))).clicked() {
                     self.start_mock(root.clone(), ui.ctx());
                     ui.close();
                 }
                 ui.separator();
                 let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[1].0);
-                if (ui.add(egui::Button::new(t("Import…")).shortcut_text(key)))
+                if (ui.add(menu_item(ui, Some(icon::DOWNLOAD), t("Import…")).shortcut_text(key)))
                     .on_hover_text(t(
                         "A Postman collection or environment, or an OpenAPI/Swagger spec",
                     ))
@@ -5506,14 +5506,14 @@ impl App {
                     label.context_menu(|ui| {
                         let ctx = ui.ctx().clone();
                         let shortcut = |s| shortcut_label(&ctx, s);
-                        let item = egui::Button::new(t("Duplicate request"))
+                        let item = menu_item(ui, Some(icon::COPY_PLUS), t("Duplicate request"))
                             .shortcut_text(shortcut(&DUPLICATE));
                         if ui.add(item).clicked() {
                             menu = Some((i, Menu::Duplicate));
                         }
                         ui.separator();
-                        let item =
-                            egui::Button::new(t("Close tab")).shortcut_text(shortcut(&CLOSE_TAB));
+                        let item = menu_item(ui, Some(icon::X), t("Close tab"))
+                            .shortcut_text(shortcut(&CLOSE_TAB));
                         if ui.add(item).clicked() {
                             close = Some(tab.path.clone());
                         }
@@ -5522,12 +5522,13 @@ impl App {
                             (t("Close tabs to the right"), Menu::Right),
                             (t("Close all tabs"), Menu::All),
                         ] {
-                            if ui.button(label).clicked() {
+                            // One × says closing for the group; the words say which.
+                            if ui.add(menu_item(ui, None, label)).clicked() {
                                 menu = Some((i, action));
                             }
                         }
                         ui.separator();
-                        let item = egui::Button::new(t("Reopen closed tab"))
+                        let item = menu_item(ui, Some(icon::UNDO), t("Reopen closed tab"))
                             .shortcut_text(shortcut(&REOPEN_TAB));
                         if ui.add_enabled(!self.closed.is_empty(), item).clicked() {
                             menu = Some((i, Menu::Reopen));
@@ -9859,7 +9860,11 @@ fn row_menu(
     if picked.len() < 2 || !picked.iter().any(|p| p == path) {
         return own(ui, actions);
     }
-    let delete = egui::Button::new(tf("Delete {} items", &[&picked.len()]));
+    let delete = menu_item(
+        ui,
+        Some(icon::TRASH),
+        &tf("Delete {} items", &[&picked.len()]),
+    );
     if ui.add(delete.shortcut_text(delete_key(ui.ctx()))).clicked() {
         actions.push(TreeAction::Dialog(Dialog::Delete(picked.to_vec())));
         ui.close();
@@ -9997,17 +10002,18 @@ fn folder_menu(
     actions: &mut Vec<TreeAction>,
 ) {
     let (rename_key, delete_key) = (shortcut_label(ui.ctx(), &RENAME), delete_key(ui.ctx()));
-    let mut keyed = |ui: &mut egui::Ui, label: &str, keys: Option<String>, a: TreeAction| {
-        let button = egui::Button::new(label);
-        let button = match keys {
-            Some(keys) => button.shortcut_text(keys),
-            None => button,
+    let mut keyed =
+        |ui: &mut egui::Ui, icon: Icon, label: &str, keys: Option<String>, a: TreeAction| {
+            let button = menu_item(ui, Some(icon), label);
+            let button = match keys {
+                Some(keys) => button.shortcut_text(keys),
+                None => button,
+            };
+            if ui.add(button).clicked() {
+                actions.push(a);
+                ui.close();
+            }
         };
-        if ui.add(button).clicked() {
-            actions.push(a);
-            ui.close();
-        }
-    };
     let dialog = |kind| TreeAction::Dialog(Dialog::name(kind, ""));
     let path = path.to_path_buf();
     // At the top, as in Postman's menu: what a collection is mostly opened for. Last, it
@@ -10016,33 +10022,40 @@ fn folder_menu(
         true => t("Run collection"),
         false => t("Run folder"),
     };
-    keyed(ui, run, None, TreeAction::Run(path.clone()));
+    keyed(ui, icon::PLAY, run, None, TreeAction::Run(path.clone()));
     ui.separator();
     let new_request = dialog(NameKind::NewRequest(path.clone()));
-    keyed(ui, t("New request"), None, new_request);
+    keyed(ui, icon::FILE_PLUS, t("New request"), None, new_request);
     let new_folder = dialog(NameKind::NewFolder(path.clone()));
-    keyed(ui, t("New folder"), None, new_folder);
+    keyed(ui, icon::FOLDER_PLUS, t("New folder"), None, new_folder);
     let rename = TreeAction::Dialog(Dialog::name(NameKind::Rename(path.clone()), name));
-    keyed(ui, t("Rename"), Some(rename_key), rename);
-    keyed(
-        ui,
-        t("Duplicate"),
-        None,
-        TreeAction::Duplicate(path.clone()),
-    );
+    keyed(ui, icon::PENCIL, t("Rename"), Some(rename_key), rename);
+    let duplicate = TreeAction::Duplicate(path.clone());
+    keyed(ui, icon::COPY_PLUS, t("Duplicate"), None, duplicate);
     let delete = TreeAction::Dialog(Dialog::Delete(vec![path.clone()]));
-    keyed(ui, t("Delete"), Some(delete_key), delete);
+    keyed(ui, icon::TRASH, t("Delete"), Some(delete_key), delete);
     ui.separator();
     let mut sorted = Vec::new();
     sort_menu(ui, &path, sort, &mut sorted);
-    let mut item = |ui: &mut egui::Ui, label: &str, a: TreeAction| keyed(ui, label, None, a);
+    let mut item =
+        |ui: &mut egui::Ui, icon: Icon, label: &str, a: TreeAction| keyed(ui, icon, label, None, a);
     let settings = match collection {
         true => t("Collection settings…"),
         false => t("Folder settings…"),
     };
-    item(ui, settings, TreeAction::FolderSettings(path.clone()));
+    item(
+        ui,
+        icon::SETTINGS,
+        settings,
+        TreeAction::FolderSettings(path.clone()),
+    );
     let picked = copy_export_menus(ui);
-    item(ui, t("Start mock server"), TreeAction::Mock(path.clone()));
+    item(
+        ui,
+        icon::SERVER,
+        t("Start mock server"),
+        TreeAction::Mock(path.clone()),
+    );
     actions.extend(picked.map(|(format, export)| match export {
         true => TreeAction::Export(path, format),
         false => TreeAction::Copy(path, format),
@@ -10058,43 +10071,46 @@ fn sort_menu(
     (by, descending): (SortBy, bool),
     actions: &mut Vec<TreeAction>,
 ) {
-    ui.menu_button(t("Sort requests"), |ui| {
-        let mut pick = |ui: &mut egui::Ui, to: (SortBy, bool), label: &str| {
-            if ui.radio((by, descending) == to, label).clicked() {
-                actions.push(TreeAction::Sort(path.to_path_buf(), to.0, to.1));
-                ui.close();
+    ui.menu_button(
+        menu_title(ui, icon::ARROW_UP_DOWN, t("Sort requests")),
+        |ui| {
+            let mut pick = |ui: &mut egui::Ui, to: (SortBy, bool), label: &str| {
+                if ui.radio((by, descending) == to, label).clicked() {
+                    actions.push(TreeAction::Sort(path.to_path_buf(), to.0, to.1));
+                    ui.close();
+                }
+            };
+            pick(ui, (SortBy::None, false), t("None (as arranged)"));
+            for (to, label) in [
+                (SortBy::Created, t("Date created")),
+                (SortBy::Updated, t("Date modified")),
+                (SortBy::Name, t("Name")),
+                (SortBy::Type, t("Type (HTTP, GraphQL, WebSocket…)")),
+                (SortBy::Method, t("Method (GET, POST…)")),
+            ] {
+                pick(ui, (to, if by == to { descending } else { false }), label);
             }
-        };
-        pick(ui, (SortBy::None, false), t("None (as arranged)"));
-        for (to, label) in [
-            (SortBy::Created, t("Date created")),
-            (SortBy::Updated, t("Date modified")),
-            (SortBy::Name, t("Name")),
-            (SortBy::Type, t("Type (HTTP, GraphQL, WebSocket…)")),
-            (SortBy::Method, t("Method (GET, POST…)")),
-        ] {
-            pick(ui, (to, if by == to { descending } else { false }), label);
-        }
-        ui.separator();
-        ui.add_enabled_ui(by != SortBy::None, |ui| {
-            pick(ui, (by, false), t("Ascending"));
-            pick(ui, (by, true), t("Descending"));
-        });
-    });
+            ui.separator();
+            ui.add_enabled_ui(by != SortBy::None, |ui| {
+                pick(ui, (by, false), t("Ascending"));
+                pick(ui, (by, true), t("Descending"));
+            });
+        },
+    );
 }
 
 /// Copy as and Export, a submenu of every format each, in a folder's menu and the
 /// collections' More menu alike: the format picked, and whether to a file.
 fn copy_export_menus(ui: &mut egui::Ui) -> Option<(Format, bool)> {
     let mut picked = None;
-    ui.menu_button(t("Copy as"), |ui| {
+    ui.menu_button(menu_title(ui, icon::COPY, t("Copy as")), |ui| {
         for format in Format::ALL {
             if ui.button(format.name()).clicked() {
                 picked = Some((format, false));
             }
         }
     });
-    ui.menu_button(t("Export"), |ui| {
+    ui.menu_button(menu_title(ui, icon::EXPORT, t("Export")), |ui| {
         for format in Format::ALL {
             if ui.button(format!("{}…", format.name())).clicked() {
                 picked = Some((format, true));
@@ -10105,24 +10121,25 @@ fn copy_export_menus(ui: &mut egui::Ui) -> Option<(Format, bool)> {
 }
 
 fn request_menu(ui: &mut egui::Ui, path: &Path, name: &str, actions: &mut Vec<TreeAction>) {
-    if ui.button(t("Open in new tab")).clicked() {
+    if (ui.add(menu_item(ui, Some(icon::EXTERNAL), t("Open in new tab")))).clicked() {
         actions.push(TreeAction::OpenNew(path.to_path_buf()));
         ui.close();
     }
     ui.separator();
-    let rename = egui::Button::new(t("Rename")).shortcut_text(shortcut_label(ui.ctx(), &RENAME));
+    let rename = menu_item(ui, Some(icon::PENCIL), t("Rename"))
+        .shortcut_text(shortcut_label(ui.ctx(), &RENAME));
     if ui.add(rename).clicked() {
         let rename = Dialog::name(NameKind::Rename(path.to_path_buf()), name);
         actions.push(TreeAction::Dialog(rename));
         ui.close();
     }
-    let duplicate =
-        egui::Button::new(t("Duplicate")).shortcut_text(shortcut_label(ui.ctx(), &DUPLICATE));
+    let duplicate = menu_item(ui, Some(icon::COPY_PLUS), t("Duplicate"))
+        .shortcut_text(shortcut_label(ui.ctx(), &DUPLICATE));
     if ui.add(duplicate).clicked() {
         actions.push(TreeAction::Duplicate(path.to_path_buf()));
         ui.close();
     }
-    let delete = egui::Button::new(t("Delete")).shortcut_text(delete_key(ui.ctx()));
+    let delete = menu_item(ui, Some(icon::TRASH), t("Delete")).shortcut_text(delete_key(ui.ctx()));
     if ui.add(delete).clicked() {
         actions.push(TreeAction::Dialog(Dialog::Delete(vec![path.to_path_buf()])));
         ui.close();
@@ -16540,6 +16557,24 @@ fn icon_text<'a>(ui: &egui::Ui, icon: Icon, text: impl Into<egui::WidgetText>) -
     egui::Button::new((image, text.into())).image_tint_follows_text_color(true)
 }
 
+/// A menu's row with its icon in front, as the Mac's menus have them. None leaves the
+/// icon's room empty, so the row's text stays in line with its neighbours'.
+fn menu_item<'a>(ui: &egui::Ui, icon: Option<Icon>, text: &str) -> egui::Button<'a> {
+    match icon {
+        Some(icon) => icon_text(ui, icon, text.to_owned()),
+        None => {
+            let blank = (icon::X.image(ui.ctx(), icon_size(ui))).tint(Color32::TRANSPARENT);
+            egui::Button::new((blank, text.to_owned()))
+        }
+    }
+}
+
+/// A submenu's row: its icon and name, the icon in the text's colour.
+fn menu_title(ui: &egui::Ui, icon: Icon, text: &str) -> (egui::Image<'static>, String) {
+    let image = (icon.image(ui.ctx(), icon_size(ui))).tint(ui.visuals().text_color());
+    (image, text.to_owned())
+}
+
 /// An icon on its own in a label's place, in the text's colour unless given one.
 fn icon_label(ui: &mut egui::Ui, icon: Icon, color: Option<Color32>) -> egui::Response {
     let size = icon_size(ui);
@@ -17464,6 +17499,7 @@ mod ui_tests {
         // The tree's "api", drawn before the breadcrumb's.
         h.get_all_by_label("api").next().unwrap().click_secondary();
         h.run();
+        shot(&mut h, "71-folder-menu");
         // A top-level folder is a collection, and its menu says so.
         h.get_by_label("Collection settings…").click();
         h.run();
