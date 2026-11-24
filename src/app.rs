@@ -4331,7 +4331,8 @@ impl App {
             6.0
         });
         ui.horizontal(|ui| {
-            ui.strong(t("Environment"));
+            // A sidebar's section header, as Finder's "Favourites".
+            ui.label(RichText::new(t("Environment")).size(11.0).weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button(t("Globals"))
@@ -4392,7 +4393,7 @@ impl App {
         // Rows lay out past a narrow panel's edge, so each is as wide as its buttons.
         self.sidebar_min = env_row.response.rect.width();
         ui.separator();
-        ui.horizontal(|ui| {
+        segmented(ui, |ui| {
             ui.selectable_value(
                 &mut self.show_history,
                 false,
@@ -5729,7 +5730,7 @@ impl App {
                     let code = crate::codegen::generate(target, wire);
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("code_lang")
+                        combo("code_lang")
                             .selected_text(target)
                             .show_ui(ui, |ui| {
                                 for name in targets {
@@ -6876,7 +6877,7 @@ impl App {
                                 .find(|(_, p)| p == folder)
                                 .map_or("", |(label, _)| label.as_str());
                             ui.label(t("Folder"));
-                            egui::ComboBox::from_id_salt("name-folder")
+                            combo("name-folder")
                                 .selected_text(shown)
                                 .width(280.0)
                                 .show_ui(ui, |ui| {
@@ -7988,7 +7989,7 @@ impl App {
             label = label.color(color).strong();
         }
         let (mut chosen, mut edit, mut create) = (None, None, false);
-        egui::ComboBox::from_id_salt("env")
+        combo("env")
             .selected_text(label)
             .width(150.0)
             .show_ui(ui, |ui| {
@@ -8496,7 +8497,7 @@ impl App {
             ui.heading(t("Settings"));
             ui.add_space(6.0);
             // A tab each: in one long grid, the sections ran together and got misread.
-            ui.horizontal(|ui| {
+            segmented(ui, |ui| {
                 sub_tab(ui, tab, SettingsTab::General, t("General"), false);
                 sub_tab(ui, tab, SettingsTab::Network, t("Network"), false);
                 sub_tab(ui, tab, SettingsTab::Updates, t("Updates"), false);
@@ -8563,7 +8564,7 @@ impl App {
                                     Level::Trace => t("Trace"),
                                 };
                                 let before = *log_level;
-                                egui::ComboBox::from_id_salt("log-level")
+                                combo("log-level")
                                     .selected_text(name(*log_level))
                                     .show_ui(ui, |ui| {
                                         for l in Level::ALL {
@@ -8611,7 +8612,7 @@ impl App {
                         };
                         ui.horizontal(|ui| {
                             ui.label(t("Check for updates"));
-                            egui::ComboBox::from_id_salt("update-check")
+                            combo("update-check")
                                 .selected_text(label(updates.check))
                                 .show_ui(ui, |ui| {
                                     for c in
@@ -8669,7 +8670,7 @@ impl App {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             ui.label(t("Client"));
-                            egui::ComboBox::from_id_salt("mcp-client")
+                            combo("mcp-client")
                                 .selected_text(MCP_CLIENTS[*mcp_client])
                                 .show_ui(ui, |ui| {
                                     for (i, name) in MCP_CLIENTS.iter().enumerate() {
@@ -8761,7 +8762,7 @@ impl App {
                     // Labelled rows: hint text alone was gone once a field was filled in.
                     egui::Grid::new("sync-fields").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                         ui.label(t("Service"));
-                        egui::ComboBox::from_id_salt("remote-provider")
+                        combo("remote-provider")
                             .selected_text(remote.provider.name())
                             .show_ui(ui, |ui| {
                                 for p in [Provider::GitHub, Provider::GitLab] {
@@ -8810,7 +8811,7 @@ impl App {
                             60 => t("Every hour").to_owned(),
                             m => tf("Every {} minutes", &[&m]),
                         };
-                        egui::ComboBox::from_id_salt("remote-every")
+                        combo("remote-every")
                             .selected_text(every(remote.every))
                             .show_ui(ui, |ui| {
                                 for m in crate::sync::EVERY {
@@ -9803,7 +9804,16 @@ fn tree_row(
     row.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, name)
     });
-    let visuals = ui.style().interact_selectable(&row, selected);
+    let mut visuals = ui.style().interact_selectable(&row, selected);
+    if selected {
+        // A sidebar's selection is a quiet gray on the Mac, the text as it was: the
+        // accent is for what's being acted on, and the open request's tab has it.
+        visuals.weak_bg_fill = match ui.visuals().dark_mode {
+            true => Color32::from_white_alpha(26),
+            false => Color32::from_black_alpha(24),
+        };
+        visuals.fg_stroke.color = ui.visuals().strong_text_color();
+    }
     if selected || row.hovered() {
         (ui.painter()).rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
     }
@@ -10617,7 +10627,7 @@ fn body_editor(
     explorer: &mut Explorer,
     stash: egui::Id,
 ) -> bool {
-    ui.horizontal(|ui| {
+    segmented(ui, |ui| {
         // A type left behind is kept under `stash` (one per request) for coming back to, as
         // Postman keeps each mode's: one stray click on None emptied a JSON body for good.
         // JSON <-> Text moves the text instead, since that switch is usually a content-type
@@ -10691,7 +10701,7 @@ fn body_editor(
             ui.horizontal(|ui| {
                 // The header's own name: what the combo changes, untranslated as in the table.
                 ui.label("Content-Type");
-                egui::ComboBox::from_id_salt("raw-type")
+                combo("raw-type")
                     .selected_text(shown)
                     .show_ui(ui, |ui| {
                         for (label, mime) in RAW_TYPES {
@@ -10992,7 +11002,7 @@ fn graphql_editor(
             // A document of several operations runs only the named one, as in Insomnia.
             let names = crate::graphql::operation_names(query);
             if let Some(shown) = crate::graphql::operation_name(query, operation) {
-                egui::ComboBox::from_id_salt("gql-operation")
+                combo("gql-operation")
                     .selected_text(shown)
                     .show_ui(ui, |ui| {
                         for n in names {
@@ -11055,8 +11065,10 @@ fn graphql_editor(
         ui.horizontal(|ui| {
             ui.label(t("Variables"));
             ui.add_space(4.0);
-            sub_tab(ui, &mut ex.vars_json, false, t("Form"), false);
-            sub_tab(ui, &mut ex.vars_json, true, "JSON", false);
+            segmented(ui, |ui| {
+                sub_tab(ui, &mut ex.vars_json, false, t("Form"), false);
+                sub_tab(ui, &mut ex.vars_json, true, "JSON", false);
+            });
             let mut random = !ex.blank;
             ui.checkbox(&mut random, t("Fill in values")).on_hover_text(t(
                 "On: a variable or field added gets a random value of its type, as gRPC's Fill body does. Off: it starts empty.",
@@ -11381,7 +11393,7 @@ fn variables_form(
             if !options.is_empty() {
                 let unset = t("(not set)");
                 let current = if shown.is_empty() { unset } else { &shown[..] };
-                egui::ComboBox::from_id_salt(id)
+                combo(id)
                     .selected_text(RichText::new(current).monospace())
                     .width(width)
                     .show_ui(ui, |ui| {
@@ -11741,7 +11753,7 @@ fn auth_editor(
         _ => true,
     };
     let current = std::mem::discriminant(&*auth);
-    egui::ComboBox::from_id_salt("auth")
+    combo("auth")
         .width(160.0)
         .selected_text(label_of(auth))
         .show_ui(ui, |ui| {
@@ -11830,7 +11842,7 @@ fn auth_editor(
             Auth::OAuth1(o) => {
                 ui.label(t("Signature"));
                 // Empty after some imports: shown as what signing falls back to.
-                egui::ComboBox::from_id_salt("oauth1-method")
+                combo("oauth1-method")
                     .selected_text(match o.signature_method.as_str() {
                         "" => "HMAC-SHA1",
                         m => m,
@@ -11863,13 +11875,11 @@ fn auth_editor(
             }
             Auth::Jwt(j) => {
                 ui.label(t("Algorithm"));
-                egui::ComboBox::from_id_salt("jwt-alg")
-                    .selected_text(j.alg())
-                    .show_ui(ui, |ui| {
-                        for alg in crate::jwt::ALGORITHMS {
-                            ui.selectable_value(&mut j.algorithm, alg.to_owned(), alg);
-                        }
-                    });
+                combo("jwt-alg").selected_text(j.alg()).show_ui(ui, |ui| {
+                    for alg in crate::jwt::ALGORITHMS {
+                        ui.selectable_value(&mut j.algorithm, alg.to_owned(), alg);
+                    }
+                });
                 ui.end_row();
                 if j.alg().starts_with("HS") {
                     secret(ui, t("Secret"), &mut j.secret);
@@ -11941,7 +11951,7 @@ fn auth_editor(
                 text(ui, t("Auth ID"), &mut h.id, "");
                 secret(ui, t("Auth key"), &mut h.key);
                 ui.label(t("Algorithm"));
-                egui::ComboBox::from_id_salt("hawk-alg")
+                combo("hawk-alg")
                     .selected_text(match h.algorithm.as_str() {
                         "" => "sha256",
                         a => a,
@@ -12293,7 +12303,7 @@ fn docs_editor(ui: &mut egui::Ui, description: &mut String) {
 /// True when a QoS was picked.
 fn qos_box(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, qos: &mut u8) -> bool {
     let before = *qos;
-    egui::ComboBox::from_id_salt(id)
+    combo(id)
         .width(64.0)
         .selected_text(format!("QoS {qos}"))
         .show_ui(ui, |ui| {
@@ -12398,7 +12408,7 @@ fn subjects_editor(
                         .lost_focus();
                 } else {
                     let before = s.from;
-                    egui::ComboBox::from_id_salt(("nats-from", i))
+                    combo(("nats-from", i))
                         .width(140.0 + 2.0 * ui.spacing().button_padding.x)
                         .selected_text(from(s.from))
                         .show_ui(ui, |ui| {
@@ -12613,7 +12623,7 @@ fn mqtt_settings(
         .spacing([16.0, 10.0])
         .show(ui, |ui| {
             ui.label(t("Version"));
-            egui::ComboBox::from_id_salt("mqtt-version")
+            combo("mqtt-version")
                 .width(80.0)
                 .selected_text(if m.v5 { "5.0" } else { "3.1.1" })
                 .show_ui(ui, |ui| {
@@ -12773,7 +12783,7 @@ fn socketio_settings(
 
             ui.label(t("Client version"));
             // v3 and v4 clients speak the same protocol (Engine.IO 4, Socket.IO 5).
-            egui::ComboBox::from_id_salt("socketio-version")
+            combo("socketio-version")
                 .width(80.0)
                 .selected_text(if s.v2 { "v2" } else { "v3, v4" })
                 .show_ui(ui, |ui| {
@@ -12907,7 +12917,7 @@ fn connection_rows(
             HttpVersion::Http1 => "HTTP/1.1",
             HttpVersion::Http2 => "HTTP/2",
         };
-        egui::ComboBox::from_id_salt("http-version")
+        combo("http-version")
             .selected_text(name(s.http_version))
             .show_ui(ui, |ui| {
                 for v in [HttpVersion::Auto, HttpVersion::Http1, HttpVersion::Http2] {
@@ -13226,7 +13236,7 @@ fn cipher_picker(ui: &mut egui::Ui, ciphers: &mut Vec<String>) {
     let canonical = |c: &str| net::cipher(c).map(|c| c.0);
     // The order the list can't show.
     let order = ciphers.join("\n");
-    let picker = egui::ComboBox::from_id_salt("ciphers")
+    let picker = combo("ciphers")
         .selected_text(shown)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
@@ -13573,8 +13583,10 @@ fn scripts_editor(
     let mut insert: Option<String> = None;
     ui.horizontal(|ui| {
         let set = |s: &str| !s.trim().is_empty();
-        sub_tab(ui, tab, ScriptTab::Pre, t("Pre-request"), set(pre_request));
-        sub_tab(ui, tab, ScriptTab::Post, t("Post-response"), set(tests));
+        segmented(ui, |ui| {
+            sub_tab(ui, tab, ScriptTab::Pre, t("Pre-request"), set(pre_request));
+            sub_tab(ui, tab, ScriptTab::Post, t("Post-response"), set(tests));
+        });
         ui.separator();
         let (snippets, template, empty) = match tab {
             ScriptTab::Pre => (
@@ -13787,7 +13799,7 @@ fn grpc_bar(
                 } else {
                     &req.rpc
                 };
-                egui::ComboBox::from_id_salt("rpc")
+                combo("rpc")
                     .selected_text(shown)
                     .width(ui.available_width() - 110.0)
                     .show_ui(ui, |ui| {
@@ -14354,7 +14366,7 @@ fn rules_ui(ui: &mut egui::Ui, rules: &mut Vec<crate::capture::Rule>) -> bool {
                 .desired_width(220.0);
             changed |= on.changed() | ui.add(url).changed();
             let shown = (kinds.iter()).find(|(_, a)| kind(a) == kind(&rule.act));
-            egui::ComboBox::from_id_salt(("capture-rule-kind", i))
+            combo(("capture-rule-kind", i))
                 .selected_text(shown.map_or("", |(label, _)| *label))
                 .width(140.0)
                 .show_ui(ui, |ui| {
@@ -15134,7 +15146,7 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
                     t("Waits for a stream to store it, and says which and where"),
                 ),
             };
-            egui::ComboBox::from_id_salt("nats-send")
+            combo("nats-send")
                 .selected_text(names(nats.send).0)
                 .show_ui(ui, |ui| {
                     for s in [Publish, Request, JetStream] {
@@ -15232,7 +15244,7 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
                 .clicked();
             if method == "WS" {
                 let names = [t("Text"), "Base64", "Hex"];
-                egui::ComboBox::from_id_salt("ws-encoding")
+                combo("ws-encoding")
                     .width(send_w - 8.0)
                     .show_index(ui, &mut c.encoding, names.len(), |i| names[i])
                     .on_hover_text(t("Base64 and hex are decoded and sent as a binary message"));
@@ -15399,7 +15411,7 @@ fn font_picker<'a>(
         true => t("Default").to_owned(),
         false => font.clone(),
     };
-    egui::ComboBox::from_id_salt(id)
+    combo(id)
         .selected_text(shown)
         .width(260.0)
         .show_ui(ui, |ui| {
@@ -15623,31 +15635,40 @@ fn response_ui(
                 {
                     *wrap = !*wrap;
                 }
-                // Right to left: Raw is added first to sit on the right. An SVG that
-                // isn't valid XML has no Pretty, but Raw still leaves the preview.
-                if (view.other.is_some() || svg)
-                    && (ui.add(egui::Button::new(t("Raw")).selected(!view.pretty && !view.preview)))
-                        .on_hover_text(t("As received"))
-                        .clicked()
-                {
-                    view.preview = false;
-                    view.set_pretty(false);
-                }
-                if view.other.is_some()
-                    && (ui
-                        .add(egui::Button::new(t("Pretty")).selected(view.pretty && !view.preview)))
-                    .clicked()
-                {
-                    view.preview = false;
-                    view.set_pretty(true);
-                }
-                if svg
-                    && ui
-                        .add(egui::Button::new(t("Preview")).selected(view.preview))
-                        .clicked()
-                {
-                    view.preview = true;
-                    view.find.close();
+                // One control for how the body is shown, when there is a choice.
+                if view.other.is_some() || svg {
+                    segmented(ui, |ui| {
+                        // Right to left: Raw is added first to sit on the right. An SVG that
+                        // isn't valid XML has no Pretty, but Raw still leaves the preview.
+                        if (view.other.is_some() || svg)
+                            && (ui.add(
+                                egui::Button::new(t("Raw")).selected(!view.pretty && !view.preview),
+                            ))
+                            .on_hover_text(t("As received"))
+                            .clicked()
+                        {
+                            view.preview = false;
+                            view.set_pretty(false);
+                        }
+                        if view.other.is_some()
+                            && (ui.add(
+                                egui::Button::new(t("Pretty"))
+                                    .selected(view.pretty && !view.preview),
+                            ))
+                            .clicked()
+                        {
+                            view.preview = false;
+                            view.set_pretty(true);
+                        }
+                        if svg
+                            && ui
+                                .add(egui::Button::new(t("Preview")).selected(view.preview))
+                                .clicked()
+                        {
+                            view.preview = true;
+                            view.find.close();
+                        }
+                    });
                 }
                 let shortcut = shortcut_label(ui.ctx(), &FIND);
                 if !view.preview
@@ -16642,6 +16663,42 @@ fn tab_label(
     r
 }
 
+/// A pop-up button as the Mac draws one: the two chevrons at its end say it opens a
+/// list to pick from, where a triangle says a menu of actions.
+fn combo(id: impl egui::AsIdSalt) -> egui::ComboBox {
+    egui::ComboBox::from_id_salt(id).icon(|ui, rect, visuals, _| {
+        icon::CHEVRONS.paint(ui, rect, 12.0, visuals.text_color());
+    })
+}
+
+/// A segmented control, as the Mac draws a choice between a few views of one thing: the
+/// choices in one trough, the chosen one raised. The whole is a button's height. What's
+/// selected inside draws raised rather than in the accent colour.
+fn segmented<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    // Translucent, so it reads on the sidebar's fill as on a panel's.
+    let (trough, raised) = match ui.visuals().dark_mode {
+        true => (Color32::from_white_alpha(14), Color32::from_gray(98)),
+        false => (Color32::from_black_alpha(16), Color32::WHITE),
+    };
+    let radius = ui.visuals().widgets.inactive.corner_radius;
+    egui::Frame::new()
+        .fill(trough)
+        .corner_radius(radius)
+        .inner_margin(2.0)
+        .show(ui, |ui| {
+            let text = ui.visuals().strong_text_color();
+            let v = ui.visuals_mut();
+            v.selection.bg_fill = raised;
+            v.selection.stroke.color = text;
+            let s = ui.spacing_mut();
+            s.interact_size.y -= 4.0;
+            s.button_padding.y = (s.button_padding.y - 2.0).max(0.0);
+            s.item_spacing.x = 1.0;
+            ui.horizontal(add).inner
+        })
+        .inner
+}
+
 /// `selectable_value` with `tab_label`'s dot: BLUE when `set`.
 fn sub_tab<T: PartialEq>(
     ui: &mut egui::Ui,
@@ -16714,7 +16771,7 @@ fn method_picker(ui: &mut egui::Ui, method: &mut String) {
         lead,
         egui::TextFormat::simple(font, color),
     );
-    let r = egui::ComboBox::from_id_salt("method")
+    let r = combo("method")
         .selected_text(job)
         .width(110.0)
         // All 16 at once: at the default height the stream types scrolled away.
@@ -17364,7 +17421,8 @@ mod ui_tests {
         (h.state_mut().settings, h.state_mut().settings_tab) = (true, SettingsTab::Network);
         h.run();
         let (apply, close, first_tab) = (rect(&h, "Apply"), rect(&h, "Close"), rect(&h, "General"));
-        assert!((apply.left() - first_tab.left()).abs() < 2.0 && apply.right() < close.left());
+        // The first tab sits 2 px inside its segmented control, whose edge is the content's.
+        assert!((apply.left() - first_tab.left()).abs() <= 2.0 && apply.right() < close.left());
         h.state_mut().settings = false;
 
         h.state_mut().open_env_editor(Some("dev".into()), &[]);

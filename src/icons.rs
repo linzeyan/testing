@@ -35,6 +35,7 @@ icons! {
     CHEVRON_LEFT "chevron-left",
     CHEVRON_RIGHT "chevron-right",
     CHEVRON_UP "chevron-up",
+    CHEVRONS "chevrons-up-down",
     CODE "code-xml",
     COLUMNS "columns-2",
     COOKIE "cookie",
