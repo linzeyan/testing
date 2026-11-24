@@ -82,6 +82,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Publish", "發佈"),
     ("Publish needs a subject", "發佈需要一個 subject"),
+    ("View", "檢視"),
     ("Bucket", "Bucket"),
     (
         "Connect first: these act on the live connection.",

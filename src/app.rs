@@ -2112,6 +2112,50 @@ impl App {
 
     /// The fonts and style chosen in Settings, when they changed. Called before the first
     /// frame too, which egui would otherwise draw in its own and then redraw in these.
+    /// The Mac's menu bar: File, Request and View, each item one of the shortcuts, so the
+    /// menu and the keys can't come to do different things.
+    #[cfg(target_os = "macos")]
+    pub fn install_menu(&self, ctx: &egui::Context) {
+        use crate::menu::Row::{Keys, Separator};
+        // Before the first frame, which is what sets it otherwise.
+        crate::i18n::set(self.appearance.language);
+        let file = vec![
+            Keys(t("New request"), NEW_REQUEST),
+            Keys(t("New collection"), KEYED_ACTIONS[0].0),
+            Keys(t("Import…"), KEYED_ACTIONS[1].0),
+            Separator,
+            Keys(t("Save"), SAVE),
+            Keys(t("Save as…"), SAVE_AS),
+            Keys(t("Duplicate"), DUPLICATE),
+            Separator,
+            Keys(t("Close tab"), CLOSE_TAB),
+            Keys(t("Reopen closed tab"), REOPEN_TAB),
+        ];
+        let request = vec![
+            Keys(t("Send"), SEND),
+            Keys(t("Send and download…"), SEND_DOWNLOAD),
+            Separator,
+            Keys(t("Select the URL"), FOCUS_URL),
+            Keys(t("Code"), CODE),
+            Keys(t("Edit environment"), EDIT_ENV),
+        ];
+        let view = vec![
+            Keys(t("Go to a request, folder or action"), SWITCH),
+            Keys(t("Find in the response"), FIND),
+            Separator,
+            Keys(t("Show or hide the sidebar"), KEYED_ACTIONS[2].0),
+            Keys(t("Side by side or stacked"), KEYED_ACTIONS[3].0),
+            Separator,
+            Keys(t("Keyboard shortcuts"), KEYED_ACTIONS[4].0),
+        ];
+        let menus = vec![
+            (t("File"), file),
+            (t("Request"), request),
+            (t("View"), view),
+        ];
+        crate::menu::install(ctx, menus);
+    }
+
     pub fn apply_appearance(&mut self, ctx: &egui::Context) {
         if self.applied.as_ref() != Some(&self.appearance) {
             if let Err(e) = crate::appearance::apply(ctx, &self.appearance) {
@@ -3721,6 +3765,12 @@ struct WindowSettings {
 }
 
 impl eframe::App for App {
+    /// The Mac's menu bar hands its picks to the frame as key presses.
+    #[cfg(target_os = "macos")]
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        crate::menu::take(ctx, input);
+    }
+
     /// Only the window is kept (persistence): the app keeps its own state in the workspace.
     fn persist_egui_memory(&self) -> bool {
         false
@@ -22386,6 +22436,24 @@ mod ui_tests {
         let events = h.state().stream.as_ref().unwrap().events();
         let (_, last) = events.last().unwrap();
         assert_eq!(*last, Event::Closed("disconnected".into()), "{events:?}");
+    }
+
+    /// What the Mac's menu bar hands a frame for a picked item is taken as the shortcut
+    /// it names: the sidebar goes and comes back, a new request is asked for.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_menu_bar_pick_acts_as_its_shortcut() {
+        let mut h = with_request("menu-bar");
+        assert!(!h.state().hide_sidebar);
+        for hidden in [true, false] {
+            h.event(crate::menu::pressed(&KEYED_ACTIONS[2].0));
+            h.run();
+            assert_eq!(h.state().hide_sidebar, hidden);
+        }
+        let tabs = h.state().tabs.len();
+        h.event(crate::menu::pressed(&NEW_REQUEST));
+        h.run();
+        assert!(h.state().tabs.len() > tabs || h.state().dialog.is_some());
     }
 
     /// On a Mac the content runs under the title bar: the sidebar starts below the

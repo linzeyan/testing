@@ -116,6 +116,8 @@ fn main() -> eframe::Result {
             app.auto_update();
             app.restore_window(cc.storage);
             app.apply_appearance(&cc.egui_ctx);
+            #[cfg(target_os = "macos")]
+            app.install_menu(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
     );

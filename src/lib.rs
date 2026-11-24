@@ -28,6 +28,8 @@ mod jwt;
 mod loadtest;
 pub mod logfile;
 mod mcp;
+#[cfg(target_os = "macos")]
+mod menu;
 mod mock;
 mod model;
 mod mqtt;
