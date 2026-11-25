@@ -4444,12 +4444,14 @@ impl App {
         self.sidebar_min = env_row.response.rect.width();
         ui.separator();
         segmented(ui, |ui| {
-            ui.selectable_value(
+            selectable_value(
+                ui,
                 &mut self.show_history,
                 false,
                 RichText::new(t("Collections")).strong(),
             );
-            ui.selectable_value(
+            selectable_value(
+                ui,
                 &mut self.show_history,
                 true,
                 RichText::new(t("History")).strong(),
@@ -5214,8 +5216,8 @@ impl App {
         }) = &mut self.capture
         {
             ui.horizontal(|ui| {
-                ui.selectable_value(conns_shown, false, t("Flows"));
-                ui.selectable_value(conns_shown, true, t("Connections"))
+                selectable_value(ui, conns_shown, false, t("Flows"));
+                selectable_value(ui, conns_shown, true, t("Connections"))
                     .on_hover_text(t(
                         "Every TCP and UDP connection the OS lists, by process: no proxy needed, no byte counts",
                     ));
@@ -5784,7 +5786,7 @@ impl App {
                             .selected_text(target)
                             .show_ui(ui, |ui| {
                                 for name in targets {
-                                    if ui.selectable_label(name == target, name).clicked() {
+                                    if selectable_label(ui, name == target, name).clicked() {
                                         lang_changed |= self.code_lang != name;
                                         self.code_lang = name.to_owned();
                                     }
@@ -5938,7 +5940,7 @@ impl App {
                 });
             });
             ui.horizontal(|ui| {
-                method_picker(ui, &mut open.draft.method);
+                method_picker(ui, &mut open.draft.method, pending.is_some() || live);
                 // GRAPHQL is a POST whose body is always a query, and the one way to send
                 // one: a switch either way carries the query over, as the JSON that goes out.
                 let gql = open.draft.method == "GRAPHQL";
@@ -6932,7 +6934,7 @@ impl App {
                                 .width(280.0)
                                 .show_ui(ui, |ui| {
                                     for (label, path) in &folders {
-                                        ui.selectable_value(folder, path.clone(), label);
+                                        selectable_value(ui, folder, path.clone(), label);
                                     }
                                 });
                             ui.end_row();
@@ -7248,7 +7250,7 @@ impl App {
                                     ui.label(text.monospace().small().weak());
                                 }
                             }
-                            let button = egui::Button::selectable(i == *selected, label.as_str());
+                            let button = selectable(ui, i == *selected, label.as_str());
                             let button = ui.add(button);
                             // What it was found by.
                             if *by_url {
@@ -8043,10 +8045,7 @@ impl App {
             .selected_text(label)
             .width(150.0)
             .show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(self.active_env.is_none(), t("No environment"))
-                    .clicked()
-                {
+                if selectable_label(ui, self.active_env.is_none(), t("No environment")).clicked() {
                     chosen = Some(None);
                 }
                 for name in &self.envs {
@@ -8060,8 +8059,7 @@ impl App {
                         {
                             edit = Some(name.clone());
                         }
-                        if ui
-                            .selectable_label(self.active_env.as_ref() == Some(name), name)
+                        if selectable_label(ui, self.active_env.as_ref() == Some(name), name)
                             .clicked()
                         {
                             chosen = Some(Some(name.clone()));
@@ -8567,8 +8565,8 @@ impl App {
                             ui.label(t("Language"));
                             ui.horizontal(|ui| {
                                 use crate::i18n::Lang;
-                                ui.selectable_value(&mut a.language, Lang::English, "English");
-                                ui.selectable_value(&mut a.language, Lang::ZhTw, "繁體中文");
+                                selectable_value(ui, &mut a.language, Lang::English, "English");
+                                selectable_value(ui, &mut a.language, Lang::ZhTw, "繁體中文");
                             });
                             ui.end_row();
                             ui.label(t("Theme"));
@@ -8578,7 +8576,7 @@ impl App {
                                     (Theme::Light, t("Light")),
                                     (Theme::Dark, t("Dark")),
                                 ] {
-                                    ui.selectable_value(&mut a.theme, theme, name);
+                                    selectable_value(ui, &mut a.theme, theme, name);
                                 }
                             });
                             ui.end_row();
@@ -8618,7 +8616,7 @@ impl App {
                                     .selected_text(name(*log_level))
                                     .show_ui(ui, |ui| {
                                         for l in Level::ALL {
-                                            ui.selectable_value(log_level, l, name(l));
+                                            selectable_value(ui, log_level, l, name(l));
                                         }
                                     })
                                     .response
@@ -8668,7 +8666,7 @@ impl App {
                                     for c in
                                         [Check::Never, Check::AtStart, Check::Daily, Check::Weekly]
                                     {
-                                        ui.selectable_value(&mut updates.check, c, label(c));
+                                        selectable_value(ui, &mut updates.check, c, label(c));
                                     }
                                 });
                             ui.checkbox(&mut updates.install, t("Install automatically"))
@@ -8724,7 +8722,7 @@ impl App {
                                 .selected_text(MCP_CLIENTS[*mcp_client])
                                 .show_ui(ui, |ui| {
                                     for (i, name) in MCP_CLIENTS.iter().enumerate() {
-                                        ui.selectable_value(mcp_client, i, *name);
+                                        selectable_value(ui, mcp_client, i, *name);
                                     }
                                 });
                             ui.checkbox(mcp_window, t("Let it operate this window"))
@@ -8816,7 +8814,7 @@ impl App {
                             .selected_text(remote.provider.name())
                             .show_ui(ui, |ui| {
                                 for p in [Provider::GitHub, Provider::GitLab] {
-                                    ui.selectable_value(&mut remote.provider, p, p.name());
+                                    selectable_value(ui, &mut remote.provider, p, p.name());
                                 }
                             });
                         ui.end_row();
@@ -8865,7 +8863,7 @@ impl App {
                             .selected_text(every(remote.every))
                             .show_ui(ui, |ui| {
                                 for m in crate::sync::EVERY {
-                                    ui.selectable_value(&mut remote.every, m, every(m));
+                                    selectable_value(ui, &mut remote.every, m, every(m));
                                 }
                             })
                             .response
@@ -9395,7 +9393,7 @@ fn run_item_ui(ui: &mut egui::Ui, item: &RunItem, open: bool) -> bool {
         method_badge(ui, &item.method, 5);
         match item.response {
             Some(_) => {
-                let name = ui.selectable_label(open, item.name.as_str());
+                let name = selectable_label(ui, open, item.name.as_str());
                 clicked = name.on_hover_text(t("Show or hide the response")).clicked();
             }
             None => {
@@ -10712,7 +10710,7 @@ fn body_editor(
         };
         let mut chosen = None;
         for (i, (label, mime, make)) in options.into_iter().enumerate() {
-            let mut r = ui.selectable_label(i == now, label);
+            let mut r = selectable_label(ui, i == now, label);
             if !mime.is_empty() {
                 r = r.on_hover_text(mime);
             }
@@ -10755,7 +10753,7 @@ fn body_editor(
                     .selected_text(shown)
                     .show_ui(ui, |ui| {
                         for (label, mime) in RAW_TYPES {
-                            if ui.selectable_label(shown == label, label).clicked() {
+                            if selectable_label(ui, shown == label, label).clicked() {
                                 headers.retain(|h| !h.key.eq_ignore_ascii_case("content-type"));
                                 if !mime.is_empty() {
                                     headers.push(KeyValue::new("Content-Type", mime));
@@ -10832,7 +10830,7 @@ fn binary_editor(ui: &mut egui::Ui, body: &mut Body, vars: &HashMap<String, Stri
                 (&*body, which),
                 (Body::File { .. }, 0) | (Body::Base64 { .. }, 1) | (Body::Hex { .. }, 2)
             );
-            if ui.selectable_label(current, label).clicked() && !current {
+            if selectable_label(ui, current, label).clicked() && !current {
                 pick = Some(which);
             }
         }
@@ -11056,7 +11054,7 @@ fn graphql_editor(
                     .selected_text(shown)
                     .show_ui(ui, |ui| {
                         for n in names {
-                            ui.selectable_value(operation, n.clone(), n);
+                            selectable_value(ui, operation, n.clone(), n);
                         }
                     })
                     .response
@@ -11449,7 +11447,7 @@ fn variables_form(
                     .show_ui(ui, |ui| {
                         for value in std::iter::once("").chain(options) {
                             let text = if value.is_empty() { unset } else { value };
-                            if ui.selectable_label(shown == value, text).clicked() {
+                            if selectable_label(ui, shown == value, text).clicked() {
                                 typed = Some(value.to_owned());
                             }
                         }
@@ -11809,7 +11807,7 @@ fn auth_editor(
         .show_ui(ui, |ui| {
             for (label, kind) in kinds.iter().filter(|(_, k)| offered(k)) {
                 let same = std::mem::discriminant(kind) == current;
-                if ui.selectable_label(same, *label).clicked() && !same {
+                if selectable_label(ui, same, *label).clicked() && !same {
                     *auth = kind.clone();
                 }
             }
@@ -11899,7 +11897,7 @@ fn auth_editor(
                     })
                     .show_ui(ui, |ui| {
                         for m in crate::oauth1::METHODS {
-                            ui.selectable_value(&mut o.signature_method, m.to_owned(), m);
+                            selectable_value(ui, &mut o.signature_method, m.to_owned(), m);
                         }
                     });
                 ui.end_row();
@@ -11927,7 +11925,7 @@ fn auth_editor(
                 ui.label(t("Algorithm"));
                 combo("jwt-alg").selected_text(j.alg()).show_ui(ui, |ui| {
                     for alg in crate::jwt::ALGORITHMS {
-                        ui.selectable_value(&mut j.algorithm, alg.to_owned(), alg);
+                        selectable_value(ui, &mut j.algorithm, alg.to_owned(), alg);
                     }
                 });
                 ui.end_row();
@@ -11988,8 +11986,8 @@ fn auth_editor(
                 ui.end_row();
                 ui.label(t("Add to"));
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut j.in_query, false, t("Header"));
-                    ui.selectable_value(&mut j.in_query, true, t("Query params"));
+                    selectable_value(ui, &mut j.in_query, false, t("Header"));
+                    selectable_value(ui, &mut j.in_query, true, t("Query params"));
                 });
                 ui.end_row();
                 match j.in_query {
@@ -12008,7 +12006,7 @@ fn auth_editor(
                     })
                     .show_ui(ui, |ui| {
                         for alg in crate::hawk::ALGORITHMS {
-                            ui.selectable_value(&mut h.algorithm, alg.to_owned(), alg);
+                            selectable_value(ui, &mut h.algorithm, alg.to_owned(), alg);
                         }
                     });
                 ui.end_row();
@@ -12057,8 +12055,8 @@ fn auth_editor(
                 text(ui, t("Value"), value, "{{api_key}}");
                 ui.label(t("Add to"));
                 ui.horizontal(|ui| {
-                    ui.selectable_value(in_query, false, t("Header"));
-                    ui.selectable_value(in_query, true, t("Query params"));
+                    selectable_value(ui, in_query, false, t("Header"));
+                    selectable_value(ui, in_query, true, t("Query params"));
                 });
                 ui.end_row();
             }
@@ -12066,18 +12064,20 @@ fn auth_editor(
                 ui.label(t("Grant"));
                 ui.horizontal(|ui| {
                     use model::Grant;
-                    ui.selectable_value(
+                    selectable_value(
+                        ui,
                         &mut o.grant,
                         Grant::ClientCredentials,
                         t("Client credentials"),
                     );
-                    ui.selectable_value(&mut o.grant, Grant::Password, t("Password"));
-                    ui.selectable_value(
+                    selectable_value(ui, &mut o.grant, Grant::Password, t("Password"));
+                    selectable_value(
+                        ui,
                         &mut o.grant,
                         Grant::AuthorizationCode,
                         t("Authorization code"),
                     );
-                    ui.selectable_value(&mut o.grant, Grant::Implicit, t("Implicit"));
+                    selectable_value(ui, &mut o.grant, Grant::Implicit, t("Implicit"));
                 });
                 ui.end_row();
                 let browser = matches!(
@@ -12108,8 +12108,8 @@ fn auth_editor(
                     // Some providers take the client one way only.
                     ui.label(t("Client authentication"));
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut o.basic_auth, false, t("In the body"));
-                        ui.selectable_value(&mut o.basic_auth, true, t("Basic Auth header"));
+                        selectable_value(ui, &mut o.basic_auth, false, t("In the body"));
+                        selectable_value(ui, &mut o.basic_auth, true, t("Basic Auth header"));
                     });
                     ui.end_row();
                 }
@@ -12358,7 +12358,7 @@ fn qos_box(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, qos: &
         .selected_text(format!("QoS {qos}"))
         .show_ui(ui, |ui| {
             for q in 0..=2u8 {
-                ui.selectable_value(qos, q, format!("QoS {q}"));
+                selectable_value(ui, qos, q, format!("QoS {q}"));
             }
         })
         .response
@@ -12464,7 +12464,7 @@ fn subjects_editor(
                         .show_ui(ui, |ui| {
                             use model::NatsFrom::*;
                             for f in [New, All, Last] {
-                                ui.selectable_value(&mut s.from, f, from(f));
+                                selectable_value(ui, &mut s.from, f, from(f));
                             }
                         });
                     done |= s.from != before;
@@ -12677,8 +12677,8 @@ fn mqtt_settings(
                 .width(80.0)
                 .selected_text(if m.v5 { "5.0" } else { "3.1.1" })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut m.v5, false, "3.1.1");
-                    ui.selectable_value(&mut m.v5, true, "5.0");
+                    selectable_value(ui, &mut m.v5, false, "3.1.1");
+                    selectable_value(ui, &mut m.v5, true, "5.0");
                 });
             grid_hint(
                 ui,
@@ -12837,8 +12837,8 @@ fn socketio_settings(
                 .width(80.0)
                 .selected_text(if s.v2 { "v2" } else { "v3, v4" })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut s.v2, false, "v3, v4");
-                    ui.selectable_value(&mut s.v2, true, "v2");
+                    selectable_value(ui, &mut s.v2, false, "v3, v4");
+                    selectable_value(ui, &mut s.v2, true, "v2");
                 });
             grid_hint(
                 ui,
@@ -12971,7 +12971,7 @@ fn connection_rows(
             .selected_text(name(s.http_version))
             .show_ui(ui, |ui| {
                 for v in [HttpVersion::Auto, HttpVersion::Http1, HttpVersion::Http2] {
-                    ui.selectable_value(&mut s.http_version, v, name(v));
+                    selectable_value(ui, &mut s.http_version, v, name(v));
                 }
             });
         grid_hint(ui, t("Auto uses HTTP/2 when an https server offers it"));
@@ -13861,7 +13861,7 @@ fn grpc_bar(
                                 (true, true) => t("  · bidi stream"),
                             };
                             let label = format!("{}{kind}", m.name);
-                            ui.selectable_value(&mut req.rpc, m.name.clone(), label);
+                            selectable_value(ui, &mut req.rpc, m.name.clone(), label);
                         }
                     });
                 if ui
@@ -14196,7 +14196,7 @@ fn trust_ui(ui: &mut egui::Ui, tab: &mut usize, file: Option<&str>, port: u16, l
     ];
     ui.horizontal(|ui| {
         for (i, name) in tabs.into_iter().enumerate() {
-            ui.selectable_value(tab, i, name);
+            selectable_value(ui, tab, i, name);
         }
     });
     if file.is_none() {
@@ -14422,7 +14422,7 @@ fn rules_ui(ui: &mut egui::Ui, rules: &mut Vec<crate::capture::Rule>) -> bool {
                 .show_ui(ui, |ui| {
                     for (label, act) in &kinds {
                         let current = kind(act) == kind(&rule.act);
-                        if ui.selectable_label(current, *label).clicked() && !current {
+                        if selectable_label(ui, current, *label).clicked() && !current {
                             (rule.act, changed) = (act.clone(), true);
                         }
                     }
@@ -14615,7 +14615,7 @@ fn flow_list(
                             ),
                             _ => t("How bodies and WebSocket messages show"),
                         };
-                        ui.selectable_value(shown_as, view, label).on_hover_text(hint);
+                        selectable_value(ui, shown_as, view, label).on_hover_text(hint);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         close = icon_button(ui, icon::X, t("Close"), None)
@@ -15201,8 +15201,7 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
                 .show_ui(ui, |ui| {
                     for s in [Publish, Request, JetStream] {
                         let (name, hint) = names(s);
-                        ui.selectable_value(&mut nats.send, s, name)
-                            .on_hover_text(hint);
+                        selectable_value(ui, &mut nats.send, s, name).on_hover_text(hint);
                     }
                 });
             // A request answers on its own inbox.
@@ -15423,7 +15422,7 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
                     // Room for "200 · 12345 ms · 999.9 KB · 59 min ago", so the ×s line
                     // up; the grow atom keeps the text at the left of the wider button.
                     .add(
-                        egui::Button::selectable(shown == Some(m.id), (text, egui::Atom::grow()))
+                        selectable(ui, shown == Some(m.id), (text, egui::Atom::grow()))
                             .min_size(egui::vec2(270.0, 0.0)),
                     )
                     .clicked()
@@ -15465,9 +15464,9 @@ fn font_picker<'a>(
         .selected_text(shown)
         .width(260.0)
         .show_ui(ui, |ui| {
-            ui.selectable_value(font, String::new(), t("Default"));
+            selectable_value(ui, font, String::new(), t("Default"));
             for f in families {
-                ui.selectable_value(font, f.clone(), f);
+                selectable_value(ui, font, f.clone(), f);
             }
         });
 }
@@ -15738,15 +15737,17 @@ fn response_ui(
                 match &shown.result {
                     Ok(view) => {
                         let h = &view.head;
-                        ui.selectable_value(tab, RespTab::Body, t("Body"));
-                        ui.selectable_value(
+                        selectable_value(ui, tab, RespTab::Body, t("Body"));
+                        selectable_value(
+                            ui,
                             tab,
                             RespTab::Headers,
                             tf("Headers ({})", &[&h.headers.len()]),
                         );
                         let cookies = view.cookies.len();
                         if cookies > 0 {
-                            ui.selectable_value(
+                            selectable_value(
+                                ui,
                                 tab,
                                 RespTab::Cookies,
                                 tf("Cookies ({})", &[&cookies]),
@@ -15755,12 +15756,12 @@ fn response_ui(
                         }
                         // gRPC goes out its own way and isn't recorded.
                         if !h.sent.method.is_empty() {
-                            ui.selectable_value(tab, RespTab::Timeline, t("Timeline"))
+                            selectable_value(ui, tab, RespTab::Timeline, t("Timeline"))
                                 .on_hover_text(t("What was sent, redirects, and what came back"));
                         }
                     }
                     Err(_) => {
-                        ui.selectable_value(tab, RespTab::Body, t("Error"));
+                        selectable_value(ui, tab, RespTab::Body, t("Error"));
                     }
                 }
                 // Always there, as Postman's Test Results: hidden, it was never found.
@@ -15770,9 +15771,10 @@ fn response_ui(
                         (n, all) => RichText::new(tf("Tests ({}/{})", &[&passed, &n]))
                             .color(if all { GREEN } else { RED }),
                     };
-                ui.selectable_value(tab, RespTab::Tests, label);
+                selectable_value(ui, tab, RespTab::Tests, label);
                 if !shown.logs.is_empty() {
-                    ui.selectable_value(
+                    selectable_value(
+                        ui,
                         tab,
                         RespTab::Console,
                         tf("Console ({})", &[&shown.logs.len()]),
@@ -15814,9 +15816,9 @@ fn response_ui(
             let passed = shown.tests.iter().filter(|t| t.passed).count();
             let failed = shown.tests.len() - passed;
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut only, None, tf("All ({})", &[&shown.tests.len()]));
-                ui.selectable_value(&mut only, Some(true), tf("Passed ({})", &[&passed]));
-                ui.selectable_value(&mut only, Some(false), tf("Failed ({})", &[&failed]));
+                selectable_value(ui, &mut only, None, tf("All ({})", &[&shown.tests.len()]));
+                selectable_value(ui, &mut only, Some(true), tf("Passed ({})", &[&passed]));
+                selectable_value(ui, &mut only, Some(false), tf("Failed ({})", &[&failed]));
             });
             ui.data_mut(|d| d.insert_temp(id, only));
             egui::ScrollArea::vertical()
@@ -16721,6 +16723,54 @@ fn combo(id: impl egui::AsIdSalt) -> egui::ComboBox {
     })
 }
 
+/// `Button::selectable`, to be added to `ui` next. egui lays a choice with no frame (not
+/// picked, not pointed at) out with the frame's inner margin alone, a stroke short on
+/// each side of one that has its frame: here, where an idle button has an edge, pointing
+/// at a choice or picking it moved its text and whatever followed it. So this one always
+/// has its frame, unseen while it's neither.
+pub(crate) fn selectable<'a>(
+    ui: &egui::Ui,
+    on: bool,
+    atoms: impl egui::IntoAtoms<'a>,
+) -> egui::Button<'a> {
+    let button = egui::Button::selectable(on, atoms).frame_when_inactive(true);
+    // As the button will ask of the frame before, to pick its style.
+    let idle = (ui.ctx().read_response(ui.next_auto_id()))
+        .is_none_or(|r| r.widget_state() == egui::widget_style::WidgetState::Inactive);
+    if on || !idle {
+        return button;
+    }
+    let edge = ui.visuals().widgets.inactive.bg_stroke.width;
+    button
+        .fill(Color32::TRANSPARENT)
+        .stroke(egui::Stroke::new(edge, Color32::TRANSPARENT))
+}
+
+/// `Ui::selectable_label`, through `selectable`.
+pub(crate) fn selectable_label<'a>(
+    ui: &mut egui::Ui,
+    on: bool,
+    atoms: impl egui::IntoAtoms<'a>,
+) -> egui::Response {
+    let button = selectable(ui, on, atoms);
+    ui.add(button)
+}
+
+/// `Ui::selectable_value`, through `selectable`.
+fn selectable_value<'a, T: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    value: T,
+    atoms: impl egui::IntoAtoms<'a>,
+) -> egui::Response {
+    let mut r = selectable_label(ui, *current == value, atoms);
+    if r.clicked() && *current != value {
+        *current = value;
+        r.mark_changed();
+    }
+    r
+}
+
 /// A segmented control, as the Mac draws a choice between a few views of one thing: the
 /// choices in one trough, the chosen one raised. The whole is a button's height. What's
 /// selected inside draws raised rather than in the accent colour.
@@ -16799,15 +16849,20 @@ fn method_item(ui: &mut egui::Ui, m: &str, on: bool) -> egui::Response {
     let item = match method_icon(m) {
         Some(i) => {
             let image = i.image(ui.ctx(), icon_size(ui)).tint(method_color(m));
-            egui::Button::selectable(on, (image, text))
+            selectable(ui, on, (image, text))
         }
-        None => egui::Button::selectable(on, text),
+        None => selectable(ui, on, text),
     };
     ui.add(item)
 }
 
-/// The method picker, a combo box showing the method's icon before its name.
-fn method_picker(ui: &mut egui::Ui, method: &mut String) {
+/// The method picker, a combo box showing the method's icon before its name. `held`
+/// while the request is out or its connection up: what's running is of this kind.
+fn method_picker(ui: &mut egui::Ui, method: &mut String, held: bool) {
+    ui.add_enabled_ui(!held, |ui| method_picker_ui(ui, method));
+}
+
+fn method_picker_ui(ui: &mut egui::Ui, method: &mut String) {
     let (size, color) = (icon_size(ui), method_color(method));
     // The name leaves room for the icon, painted on top: a combo box takes text only.
     let lead = match method_icon(method) {
@@ -16838,7 +16893,8 @@ fn method_picker(ui: &mut egui::Ui, method: &mut String) {
                 }
             }
         })
-        .response;
+        .response
+        .on_disabled_hover_text(t("Disconnect first"));
     if let Some(i) = method_icon(method) {
         let left = r.rect.left() + ui.spacing().button_padding.x;
         let at = egui::Rect::from_min_size(
@@ -25962,6 +26018,59 @@ mod ui_tests {
             walk(&c.shape, color, &mut out);
         }
         out
+    }
+
+    /// 0.163.1 feedback: 「游標移到某些字 或是字的icon上 看起來字會移動」. A choice that
+    /// isn't the picked one was laid out a frame's stroke smaller on each side than a
+    /// hovered or picked one: pointing at it moved its text, and what came after it in
+    /// the row.
+    #[test]
+    fn regression_fb20261125a_pointing_at_a_choice_moves_nothing() {
+        let mut h = Harness::new_ui(|ui| {
+            ui.horizontal(|ui| {
+                let _ = selectable_label(ui, false, "Body");
+                method_item(ui, "NATS", false);
+                ui.label("after");
+            });
+        });
+        crate::appearance::apply(&h.ctx, &Appearance::default()).unwrap();
+        h.run();
+        let at = |h: &Harness<'_>, text: &str| {
+            let texts = painted_texts(h);
+            texts.iter().find(|(s, ..)| s == text).unwrap().1
+        };
+        let before = ["Body", "NATS", "after"].map(|text| at(&h, text));
+        for choice in ["Body", "NATS"] {
+            h.get_by_label(choice).hover();
+            h.run();
+            let now = ["Body", "NATS", "after"].map(|text| at(&h, text));
+            assert_eq!(now, before, "pointing at {choice}");
+        }
+    }
+
+    /// 0.163.1 feedback: 「長連線 connect 時 request類型下拉選單不能打開不能選也不能變更
+    /// disconnect之後才可以」. Another kind of request picked under a live connection
+    /// left the session of the old kind running behind the new one's tabs.
+    #[test]
+    fn regression_fb20261125c_the_method_is_fixed_while_connected() {
+        let mut h = with_request("method-locked");
+        let d = &mut h.state_mut().open.as_mut().unwrap().draft;
+        d.method = "NATS".into();
+        d.url = format!("nats://127.0.0.1:{}", crate::nats::tests::server());
+        h.run();
+        let locked = |h: &Harness<'_, App>| {
+            let picker = egui_kittest::kittest::By::new()
+                .role(Role::ComboBox)
+                .value("NATS");
+            h.get(picker).accesskit_node().is_disabled()
+        };
+        assert!(!locked(&h));
+        h.get_by_label("Connect").click();
+        wait(&mut h, |app| app.stream.as_ref().is_some_and(|s| s.live));
+        assert!(locked(&h));
+        h.get_by_label("Disconnect").click();
+        wait(&mut h, |app| app.stream.as_ref().is_some_and(|s| !s.live));
+        assert!(!locked(&h));
     }
 
     /// The name sat after the status code, leaving a gap where it belonged and cutting

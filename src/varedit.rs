@@ -305,7 +305,8 @@ pub fn var_edit(
                         .show(ui, |ui| {
                             for (i, (name, value)) in suggestions.iter().enumerate() {
                                 let item = ui.horizontal(|ui| {
-                                    let r = ui.selectable_label(
+                                    let r = crate::app::selectable_label(
+                                        ui,
                                         i == popup.selected,
                                         RichText::new(name).monospace(),
                                     );

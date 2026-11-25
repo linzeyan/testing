@@ -82,7 +82,8 @@ MQTT:
 Every stream's log narrows to received or sent messages (↓ ↑) and to text, which keeps up
 with a busy feed. Each message shows the local time it came or went, to the millisecond;
 hovering shows the seconds since connecting. The message box is there before Connect, so a message can be written
-first; Send waits for the connection. A message that can't go out (JSON that doesn't parse,
+first; Send waits for the connection. The method picker is greyed while connected (or while
+a request is out): Disconnect first to pick another kind of request. A message that can't go out (JSON that doesn't parse,
 a typo in Base64) says why under the box. The bookmark under Send keeps the typed message in
 the request; the list beside it puts a kept one back in the box. Clicking a message shows its
 payload below, to copy, as indented JSON even after a topic or event name (`chat {…}`); ×

@@ -1901,6 +1901,7 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Its argument: JSON, or text", "事件的參數：JSON 或文字"),
     ("Connect first", "請先連線"),
+    ("Disconnect first", "請先中斷連線"),
     ("The operation to run", "要執行的操作"),
     ("Client authentication", "用戶端驗證方式"),
     ("In the body", "放在內容中"),

@@ -487,8 +487,12 @@ async fn streams(client: Client, got: mpsc::UnboundedSender<Got>) {
                     info.state.last_sequence
                 )
             }
-            // JetStream off on the server, or no permission.
-            Err(e) => format!("streams: {e}"),
+            // JetStream off on the server, or no permission. The last line: polled
+            // again after an error, the list asks the server again, for ever.
+            Err(e) => {
+                let _ = got.send(Got::Info(format!("streams: {e}")));
+                return;
+            }
         };
         if got.send(Got::Info(line)).is_err() {
             return;
@@ -1061,6 +1065,29 @@ pub(crate) mod tests {
             matches!(&missing, Event::Info(s) if s.starts_with("orders.> in NOPE (all): ")),
             "{missing:?}"
         );
+    }
+
+    /// 0.163.1 feedback: 「nats list streams 會一直發 即便顯示not exist」. On a server
+    /// that doesn't answer for JetStream the list failed, and was asked for again and
+    /// again: a request and a line in the log each time, until Disconnect.
+    #[test]
+    fn regression_fb20261125b_a_failed_stream_list_is_asked_for_once() {
+        let mut req = request(server(), &[]);
+        // The fake has no JetStream: the list's request goes unanswered. Connecting
+        // has the same time, so not too little of it for a busy runner.
+        req.settings.timeout_ms = 1000;
+        let (tx, events) = start(req);
+        let open = next(&events);
+        assert!(matches!(open, Event::Open(_)), "{open:?}");
+        tx.send(Command::Streams).unwrap();
+        let failed = next(&events);
+        assert!(
+            matches!(&failed, Event::Info(s) if s.starts_with("streams: ")),
+            "{failed:?}"
+        );
+        // Two timeouts' worth of asking again.
+        let again = events.recv_timeout(Duration::from_millis(2500));
+        assert!(again.is_err(), "{again:?}");
     }
 
     /// A bucket against a real server: put, get, keys and delete say what they did, a
