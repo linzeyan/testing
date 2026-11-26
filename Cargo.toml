@@ -1,6 +1,6 @@
 [package]
 name = "apitool"
-version = "0.163.3"
+version = "0.163.4"
 edition = "2024"
 
 [dependencies]
