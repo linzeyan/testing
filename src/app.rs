@@ -36,8 +36,10 @@ const NARROW: f32 = 1000.0;
 /// dragged to in a bigger one: a panel gets no more than leaves this beside it. Squeezed
 /// under it, the request and its response were cut off or gone, and their rows, with no
 /// width to lie in, wrapped into a column that grew the request over the response. This
-/// is the URL bar's: the method, Send and a URL two dozen letters to the line.
-const MAIN_LEAST: f32 = 400.0;
+/// is what the smallest window (720 wide) leaves beside the sidebar as it comes: the
+/// request's rows are laid out to fit that, and its settings grids, of fixed columns,
+/// fit no less.
+const MAIN_LEAST: f32 = 460.0;
 /// And what a panel beside the request (the code, the variables) is never under.
 const SIDE_LEAST: f32 = 240.0;
 /// The same for the response under the request: its status line and a few lines of body.
@@ -51,6 +53,9 @@ const DETAIL_LEAST: f32 = 90.0;
 const LIST_LEAST: f32 = 60.0;
 /// What a dialog keeps clear of the window's edge, on each side.
 const DIALOG_MARGIN: f32 = 24.0;
+/// A text field's own margins, left and right together: its `desired_width` is the
+/// text's, without them.
+const FIELD_MARGINS: f32 = 8.0;
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
@@ -7744,7 +7749,8 @@ impl App {
             "Shared by every request in this folder and its subfolders. \
              Written to its .folder.toml, for git.",
         ));
-        ui.horizontal(|ui| {
+        // Wrapped, as a request's tabs are: seven in a line are wider than a narrow pane.
+        ui.horizontal_wrapped(|ui| {
             let f = &ed.folder;
             let n = (f.vars.iter())
                 .filter(|v| v.enabled && !v.key.is_empty())
@@ -8380,8 +8386,7 @@ impl App {
                     // than this, the button went past the edge and widened the page, and
                     // the export button at the right of the row below went out with it.
                     let button = button_height(ui) + ui.spacing().item_spacing.x;
-                    let margins = 2.0 * ui.spacing().button_padding.x;
-                    let room = ui.available_width() - button - margins;
+                    let room = ui.available_width() - button - FIELD_MARGINS;
                     ui.add(
                         egui::TextEdit::singleline(&mut view.data_path)
                             .hint_text(t("Optional CSV (with header row) or JSON array; one iteration per row"))
@@ -11968,6 +11973,10 @@ fn auth_editor(
         let reveal = ui.data(|d| d.get_temp(shown)).unwrap_or(false);
         let reference = value.trim_start().starts_with("{{");
         ui.horizontal(|ui| {
+            // What the eye beside it leaves: the field took the whole row of a narrow
+            // pane, and the eye was past the pane's edge, which every row then ran to.
+            let eye = button_height(ui) + ui.spacing().item_spacing.x;
+            let width = (ui.available_width() - eye - FIELD_MARGINS).min(420.0);
             if reveal || reference {
                 var_edit(
                     ui,
@@ -11978,11 +11987,11 @@ fn auth_editor(
                     false,
                     None,
                     Complete::None,
-                    |e| e.desired_width(420.0),
+                    |e| e.desired_width(width),
                 );
             } else {
                 let edit = egui::TextEdit::singleline(value).id(id).password(true);
-                ui.add(edit.desired_width(420.0));
+                ui.add(edit.desired_width(width));
             }
             if !reference
                 && icon_button(ui, icon::EYE, t("Show the secret"), Some(reveal)).clicked()
@@ -12191,22 +12200,29 @@ fn auth_editor(
             }
             Auth::OAuth2(o) => {
                 ui.label(t("Grant"));
-                ui.horizontal(|ui| {
-                    use model::Grant;
-                    selectable_value(
-                        ui,
-                        &mut o.grant,
-                        Grant::ClientCredentials,
-                        t("Client credentials"),
-                    );
-                    selectable_value(ui, &mut o.grant, Grant::Password, t("Password"));
-                    selectable_value(
-                        ui,
-                        &mut o.grant,
-                        Grant::AuthorizationCode,
-                        t("Authorization code"),
-                    );
-                    selectable_value(ui, &mut o.grant, Grant::Implicit, t("Implicit"));
+                use model::Grant;
+                let grants = [
+                    (Grant::ClientCredentials, t("Client credentials")),
+                    (Grant::Password, t("Password")),
+                    (Grant::AuthorizationCode, t("Authorization code")),
+                    (Grant::Implicit, t("Implicit")),
+                ];
+                // Two lines of two where the four don't fit in one: the last was past a
+                // narrow pane's edge, out of reach. Lines of their own, not a wrapped
+                // row: the grid gives that one line's height, its second laid over the
+                // row below.
+                let per = match ui.available_width() < 420.0 {
+                    true => 2,
+                    false => 4,
+                };
+                ui.vertical(|ui| {
+                    for line in grants.chunks(per) {
+                        ui.horizontal(|ui| {
+                            for (grant, name) in line {
+                                selectable_value(ui, &mut o.grant, *grant, *name);
+                            }
+                        });
+                    }
                 });
                 ui.end_row();
                 let browser = matches!(
@@ -12844,15 +12860,20 @@ fn mqtt_settings(
             ui.end_row();
 
             ui.label(t("Last will"));
-            ui.horizontal(|ui| {
+            // QoS and Retain under the topic, not beside it: the three in a line made
+            // this column half as wide again as its other rows, and the grid wider than
+            // a narrow pane, Retain out of reach.
+            ui.vertical(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut m.will_topic)
                         .hint_text("devices/42/status")
                         .font(egui::TextStyle::Monospace)
                         .desired_width(240.0),
                 );
-                qos_box(ui, "will-qos", &mut m.will_qos);
-                ui.checkbox(&mut m.will_retain, t("Retain"));
+                ui.horizontal(|ui| {
+                    qos_box(ui, "will-qos", &mut m.will_qos);
+                    ui.checkbox(&mut m.will_retain, t("Retain"));
+                });
             });
             grid_hint(
                 ui,
@@ -15139,6 +15160,15 @@ fn captured_request(f: &crate::capture::Flow) -> Option<(String, Request)> {
     Some((store::unescape_name(name), request))
 }
 
+/// In a wrapped row, before a combo box `width` wide: it is a row of its own inside, and
+/// those stay on the line they start on and run past its end. Goes to the next line when
+/// this one hasn't the room.
+fn wrap_before(ui: &mut egui::Ui, width: f32) {
+    if ui.available_width() < width {
+        ui.end_row();
+    }
+}
+
 /// A dialog's width: what it asks for, or what the window has room for.
 fn dialog_width(ui: &egui::Ui, wanted: f32) -> f32 {
     wanted.min(ui.ctx().content_rect().width() - 2.0 * DIALOG_MARGIN)
@@ -15389,6 +15419,7 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
                     t("Waits for a stream to store it, and says which and where"),
                 ),
             };
+            wrap_before(ui, ui.spacing().combo_width);
             combo("nats-send")
                 .selected_text(names(nats.send).0)
                 .show_ui(ui, |ui| {
@@ -15418,6 +15449,7 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
                     .font(egui::TextStyle::Monospace)
                     .desired_width(240.0),
             );
+            wrap_before(ui, 72.0);
             qos_box(ui, "publish-qos", &mut mqtt.qos);
             ui.checkbox(&mut mqtt.retain, t("Retain"))
                 .on_hover_text(t("The broker keeps it for whoever subscribes later"));
@@ -26283,6 +26315,36 @@ mod ui_tests {
         found
     }
 
+    /// The controls the last frame laid out past the window's right edge, wholly or in
+    /// part: out of reach, with nothing that scrolls to them.
+    fn controls_past_the_edge<S>(h: &Harness<'_, S>) -> Vec<String> {
+        let edge = h.ctx.content_rect().right();
+        let roles = [
+            Role::Button,
+            Role::CheckBox,
+            Role::RadioButton,
+            Role::ComboBox,
+            Role::Link,
+            Role::TextInput,
+            Role::SpinButton,
+        ];
+        let mut found = Vec::new();
+        for role in roles {
+            for node in h.query_all_by_role(role) {
+                let at = node.rect();
+                if at.right() > edge + 1.0 {
+                    let name = node.accesskit_node().label().unwrap_or_default();
+                    found.push(format!(
+                        "{role:?} {name:?} at x {}..{}",
+                        at.left(),
+                        at.right()
+                    ));
+                }
+            }
+        }
+        found
+    }
+
     /// The colour the last frame painted `text` in, if it did.
     fn painted_color<S>(h: &Harness<'_, S>, text: &str) -> Option<Color32> {
         fn walk(shape: &egui::Shape, text: &str) -> Option<Color32> {
@@ -26441,22 +26503,22 @@ mod ui_tests {
     }
 
     /// The same feedback's 「其他可能也會」: every screen of the tour in the smallest
-    /// window the app allows, and no text of any of them written over another.
+    /// window the app allows, and no text of any of them written over another, no line
+    /// cut off at its pane's edge, no control past the window's.
     #[test]
     fn regression_fb20261126b_no_screen_of_the_smallest_window_writes_over_its_text() {
         let mut h = with_request_sized("small-tour", [720.0, 480.0]);
-        let (mut over, mut cut) = (Vec::new(), Vec::new());
+        let (mut over, mut cut, mut past) = (Vec::new(), Vec::new(), Vec::new());
         tour(&mut h, &mut |h, name| {
             shot(h, &format!("s-{name}"));
-            over.extend(
-                texts_over_texts(h)
-                    .into_iter()
-                    .map(|o| format!("{name}: {o}")),
-            );
-            cut.extend(texts_cut_off(h).into_iter().map(|o| format!("{name}: {o}")));
+            let named = |found: Vec<String>| found.into_iter().map(move |o| format!("{name}: {o}"));
+            over.extend(named(texts_over_texts(h)));
+            cut.extend(named(texts_cut_off(h)));
+            past.extend(named(controls_past_the_edge(h)));
         });
         assert!(over.is_empty(), "{over:#?}");
         assert!(cut.is_empty(), "{cut:#?}");
+        assert!(past.is_empty(), "{past:#?}");
     }
 
     /// The same feedback's 「其他可能也會」, the dialogs: in the smallest window the
@@ -26501,6 +26563,34 @@ mod ui_tests {
         shot(&mut h, "99-small-env-editor");
         let save = h.get_all_by_label("Save").last().unwrap().rect();
         assert!(window.contains_rect(save), "{save:?}");
+    }
+
+    /// Found with the same feedback: OAuth 2.0's four grants in a line were wider than
+    /// the request's pane in a window 720 wide, Implicit past its edge. Two lines there,
+    /// both above the row under them.
+    #[test]
+    fn the_oauth_grants_take_two_lines_in_a_narrow_pane() {
+        let mut h = with_request_sized("grants", [720.0, 480.0]);
+        let grant = model::Grant::AuthorizationCode;
+        let auth = Auth::OAuth2(model::OAuth2 {
+            grant,
+            ..Default::default()
+        });
+        h.state_mut().open.as_mut().unwrap().draft.auth = auth;
+        h.state_mut().req_tab = ReqTab::Auth;
+        h.run();
+        let window = h.ctx.content_rect();
+        let last = h.get_by_label("Implicit").rect();
+        assert!(window.contains_rect(last), "{last:?}");
+        assert!(last.top() > h.get_by_label("Password").rect().bottom());
+        // The first field under them is the auth URL's.
+        let fields = h.query_all_by_role(Role::TextInput).map(|n| n.rect());
+        let under = fields.filter(|r| r.left() > last.left() - 200.0 && r.top() > last.top());
+        let top = under.map(|r| r.top()).fold(f32::INFINITY, f32::min);
+        assert!(
+            top >= last.bottom(),
+            "the row under them starts at {top}: {last:?}"
+        );
     }
 
     /// Found with the same feedback: a stream one writes to keeps more of a short window
