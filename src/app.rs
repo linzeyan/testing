@@ -4163,11 +4163,11 @@ impl eframe::App for App {
                 egui::Frame::side_top_panel(ui.style()).fill(crate::appearance::sidebar_fill(dark));
             let least = self.sidebar_min + margins;
             let most = (ui.available_width() - MAIN_LEAST).max(least);
-            egui::Panel::left("sidebar")
+            let sidebar = egui::Panel::left("sidebar")
                 .default_size(260.0)
                 .size_range(least..=most)
-                .frame(frame)
-                .show(ui, |ui| self.sidebar(ui));
+                .frame(frame);
+            held(ui, "sidebar", sidebar, |ui| self.sidebar(ui));
         }
         if quick_look {
             self.quick_look_panel(ui);
@@ -5845,71 +5845,69 @@ impl App {
         let filters_before = self.recent_filters.first().cloned();
         let mut raw_changed = false;
         if self.code {
-            egui::Panel::right("code")
+            let panel = egui::Panel::right("code")
                 .resizable(true)
                 .default_size(380.0)
-                .max_size((ui.available_width() - MAIN_LEAST).max(SIDE_LEAST))
-                .show(ui, |ui| {
-                    let (wire, _) = open.draft.resolved(&all_vars);
-                    // code_lang is the last pick; each kind of request shows its nearest.
-                    let target = crate::codegen::pick(&wire.method, &self.code_lang);
-                    let targets = crate::codegen::targets(&wire.method);
-                    let code = crate::codegen::generate(target, wire);
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        combo("code_lang")
-                            .selected_text(target)
-                            .show_ui(ui, |ui| {
-                                for name in targets {
-                                    if selectable_label(ui, name == target, name).clicked() {
-                                        lang_changed |= self.code_lang != name;
-                                        self.code_lang = name.to_owned();
-                                    }
-                                }
-                            });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if icon_button(ui, icon::X, t("Close"), None)
-                                .on_hover_text(t("Close"))
-                                .clicked()
-                            {
-                                self.code = false;
+                .max_size((ui.available_width() - MAIN_LEAST).max(SIDE_LEAST));
+            held(ui, "code", panel, |ui| {
+                let (wire, _) = open.draft.resolved(&all_vars);
+                // code_lang is the last pick; each kind of request shows its nearest.
+                let target = crate::codegen::pick(&wire.method, &self.code_lang);
+                let targets = crate::codegen::targets(&wire.method);
+                let code = crate::codegen::generate(target, wire);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    combo("code_lang").selected_text(target).show_ui(ui, |ui| {
+                        for name in targets {
+                            if selectable_label(ui, name == target, name).clicked() {
+                                lang_changed |= self.code_lang != name;
+                                self.code_lang = name.to_owned();
                             }
-                            if let Ok(code) = &code
-                                && ui.add(primary(t("Copy"))).clicked()
-                            {
-                                ui.ctx().copy_text(code.clone());
-                                self.status = tf("Copied {} snippet", &[&target]);
-                            }
-                        });
+                        }
                     });
-                    ui.weak(t("Variables are filled in; scripts don't run."));
-                    ui.separator();
-                    match code {
-                        Ok(code) if code.len() > crate::varedit::MAX_EDIT => {
-                            ui.weak(tf("This snippet is {}: too big to show here. Copy still copies all of it.", &[&human_size(code.len())]));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, icon::X, t("Close"), None)
+                            .on_hover_text(t("Close"))
+                            .clicked()
+                        {
+                            self.code = false;
                         }
-                        Ok(code) => {
-                            let lang = crate::syntax::of_target(target);
-                            let mut colored = crate::syntax::layouter(lang);
-                            // Unwrapped, scrolled sideways: wrapping at the panel's edge
-                            // broke URLs and tokens in two.
-                            let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _| {
-                                colored(ui, buf, f32::INFINITY)
-                            };
-                            egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut code.as_str())
-                                        .code_editor()
-                                        .layouter(&mut layouter)
-                                        .desired_width(f32::INFINITY),
-                                );
-                            });
+                        if let Ok(code) = &code
+                            && ui.add(primary(t("Copy"))).clicked()
+                        {
+                            ui.ctx().copy_text(code.clone());
+                            self.status = tf("Copied {} snippet", &[&target]);
                         }
-                        Err(e) => {
-                            ui.colored_label(ORANGE, e);
-                        }
-                    }
+                    });
                 });
+                ui.weak(t("Variables are filled in; scripts don't run."));
+                ui.separator();
+                match code {
+                    Ok(code) if code.len() > crate::varedit::MAX_EDIT => {
+                        ui.weak(tf("This snippet is {}: too big to show here. Copy still copies all of it.", &[&human_size(code.len())]));
+                    }
+                    Ok(code) => {
+                        let lang = crate::syntax::of_target(target);
+                        let mut colored = crate::syntax::layouter(lang);
+                        // Unwrapped, scrolled sideways: wrapping at the panel's edge
+                        // broke URLs and tokens in two.
+                        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _| {
+                            colored(ui, buf, f32::INFINITY)
+                        };
+                        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut code.as_str())
+                                    .code_editor()
+                                    .layouter(&mut layouter)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    }
+                    Err(e) => {
+                        ui.colored_label(ORANGE, e);
+                    }
+                }
+            });
         }
 
         // Too narrow for two columns of URL bar and JSON: stacked whatever the toggle says,
@@ -5920,21 +5918,21 @@ impl App {
         // at its right; the request gets the rest, the central panel's margins around it.
         let folded = button_height(ui) + 2.0 * 8.0 + 1.0;
         // Separate ids, so each layout keeps its own dragged size.
-        let panel = if self.hide_response && beside {
+        let (id, panel) = if self.hide_response && beside {
             let rest = (ui.available_width() - folded).max(0.0);
-            egui::Panel::left("request-full-side")
-                .exact_size(rest)
-                .resizable(false)
+            let id = "request-full-side";
+            (id, egui::Panel::left(id).exact_size(rest).resizable(false))
         } else if self.hide_response {
             let rest = (ui.available_height() - folded).max(0.0);
-            egui::Panel::top("request-full")
-                .exact_size(rest)
-                .resizable(false)
+            let id = "request-full";
+            (id, egui::Panel::top(id).exact_size(rest).resizable(false))
         } else if beside {
-            egui::Panel::left("request-side")
+            let id = "request-side";
+            let panel = egui::Panel::left(id)
                 .default_size(ui.available_width() / 2.0)
                 .max_size(ui.available_width() - MAIN_LEAST)
-                .resizable(true)
+                .resizable(true);
+            (id, panel)
         } else {
             // Most of the height to the request: a response under 320 px of request took
             // the rest, more than a status and a few lines of body need to be read.
@@ -5946,12 +5944,13 @@ impl App {
                 true => ("request-composing", STREAM_LEAST),
                 false => ("request", RESPONSE_LEAST),
             };
-            egui::Panel::top(id)
+            let panel = egui::Panel::top(id)
                 .default_size(ui.available_height() * 0.6)
                 .max_size(ui.available_height() - least)
-                .resizable(true)
+                .resizable(true);
+            (id, panel)
         };
-        panel.show(ui, |ui| {
+        held(ui, id, panel, |ui| {
             ui.add_space(4.0);
             // Buttons first, from the right; the name gets what is left and truncates,
             // instead of running under them.
@@ -6018,7 +6017,9 @@ impl App {
                             dot(ui, ORANGE).on_hover_text(t("Unsaved changes"));
                         }
                         let name = RichText::new(open.name()).strong();
-                        let label = egui::Label::new(name).truncate().sense(egui::Sense::click());
+                        let label = egui::Label::new(name)
+                            .truncate()
+                            .sense(egui::Sense::click());
                         let hover = format!("{}\n{}", open.name(), t("Double-click to rename"));
                         rename = ui.add(label).on_hover_text(hover).double_clicked();
                     });
@@ -6033,7 +6034,8 @@ impl App {
                     let body = std::mem::take(&mut open.draft.body);
                     // Not to a stream or gRPC: the query's JSON went out as a handshake
                     // body, an auth payload or a request message nobody wrote.
-                    let http = !model::is_streaming(&open.draft.method) && open.draft.method != "GRPC";
+                    let http =
+                        !model::is_streaming(&open.draft.method) && open.draft.method != "GRPC";
                     open.draft.body = match gql || http {
                         true => body.graphql_switched(gql),
                         false => Body::None,
@@ -6211,13 +6213,22 @@ impl App {
                 if !kinds.contains(current) && !(*current == ReqTab::Examples && examples > 0) {
                     *current = kinds[0];
                 }
-                let shown = kinds.iter().chain((examples > 0).then_some(&ReqTab::Examples));
+                let shown = kinds
+                    .iter()
+                    .chain((examples > 0).then_some(&ReqTab::Examples));
                 for &kind in shown {
                     let (label, set) = match kind {
-                        ReqTab::Params => (tab(count(&d.params) + count(&d.path_vars), t("Params")), false),
+                        ReqTab::Params => (
+                            tab(count(&d.params) + count(&d.path_vars), t("Params")),
+                            false,
+                        ),
                         // gRPC's name for them, as in Postman: they go out as metadata.
                         ReqTab::Headers => {
-                            let name = if method == "GRPC" { t("Metadata") } else { t("Headers") };
+                            let name = if method == "GRPC" {
+                                t("Metadata")
+                            } else {
+                                t("Headers")
+                            };
                             (tab(count(&d.headers), name), false)
                         }
                         ReqTab::Body => {
@@ -6231,10 +6242,14 @@ impl App {
                         }
                         ReqTab::Auth => {
                             let auth = d.effective_auth();
-                            (t("Auth").to_owned(), !matches!(auth, Auth::None | Auth::Inherit))
+                            (
+                                t("Auth").to_owned(),
+                                !matches!(auth, Auth::None | Auth::Inherit),
+                            )
                         }
                         ReqTab::Scripts => {
-                            let set = !d.pre_request.trim().is_empty() || !d.tests.trim().is_empty();
+                            let set =
+                                !d.pre_request.trim().is_empty() || !d.tests.trim().is_empty();
                             (t("Scripts").to_owned(), set)
                         }
                         ReqTab::Vars => (tab(count(&d.response_vars), t("Vars")), false),
@@ -6270,7 +6285,9 @@ impl App {
                         }
                         ReqTab::Subjects => {
                             let subjects = d.nats.subjects.iter();
-                            let on = subjects.filter(|s| s.enabled && !s.subject.is_empty()).count();
+                            let on = subjects
+                                .filter(|s| s.enabled && !s.subject.is_empty())
+                                .count();
                             (tab(on, t("Subjects")), false)
                         }
                         ReqTab::Kv => (t("Key-value").to_owned(), !d.nats.bucket.is_empty()),
@@ -7868,7 +7885,8 @@ impl App {
         let (mut close, mut remove, mut clear) = (false, None, false);
         // A centred modal like every other dialog: as a free window it opened over the
         // environment picker, far from the cookie icon at the right.
-        let modal = fitted(ctx, egui::Modal::new(egui::Id::new("cookies")), |ui| {
+        let id = egui::Id::new("cookies");
+        let modal = egui::Modal::new(id).show(ctx, |ui| {
             ui.set_width(dialog_width(ui, 560.0));
             ui.heading(t("Cookies"));
             if rows.is_empty() {
@@ -7877,8 +7895,13 @@ impl App {
                 ui.weak(t(
                     "Sent back to matching URLs, unless a request sets its own Cookie header.",
                 ));
+                // Only the list scrolls, under its heading and over Close.
+                let room = body_room(ui, id).min(400.0);
+                // Its scroll bar at the dialog's edge, as Settings', not after the rows.
                 egui::ScrollArea::vertical()
-                    .max_height(400.0)
+                    .auto_shrink([false, true])
+                    .max_height(room)
+                    .min_scrolled_height(room)
                     .show(ui, |ui| {
                         let mut domain = "";
                         for (i, r) in rows.iter().enumerate() {
@@ -7905,6 +7928,7 @@ impl App {
                         }
                     });
             }
+            let foot = ui.cursor().top();
             ui.separator();
             ui.horizontal(|ui| {
                 close = ui.button(t("Close")).clicked();
@@ -7919,6 +7943,7 @@ impl App {
                     });
                 }
             });
+            footer_ends(ui, id, foot);
         });
         if let Some(i) = remove {
             self.cookies.remove(&rows[i]);
@@ -7943,136 +7968,131 @@ impl App {
         let mut set: Option<(Option<String>, String, String)> = None;
         let mut edit = None;
         let mut close = false;
-        egui::Panel::right("quick-look")
+        let panel = egui::Panel::right("quick-look")
             .resizable(true)
             .default_size(320.0)
-            .max_size((ui.available_width() - MAIN_LEAST).max(SIDE_LEAST))
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.strong(t("Variables in scope"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        close = icon_button(ui, icon::X, t("Close"), None)
-                            .on_hover_text(t("Close"))
-                            .clicked();
-                        if !self.secrets.is_empty() {
-                            secrets_eye(ui, true);
-                        }
-                    });
+            .max_size((ui.available_width() - MAIN_LEAST).max(SIDE_LEAST));
+        held(ui, "quick-look", panel, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.strong(t("Variables in scope"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    close = icon_button(ui, icon::X, t("Close"), None)
+                        .on_hover_text(t("Close"))
+                        .clicked();
+                    if !self.secrets.is_empty() {
+                        secrets_eye(ui, true);
+                    }
                 });
-                ui.weak(t(
-                    "The nearest scope wins. Enter keeps an edited value, Esc puts it back.",
-                ));
-                ui.separator();
-                let shown = secrets_eye(ui, false);
-                let masked = |k: &str| !shown && self.secrets.contains(k);
-                let sorted = |vars: &HashMap<String, String>| {
-                    let mut vars: Vec<(String, String)> =
-                        vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                    vars.sort_by_key(|(k, _)| k.to_lowercase());
-                    vars
-                };
-                egui::ScrollArea::vertical()
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        let heading = |ui: &mut egui::Ui, title: String, tip: String| {
-                            ui.horizontal(|ui| {
-                                ui.strong(title);
-                                icon_button(ui, icon::PENCIL, t("Edit"), None)
-                                    .on_hover_text(tip)
-                                    .clicked()
-                            })
-                            .inner
-                        };
-                        // Nearest first, as they win.
-                        if !folder.is_empty() {
-                            ui.strong(t("Folders"));
-                            ui.weak(t("Set in Folder settings."));
-                            egui::Grid::new("qv-folder")
-                                .num_columns(2)
-                                .striped(true)
-                                .show(ui, |ui| {
-                                    for (k, v) in sorted(&folder) {
-                                        scope_var(
-                                            ui,
-                                            egui::Id::new(("qv-folder", &k)),
-                                            &k,
-                                            &v,
-                                            None,
-                                            false,
-                                            false,
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                        }
-                        match &env {
-                            Some(name) => {
-                                if heading(
-                                    ui,
-                                    tf("Environment: {}", &[name]),
-                                    tf("Edit {}", &[name]),
-                                ) {
-                                    edit = Some(Some(name.clone()));
-                                }
-                                egui::Grid::new("qv-env").num_columns(2).striped(true).show(
-                                    ui,
-                                    |ui| {
-                                        for (k, v) in sorted(&self.vars) {
-                                            let id = egui::Id::new(("qv-env", &k));
-                                            let hide = masked(&k);
-                                            let over =
-                                                folder.contains_key(&k).then_some(t("Folders"));
-                                            if let Some(new) =
-                                                scope_var(ui, id, &k, &v, over, true, hide)
-                                            {
-                                                set = Some((env.clone(), k, new));
-                                            }
-                                        }
-                                    },
-                                );
-                            }
-                            None => {
-                                ui.strong(t("No environment"));
-                            }
-                        }
-                        ui.add_space(8.0);
-                        if heading(ui, t("Globals").to_owned(), t("Edit Globals").to_owned()) {
-                            edit = Some(None);
-                        }
-                        egui::Grid::new("qv-globals")
+            });
+            ui.weak(t(
+                "The nearest scope wins. Enter keeps an edited value, Esc puts it back.",
+            ));
+            ui.separator();
+            let shown = secrets_eye(ui, false);
+            let masked = |k: &str| !shown && self.secrets.contains(k);
+            let sorted = |vars: &HashMap<String, String>| {
+                let mut vars: Vec<(String, String)> =
+                    vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                vars.sort_by_key(|(k, _)| k.to_lowercase());
+                vars
+            };
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    let heading = |ui: &mut egui::Ui, title: String, tip: String| {
+                        ui.horizontal(|ui| {
+                            ui.strong(title);
+                            icon_button(ui, icon::PENCIL, t("Edit"), None)
+                                .on_hover_text(tip)
+                                .clicked()
+                        })
+                        .inner
+                    };
+                    // Nearest first, as they win.
+                    if !folder.is_empty() {
+                        ui.strong(t("Folders"));
+                        ui.weak(t("Set in Folder settings."));
+                        egui::Grid::new("qv-folder")
                             .num_columns(2)
                             .striped(true)
                             .show(ui, |ui| {
-                                for (k, v) in sorted(&self.globals) {
-                                    let over = if folder.contains_key(&k) {
-                                        Some(t("Folders"))
-                                    } else if self.vars.contains_key(&k) {
-                                        Some(env_label.as_str())
-                                    } else {
-                                        None
-                                    };
-                                    let id = egui::Id::new(("qv-globals", &k));
-                                    let hide = masked(&k);
-                                    if let Some(new) = scope_var(ui, id, &k, &v, over, true, hide) {
-                                        set = Some((None, k, new));
-                                    }
+                                for (k, v) in sorted(&folder) {
+                                    scope_var(
+                                        ui,
+                                        egui::Id::new(("qv-folder", &k)),
+                                        &k,
+                                        &v,
+                                        None,
+                                        false,
+                                        false,
+                                    );
                                 }
                             });
-                        if self.vars.is_empty() && folder.is_empty() && self.globals.is_empty() {
-                            ui.weak(t(
-                                "No variables yet. Add some to an environment or to Globals.",
-                            ));
-                        }
                         ui.add_space(8.0);
-                        // 120 names don't fit a line: name the common ones, autocomplete has the rest.
-                        ui.weak(tf(
-                            "Always available: $guid, $timestamp, $randomInt, $randomEmail… \
-                         ({} in all; type {{$ for the list)",
-                            &[&model::DYNAMIC.len()],
+                    }
+                    match &env {
+                        Some(name) => {
+                            if heading(ui, tf("Environment: {}", &[name]), tf("Edit {}", &[name])) {
+                                edit = Some(Some(name.clone()));
+                            }
+                            egui::Grid::new("qv-env")
+                                .num_columns(2)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for (k, v) in sorted(&self.vars) {
+                                        let id = egui::Id::new(("qv-env", &k));
+                                        let hide = masked(&k);
+                                        let over = folder.contains_key(&k).then_some(t("Folders"));
+                                        if let Some(new) =
+                                            scope_var(ui, id, &k, &v, over, true, hide)
+                                        {
+                                            set = Some((env.clone(), k, new));
+                                        }
+                                    }
+                                });
+                        }
+                        None => {
+                            ui.strong(t("No environment"));
+                        }
+                    }
+                    ui.add_space(8.0);
+                    if heading(ui, t("Globals").to_owned(), t("Edit Globals").to_owned()) {
+                        edit = Some(None);
+                    }
+                    egui::Grid::new("qv-globals")
+                        .num_columns(2)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (k, v) in sorted(&self.globals) {
+                                let over = if folder.contains_key(&k) {
+                                    Some(t("Folders"))
+                                } else if self.vars.contains_key(&k) {
+                                    Some(env_label.as_str())
+                                } else {
+                                    None
+                                };
+                                let id = egui::Id::new(("qv-globals", &k));
+                                let hide = masked(&k);
+                                if let Some(new) = scope_var(ui, id, &k, &v, over, true, hide) {
+                                    set = Some((None, k, new));
+                                }
+                            }
+                        });
+                    if self.vars.is_empty() && folder.is_empty() && self.globals.is_empty() {
+                        ui.weak(t(
+                            "No variables yet. Add some to an environment or to Globals.",
                         ));
-                    });
-            });
+                    }
+                    ui.add_space(8.0);
+                    // 120 names don't fit a line: name the common ones, autocomplete has the rest.
+                    ui.weak(tf(
+                        "Always available: $guid, $timestamp, $randomInt, $randomEmail… \
+                         ({} in all; type {{$ for the list)",
+                        &[&model::DYNAMIC.len()],
+                    ));
+                });
+        });
         self.quick_look &= !close;
         if let Some((env, name, value)) = set
             && let Err(e) = self.set_var(env.as_deref(), &name, &value, true)
@@ -8485,17 +8505,17 @@ impl App {
 
         // No more than half the page: the results are the other.
         let most = (ui.available_width() / 2.0).max(180.0);
-        let changed = egui::Panel::left("runner-order")
+        let panel = egui::Panel::left("runner-order")
             .resizable(true)
             .default_size(280.0)
-            .size_range(180.0..=most)
-            .show(ui, |ui| {
-                ui.add_enabled_ui(!running, |ui| {
-                    run_order_ui(ui, &mut view.order, &tree, &self.ws)
-                })
-                .inner
+            .size_range(180.0..=most);
+        let changed = held(ui, "runner-order", panel, |ui| {
+            ui.add_enabled_ui(!running, |ui| {
+                run_order_ui(ui, &mut view.order, &tree, &self.ws)
             })
-            .inner;
+            .inner
+        })
+        .inner;
         if changed {
             let key = self.ws.key(&view.scope);
             let as_tree = view
@@ -8657,7 +8677,8 @@ impl App {
         let mut close = false;
         let (mut check, mut install, mut restart) = (false, None, false);
         let tab = &mut self.settings_tab;
-        let modal = fitted(ctx, egui::Modal::new(egui::Id::new("settings")), |ui| {
+        let id = egui::Id::new("settings");
+        let modal = egui::Modal::new(id).show(ctx, |ui| {
             // As wide as Network needs, on every tab: a width per tab moved the tabs.
             ui.set_width(dialog_width(ui, 560.0));
             ui.heading(t("Settings"));
@@ -8673,378 +8694,384 @@ impl App {
                 sub_tab(ui, tab, SettingsTab::Sync, t("Sync"), false);
             });
             ui.separator();
-            let top = ui.cursor().top();
-            match *tab {
-                SettingsTab::General => {
-                    egui::Grid::new("appearance")
-                        .num_columns(2)
-                        .spacing([12.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label(t("Language"));
-                            ui.horizontal(|ui| {
-                                use crate::i18n::Lang;
-                                selectable_value(ui, &mut a.language, Lang::English, "English");
-                                selectable_value(ui, &mut a.language, Lang::ZhTw, "繁體中文");
-                            });
-                            ui.end_row();
-                            ui.label(t("Theme"));
-                            ui.horizontal(|ui| {
-                                for (theme, name) in [
-                                    (Theme::System, t("System")),
-                                    (Theme::Light, t("Light")),
-                                    (Theme::Dark, t("Dark")),
-                                ] {
-                                    selectable_value(ui, &mut a.theme, theme, name);
-                                }
-                            });
-                            ui.end_row();
-                            ui.label(t("Interface font"));
-                            let all = families.iter().map(|f| &f.0);
-                            font_picker(ui, "ui-font", &mut a.ui_font, all);
-                            ui.end_row();
-                            ui.label(t("Code font"));
-                            let mono = families.iter().filter(|f| f.1).map(|f| &f.0);
-                            font_picker(ui, "code-font", &mut a.code_font, mono);
-                            ui.end_row();
-                            ui.label(t("Text size"));
-                            ui.horizontal(|ui| {
-                                let slider = egui::Slider::new(&mut a.size, SIZES).step_by(0.5);
-                                ui.add(slider.suffix(" pt"));
-                                if a.size != DEFAULT_SIZE
-                                    && icon_button(ui, icon::RESET, t("Reset"), None)
-                                        .on_hover_text(t("Reset"))
-                                        .clicked()
-                                {
-                                    a.size = DEFAULT_SIZE;
-                                }
-                            });
-                            ui.end_row();
-                            ui.label(t("Log"));
-                            ui.horizontal(|ui| {
-                                use crate::logfile::Level;
-                                let name = |l| match l {
-                                    Level::Error => t("Errors"),
-                                    Level::Warn => t("Warnings"),
-                                    Level::Info => t("Info"),
-                                    Level::Debug => t("Debug"),
-                                    Level::Trace => t("Trace"),
-                                };
-                                let before = *log_level;
-                                combo("log-level")
-                                    .selected_text(name(*log_level))
-                                    .show_ui(ui, |ui| {
-                                        for l in Level::ALL {
-                                            selectable_value(ui, log_level, l, name(l));
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text(t(
-                                        "How much goes into apitool.log. Debug adds each step of a request or stream: proxy picked, connection, TLS, redirects, status. Trace also each message's size. Headers, bodies and tokens are never written, nor a URL's query.",
-                                    ));
-                                if *log_level != before {
-                                    crate::logfile::set_level(*log_level);
-                                }
-                                if let Some(path) = crate::logfile::path() {
-                                    open_logs = icon_button(ui, icon::FOLDER_OPEN, t("Open the log's folder"), None)
-                                        .on_hover_text(path.display().to_string())
-                                        .clicked();
-                                }
-                            });
-                            ui.end_row();
-                            ui.label(t("Response history"));
-                            let mut keep = !*forget_responses;
-                            ui.checkbox(&mut keep, t("Keep each request's last 10 responses"))
-                                .on_hover_text(t(
-                                    "Each Send keeps its response for the response's History menu (the clock icon). Examples are separate: only Save as example adds one.",
-                                ));
-                            *forget_responses = !keep;
-                            ui.end_row();
-                        });
-                }
-                SettingsTab::Network => {
-                    // A copy until Apply: a proxy URL half typed would be used, and a mode
-                    // picked on the way to its URL would cut the network off meanwhile.
-                    let net = net_draft.get_or_insert_with(|| net_now.clone());
-                    network_settings(ui, net, skipped.as_deref());
-                }
-                SettingsTab::Updates => {
-                    ui.vertical(|ui| {
-                        use crate::update::Check;
-                        let label = |c| match c {
-                            Check::Never => t("Don't check"),
-                            Check::AtStart => t("Check when apitool starts"),
-                            Check::Daily => t("Check every day"),
-                            Check::Weekly => t("Check every week"),
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label(t("Check for updates"));
-                            combo("update-check")
-                                .selected_text(label(updates.check))
-                                .show_ui(ui, |ui| {
-                                    for c in
-                                        [Check::Never, Check::AtStart, Check::Daily, Check::Weekly]
-                                    {
-                                        selectable_value(ui, &mut updates.check, c, label(c));
-                                    }
-                                });
-                            ui.checkbox(&mut updates.install, t("Install automatically"))
-                                .on_hover_text(t(
-                                    "Downloads it in the background; it starts next time",
-                                ));
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            let busy = matches!(update, Update::Checking | Update::Installing(_));
-                            check = ui
-                                .add_enabled(!busy, egui::Button::new(t("Check now")))
-                                .clicked();
-                            match update {
-                                Update::Idle => {
-                                    ui.weak(format!("apitool {}", crate::update::CURRENT));
-                                }
-                                Update::Checking => {
-                                    icon_label(ui, icon::HOURGLASS, None);
-                                }
-                                Update::UpToDate => {
-                                    ui.label(tf(
-                                        "apitool {} is the latest",
-                                        &[&crate::update::CURRENT],
-                                    ));
-                                }
-                                Update::Available(r) => {
-                                    ui.label(tf("{} is available", &[&r.version]));
-                                    if r.archive.is_some() && ui.button(t("Install")).clicked() {
-                                        install = Some(r.clone());
-                                    }
-                                    ui.hyperlink_to(t("Release notes"), &r.page);
-                                }
-                                Update::Installing(v) => {
-                                    icon_label(ui, icon::HOURGLASS, None);
-                                    ui.label(tf("Installing {}…", &[v]));
-                                }
-                                Update::Installed(v) => {
-                                    ui.label(tf("{} is installed and starts next time", &[v]));
-                                    restart = ui.button(t("Restart now")).clicked();
-                                }
-                                Update::Failed(e) => {
-                                    ui.colored_label(ORANGE, clip(e, 200));
-                                }
-                            }
-                        });
-                    });
-                }
-                SettingsTab::Mcp => {
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(t("Client"));
-                            combo("mcp-client")
-                                .selected_text(MCP_CLIENTS[*mcp_client])
-                                .show_ui(ui, |ui| {
-                                    for (i, name) in MCP_CLIENTS.iter().enumerate() {
-                                        selectable_value(ui, mcp_client, i, *name);
-                                    }
-                                });
-                            ui.checkbox(mcp_window, t("Let it operate this window"))
-                                .on_hover_text(t(
-                                    "While apitool runs, the client can also see what's open, open requests, press Send and switch environments here. Without it, the client works on the workspace, even with apitool closed.",
-                                ));
-                        });
-                        if *mcp_window {
-                            ui.horizontal(|ui| {
-                                ui.label(t("Host"));
-                                let host = egui::TextEdit::singleline(bind_host)
-                                    .hint_text("127.0.0.1")
-                                    .desired_width(110.0);
-                                let host = ui.add(host).on_hover_text(t(
-                                    "127.0.0.1: this machine only. 0.0.0.0: other machines too; every call still needs the token.",
-                                ));
-                                ui.label(t("Port"));
-                                let auto = t("auto");
-                                // Typed, not dragged: a port is a number to pick, not a slider.
-                                let port = egui::DragValue::new(bind_port)
-                                    .speed(0.0)
-                                    .custom_formatter(move |n, _| match n as u16 {
-                                        0 => auto.to_owned(),
-                                        n => n.to_string(),
-                                    })
-                                    .custom_parser(move |s| match s.trim() {
-                                        "" => Some(0.0),
-                                        s if s == auto => Some(0.0),
-                                        s => s.parse().ok(),
-                                    });
-                                let port = ui.add(port).on_hover_text(t(
-                                    "auto: a free one the system picks, new each start",
-                                ));
-                                rebind = host.lost_focus() || port.lost_focus();
-                            });
-                        }
-                        if let Ok(cli) = &cli
-                            && !cli.exists()
-                        {
-                            let at = cli.display();
-                            ui.colored_label(ORANGE, tf("apitool-cli isn't at {}", &[&at]));
-                        }
-                        match &serving {
-                            Some(Err(e)) => {
-                                ui.colored_label(ORANGE, tf("Can't serve MCP: {}", &[e]));
-                            }
-                            // Shown without apitool-cli too: a client connecting over HTTP
-                            // doesn't need it, only the token it would read for one.
-                            Some(Ok((addr, token))) if *mcp_window => {
-                                let url = format!("http://{addr}/mcp");
-                                ui.weak(tf("Serving this window on {}", &[&url]));
+            // Only the tab scrolls: scrolled with it, the tabs went out of view in a short window.
+            let room = body_room(ui, id);
+            let scroll = egui::ScrollArea::vertical().auto_shrink([false, true]);
+            scroll.max_height(room).min_scrolled_height(room).show(ui, |ui| {
+                let top = ui.cursor().top();
+                match *tab {
+                    SettingsTab::General => {
+                        egui::Grid::new("appearance")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label(t("Language"));
                                 ui.horizontal(|ui| {
-                                    ui.label(t("Token"));
-                                    ui.label(RichText::new(token).monospace()).on_hover_text(t(
-                                        "Sent as Authorization: Bearer by a client that connects over HTTP. New each start.",
-                                    ));
-                                    if icon_button(ui, icon::COPY, t("Copy"), None)
-                                        .on_hover_text(t("Copy"))
-                                        .clicked()
-                                    {
-                                        ui.ctx().copy_text(token.clone());
-                                        copied = Some(t("Copied the token").to_owned());
+                                    use crate::i18n::Lang;
+                                    selectable_value(ui, &mut a.language, Lang::English, "English");
+                                    selectable_value(ui, &mut a.language, Lang::ZhTw, "繁體中文");
+                                });
+                                ui.end_row();
+                                ui.label(t("Theme"));
+                                ui.horizontal(|ui| {
+                                    for (theme, name) in [
+                                        (Theme::System, t("System")),
+                                        (Theme::Light, t("Light")),
+                                        (Theme::Dark, t("Dark")),
+                                    ] {
+                                        selectable_value(ui, &mut a.theme, theme, name);
                                     }
                                 });
-                            }
-                            _ => {}
-                        }
-                        if let Ok(cli) = &cli {
-                            let setup = mcp_setup(*mcp_client, cli, &root, *mcp_window);
-                            if code_block(ui, &setup) {
-                                ui.ctx().copy_text(setup.clone());
-                                let client = MCP_CLIENTS[*mcp_client];
-                                copied = Some(tf("Copied the setup for {}", &[&client]));
-                            }
-                            ui.weak(match *mcp_client {
-                                0 => t("Run it in a terminal; add --scope user for every project."),
-                                1 => t("Add it to claude_desktop_config.json (Claude's Settings > Developer > Edit Config), then restart Claude."),
-                                _ => t("Add it to ~/.cursor/mcp.json, or .cursor/mcp.json in a project."),
+                                ui.end_row();
+                                ui.label(t("Interface font"));
+                                let all = families.iter().map(|f| &f.0);
+                                font_picker(ui, "ui-font", &mut a.ui_font, all);
+                                ui.end_row();
+                                ui.label(t("Code font"));
+                                let mono = families.iter().filter(|f| f.1).map(|f| &f.0);
+                                font_picker(ui, "code-font", &mut a.code_font, mono);
+                                ui.end_row();
+                                ui.label(t("Text size"));
+                                ui.horizontal(|ui| {
+                                    let slider = egui::Slider::new(&mut a.size, SIZES).step_by(0.5);
+                                    ui.add(slider.suffix(" pt"));
+                                    if a.size != DEFAULT_SIZE
+                                        && icon_button(ui, icon::RESET, t("Reset"), None)
+                                            .on_hover_text(t("Reset"))
+                                            .clicked()
+                                    {
+                                        a.size = DEFAULT_SIZE;
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label(t("Log"));
+                                ui.horizontal(|ui| {
+                                    use crate::logfile::Level;
+                                    let name = |l| match l {
+                                        Level::Error => t("Errors"),
+                                        Level::Warn => t("Warnings"),
+                                        Level::Info => t("Info"),
+                                        Level::Debug => t("Debug"),
+                                        Level::Trace => t("Trace"),
+                                    };
+                                    let before = *log_level;
+                                    combo("log-level")
+                                        .selected_text(name(*log_level))
+                                        .show_ui(ui, |ui| {
+                                            for l in Level::ALL {
+                                                selectable_value(ui, log_level, l, name(l));
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text(t(
+                                            "How much goes into apitool.log. Debug adds each step of a request or stream: proxy picked, connection, TLS, redirects, status. Trace also each message's size. Headers, bodies and tokens are never written, nor a URL's query.",
+                                        ));
+                                    if *log_level != before {
+                                        crate::logfile::set_level(*log_level);
+                                    }
+                                    if let Some(path) = crate::logfile::path() {
+                                        open_logs = icon_button(ui, icon::FOLDER_OPEN, t("Open the log's folder"), None)
+                                            .on_hover_text(path.display().to_string())
+                                            .clicked();
+                                    }
+                                });
+                                ui.end_row();
+                                ui.label(t("Response history"));
+                                let mut keep = !*forget_responses;
+                                ui.checkbox(&mut keep, t("Keep each request's last 10 responses"))
+                                    .on_hover_text(t(
+                                        "Each Send keeps its response for the response's History menu (the clock icon). Examples are separate: only Save as example adds one.",
+                                    ));
+                                *forget_responses = !keep;
+                                ui.end_row();
                             });
-                        }
-                    });
-                }
-                SettingsTab::Sync => {
-                    use crate::sync::Provider;
-                    // Labelled rows: hint text alone was gone once a field was filled in.
-                    egui::Grid::new("sync-fields").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                        ui.label(t("Service"));
-                        combo("remote-provider")
-                            .selected_text(remote.provider.name())
-                            .show_ui(ui, |ui| {
-                                for p in [Provider::GitHub, Provider::GitLab] {
-                                    selectable_value(ui, &mut remote.provider, p, p.name());
+                    }
+                    SettingsTab::Network => {
+                        // A copy until Apply: a proxy URL half typed would be used, and a mode
+                        // picked on the way to its URL would cut the network off meanwhile.
+                        let net = net_draft.get_or_insert_with(|| net_now.clone());
+                        network_settings(ui, net, skipped.as_deref());
+                    }
+                    SettingsTab::Updates => {
+                        ui.vertical(|ui| {
+                            use crate::update::Check;
+                            let label = |c| match c {
+                                Check::Never => t("Don't check"),
+                                Check::AtStart => t("Check when apitool starts"),
+                                Check::Daily => t("Check every day"),
+                                Check::Weekly => t("Check every week"),
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(t("Check for updates"));
+                                combo("update-check")
+                                    .selected_text(label(updates.check))
+                                    .show_ui(ui, |ui| {
+                                        for c in
+                                            [Check::Never, Check::AtStart, Check::Daily, Check::Weekly]
+                                        {
+                                            selectable_value(ui, &mut updates.check, c, label(c));
+                                        }
+                                    });
+                                ui.checkbox(&mut updates.install, t("Install automatically"))
+                                    .on_hover_text(t(
+                                        "Downloads it in the background; it starts next time",
+                                    ));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                let busy = matches!(update, Update::Checking | Update::Installing(_));
+                                check = ui
+                                    .add_enabled(!busy, egui::Button::new(t("Check now")))
+                                    .clicked();
+                                match update {
+                                    Update::Idle => {
+                                        ui.weak(format!("apitool {}", crate::update::CURRENT));
+                                    }
+                                    Update::Checking => {
+                                        icon_label(ui, icon::HOURGLASS, None);
+                                    }
+                                    Update::UpToDate => {
+                                        ui.label(tf(
+                                            "apitool {} is the latest",
+                                            &[&crate::update::CURRENT],
+                                        ));
+                                    }
+                                    Update::Available(r) => {
+                                        ui.label(tf("{} is available", &[&r.version]));
+                                        if r.archive.is_some() && ui.button(t("Install")).clicked() {
+                                            install = Some(r.clone());
+                                        }
+                                        ui.hyperlink_to(t("Release notes"), &r.page);
+                                    }
+                                    Update::Installing(v) => {
+                                        icon_label(ui, icon::HOURGLASS, None);
+                                        ui.label(tf("Installing {}…", &[v]));
+                                    }
+                                    Update::Installed(v) => {
+                                        ui.label(tf("{} is installed and starts next time", &[v]));
+                                        restart = ui.button(t("Restart now")).clicked();
+                                    }
+                                    Update::Failed(e) => {
+                                        ui.colored_label(ORANGE, clip(e, 200));
+                                    }
                                 }
                             });
-                        ui.end_row();
-                        ui.label(t("Repository"));
-                        ui.horizontal(|ui| {
-                            let repo = egui::TextEdit::singleline(&mut remote.repo)
-                                .hint_text(t("owner/repository"))
-                                .desired_width(230.0);
-                            ui.add(repo);
-                            ui.label(t("Branch"));
-                            let branch = egui::TextEdit::singleline(&mut remote.branch)
-                                .hint_text("main")
-                                .desired_width(70.0);
-                            ui.add(branch);
                         });
-                        ui.end_row();
-                        ui.label(t("Token"));
-                        ui.horizontal(|ui| {
-                            let hint = match token_saved {
-                                true => t("Token kept; type to replace"),
-                                false => t("Personal access token"),
-                            };
-                            let scope = match remote.provider {
-                                Provider::GitHub => t("A fine-grained token with Contents: read and write on the repository"),
-                                Provider::GitLab => t("A token with the api scope"),
-                            };
-                            let field = egui::TextEdit::singleline(remote_token)
-                                .password(true)
-                                .hint_text(hint)
-                                .desired_width(230.0);
-                            ui.add(field).on_hover_text(scope);
-                            ui.hyperlink_to(t("Create a token"), remote.token_page())
-                                .on_hover_text(tf(
-                                    "Sign in to {} and make one with what sync needs filled in",
-                                    &[&remote.provider.name()],
-                                ));
-                        });
-                        ui.end_row();
-                        ui.label(t("Sync automatically"));
-                        let every = |m: u32| match m {
-                            0 => t("Off").to_owned(),
-                            60 => t("Every hour").to_owned(),
-                            m => tf("Every {} minutes", &[&m]),
-                        };
-                        combo("remote-every")
-                            .selected_text(every(remote.every))
-                            .show_ui(ui, |ui| {
-                                for m in crate::sync::EVERY {
-                                    selectable_value(ui, &mut remote.every, m, every(m));
+                    }
+                    SettingsTab::Mcp => {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(t("Client"));
+                                combo("mcp-client")
+                                    .selected_text(MCP_CLIENTS[*mcp_client])
+                                    .show_ui(ui, |ui| {
+                                        for (i, name) in MCP_CLIENTS.iter().enumerate() {
+                                            selectable_value(ui, mcp_client, i, *name);
+                                        }
+                                    });
+                                ui.checkbox(mcp_window, t("Let it operate this window"))
+                                    .on_hover_text(t(
+                                        "While apitool runs, the client can also see what's open, open requests, press Send and switch environments here. Without it, the client works on the workspace, even with apitool closed.",
+                                    ));
+                            });
+                            if *mcp_window {
+                                ui.horizontal(|ui| {
+                                    ui.label(t("Host"));
+                                    let host = egui::TextEdit::singleline(bind_host)
+                                        .hint_text("127.0.0.1")
+                                        .desired_width(110.0);
+                                    let host = ui.add(host).on_hover_text(t(
+                                        "127.0.0.1: this machine only. 0.0.0.0: other machines too; every call still needs the token.",
+                                    ));
+                                    ui.label(t("Port"));
+                                    let auto = t("auto");
+                                    // Typed, not dragged: a port is a number to pick, not a slider.
+                                    let port = egui::DragValue::new(bind_port)
+                                        .speed(0.0)
+                                        .custom_formatter(move |n, _| match n as u16 {
+                                            0 => auto.to_owned(),
+                                            n => n.to_string(),
+                                        })
+                                        .custom_parser(move |s| match s.trim() {
+                                            "" => Some(0.0),
+                                            s if s == auto => Some(0.0),
+                                            s => s.parse().ok(),
+                                        });
+                                    let port = ui.add(port).on_hover_text(t(
+                                        "auto: a free one the system picks, new each start",
+                                    ));
+                                    rebind = host.lost_focus() || port.lost_focus();
+                                });
+                            }
+                            if let Ok(cli) = &cli
+                                && !cli.exists()
+                            {
+                                let at = cli.display();
+                                ui.colored_label(ORANGE, tf("apitool-cli isn't at {}", &[&at]));
+                            }
+                            match &serving {
+                                Some(Err(e)) => {
+                                    ui.colored_label(ORANGE, tf("Can't serve MCP: {}", &[e]));
                                 }
-                            })
-                            .response
-                            .on_hover_text(t("When apitool starts, then this often"));
-                        ui.end_row();
-                        ui.label(t("Also sync"));
-                        ui.horizontal(|ui| {
-                            let share = &mut remote.share;
-                            ui.checkbox(&mut share.secrets, t("Secret values"));
-                            ui.checkbox(&mut share.history, t("History"));
-                            ui.checkbox(&mut share.cookies, t("Cookies"));
-                            ui.checkbox(&mut share.tokens, t("OAuth tokens"));
+                                // Shown without apitool-cli too: a client connecting over HTTP
+                                // doesn't need it, only the token it would read for one.
+                                Some(Ok((addr, token))) if *mcp_window => {
+                                    let url = format!("http://{addr}/mcp");
+                                    ui.weak(tf("Serving this window on {}", &[&url]));
+                                    ui.horizontal(|ui| {
+                                        ui.label(t("Token"));
+                                        ui.label(RichText::new(token).monospace()).on_hover_text(t(
+                                            "Sent as Authorization: Bearer by a client that connects over HTTP. New each start.",
+                                        ));
+                                        if icon_button(ui, icon::COPY, t("Copy"), None)
+                                            .on_hover_text(t("Copy"))
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(token.clone());
+                                            copied = Some(t("Copied the token").to_owned());
+                                        }
+                                    });
+                                }
+                                _ => {}
+                            }
+                            if let Ok(cli) = &cli {
+                                let setup = mcp_setup(*mcp_client, cli, &root, *mcp_window);
+                                if code_block(ui, &setup) {
+                                    ui.ctx().copy_text(setup.clone());
+                                    let client = MCP_CLIENTS[*mcp_client];
+                                    copied = Some(tf("Copied the setup for {}", &[&client]));
+                                }
+                                ui.weak(match *mcp_client {
+                                    0 => t("Run it in a terminal; add --scope user for every project."),
+                                    1 => t("Add it to claude_desktop_config.json (Claude's Settings > Developer > Edit Config), then restart Claude."),
+                                    _ => t("Add it to ~/.cursor/mcp.json, or .cursor/mcp.json in a project."),
+                                });
+                            }
                         });
-                        ui.end_row();
-                        if remote.share.any() {
-                            ui.label(t("Passphrase"));
-                            let hint = match passphrase_saved {
-                                true => t("Passphrase kept; type to replace"),
-                                false => t("Passphrase, the same on every machine"),
-                            };
-                            let field = egui::TextEdit::singleline(remote_passphrase)
-                                .password(true)
-                                .hint_text(hint)
-                                .desired_width(230.0);
-                            ui.add(field).on_hover_text(t("What's ticked is encrypted with it before it leaves; another machine opens it with the same one."));
+                    }
+                    SettingsTab::Sync => {
+                        use crate::sync::Provider;
+                        // Labelled rows: hint text alone was gone once a field was filled in.
+                        egui::Grid::new("sync-fields").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                            ui.label(t("Service"));
+                            combo("remote-provider")
+                                .selected_text(remote.provider.name())
+                                .show_ui(ui, |ui| {
+                                    for p in [Provider::GitHub, Provider::GitLab] {
+                                        selectable_value(ui, &mut remote.provider, p, p.name());
+                                    }
+                                });
                             ui.end_row();
-                        }
-                        // Greyed with what's missing beside it: greyed alone left a guess.
-                        let why = if syncing {
-                            Some(t("Syncing…"))
-                        } else if !remote.is_set() {
-                            Some(t("Fill in the repository and branch first"))
-                        } else if !token_saved && remote_token.is_empty() {
-                            Some(t("Paste a token first"))
-                        } else if remote.share.any() && !passphrase_saved && remote_passphrase.is_empty() {
-                            Some(t("Set a passphrase first: what's ticked goes encrypted"))
-                        } else {
-                            None
-                        };
-                        ui.label("");
-                        ui.horizontal(|ui| {
-                            sync_now = (ui.add_enabled(why.is_none(), egui::Button::new(t("Sync now"))))
-                                .clicked();
-                            if let Some(why) = why {
-                                ui.weak(why);
+                            ui.label(t("Repository"));
+                            ui.horizontal(|ui| {
+                                let repo = egui::TextEdit::singleline(&mut remote.repo)
+                                    .hint_text(t("owner/repository"))
+                                    .desired_width(230.0);
+                                ui.add(repo);
+                                ui.label(t("Branch"));
+                                let branch = egui::TextEdit::singleline(&mut remote.branch)
+                                    .hint_text("main")
+                                    .desired_width(70.0);
+                                ui.add(branch);
+                            });
+                            ui.end_row();
+                            ui.label(t("Token"));
+                            ui.horizontal(|ui| {
+                                let hint = match token_saved {
+                                    true => t("Token kept; type to replace"),
+                                    false => t("Personal access token"),
+                                };
+                                let scope = match remote.provider {
+                                    Provider::GitHub => t("A fine-grained token with Contents: read and write on the repository"),
+                                    Provider::GitLab => t("A token with the api scope"),
+                                };
+                                let field = egui::TextEdit::singleline(remote_token)
+                                    .password(true)
+                                    .hint_text(hint)
+                                    .desired_width(230.0);
+                                ui.add(field).on_hover_text(scope);
+                                ui.hyperlink_to(t("Create a token"), remote.token_page())
+                                    .on_hover_text(tf(
+                                        "Sign in to {} and make one with what sync needs filled in",
+                                        &[&remote.provider.name()],
+                                    ));
+                            });
+                            ui.end_row();
+                            ui.label(t("Sync automatically"));
+                            let every = |m: u32| match m {
+                                0 => t("Off").to_owned(),
+                                60 => t("Every hour").to_owned(),
+                                m => tf("Every {} minutes", &[&m]),
+                            };
+                            combo("remote-every")
+                                .selected_text(every(remote.every))
+                                .show_ui(ui, |ui| {
+                                    for m in crate::sync::EVERY {
+                                        selectable_value(ui, &mut remote.every, m, every(m));
+                                    }
+                                })
+                                .response
+                                .on_hover_text(t("When apitool starts, then this often"));
+                            ui.end_row();
+                            ui.label(t("Also sync"));
+                            ui.horizontal(|ui| {
+                                let share = &mut remote.share;
+                                ui.checkbox(&mut share.secrets, t("Secret values"));
+                                ui.checkbox(&mut share.history, t("History"));
+                                ui.checkbox(&mut share.cookies, t("Cookies"));
+                                ui.checkbox(&mut share.tokens, t("OAuth tokens"));
+                            });
+                            ui.end_row();
+                            if remote.share.any() {
+                                ui.label(t("Passphrase"));
+                                let hint = match passphrase_saved {
+                                    true => t("Passphrase kept; type to replace"),
+                                    false => t("Passphrase, the same on every machine"),
+                                };
+                                let field = egui::TextEdit::singleline(remote_passphrase)
+                                    .password(true)
+                                    .hint_text(hint)
+                                    .desired_width(230.0);
+                                ui.add(field).on_hover_text(t("What's ticked is encrypted with it before it leaves; another machine opens it with the same one."));
+                                ui.end_row();
                             }
+                            // Greyed with what's missing beside it: greyed alone left a guess.
+                            let why = if syncing {
+                                Some(t("Syncing…"))
+                            } else if !remote.is_set() {
+                                Some(t("Fill in the repository and branch first"))
+                            } else if !token_saved && remote_token.is_empty() {
+                                Some(t("Paste a token first"))
+                            } else if remote.share.any() && !passphrase_saved && remote_passphrase.is_empty() {
+                                Some(t("Set a passphrase first: what's ticked goes encrypted"))
+                            } else {
+                                None
+                            };
+                            ui.label("");
+                            ui.horizontal(|ui| {
+                                sync_now = (ui.add_enabled(why.is_none(), egui::Button::new(t("Sync now"))))
+                                    .clicked();
+                                if let Some(why) = why {
+                                    ui.weak(why);
+                                }
+                            });
+                            ui.end_row();
                         });
-                        ui.end_row();
-                    });
-                    ui.weak(t(
-                        "To a private repository. What isn't ticked stays on this machine.",
-                    ));
+                        ui.weak(t(
+                            "To a private repository. What isn't ticked stays on this machine.",
+                        ));
+                    }
                 }
-            }
-            // As tall as the tallest tab shown yet: a shorter one would re-centre the window
-            // and move the tabs out from under the pointer.
-            let (used, tallest) = (ui.cursor().top() - top, egui::Id::new("settings-tallest"));
-            let most = ui.data_mut(|d| {
-                let most = d.get_temp_mut_or(tallest, 0.0f32);
-                *most = most.max(used);
-                *most
+                // As tall as the tallest tab shown yet: a shorter one would re-centre the window
+                // and move the tabs out from under the pointer.
+                let (used, tallest) = (ui.cursor().top() - top, egui::Id::new("settings-tallest"));
+                let most = ui.data_mut(|d| {
+                    let most = d.get_temp_mut_or(tallest, 0.0f32);
+                    *most = most.max(used);
+                    *most
+                });
+                ui.add_space(most - used);
             });
-            ui.add_space(most - used);
+            let foot = ui.cursor().top();
             ui.separator();
             // As every dialog's footer: the action, then Close, from the left. By Close:
             // under the default headers it read as theirs.
@@ -9063,6 +9090,7 @@ impl App {
                 }
                 close = ui.button(t("Close")).clicked();
             });
+            footer_ends(ui, id, foot);
         });
         if let Some(copied) = copied {
             self.status = copied;
@@ -15175,8 +15203,9 @@ fn dialog_width(ui: &egui::Ui, wanted: f32) -> f32 {
 }
 
 /// `modal` shown no taller than the window: in a shorter one it scrolls as a whole. In
-/// the smallest window (720 x 480) the shortcut list was wider than the window and
-/// Settings taller: their edges were outside it, Close and Apply with them.
+/// the smallest window (720 x 480) the shortcut list was wider than the window: its edges
+/// were outside it, Close with them. A dialog with tabs or a long list scrolls only that
+/// instead ([`body_room`]).
 fn fitted<R>(
     ctx: &egui::Context,
     modal: egui::Modal,
@@ -15190,6 +15219,28 @@ fn fitted<R>(
         let scroll = egui::ScrollArea::vertical().max_height(room);
         scroll.min_scrolled_height(room).show(ui, add).inner
     })
+}
+
+/// How tall a dialog's body may be for the dialog to fit the window: the window's
+/// height less the dialog's frame, what is drawn above the body, and its footer as tall
+/// as the frame before ([`footer_ends`]).
+fn body_room(ui: &egui::Ui, id: egui::Id) -> f32 {
+    let footer = ui.data(|d| d.get_temp::<f32>(id.with("footer")));
+    let frame = egui::Frame::popup(ui.style()).total_margin().sum().y;
+    let above = ui.cursor().top() - ui.min_rect().top();
+    let window = ui.ctx().content_rect().height() - 2.0 * DIALOG_MARGIN;
+    (window - frame - above - footer.unwrap_or(0.0)).max(LIST_LEAST)
+}
+
+/// Keeps the height of the footer begun at `top` for [`body_room`]. A frame drawn with
+/// another one is drawn again, so no frame shows the dialog taller than the window.
+fn footer_ends(ui: &egui::Ui, id: egui::Id, top: f32) {
+    let (height, key) = (ui.min_rect().bottom() - top, id.with("footer"));
+    let before = ui.data(|d| d.get_temp::<f32>(key));
+    if before.is_none_or(|b| (b - height).abs() > 0.5) {
+        ui.data_mut(|d| d.insert_temp(key, height));
+        ui.ctx().request_discard("a dialog's footer measured");
+    }
 }
 
 /// Where an opened item of a list shows: in a panel under the list, dragged to size, when
@@ -15207,12 +15258,40 @@ fn under_list(
         add(ui);
         return false;
     }
-    egui::Panel::bottom(id)
+    let panel = egui::Panel::bottom(id)
         .resizable(true)
         .default_size(default)
-        .size_range(DETAIL_LEAST..=room - LIST_LEAST)
-        .show(ui, add);
+        .size_range(DETAIL_LEAST..=room - LIST_LEAST);
+    held(ui, id, panel, add);
     true
+}
+
+/// `panel` at the size it was last dragged to, as far as the room allows, and at its
+/// default until it is dragged. egui keeps the size it drew: squeezed by a small window, a
+/// panel stayed that small when the window grew again.
+fn held<R>(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    panel: egui::Panel,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let (ctx, id) = (ui.ctx().clone(), egui::Id::new(id));
+    let dragged = id.with("dragged");
+    ctx.data_mut(|d| match d.get_persisted::<egui::Vec2>(dragged) {
+        // Only the size counts: egui places the panel itself.
+        Some(size) => {
+            let outer_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            d.insert_persisted(id, egui::PanelState { outer_rect });
+        }
+        None => d.remove::<egui::PanelState>(id),
+    });
+    let shown = panel.show(ui, add);
+    // egui's id for the panel's separator.
+    let handle = ctx.read_response(id.with("__resize"));
+    if handle.is_some_and(|r| r.drag_stopped()) {
+        ctx.data_mut(|d| d.insert_persisted(dragged, shown.response.rect.size()));
+    }
+    shown
 }
 
 fn stream_ui(
@@ -26569,6 +26648,93 @@ mod ui_tests {
         shot(&mut h, "99-small-env-editor");
         let save = h.get_all_by_label("Save").last().unwrap().rect();
         assert!(window.contains_rect(save), "{save:?}");
+    }
+
+    /// fb20261127a: 「視窗縮小後再放大，被壓小的窗格會停在壓小後的尺寸，要手動拖回」. A pane
+    /// squeezed by a small window is as big as before when the window grows again, the
+    /// sidebar at the width it was dragged to and the request at its default: dragged back
+    /// by hand after every shrink otherwise.
+    #[test]
+    fn regression_fb20261127a_a_squeezed_pane_grows_back_with_the_window() {
+        let big = egui::vec2(1200.0, 1000.0);
+        let mut h = with_request_sized("grows-back", big.into());
+        let size = |h: &Harness<'_, App>, id: &'static str| {
+            egui::PanelState::load(&h.ctx, id.into()).unwrap().size()
+        };
+        let edge = size(&h, "sidebar").x;
+        let to = egui::pos2(edge + 140.0, 400.0);
+        h.drag_at(egui::pos2(edge, 400.0));
+        h.run();
+        h.hover_at(to);
+        h.run();
+        h.drop_at(to);
+        h.run();
+        h.run();
+        let (sidebar, request) = (size(&h, "sidebar").x, size(&h, "request").y);
+        assert!(sidebar > edge + 100.0, "dragged from {edge} to {sidebar}");
+        h.set_size(egui::vec2(720.0, 480.0));
+        h.run();
+        h.run();
+        let squeezed = (size(&h, "sidebar").x, size(&h, "request").y);
+        assert!(
+            squeezed.0 < sidebar - 100.0 && squeezed.1 < request - 100.0,
+            "{squeezed:?}"
+        );
+        h.set_size(big);
+        h.run();
+        h.run();
+        let after = (size(&h, "sidebar").x, size(&h, "request").y);
+        let near = |a: f32, b: f32| (a - b).abs() < 1.0;
+        assert!(
+            near(after.0, sidebar) && near(after.1, request),
+            "before {:?}, squeezed {squeezed:?}, after {after:?}",
+            (sidebar, request)
+        );
+    }
+
+    /// fb20261127b: 「480 高的視窗裡 Settings 是整個捲動（分頁列會捲走）；Cookies 清單滿的時候
+    /// 也是整個對話框捲動」. In a short window only a dialog's body scrolls: scrolled as a
+    /// whole, Settings' tabs went out of view on the way to the end of a tab, and Close was
+    /// below the window until scrolled to.
+    #[test]
+    fn regression_fb20261127b_a_short_windows_dialog_scrolls_only_its_body() {
+        let mut h = with_request_sized("dialog-body", [720.0, 480.0]);
+        // With the margin every dialog keeps from the window's edges.
+        let window = h.ctx.content_rect().shrink(DIALOG_MARGIN);
+        // The dialog's is the last: it is above everything else.
+        let inside = |h: &Harness<'_, App>, what: &str, labels: &[&str]| {
+            for label in labels {
+                let at = h.get_all_by_label(label).last().unwrap().rect();
+                assert!(window.contains_rect(at), "{what}: {label} at {at:?}");
+            }
+        };
+        (h.state_mut().settings, h.state_mut().settings_tab) = (true, SettingsTab::Network);
+        h.run();
+        inside(&h, "settings", &["General", "Sync", "Apply", "Close"]);
+        // The tab's last row, scrolled to: the tabs and the footer haven't moved.
+        h.get_by_label("gzip").scroll_to_me();
+        h.run();
+        inside(
+            &h,
+            "settings, scrolled",
+            &["gzip", "General", "Sync", "Close"],
+        );
+        shot(&mut h, "99-short-settings");
+        h.state_mut().settings = false;
+        let url = reqwest::Url::parse("http://a.test/").unwrap();
+        for i in 0..40 {
+            h.state()
+                .cookies
+                .set(&url, &format!("c{i:02}"), "1")
+                .unwrap();
+        }
+        h.state_mut().cookie_manager = true;
+        h.run();
+        inside(&h, "cookies", &["Cookies", "Close", "Clear all"]);
+        h.get_by_label("c39=1").scroll_to_me();
+        h.run();
+        inside(&h, "cookies, scrolled", &["c39=1", "Cookies", "Close"]);
+        shot(&mut h, "99-short-cookies");
     }
 
     /// Found with the same feedback: OAuth 2.0's four grants in a line were wider than
