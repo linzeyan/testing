@@ -22664,6 +22664,12 @@ mod ui_tests {
         wait_live(&mut h, |app| got(app, "[a/1] hello"));
         // Connected and quiet, it draws a frame a second for its clock: its spinner drew
         // one after another for as long as the connection lasted, all CPU under WARP.
+        // Without the timer that writes unsaved edits 2 s after a click: it asks for a
+        // frame when it is due, and a step that comes 1.25 to 1.5 s after the click is
+        // told less than 500 ms (what was asked, less the harness's 250 ms step). A
+        // runner slow to connect got there: 308 ms on macOS CI, 369 ms here after a
+        // sleep of 750 ms.
+        h.state_mut().drafts_due = None;
         h.step();
         let delay = h.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
         assert!(delay >= Duration::from_millis(500), "{delay:?}");
