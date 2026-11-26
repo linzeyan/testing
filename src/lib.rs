@@ -38,6 +38,7 @@ mod net;
 mod ntlm;
 mod oauth1;
 mod openapi;
+pub mod paint;
 mod postman;
 mod postman3;
 mod runner;

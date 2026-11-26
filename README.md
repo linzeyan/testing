@@ -650,3 +650,5 @@ Interface icons are from [Lucide](https://lucide.dev) (ISC licence, in
 `assets/icons/LICENSE`).
 Bundled JavaScript, each with its licence in `vendor/`: chai, crypto-js, lodash, moment,
 tweetnacl, @noble/ed25519, sucrase (TypeScript) and js-beautify (Format).
+`vendor/eframe` is [eframe](https://github.com/emilk/egui) 0.36.2 (MIT or Apache-2.0, both
+licences beside it) with one hook added, each change marked `apitool:` in its source.

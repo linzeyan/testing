@@ -31,6 +31,26 @@ const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S)
 /// Below this workbench width (logical px) the response goes under the request: each half
 /// needs ~500 for the URL bar's buttons and the status line not to be cut off.
 const NARROW: f32 = 1000.0;
+
+/// What a pane keeps of a window too small for the sizes its neighbours were given or
+/// dragged to in a bigger one: a panel gets no more than leaves this beside it. Squeezed
+/// under it, the request and its response were cut off or gone, and their rows, with no
+/// width to lie in, wrapped into a column that grew the request over the response. This
+/// is the URL bar's: the method, Send and a URL two dozen letters to the line.
+const MAIN_LEAST: f32 = 400.0;
+/// And what a panel beside the request (the code, the variables) is never under.
+const SIDE_LEAST: f32 = 240.0;
+/// The same for the response under the request: its status line and a few lines of body.
+const RESPONSE_LEAST: f32 = 160.0;
+/// And for a stream one writes to: its message box, and a few lines of its log or of the
+/// message opened from it.
+const STREAM_LEAST: f32 = 240.0;
+/// An opened item under its list (`under_list`): a row of buttons and four lines of it,
+/// and three rows of the list.
+const DETAIL_LEAST: f32 = 90.0;
+const LIST_LEAST: f32 = 60.0;
+/// What a dialog keeps clear of the window's edge, on each side.
+const DIALOG_MARGIN: f32 = 24.0;
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
@@ -1187,6 +1207,11 @@ pub struct App {
     side_by_side: bool,
     /// Set each frame: the workbench is too narrow for side by side.
     narrow: bool,
+    /// Set each frame: the window is too narrow for the sidebar, the request and a panel
+    /// beside it (the code, the variables) abreast. The sidebar is out of the way until
+    /// the panel is closed or the window wider, whatever its toggle says, as the response
+    /// goes under the request in a narrow one.
+    crowded: bool,
     hide_sidebar: bool,
     /// macOS: the window's content runs under a transparent title bar, so the top row
     /// keeps clear of the traffic lights and moves the window when dragged.
@@ -1300,6 +1325,8 @@ pub struct App {
     tx: mpsc::Sender<Msg>,
     rx: mpsc::Receiver<Msg>,
     renderer: String,
+    /// What the window shows: a frame that comes to the same picture isn't drawn again.
+    pub painted: crate::paint::Painted,
 }
 
 impl App {
@@ -1344,6 +1371,7 @@ impl App {
             wrap_response: state.wrap_response,
             side_by_side: !state.stacked,
             narrow: false,
+            crowded: false,
             hide_sidebar: state.hide_sidebar,
             in_title_bar: false,
             sidebar_min: 0.0,
@@ -1425,6 +1453,7 @@ impl App {
             tx,
             rx,
             renderer,
+            painted: Default::default(),
         };
         app.set_tree(app.ws.tree());
         app.sync();
@@ -3806,11 +3835,31 @@ impl eframe::App for App {
     /// The system's proxy can't be left pointing at a capture that's gone.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.restore_system_proxy();
+        let (frames, drawn) = crate::paint::counts();
+        log::info!("frames: {frames} run, {drawn} drawn");
+    }
+
+    /// The window is left as it is when the frame came to the picture it shows already
+    /// (`paint::Painted`). Held back here rather than by a repaint asked for later: within
+    /// a frame's time egui counts that as now, and frames would run back to back until it
+    /// came.
+    fn wants_paint(
+        &mut self,
+        ctx: &egui::Context,
+        primitives: &[egui::ClippedPrimitive],
+        must: bool,
+    ) -> bool {
+        let target = ctx.input(crate::paint::Target::of);
+        let (draw, wait) = (self.painted).judge(primitives, target, must, Instant::now());
+        std::thread::sleep(wait);
+        draw
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         crate::i18n::set(self.appearance.language);
-        self.log_frame(frame.info().cpu_usage);
+        // Less what the frame waited in `wants_paint`: that is not work.
+        let waited = self.painted.waited().as_secs_f32();
+        self.log_frame(frame.info().cpu_usage.map(|took| took - waited));
         self.apply_appearance(ui.ctx());
         let dark = ui.ctx().theme() == egui::Theme::Dark;
         let title_bar = Some((dark, ui.input(|i| i.raw.system_theme)));
@@ -4087,8 +4136,17 @@ impl eframe::App for App {
         if let Some(e) = crate::codeedit::status(ui.ctx()) {
             self.fail(e);
         }
+        // Before the status bar, whose toggle shows it. The sidebar's width is the one it
+        // had: it keeps it while out of the way.
+        let sidebar = egui::containers::panel::PanelState::load(ui.ctx(), "sidebar".into())
+            .map_or(260.0, |state| state.size().x);
+        // As it is now: asked for from the sidebar, it comes with the next frame, which
+        // knows to make room for it.
+        let quick_look = self.quick_look;
+        let beside = quick_look || self.code_beside();
+        self.crowded = beside && ui.available_width() - sidebar - MAIN_LEAST < SIDE_LEAST;
         self.status_bar(ui);
-        if !self.hide_sidebar {
+        if self.sidebar_shown() {
             // Never narrower than its buttons: dragged to egui's 96 px, the environment's
             // and the tree's were cut off.
             let margins = egui::Frame::side_top_panel(ui.style())
@@ -4098,13 +4156,15 @@ impl eframe::App for App {
             let dark = ui.visuals().dark_mode;
             let frame =
                 egui::Frame::side_top_panel(ui.style()).fill(crate::appearance::sidebar_fill(dark));
+            let least = self.sidebar_min + margins;
+            let most = (ui.available_width() - MAIN_LEAST).max(least);
             egui::Panel::left("sidebar")
                 .default_size(260.0)
-                .min_size(self.sidebar_min + margins)
+                .size_range(least..=most)
                 .frame(frame)
                 .show(ui, |ui| self.sidebar(ui));
         }
-        if self.quick_look {
+        if quick_look {
             self.quick_look_panel(ui);
         }
         egui::CentralPanel::default().show(ui, |ui| self.main_area(ui));
@@ -4231,10 +4291,19 @@ impl App {
                 }
                 ui.separator();
                 let shown = !self.hide_sidebar;
-                let hint = t("Show or hide collections and history, for more room");
+                let hint = match self.crowded {
+                    true => t("The window is too narrow: the sidebar is back once the panel beside the request is closed"),
+                    false => t("Show or hide collections and history, for more room"),
+                };
                 let key = shortcut_label(ui.ctx(), &KEYED_ACTIONS[2].0);
-                if icon_button(ui, icon::SIDEBAR, t("Sidebar"), Some(shown))
+                // Greyed while it is out of the way, as Side by side is in a narrow window.
+                let lit = self.sidebar_shown();
+                let button = ui.add_enabled_ui(!self.crowded, |ui| {
+                    icon_button(ui, icon::SIDEBAR, t("Sidebar"), Some(lit))
+                });
+                if (button.inner)
                     .on_hover_text(format!("{hint} ({key})"))
+                    .on_disabled_hover_text(hint)
                     .clicked()
                 {
                     self.hide_sidebar = shown;
@@ -5007,7 +5076,9 @@ impl App {
         let (mut let_in, mut port_set) = (None, None);
         let (mut start, mut stop, mut export, mut open_as) = (false, false, false, None);
         let (mut decrypt, mut export_ca, mut system) = (None, false, None);
-        ui.horizontal(|ui| {
+        // Wrapped: in a window narrower than the row its end, the HTTPS switch and the CA
+        // export, was past the edge with nothing to bring it back.
+        ui.horizontal_wrapped(|ui| {
             ui.heading(t("Capture"));
             ui.add_space(8.0);
             // While listening, the address shows the port.
@@ -5041,10 +5112,9 @@ impl App {
                 None => start = ui.add(primary(t("Start capturing"))).clicked(),
             }
             let mut on = open;
-            let tick = ui.add_enabled_ui(listening.is_none(), |ui| {
-                ui.checkbox(&mut on, t("Other devices too"))
-            });
-            if (tick.inner)
+            let tick = egui::Checkbox::new(&mut on, t("Other devices too"));
+            if ui
+                .add_enabled(listening.is_none(), tick)
                 .on_hover_text(t(
                     "Listens on every network interface, not only 127.0.0.1, so WSL, a VM or a phone can use it. Anyone who can reach this machine can then send through it; Windows may ask to let apitool accept connections.",
                 ))
@@ -5054,10 +5124,9 @@ impl App {
                 let_in = Some(on);
             }
             let mut on = pointing;
-            let tick = ui.add_enabled_ui(listening.is_some(), |ui| {
-                ui.checkbox(&mut on, t("Use as the system proxy"))
-            });
-            if (tick.inner)
+            let tick = egui::Checkbox::new(&mut on, t("Use as the system proxy"));
+            if ui
+                .add_enabled(listening.is_some(), tick)
                 .on_hover_text(t(
                     "Points the system's HTTP and HTTPS proxy here; Stop or quitting puts back what was set",
                 ))
@@ -5649,7 +5718,7 @@ impl App {
             || self.runner.is_some()
             || capture
             || folder
-            || self.hide_sidebar
+            || !self.sidebar_shown()
             || title_bar
         {
             let height = if title_bar {
@@ -5662,7 +5731,7 @@ impl App {
                     // Before the tabs, so they are in front of it.
                     title_bar_drag(ui, ui.max_rect());
                 }
-                if !self.hide_sidebar {
+                if self.sidebar_shown() {
                     return self.tab_bar(ui);
                 }
                 if title_bar {
@@ -5774,6 +5843,7 @@ impl App {
             egui::Panel::right("code")
                 .resizable(true)
                 .default_size(380.0)
+                .max_size((ui.available_width() - MAIN_LEAST).max(SIDE_LEAST))
                 .show(ui, |ui| {
                     let (wire, _) = open.draft.resolved(&all_vars);
                     // code_lang is the last pick; each kind of request shows its nearest.
@@ -5858,12 +5928,22 @@ impl App {
         } else if beside {
             egui::Panel::left("request-side")
                 .default_size(ui.available_width() / 2.0)
+                .max_size(ui.available_width() - MAIN_LEAST)
                 .resizable(true)
         } else {
             // Most of the height to the request: a response under 320 px of request took
             // the rest, more than a status and a few lines of body need to be read.
-            egui::Panel::top("request")
+            // And no more than leaves the response its least: under a request sized in a
+            // taller window there was none.
+            // With a size of its own for a stream one writes to: held to that least in a
+            // short window, the request stayed as small under every tab opened after it.
+            let (id, least) = match streaming && composes(&open.draft, &self.grpc_methods) {
+                true => ("request-composing", STREAM_LEAST),
+                false => ("request", RESPONSE_LEAST),
+            };
+            egui::Panel::top(id)
                 .default_size(ui.available_height() * 0.6)
+                .max_size(ui.available_height() - least)
                 .resizable(true)
         };
         panel.show(ui, |ui| {
@@ -5961,7 +6041,10 @@ impl App {
                 // gRPC answers aren't read as an HTTP body, so they can't go to a file.
                 let downloadable = !streaming && open.draft.method != "GRPC";
                 let more = match downloadable {
-                    true => 22.0 + ui.spacing().item_spacing.x,
+                    // The caret's own width, its icon and padding: the 22 kept for it was
+                    // short of that, so the row ran past its pane, and a pane takes the
+                    // width of its widest row: what came under it was cut off at the right.
+                    true => more_width(ui).max(22.0) + ui.spacing().item_spacing.x,
                     false => 0.0,
                 };
                 let width = ui.available_width() - button[0] - 8.0 - more;
@@ -6889,15 +6972,17 @@ impl App {
             let area = egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, [0.0, 80.0]);
             modal = modal.area(area);
         }
-        // Room for the list's two columns side by side, as on the pane.
+        // Room for the list's two columns side by side, as on the pane; one column where
+        // the window hasn't that.
+        let wide = ctx.content_rect().width() - 2.0 * DIALOG_MARGIN >= SHORTCUTS_WIDE;
         let width = match dialog {
-            Dialog::Shortcuts => 720.0,
+            Dialog::Shortcuts if wide => SHORTCUTS_WIDE,
             // A pasted spec is long lines: the box was 360 px.
             Dialog::Paste { .. } => 560.0,
             _ => 360.0,
         };
-        let modal = modal.show(ctx, |ui| {
-            ui.set_width(width);
+        let modal = fitted(ctx, modal, |ui| {
+            ui.set_width(dialog_width(ui, width));
             match dialog {
                 Dialog::Name { kind, name, error } => {
                     ui.heading(match kind {
@@ -6920,33 +7005,36 @@ impl App {
                     // Labels before their fields: the folder's came after its combo, and the
                     // name had only a hint, gone once typed in.
                     let id = egui::Id::new("name-edit");
-                    egui::Grid::new("name-fields").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                        if let NameKind::SaveAs { folder, .. }
-                        | NameKind::NewRequest(folder)
-                        | NameKind::Captured { folder, .. } = kind
-                        {
-                            let shown = (folders.iter())
-                                .find(|(_, p)| p == folder)
-                                .map_or("", |(label, _)| label.as_str());
-                            ui.label(t("Folder"));
-                            combo("name-folder")
-                                .selected_text(shown)
-                                .width(280.0)
-                                .show_ui(ui, |ui| {
-                                    for (label, path) in &folders {
-                                        selectable_value(ui, folder, path.clone(), label);
-                                    }
-                                });
+                    egui::Grid::new("name-fields")
+                        .num_columns(2)
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            if let NameKind::SaveAs { folder, .. }
+                            | NameKind::NewRequest(folder)
+                            | NameKind::Captured { folder, .. } = kind
+                            {
+                                let shown = (folders.iter())
+                                    .find(|(_, p)| p == folder)
+                                    .map_or("", |(label, _)| label.as_str());
+                                ui.label(t("Folder"));
+                                combo("name-folder")
+                                    .selected_text(shown)
+                                    .width(280.0)
+                                    .show_ui(ui, |ui| {
+                                        for (label, path) in &folders {
+                                            selectable_value(ui, folder, path.clone(), label);
+                                        }
+                                    });
+                                ui.end_row();
+                            }
+                            ui.label(t("Name"));
+                            ui.add(
+                                egui::TextEdit::singleline(name)
+                                    .id(id)
+                                    .desired_width(f32::INFINITY),
+                            );
                             ui.end_row();
-                        }
-                        ui.label(t("Name"));
-                        ui.add(
-                            egui::TextEdit::singleline(name)
-                                .id(id)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.end_row();
-                    });
+                        });
                     // Before refocusing: Enter is what made the field let go of focus.
                     let enter = enter_pressed(ui);
                     if !enter && ui.memory(|m| m.focused().is_none()) {
@@ -7076,10 +7164,9 @@ impl App {
                     ui.heading(title);
                     ui.label(text);
                     ui.horizontal(|ui| {
-                        let go = egui::Button::new(
-                            RichText::new(go).strong().color(Color32::WHITE),
-                        )
-                        .fill(RED);
+                        let go =
+                            egui::Button::new(RichText::new(go).strong().color(Color32::WHITE))
+                                .fill(RED);
                         if ui.add(go).clicked() || enter_pressed(ui) {
                             let doomed = doomed.clone();
                             then = Some(Box::new(move |app, _| {
@@ -7403,8 +7490,8 @@ impl App {
                             .then(|| rfd::FileDialog::new().pick_folder())
                             .flatten()
                             .map(|p| p.display().to_string());
-                        let input = (dropped.or(chosen).or(folder))
-                            .or(import.then(|| text.clone()));
+                        let input =
+                            (dropped.or(chosen).or(folder)).or(import.then(|| text.clone()));
                         if let Some(input) = input {
                             then = Some(Box::new(move |app, _| app.submit_import(&input)));
                         }
@@ -7445,8 +7532,8 @@ impl App {
         // fields from taking a click.)
         let id = egui::Id::new("env-editor");
         let area = egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, [0.0, 60.0]);
-        egui::Modal::new(id).area(area).show(ctx, |ui| {
-            ui.set_width(620.0);
+        fitted(ctx, egui::Modal::new(id).area(area), |ui| {
+            ui.set_width(dialog_width(ui, 620.0));
             match &ed.env {
                 Some(name) => ui.heading(tf("Environment: {}", &[&name])),
                 None => ui.heading(t("Globals")),
@@ -7458,11 +7545,21 @@ impl App {
                 let n = (ed.shared.iter().chain(&ed.secret))
                     .filter(|v| v.enabled && !v.key.is_empty())
                     .count();
-                sub_tab(ui, &mut ed.tab, FolderTab::Vars, counted(n, t("Variables")), false);
+                sub_tab(
+                    ui,
+                    &mut ed.tab,
+                    FolderTab::Vars,
+                    counted(n, t("Variables")),
+                    false,
+                );
                 scope_tabs(ui, &mut ed.tab, &ed.scope);
             });
             ui.separator();
-            let scroll = egui::ScrollArea::vertical().max_height(420.0);
+            // No further down than leaves the buttons under it inside the window: the
+            // dialog hangs from the top, and only its buttons close it.
+            let under = 70.0;
+            let room = ui.ctx().content_rect().bottom() - ui.cursor().top() - under;
+            let scroll = egui::ScrollArea::vertical().max_height(room.clamp(80.0, 420.0));
             scroll.show(ui, |ui| {
                 // What `{{…}}` is in this environment, not in the active one: a value made of
                 // another variable is red only when that one is nowhere.
@@ -7477,15 +7574,20 @@ impl App {
                     return scope_editor(ui, "env", tab, scope, parent, vars, script_tab, timeout);
                 }
                 ui.label(RichText::new(t("Shared")).strong());
-                ui.weak(tf("Written to {} in the workspace folder, for git.", &[&file]));
+                ui.weak(tf(
+                    "Written to {} in the workspace folder, for git.",
+                    &[&file],
+                ));
                 kv_table(ui, "env-shared", &mut ed.shared, vars, false);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(t("Secret")).strong());
                     secrets_eye(ui, true);
                 });
-                ui.weak(t("Kept on this machine only (in apitool.db), never written to the files. \
-                     Overrides shared values; values set by scripts land here."));
+                ui.weak(t(
+                    "Kept on this machine only (in apitool.db), never written to the files. \
+                     Overrides shared values; values set by scripts land here.",
+                ));
                 kv_table(ui, "env-secret", &mut ed.secret, vars, false);
             });
             if !ed.error.is_empty() {
@@ -7501,7 +7603,9 @@ impl App {
                 if ed.env.is_some() {
                     duplicate = ui
                         .button(t("Duplicate…"))
-                        .on_hover_text(t("Save, then copy into a new environment (e.g. dev → prod)"))
+                        .on_hover_text(t(
+                            "Save, then copy into a new environment (e.g. dev → prod)",
+                        ))
                         .clicked();
                     // As shown, edits included; for Postman's Import > Raw text.
                     if ui.button(t("Copy as Postman environment")).clicked() {
@@ -7758,8 +7862,8 @@ impl App {
         let (mut close, mut remove, mut clear) = (false, None, false);
         // A centred modal like every other dialog: as a free window it opened over the
         // environment picker, far from the cookie icon at the right.
-        let modal = egui::Modal::new(egui::Id::new("cookies")).show(ctx, |ui| {
-            ui.set_width(560.0);
+        let modal = fitted(ctx, egui::Modal::new(egui::Id::new("cookies")), |ui| {
+            ui.set_width(dialog_width(ui, 560.0));
             ui.heading(t("Cookies"));
             if rows.is_empty() {
                 ui.weak(t("No cookies yet. Set-Cookie responses fill the jar."));
@@ -7836,6 +7940,7 @@ impl App {
         egui::Panel::right("quick-look")
             .resizable(true)
             .default_size(320.0)
+            .max_size((ui.available_width() - MAIN_LEAST).max(SIDE_LEAST))
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -8271,10 +8376,16 @@ impl App {
             egui::Grid::new("runner-settings").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label(t("Data file"));
                 ui.horizontal(|ui| {
+                    // And its button beside it: the field took all of a page narrower
+                    // than this, the button went past the edge and widened the page, and
+                    // the export button at the right of the row below went out with it.
+                    let button = button_height(ui) + ui.spacing().item_spacing.x;
+                    let margins = 2.0 * ui.spacing().button_padding.x;
+                    let room = ui.available_width() - button - margins;
                     ui.add(
                         egui::TextEdit::singleline(&mut view.data_path)
                             .hint_text(t("Optional CSV (with header row) or JSON array; one iteration per row"))
-                            .desired_width(480.0),
+                            .desired_width(room.min(480.0)),
                     );
                     browse(ui, &mut view.data_path, &[(t("CSV or JSON"), &["csv", "json"])], false);
                 });
@@ -8367,10 +8478,12 @@ impl App {
         });
         ui.separator();
 
+        // No more than half the page: the results are the other.
+        let most = (ui.available_width() / 2.0).max(180.0);
         let changed = egui::Panel::left("runner-order")
             .resizable(true)
             .default_size(280.0)
-            .min_size(180.0)
+            .size_range(180.0..=most)
             .show(ui, |ui| {
                 ui.add_enabled_ui(!running, |ui| {
                     run_order_ui(ui, &mut view.order, &tree, &self.ws)
@@ -8539,9 +8652,9 @@ impl App {
         let mut close = false;
         let (mut check, mut install, mut restart) = (false, None, false);
         let tab = &mut self.settings_tab;
-        let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
+        let modal = fitted(ctx, egui::Modal::new(egui::Id::new("settings")), |ui| {
             // As wide as Network needs, on every tab: a width per tab moved the tabs.
-            ui.set_width(560.0);
+            ui.set_width(dialog_width(ui, 560.0));
             ui.heading(t("Settings"));
             ui.add_space(6.0);
             // A tab each: in one long grid, the sections ran together and got misread.
@@ -8913,7 +9026,9 @@ impl App {
                         });
                         ui.end_row();
                     });
-                    ui.weak(t("To a private repository. What isn't ticked stays on this machine."));
+                    ui.weak(t(
+                        "To a private repository. What isn't ticked stays on this machine.",
+                    ));
                 }
             }
             // As tall as the tallest tab shown yet: a shorter one would re-centre the window
@@ -9518,7 +9633,21 @@ impl App {
 
     /// The last click was in the tree, and it's still in view.
     fn tree_focused(&self) -> bool {
-        self.tree_focus && !self.hide_sidebar && !self.show_history
+        self.tree_focus && self.sidebar_shown() && !self.show_history
+    }
+
+    /// Whether the sidebar is laid out: not when hidden, nor while `crowded`.
+    fn sidebar_shown(&self) -> bool {
+        !self.hide_sidebar && !self.crowded
+    }
+
+    /// Whether the code panel is laid out this frame: asked for, and a request is what
+    /// the main area shows (`main_area`'s own order of what it shows).
+    fn code_beside(&self) -> bool {
+        let page = self.capture_shown
+            || self.runner.is_some() && self.runner_shown
+            || self.folder_shown && self.folder_editor().is_some();
+        self.code && !page && self.open.is_some()
     }
 
     /// What F2 and Delete are for: the folder last clicked, while the tree has the focus,
@@ -12935,9 +13064,15 @@ fn reset_button(ui: &mut egui::Ui, default: bool, inherited: &Inherited) -> bool
 }
 
 /// A settings grid's third column. Wrapped: a Grid doesn't wrap by itself, so a long
-/// one ran past the pane's edge, which has no sideways scroll.
+/// one ran past the pane's edge, which has no sideways scroll. With less than a few
+/// words' width left it is a "…" that shows it on hover: wrapped there it was a column
+/// of single words, its row a dozen lines tall and the rows after it out of view, and
+/// cut short, three or four letters that said nothing.
 fn grid_hint(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(egui::Label::new(RichText::new(text).weak()).wrap())
+    match ui.available_width() < 120.0 {
+        true => ui.weak("…").on_hover_text(text),
+        false => ui.add(egui::Label::new(RichText::new(text).weak()).wrap()),
+    }
 }
 
 /// The Settings tab's rows for how a `method` request connects, in a 3-column grid: each
@@ -13319,6 +13454,9 @@ fn cipher_picker(ui: &mut egui::Ui, ciphers: &mut Vec<String>) {
 /// biggest blank area, and it is in view exactly when nothing has been sent yet. There it
 /// shows the everyday few and the key for the rest (`all` false), as Hoppscotch does: all
 /// of them in two columns ran off a narrow pane.
+/// What the whole list takes as two lists side by side.
+const SHORTCUTS_WIDE: f32 = 720.0;
+
 fn shortcut_list(ui: &mut egui::Ui, all: bool) {
     ui.add_space(12.0);
     let key = |k: &KeyboardShortcut| shortcut_label(ui.ctx(), k);
@@ -13402,11 +13540,14 @@ fn shortcut_list(ui: &mut egui::Ui, all: bool) {
         keyed(4),
     ];
     let few: Vec<_> = rows[..7].iter().chain(rows.last()).cloned().collect();
+    // Two lists side by side when there's room, one long one when there isn't: the
+    // layout below doesn't put a grid on the next line by itself, and the two made the
+    // dialog wider than a window 720 wide, its left edge and Close outside it.
     let (rows, per) = match all {
-        true => (&rows[..], rows.len().div_ceil(2)),
+        true if ui.available_width() >= SHORTCUTS_WIDE => (&rows[..], rows.len().div_ceil(2)),
+        true => (&rows[..], rows.len()),
         false => (&few[..], few.len()),
     };
-    // Two lists side by side when there's room, one under the other when there isn't.
     egui::ScrollArea::vertical().show(ui, |ui| {
         let layout = egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true);
         ui.with_layout(layout, |ui| {
@@ -13674,7 +13815,8 @@ fn scripts_editor(
             }
         });
         // Nothing to pick: a script that isn't JavaScript runs as TypeScript.
-        ui.weak("JavaScript · TypeScript")
+        // Cut short when the row has no room for it, not run past the pane's edge.
+        ui.add(egui::Label::new(RichText::new("JavaScript · TypeScript").weak()).truncate())
             .on_hover_text(t("TypeScript's types are stripped before it runs; they aren't checked."));
     });
     let above = match tab {
@@ -13813,7 +13955,9 @@ fn grpc_bar(
 ) -> (Option<String>, bool) {
     let (mut error, mut ask) = (None, false);
     let reflection = source.starts_with(crate::grpc::REFLECTION);
-    ui.horizontal(|ui| {
+    // Wrapped: the note at its end is a sentence, and in one line it ran past a narrow
+    // pane's edge and widened the pane, the tabs and tables under it cut off with it.
+    ui.horizontal_wrapped(|ui| {
         ui.label(t("Proto"));
         // A path's room grows with the pane, the rest is hover. Empty asks the server, as
         // the note beside says: the hint only shows what goes here.
@@ -13851,7 +13995,7 @@ fn grpc_bar(
                 };
                 combo("rpc")
                     .selected_text(shown)
-                    .width(ui.available_width() - 110.0)
+                    .width((ui.available_width() - 110.0).max(160.0))
                     .show_ui(ui, |ui| {
                         for m in list.iter() {
                             let kind = match (m.client_streaming, m.server_streaming) {
@@ -14579,14 +14723,11 @@ fn flow_list(
     if shown.is_none() {
         *picked = None;
     }
-    let (mut open_as, mut close) = (None, false);
+    let (mut open_as, mut close, mut listed) = (None, false, true);
     if let Some(f) = shown {
-        egui::Panel::bottom("capture-detail")
-            .resizable(true)
-            .default_size(220.0)
-            .show(ui, |ui| {
-                let text = flow_text(f, *shown_as);
-                ui.horizontal(|ui| {
+        listed = under_list(ui, "capture-detail", 220.0, |ui| {
+            let text = flow_text(f, *shown_as);
+            ui.horizontal(|ui| {
                     let open = ui.add_enabled(!f.tunnel(), egui::Button::new(t("Open as request")));
                     let open = (open.on_hover_text(t(
                         "A new request from what was sent, its answer saved as an example",
@@ -14623,16 +14764,19 @@ fn flow_list(
                             .clicked();
                     });
                 });
-                egui::ScrollArea::vertical()
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        let text = RichText::new(text).monospace();
-                        ui.add(egui::Label::new(text).selectable(true).wrap());
-                    });
-            });
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    let text = RichText::new(text).monospace();
+                    ui.add(egui::Label::new(text).selectable(true).wrap());
+                });
+        });
     }
     if close {
         *picked = None;
+    }
+    if !listed {
+        return open_as;
     }
     if list.is_empty() {
         ui.weak(t("Nothing captured yet."));
@@ -14642,6 +14786,7 @@ fn flow_list(
     let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
     egui::ScrollArea::vertical()
         .auto_shrink(false)
+        .min_scrolled_height(LIST_LEAST)
         .stick_to_bottom(true)
         .show_rows(ui, row_h, hits.len(), |ui, rows| {
             // As the response body's rows: no taller than `row_h`.
@@ -14994,6 +15139,52 @@ fn captured_request(f: &crate::capture::Flow) -> Option<(String, Request)> {
     Some((store::unescape_name(name), request))
 }
 
+/// A dialog's width: what it asks for, or what the window has room for.
+fn dialog_width(ui: &egui::Ui, wanted: f32) -> f32 {
+    wanted.min(ui.ctx().content_rect().width() - 2.0 * DIALOG_MARGIN)
+}
+
+/// `modal` shown no taller than the window: in a shorter one it scrolls as a whole. In
+/// the smallest window (720 x 480) the shortcut list was wider than the window and
+/// Settings taller: their edges were outside it, Close and Apply with them.
+fn fitted<R>(
+    ctx: &egui::Context,
+    modal: egui::Modal,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::ModalResponse<R> {
+    let room = ctx.content_rect().height() - 2.0 * DIALOG_MARGIN;
+    modal.show(ctx, |ui| {
+        // The least too: a scroll area takes no more than the height it is offered, and a
+        // centred dialog is offered what it had the frame before, so it stayed short of
+        // the window by a third.
+        let scroll = egui::ScrollArea::vertical().max_height(room);
+        scroll.min_scrolled_height(room).show(ui, add).inner
+    })
+}
+
+/// Where an opened item of a list shows: in a panel under the list, dragged to size, when
+/// the pane has the height for both; in the list's place when it hasn't. The panel used to
+/// take what height there was, and the list, which a scroll area never makes shorter than
+/// its least, was drawn on over it. Returns whether the list has its place.
+fn under_list(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    default: f32,
+    add: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let room = ui.available_height();
+    if room < DETAIL_LEAST + LIST_LEAST {
+        add(ui);
+        return false;
+    }
+    egui::Panel::bottom(id)
+        .resizable(true)
+        .default_size(default)
+        .size_range(DETAIL_LEAST..=room - LIST_LEAST)
+        .show(ui, add);
+    true
+}
+
 fn stream_ui(
     ui: &mut egui::Ui,
     s: &mut StreamSession,
@@ -15061,39 +15252,39 @@ fn stream_ui(
     if selected.and_then(at).is_none_or(|i| i >= log.events.len()) {
         s.selected = None;
     }
-    let mut close_detail = false;
+    let (mut close_detail, mut listed) = (false, true);
     if let Some((_, text)) = &s.selected {
-        egui::Panel::bottom("stream-detail")
-            .resizable(true)
-            .default_size(160.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if icon_button(ui, icon::COPY, t("Copy"), None)
-                        .on_hover_text(t("Copy"))
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(text.clone());
-                    }
-                    ui.weak(human_size(text.len()));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        close_detail = icon_button(ui, icon::X, t("Close"), None)
-                            .on_hover_text(t("Close"))
-                            .clicked();
-                    });
+        listed = under_list(ui, "stream-detail", 160.0, |ui| {
+            ui.horizontal(|ui| {
+                if icon_button(ui, icon::COPY, t("Copy"), None)
+                    .on_hover_text(t("Copy"))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(text.clone());
+                }
+                ui.weak(human_size(text.len()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    close_detail = icon_button(ui, icon::X, t("Close"), None)
+                        .on_hover_text(t("Close"))
+                        .clicked();
                 });
-                egui::ScrollArea::vertical()
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new(text.as_str()).monospace())
-                                .selectable(true)
-                                .wrap(),
-                        );
-                    });
             });
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(text.as_str()).monospace())
+                            .selectable(true)
+                            .wrap(),
+                    );
+                });
+        });
     }
     if close_detail {
         s.selected = None;
+    }
+    if !listed {
+        return;
     }
     // One line per event and only the rows in view laid out: 5000 wrapped messages
     // would cost gigabytes of text layout every frame.
@@ -15102,6 +15293,7 @@ fn stream_ui(
     let mut clicked = None;
     egui::ScrollArea::vertical()
         .auto_shrink(false)
+        .min_scrolled_height(LIST_LEAST)
         .stick_to_bottom(true)
         .show_rows(
             ui,
@@ -15172,8 +15364,9 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
     let method = draft.method.as_str();
     let (mqtt, nats, saved) = (&mut draft.mqtt, &mut draft.nats, &mut draft.messages);
     if method == "NATS" {
-        // Part of the request, as MQTT's topic is.
-        ui.horizontal(|ui| {
+        // Part of the request, as MQTT's topic is. Wrapped: in a narrow pane the row ran
+        // on past the edge, and took Send and the buttons under it out with it.
+        ui.horizontal_wrapped(|ui| {
             ui.label(t("Publish to"));
             ui.add(
                 egui::TextEdit::singleline(&mut nats.subject)
@@ -15217,7 +15410,7 @@ fn composer(ui: &mut egui::Ui, c: &mut Compose, draft: &mut Request, can_send: b
     }
     if method == "MQTT" {
         // Part of the request, as in Postman, so it's there next time.
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(t("Publish to"));
             ui.add(
                 egui::TextEdit::singleline(&mut mqtt.topic)
@@ -17074,8 +17267,13 @@ mod ui_tests {
     }
 
     fn harness(ws: Workspace) -> Harness<'static, App> {
+        harness_sized(ws, [1200.0, 800.0])
+    }
+
+    /// In a window that size from its first frame: panes keep the sizes they first got.
+    fn harness_sized(ws: Workspace, size: [f32; 2]) -> Harness<'static, App> {
         Harness::builder()
-            .with_size([1200.0, 800.0])
+            .with_size(size)
             .build_eframe(|_| App::new(ws, "test".into()))
     }
 
@@ -18044,6 +18242,10 @@ mod ui_tests {
 
     /// A workspace with one request `r` (and env `dev` with `host`), opened in the app.
     fn with_request(name: &str) -> Harness<'static, App> {
+        with_request_sized(name, [1200.0, 800.0])
+    }
+
+    fn with_request_sized(name: &str, size: [f32; 2]) -> Harness<'static, App> {
         let ws = workspace(name);
         ws.create_request(&ws.collections(), "r").unwrap();
         ws.save_env(Some("dev"), &[KeyValue::new("host", "127.0.0.1:1")], &[])
@@ -18052,7 +18254,7 @@ mod ui_tests {
             active_env: Some("dev".into()),
             ..Default::default()
         });
-        let mut h = harness(ws);
+        let mut h = harness_sized(ws, size);
         h.run();
         h.get_by_label("r").click();
         h.run();
@@ -25990,6 +26192,97 @@ mod ui_tests {
         out
     }
 
+    /// The texts the last frame painted over a text painted before them, as "later over
+    /// earlier": two lines printed on top of each other. A text under something opaque
+    /// painted in between (a menu, a dialog, a panel) doesn't count: it isn't seen.
+    fn texts_over_texts<S>(h: &Harness<'_, S>) -> Vec<String> {
+        enum Painted {
+            Text(String, egui::Rect),
+            Cover(egui::Rect),
+        }
+        fn walk(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<Painted>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, clip, out)),
+                egui::Shape::Text(t) => {
+                    for row in &t.galley.rows {
+                        // The ink, not the line's box: the boxes of neighbours may touch.
+                        let at = row.pos.to_vec2() + t.pos.to_vec2();
+                        let ink = row.visuals.mesh_bounds.translate(at).intersect(clip);
+                        if ink.is_positive() {
+                            out.push(Painted::Text(row.text(), ink));
+                        }
+                    }
+                }
+                egui::Shape::Rect(r) if r.fill.is_opaque() => {
+                    out.push(Painted::Cover(r.rect.intersect(clip)));
+                }
+                _ => {}
+            }
+        }
+        let mut painted = Vec::new();
+        for c in &h.output().shapes {
+            walk(&c.shape, c.clip_rect, &mut painted);
+        }
+        let mut found = Vec::new();
+        for (j, later) in painted.iter().enumerate() {
+            let Painted::Text(text, rect) = later else {
+                continue;
+            };
+            for (i, earlier) in painted[..j].iter().enumerate() {
+                let Painted::Text(under, at) = earlier else {
+                    continue;
+                };
+                let both = rect.intersect(*at);
+                // More than the edges of two neighbours meeting.
+                if both.width() < 3.0 || both.height() < 3.0 {
+                    continue;
+                }
+                let covers = |p: &Painted| matches!(p, Painted::Cover(c) if c.contains_rect(both));
+                if !painted[i + 1..j].iter().any(covers) {
+                    found.push(format!("{text:?} over {under:?} at {both:?}"));
+                }
+            }
+        }
+        found
+    }
+
+    /// The lines of text the last frame painted that are cut off at the right: part of
+    /// one in view and the rest past the edge of what it was painted under. Not what
+    /// scrolls sideways by design: monospace (code, bodies, logs) and the one line of a
+    /// text field.
+    fn texts_cut_off<S>(h: &Harness<'_, S>) -> Vec<String> {
+        fn walk(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, clip, out)),
+                egui::Shape::Text(t) => {
+                    let mono = (t.galley.job.sections.first())
+                        .is_some_and(|s| s.format.font_id.family == egui::FontFamily::Monospace);
+                    // A field's clip is its own line.
+                    if mono || clip.height() < 40.0 {
+                        return;
+                    }
+                    for row in &t.galley.rows {
+                        let at = row.pos.to_vec2() + t.pos.to_vec2();
+                        let ink = row.visuals.mesh_bounds.translate(at);
+                        let seen = ink.intersect(clip);
+                        if seen.is_positive()
+                            && seen.width() >= 3.0
+                            && ink.right() > clip.right() + 3.0
+                        {
+                            out.push(format!("{:?} cut at x {}", row.text(), clip.right()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for c in &h.output().shapes {
+            walk(&c.shape, c.clip_rect, &mut found);
+        }
+        found
+    }
+
     /// The colour the last frame painted `text` in, if it did.
     fn painted_color<S>(h: &Harness<'_, S>, text: &str) -> Option<Color32> {
         fn walk(shape: &egui::Shape, text: &str) -> Option<Color32> {
@@ -26046,6 +26339,217 @@ mod ui_tests {
             let now = ["Body", "NATS", "after"].map(|text| at(&h, text));
             assert_eq!(now, before, "pointing at {choice}");
         }
+    }
+
+    /// 0.163.2 feedback: 「游標在程式畫面上移動 cpu會飆很高」. eframe draws every frame it
+    /// runs and runs one for every pointer move; on the VDI the renderer is the CPU (WARP),
+    /// so the whole window was rasterised again for each, on every core, for as long as
+    /// the pointer moved (Windows VM: 28 frames a second, 1.7 cores). A frame that comes
+    /// to the picture already in the window is no longer drawn; one that changes it, a
+    /// row's hover, still is, on the frame the pointer gets there.
+    #[test]
+    fn regression_fb20261126a_a_pointer_moving_over_nothing_draws_nothing() {
+        let mut h = with_request("pointer-draws");
+        // What eframe asks after each frame, and draws on a yes; with it, whether the
+        // frame came to other shapes than the one before. Now and then one does with the
+        // pointer over nothing: the status bar's memory figure turns over.
+        let mut last = Vec::new();
+        let mut frame = |h: &mut Harness<'_, App>| {
+            let out = h.output();
+            let changed = out.shapes != last;
+            last.clone_from(&out.shapes);
+            let primitives = h.ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
+            let ctx = h.ctx.clone();
+            let drawn = eframe::App::wants_paint(h.state_mut(), &ctx, &primitives, false);
+            (drawn, changed)
+        };
+        let move_to = |h: &mut Harness<'_, App>, at: egui::Pos2| {
+            h.event(egui::Event::PointerMoved(at));
+            h.step();
+        };
+        // The sidebar under its one row: nothing there answers to the pointer.
+        let empty = egui::pos2(130.0, 600.0);
+        move_to(&mut h, empty);
+        h.run();
+        frame(&mut h);
+        let (mut same, mut needless) = (0, 0);
+        for i in 0..40 {
+            let (dx, dy) = ((i % 8) as f32 * 9.0, (i / 8) as f32 * 9.0);
+            move_to(&mut h, empty + egui::vec2(dx, dy));
+            let (drawn, changed) = frame(&mut h);
+            same += usize::from(!changed);
+            needless += usize::from(drawn && !changed);
+        }
+        assert!(same > 0, "no move of 40 left the window as it was");
+        assert_eq!(
+            needless, 0,
+            "frames drawn in 40 moves of the pointer over an empty part of the window, \
+             of the {same} that came to the picture already in it"
+        );
+        // The first "r" is the tree's; its tab is the other.
+        let row = h.get_all_by_label("r").next().unwrap().rect().center();
+        assert!(row.x < 260.0, "{row:?}");
+        move_to(&mut h, row);
+        // egui knows what is under the pointer from the frame before.
+        let first = frame(&mut h).0;
+        h.step();
+        assert!(first || frame(&mut h).0, "the row's hover is drawn");
+        h.run();
+        frame(&mut h);
+        move_to(&mut h, row + egui::vec2(2.0, 0.0));
+        let (drawn, changed) = frame(&mut h);
+        assert!(
+            !drawn || changed,
+            "and once: the pointer is still on the row"
+        );
+    }
+
+    /// 0.163.2 feedback: 「在視窗不夠大的狀況下 點開nats 訊息 會發生重疊 其他可能也會」. The
+    /// opened message's panel took all the height its pane had left, and the log, which
+    /// a scroll area never lets be shorter than 64 px, was drawn on over it: the message
+    /// and the log's lines on top of each other, neither to be read. With the height for
+    /// one of them only, the message has it: it is what was asked for.
+    #[test]
+    fn regression_fb20261126b_an_opened_message_is_not_written_over_in_a_small_window() {
+        for (w, t) in [(720.0, 480.0), (900.0, 560.0), (1100.0, 640.0)] {
+            // In a window that size from its start, and in one made that size after: the
+            // panes come with the heights they had.
+            for shrunk in [false, true] {
+                let name = format!("small-{w}-{shrunk}");
+                let mut h = match shrunk {
+                    false => with_request_sized(&name, [w, t]),
+                    true => with_request(&name),
+                };
+                stream_with_a_message_open(&mut h, "NATS");
+                if shrunk {
+                    h.set_size(egui::vec2(w, t));
+                    h.run_steps(3);
+                }
+                shot(&mut h, &format!("99-small-{w}-message-{shrunk}"));
+                let over = texts_over_texts(&h);
+                assert!(over.is_empty(), "{w}x{t}, shrunk {shrunk}: {over:#?}");
+                // What it was opened for: three of its lines at least, to read.
+                let read = (painted_texts(&h).iter())
+                    .find(|(text, ..)| text.contains("\n") && text.contains(r#""sku": "A-3""#))
+                    .map_or(0.0, |(_, rect, clip)| rect.intersect(*clip).height());
+                assert!(
+                    read >= 40.0,
+                    "{w}x{t}, shrunk {shrunk}: {read} px of the message"
+                );
+            }
+        }
+    }
+
+    /// The same feedback's 「其他可能也會」: every screen of the tour in the smallest
+    /// window the app allows, and no text of any of them written over another.
+    #[test]
+    fn regression_fb20261126b_no_screen_of_the_smallest_window_writes_over_its_text() {
+        let mut h = with_request_sized("small-tour", [720.0, 480.0]);
+        let (mut over, mut cut) = (Vec::new(), Vec::new());
+        tour(&mut h, &mut |h, name| {
+            shot(h, &format!("s-{name}"));
+            over.extend(
+                texts_over_texts(h)
+                    .into_iter()
+                    .map(|o| format!("{name}: {o}")),
+            );
+            cut.extend(texts_cut_off(h).into_iter().map(|o| format!("{name}: {o}")));
+        });
+        assert!(over.is_empty(), "{over:#?}");
+        assert!(cut.is_empty(), "{cut:#?}");
+    }
+
+    /// The same feedback's 「其他可能也會」, the dialogs: in the smallest window the
+    /// shortcut list was wider than the window and Settings taller, their edges outside
+    /// it and Close with them. Each is inside the window now, its buttons there or
+    /// scrolled to.
+    #[test]
+    fn regression_fb20261126b_a_dialog_is_inside_the_smallest_window() {
+        let mut h = with_request_sized("small-dialogs", [720.0, 480.0]);
+        let window = h.ctx.content_rect();
+        let reached = |h: &mut Harness<'static, App>, what: &str, label: &str| {
+            // The dialog's is the last: it is above everything else.
+            h.get_all_by_label(label).last().unwrap().scroll_to_me();
+            h.run();
+            let at = h.get_all_by_label(label).last().unwrap().rect();
+            assert!(window.contains_rect(at), "{what}: {label} at {at:?}");
+        };
+        h.state_mut().act(Action::Shortcuts);
+        h.run();
+        shot(&mut h, "99-small-shortcuts");
+        // The upper one is the heading: the list's last row is the shortcut for this list.
+        let named = h.get_all_by_label("Keyboard shortcuts").map(|n| n.rect());
+        let heading = named.min_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
+        assert!(window.contains_rect(heading), "{heading:?}");
+        reached(&mut h, "shortcuts", "Close");
+        h.state_mut().dialog = None;
+        // The tallest of its tabs, which the others are then padded to.
+        (h.state_mut().settings, h.state_mut().settings_tab) = (true, SettingsTab::Network);
+        h.run();
+        let heading = h.get_all_by_label("Settings").last().unwrap().rect();
+        assert!(window.contains_rect(heading), "{heading:?}");
+        reached(&mut h, "settings", "Close");
+        shot(&mut h, "99-small-settings");
+        h.state_mut().settings = false;
+        // An environment of forty variables: its list is what gives way, not Save.
+        h.state_mut().act(Action::Globals);
+        h.run();
+        h.state_mut().env_editor.as_mut().unwrap().shared = (0..40)
+            .map(|i| KeyValue::new(format!("key_{i}"), "value"))
+            .collect();
+        h.run();
+        shot(&mut h, "99-small-env-editor");
+        let save = h.get_all_by_label("Save").last().unwrap().rect();
+        assert!(window.contains_rect(save), "{save:?}");
+    }
+
+    /// Found with the same feedback: a stream one writes to keeps more of a short window
+    /// for its log than a response gets, and the request it left small for that was as
+    /// small under the tab opened next.
+    #[test]
+    fn a_streams_short_request_is_not_the_next_tabs() {
+        let mut h = with_request_sized("own-size", [720.0, 480.0]);
+        let request = |h: &Harness<'_, App>| {
+            let state = egui::containers::panel::PanelState::load(&h.ctx, "request".into());
+            state.unwrap().size().y
+        };
+        let before = request(&h);
+        for method in ["NATS", "GET"] {
+            h.state_mut().open.as_mut().unwrap().draft.method = method.into();
+            h.run();
+        }
+        assert_eq!(request(&h), before);
+    }
+
+    /// Found with the same feedback: the code or the variables opened beside the request
+    /// in a window 720 wide left the request 60 px between them and the sidebar, its rows
+    /// wrapped into a column. The sidebar gives way while one is open, and comes back.
+    #[test]
+    fn the_sidebar_gives_way_to_a_panel_beside_the_request_in_a_narrow_window() {
+        let sidebar = |h: &Harness<'_, App>| h.query_all_by_label("Collections").count();
+        for quick_look in [false, true] {
+            let mut h = with_request_sized(&format!("crowded-{quick_look}"), [720.0, 480.0]);
+            assert_eq!(sidebar(&h), 1);
+            let open = |h: &mut Harness<'_, App>, on: bool| {
+                match quick_look {
+                    true => h.state_mut().quick_look = on,
+                    false => h.state_mut().code = on,
+                }
+                h.run();
+            };
+            open(&mut h, true);
+            assert_eq!(sidebar(&h), 0, "quick look {quick_look}: out of the way");
+            // The URL bar is a row still: Send beside the URL, under the request's name.
+            let send = h.get_by_label("Send").rect();
+            assert!(send.top() < 120.0 && send.right() < 480.0, "{send:?}");
+            open(&mut h, false);
+            assert_eq!(sidebar(&h), 1, "quick look {quick_look}: and back");
+        }
+        // With the width for all three it stays.
+        let mut h = with_request("roomy");
+        h.state_mut().code = true;
+        h.run();
+        assert_eq!(sidebar(&h), 1);
     }
 
     /// 0.163.1 feedback: 「長連線 connect 時 request類型下拉選單不能打開不能選也不能變更
@@ -26906,6 +27410,35 @@ mod ui_tests {
         }
     }
 
+    /// The open request as a stream of `method`, connected, with messages in its log and
+    /// the fourth opened under the list. No server: the log is filled in by hand.
+    fn stream_with_a_message_open(h: &mut Harness<'_, App>, method: &str) {
+        let app = h.state_mut();
+        let open = app.open.as_mut().unwrap();
+        (open.draft.method, open.draft.url) = (method.into(), "nats://127.0.0.1:4222".into());
+        let mut log = Log::default();
+        log.push(Duration::ZERO, Event::Open("connected".into()));
+        let message = |i: u64| format!(r#"[orders.new] {{"id": {i}, "sku": "A-{i}", "qty": 2}}"#);
+        for i in 0..30 {
+            log.push(Duration::from_millis(40 * i), Event::In(message(i)));
+        }
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        app.stream = Some(StreamSession {
+            path: open.path.clone(),
+            started: Instant::now(),
+            opened: std::time::SystemTime::now(),
+            log: Arc::new(std::sync::Mutex::new(log)),
+            selected: Some((4, pretty_event(&message(3)))),
+            outgoing: Some(Outgoing::Nats(tx)),
+            grpc: None,
+            socketio: false,
+            live: true,
+            filter: LogFilter::default(),
+            abort: app.rt.spawn(async {}).abort_handle(),
+        });
+        h.run_steps(3);
+    }
+
     /// Not a check: every tab of every kind of request, each auth and body type, every
     /// dialog and settings page, as pictures for a UX review against Postman and Hoppscotch.
     /// `APITOOL_SHOTS=1 cargo test ux_tour -- --ignored`, into /tmp/apitool-shots/t-*.png;
@@ -26913,12 +27446,19 @@ mod ui_tests {
     #[test]
     #[ignore = "screenshots for a UX review"]
     fn ux_tour() {
-        use egui_kittest::kittest::By;
         let mut h = with_request("tour");
         if std::env::var_os("APITOOL_SHOTS_LIGHT").is_some() {
             h.state_mut().appearance.theme = crate::appearance::Theme::Light;
             h.run();
         }
+        tour(&mut h, &mut |h, name| shot(h, &format!("t-{name}")));
+    }
+
+    /// Every tab of every kind of request, each auth and body type, every dialog and
+    /// settings page, a stream's log and the capture's with one of theirs opened: `see`
+    /// is shown each, with a name for it.
+    fn tour(h: &mut Harness<'static, App>, see: &mut dyn FnMut(&mut Harness<'static, App>, &str)) {
+        use egui_kittest::kittest::By;
         let kinds = [
             ("GET", "https://{{host}}/users/{id}?page=1"),
             ("POST", "https://{{host}}/users"),
@@ -26962,7 +27502,7 @@ mod ui_tests {
                 h.run();
                 // A tab the kind doesn't have falls back to its first: the same picture.
                 if h.state().req_tab == tab {
-                    shot(&mut h, &format!("t-{}-{name}", kind.to_lowercase()));
+                    see(h, &format!("{}-{name}", kind.to_lowercase()));
                 }
             }
         }
@@ -27012,7 +27552,7 @@ mod ui_tests {
         for (name, body) in bodies {
             h.state_mut().open.as_mut().unwrap().draft.body = body;
             h.run();
-            shot(&mut h, &format!("t-body-{name}"));
+            see(h, &format!("body-{name}"));
         }
 
         h.state_mut().open.as_mut().unwrap().draft.method = "GET".into();
@@ -27021,7 +27561,7 @@ mod ui_tests {
         h.get(By::new().role(Role::ComboBox).value("Inherit from parent"))
             .click();
         h.run();
-        shot(&mut h, "t-auth-list");
+        see(h, "auth-list");
         h.key_press(Key::Escape);
         let auths = [
             (
@@ -27064,12 +27604,12 @@ mod ui_tests {
         for (name, auth) in auths {
             h.state_mut().open.as_mut().unwrap().draft.auth = auth;
             h.run();
-            shot(&mut h, &format!("t-auth-{name}"));
+            see(h, &format!("auth-{name}"));
         }
 
         h.state_mut().req_tab = ReqTab::Params;
         let json = r#"{"id":42,"name":"Ada","tags":["a","b"]}"#;
-        show_response(&mut h, "application/json", json.into());
+        show_response(h, "application/json", json.into());
         for (tab, name) in [
             (RespTab::Body, "body"),
             (RespTab::Headers, "headers"),
@@ -27080,7 +27620,7 @@ mod ui_tests {
         ] {
             h.state_mut().resp_tab = tab;
             h.run();
-            shot(&mut h, &format!("t-resp-{name}"));
+            see(h, &format!("resp-{name}"));
         }
         h.state_mut().resp_tab = RespTab::Body;
 
@@ -27107,11 +27647,11 @@ mod ui_tests {
         ] {
             h.state_mut().act(action);
             h.run();
-            shot(&mut h, &format!("t-do-{name}"));
+            see(h, &format!("do-{name}"));
             if matches!(action, Action::SideBySide | Action::Response) {
                 h.state_mut().act(action);
             }
-            close(&mut h);
+            close(h);
         }
         for (tab, name) in [
             (SettingsTab::General, "general"),
@@ -27122,9 +27662,9 @@ mod ui_tests {
         ] {
             (h.state_mut().settings, h.state_mut().settings_tab) = (true, tab);
             h.run();
-            shot(&mut h, &format!("t-settings-{name}"));
+            see(h, &format!("settings-{name}"));
         }
-        close(&mut h);
+        close(h);
 
         let top = h.state().ws.collections();
         let dir = h.state().ws.create_folder(&top, "api").unwrap();
@@ -27138,18 +27678,18 @@ mod ui_tests {
             let app = h.state_mut();
             app.folders[app.folder_at].tab = tab;
             h.run();
-            shot(&mut h, &format!("t-folder-{name}"));
+            see(h, &format!("folder-{name}"));
         }
-        close(&mut h);
+        close(h);
 
         h.state_mut().code = true;
         h.run();
-        shot(&mut h, "t-code");
-        close(&mut h);
+        see(h, "code");
+        close(h);
         h.state_mut().show_history = true;
         h.run();
-        shot(&mut h, "t-history");
-        close(&mut h);
+        see(h, "history");
+        close(h);
         h.state_mut().load = Some(LoadView {
             vus: 10,
             secs: 30,
@@ -27157,10 +27697,50 @@ mod ui_tests {
             abort: None,
         });
         h.run();
-        shot(&mut h, "t-load");
-        close(&mut h);
+        see(h, "load");
+        close(h);
+        h.state_mut().quick_look = true;
+        h.run();
+        see(h, "quick-look");
+        h.state_mut().quick_look = false;
+        stream_with_a_message_open(h, "NATS");
+        see(h, "stream-message");
+        h.state_mut().stream = None;
+        h.state_mut().open.as_mut().unwrap().draft.method = "GET".into();
+        capture_with_a_flow_picked(h);
+        see(h, "capture-flow");
+        (h.state_mut().capture, h.state_mut().capture_shown) = (None, false);
         h.key_press_modifiers(Modifiers::COMMAND, Key::K);
         h.run();
-        shot(&mut h, "t-switcher");
+        see(h, "switcher");
+    }
+
+    /// The capture pane with what went through it listed, and the fourth opened under the
+    /// list.
+    fn capture_with_a_flow_picked(h: &mut Harness<'_, App>) {
+        use std::io::{Read, Write};
+        let server = crate::http::tests::serve(|_| ("200 OK".into(), r#"{"id":7}"#.into()));
+        h.state_mut().capture_shown = true;
+        h.run();
+        h.get_by_label("Start capturing").click();
+        h.run();
+        let proxy = h.state_mut().capturing().expect("listening");
+        for i in 0..12 {
+            let mut app = std::net::TcpStream::connect(proxy).unwrap();
+            let url = format!("http://{server}/items/{i}");
+            write!(
+                app,
+                "GET {url} HTTP/1.1\r\nHost: {server}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            app.read_to_string(&mut String::new()).unwrap();
+        }
+        wait_live(h, |app| {
+            let flows = &app.capture.as_ref().unwrap().flows;
+            flows.with(|l| l.iter().filter(|f| f.elapsed.is_some()).count() == 12)
+        });
+        let view = h.state_mut().capture.as_mut().unwrap();
+        view.picked = view.flows.with(|l| Some(l[3].id));
+        h.run_steps(3);
     }
 }

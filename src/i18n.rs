@@ -1442,6 +1442,10 @@ const ZH_TW: &[(&str, &str)] = &[
         "The window is too narrow: the response is under the request until it is wider",
         "視窗太窄：回應會放在請求下方，直到視窗夠寬",
     ),
+    (
+        "The window is too narrow: the sidebar is back once the panel beside the request is closed",
+        "視窗太窄：關閉請求旁的面板後，側邊欄就會回來",
+    ),
     ("Theme", "主題"),
     (
         "This body is {}: showing it takes a moment and a lot of memory.",

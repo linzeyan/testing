@@ -9,7 +9,7 @@ csv = "1"
 # x11 and wayland matter only on Linux, where winit needs at least one; both load their
 # libraries at run time, so building needs none installed. persistence keeps the window's
 # size, place and maximized across restarts.
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "glow", "default_fonts", "accesskit", "x11", "wayland", "persistence"] }
+eframe = { version = "=0.36.2", default-features = false, features = ["wgpu", "glow", "default_fonts", "accesskit", "x11", "wayland", "persistence"] }
 # Already in the tree via eframe (PNG, for icons); JPEG added for the response preview.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # No raster-images (pictures inside an SVG) or svgz: those pull in more decoders.
@@ -24,6 +24,8 @@ jsonschema = { version = "0.58.3", default-features = false }
 regex = "1"
 # Already in the tree (egui, wgpu, reqwest): their warnings reach our log too.
 log = "0.4"
+# Already in the tree via egui: a frame's vertices as bytes, to tell whether it changed.
+bytemuck = "1"
 memmap2 = "0.9.11"
 memory-stats = "1.2.0"
 p12-keystore = "0.3"
@@ -123,3 +125,11 @@ egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
 egui-winit = { version = "0.36.2", default-features = false, features = ["serde"] }
 # Already in the tree via hayro: compresses the br answer the capture's test unpacks.
 brotli = "8"
+
+# eframe 0.36.2 with one hook added, `App::wants_paint` (each change is marked `apitool:` in
+# vendor/eframe/src): eframe draws and presents every frame, and on a software renderer
+# (WARP on the VDI) each one is CPU. The app uses it to leave the window alone when a frame
+# came to the same picture (App::wants_paint in src/app.rs). On an eframe upgrade: copy the
+# new release's src/, Cargo.toml and data/ over, and put the marked changes back.
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }

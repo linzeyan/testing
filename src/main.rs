@@ -6,7 +6,7 @@ use eframe::egui;
 use eframe::egui_wgpu::WgpuSetup;
 use eframe::wgpu;
 
-use apitool::{app, appearance, logfile, store, update};
+use apitool::{app, appearance, logfile, paint, store, update};
 
 fn main() -> eframe::Result {
     let use_glow = std::env::args().any(|a| a == "--glow");
@@ -44,6 +44,16 @@ fn main() -> eframe::Result {
             ..base(adapter)
         });
     }
+    // A frame that didn't reach the window isn't what it shows (`paint::Painted`).
+    let unshown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (status, failed) = (
+        options.wgpu_options.on_surface_status.clone(),
+        unshown.clone(),
+    );
+    options.wgpu_options.on_surface_status = Arc::new(move |s| {
+        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+        status(s)
+    });
 
     // The Mac's way since Big Sur: no title, the tab strip in the title bar's row and the
     // sidebar running to the top, under the traffic lights (`App::in_title_bar`).
@@ -92,11 +102,17 @@ fn main() -> eframe::Result {
         loop {
             if let Some(m) = memory_stats::memory_stats() {
                 let ram = m.physical_mem >> 20;
+                let (frames, drawn) = paint::counts();
                 // Private bytes on Windows; elsewhere it's the address space, which says
                 // nothing.
                 match cfg!(windows) {
-                    true => log::info!("memory: RAM {ram} MB, private {} MB", m.virtual_mem >> 20),
-                    false => log::info!("memory: RAM {ram} MB"),
+                    true => log::info!(
+                        "memory: RAM {ram} MB, private {} MB; frames: {frames} run, {drawn} drawn",
+                        m.virtual_mem >> 20
+                    ),
+                    false => {
+                        log::info!("memory: RAM {ram} MB; frames: {frames} run, {drawn} drawn")
+                    }
                 }
             }
             std::thread::sleep(std::time::Duration::from_secs(60));
@@ -112,6 +128,17 @@ fn main() -> eframe::Result {
             log::info!("{}", renderer.replace('\n', ", "));
             cc.egui_ctx.add_plugin(app::OpenLinks);
             let mut app = app::App::new(ws, renderer);
+            // Each frame drawn on a software renderer is the CPU's: no more than 30 a second.
+            let software = (cc.wgpu_render_state.as_ref())
+                .is_some_and(|rs| rs.adapter.get_info().device_type == wgpu::DeviceType::Cpu);
+            app.painted.gap = software.then_some(paint::SOFTWARE_GAP);
+            // For the field, as WGPU_BACKEND is: every frame drawn, as eframe does by
+            // itself, to tell a window that is behind from one that is slow.
+            app.painted.all = std::env::var("APITOOL_PAINT").is_ok_and(|v| v == "all");
+            app.painted.failed = unshown;
+            if app.painted.all {
+                log::info!("APITOOL_PAINT=all: every frame is drawn");
+            }
             app.in_title_bar = cfg!(target_os = "macos");
             app.auto_update();
             app.restore_window(cc.storage);
