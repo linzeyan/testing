@@ -2,9 +2,12 @@
 //! small scanner serves every language here, told only its keywords, comments and quotes; a
 //! grammar engine (syntect) would add megabytes for colours nobody reads more closely.
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::ops::Range;
 use std::sync::Arc;
 
+use eframe::egui;
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{Color32, FontId, Galley, TextBuffer, TextStyle, Ui, Visuals};
 
@@ -21,7 +24,7 @@ pub enum Kind {
     Punct,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Lang {
     Json,
     JavaScript,
@@ -407,13 +410,84 @@ pub fn job(text: &str, colors: &[Color32], font: &FontId) -> LayoutJob {
 pub fn layouter(lang: Option<Lang>) -> impl FnMut(&Ui, &dyn TextBuffer, f32) -> Arc<Galley> {
     move |ui, buf, wrap_width| {
         let text = buf.as_str();
-        let mut colors = vec![ui.visuals().text_color(); text.len()];
-        if let Some(lang) = lang {
-            paint(&mut colors, text, lang, ui.visuals());
-        }
-        let mut job = job(text, &colors, &TextStyle::Monospace.resolve(ui.style()));
-        job.wrap.max_width = wrap_width;
-        ui.painter().layout_job(job)
+        let font = TextStyle::Monospace.resolve(ui.style());
+        let key = (text, lang, &font, wrap_width.to_bits(), looks(ui.visuals()));
+        cached(ui, key, || {
+            let mut colors = vec![ui.visuals().text_color(); text.len()];
+            if let Some(lang) = lang {
+                paint(&mut colors, text, lang, ui.visuals());
+            }
+            let mut job = job(text, &colors, &font);
+            job.wrap.max_width = wrap_width;
+            job
+        })
+    }
+}
+
+/// What of the visuals `color` reads, for a cache key.
+pub fn looks(visuals: &Visuals) -> (bool, Color32, Color32) {
+    (
+        visuals.dark_mode,
+        visuals.text_color(),
+        visuals.weak_text_color(),
+    )
+}
+
+/// The galley of a coloured text, by a key that stands for everything the job is made
+/// from. egui keeps a galley from frame to frame too, but finding it hashes the whole job,
+/// every coloured span of it, and the job had to be coloured first: 2.3 ms of each frame
+/// for a 112 KB JSON body (1.1 colouring, 1.2 finding), every frame the pointer moves
+/// (`pointer_sweep_cost`, release build on an M-series Mac). Hashing the key is ~5 µs.
+pub fn cached(ui: &Ui, key: impl Hash, build: impl FnOnce() -> LayoutJob) -> Arc<Galley> {
+    // A galley points into the font atlas, which egui rebuilds when it fills up or the
+    // fonts change: a galley from before would draw the wrong glyphs. Every new atlas
+    // (and every glyph added) moves the fill ratio, so it goes in the key, as does the
+    // scale the glyphs were rasterised for.
+    let ctx = ui.ctx();
+    let key = |ui: &Ui| {
+        let atlas = ui.ctx().fonts(|f| f.font_atlas_fill_ratio()).to_bits();
+        egui::util::hash((&key, atlas, ui.ctx().pixels_per_point().to_bits()))
+    };
+    let before = key(ui);
+    if let Some(galley) = ctx.memory_mut(|m| m.caches.cache::<Galleys>().get(before)) {
+        return galley;
+    }
+    let galley = ui.painter().layout_job(build());
+    // Laying it out may have added glyphs: kept under the key the next frame will ask with.
+    let after = key(ui);
+    ctx.memory_mut(|m| m.caches.cache::<Galleys>().put(after, galley.clone()));
+    galley
+}
+
+/// `cached`'s store. Like egui's own caches, a galley not asked for in a frame is dropped
+/// at the start of the next: one held for a closed tab's 100 KB body is megabytes.
+#[derive(Default)]
+struct Galleys {
+    frame: u32,
+    by_key: HashMap<u64, (u32, Arc<Galley>)>,
+}
+
+impl Galleys {
+    fn get(&mut self, key: u64) -> Option<Arc<Galley>> {
+        let (used, galley) = self.by_key.get_mut(&key)?;
+        *used = self.frame;
+        Some(galley.clone())
+    }
+
+    fn put(&mut self, key: u64, galley: Arc<Galley>) {
+        self.by_key.insert(key, (self.frame, galley));
+    }
+}
+
+impl egui::cache::CacheTrait for Galleys {
+    fn update(&mut self) {
+        let frame = self.frame;
+        self.by_key.retain(|_, (used, _)| *used == frame);
+        self.frame = frame.wrapping_add(1);
+    }
+
+    fn len(&self) -> usize {
+        self.by_key.len()
     }
 }
 

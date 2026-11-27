@@ -808,24 +808,39 @@ impl WgpuWinitRunning<'_> {
                     true
                 }
             });
-            // apitool: the app may leave the window as it is (`App::wants_paint`). Only the
-            // root viewport is the app's to judge; the others draw as they always did.
+            // apitool: the app may leave the window as it is, or draw only what changed
+            // (`App::wants_paint`). Only the root viewport is the app's to judge; the others
+            // draw as they always did.
             let must = !pending_deltas.is_empty() || !screenshot_commands.is_empty();
-            let paint = viewport_id != ViewportId::ROOT
-                || app.wants_paint(egui_ctx, &clipped_primitives, must)
-                || must;
-            let vsync_secs = if paint {
+            let paint = match viewport_id == ViewportId::ROOT {
+                true => {
+                    let kept = painter.kept(viewport_id);
+                    match app.wants_paint(egui_ctx, &clipped_primitives, must, kept) {
+                        crate::Paint::Skip if must => crate::Paint::All,
+                        crate::Paint::Part(_) if must || !kept => crate::Paint::Keep,
+                        paint => paint,
+                    }
+                }
+                false => crate::Paint::All,
+            };
+            let (primitives, keep) = match &paint {
+                crate::Paint::Skip | crate::Paint::All => (&clipped_primitives, None),
+                crate::Paint::Keep => (&clipped_primitives, Some(false)),
+                crate::Paint::Part(part) => (part, Some(true)),
+            };
+            let vsync_secs = if matches!(paint, crate::Paint::Skip) {
+                0.0
+            } else {
                 painter.paint_and_update_textures(
                     viewport_id,
                     pixels_per_point,
                     app.clear_color(&egui_ctx.global_style().visuals),
-                    &clipped_primitives,
+                    primitives,
                     pending_deltas,
                     screenshot_commands,
                     window,
+                    keep,
                 )
-            } else {
-                0.0
             };
 
             for action in viewport.actions_requested.drain(..) {
@@ -1253,6 +1268,7 @@ fn render_immediate_viewport(
         &mut viewport.pending_delta,
         vec![],
         window,
+        None, // apitool: drawn straight into its window, as before
     );
 
     egui_winit.handle_platform_output(window, platform_output);

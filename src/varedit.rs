@@ -4,11 +4,14 @@
 //! selection or stores it as a variable.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use eframe::egui::text::{CCursor, CCursorRange, LayoutJob};
 use eframe::egui::{self, Color32, FontId, Id, Key, Modifiers, PointerButton, RichText, TextStyle};
 
+use crate::app::{menu_item, menu_title};
 use crate::i18n::{t, tf};
+use crate::icons as icon;
 use crate::model::{self, DYNAMIC};
 use crate::syntax::{self, Lang};
 
@@ -116,7 +119,7 @@ pub fn too_big(ui: &mut egui::Ui, id: Id, text: &mut String) -> Option<egui::Res
                     .monospace()
                     .weak(),
             );
-            ui.button(t("Clear"))
+            crate::app::icon_button(ui, icon::ERASER, t("Clear"), None).on_hover_text(t("Clear"))
         })
         .inner;
     if response.clicked() {
@@ -181,12 +184,29 @@ pub fn var_edit(
 
     let font = style.resolve(ui.style());
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-        let mut job = highlight(buf.as_str(), vars, &font, lang, ui.visuals());
-        if multiline {
-            crate::codeedit::mark(&mut job, ui, id, buf.as_str());
-        }
-        job.wrap.max_width = wrap_width;
-        ui.painter().layout_job(job)
+        let text = buf.as_str();
+        let spans = var_spans(text, vars);
+        let marks = (multiline)
+            .then(|| crate::codeedit::found(ui.ctx(), id, text))
+            .flatten();
+        let looks = syntax::looks(ui.visuals());
+        let key = (
+            text,
+            &spans,
+            &marks,
+            &font,
+            lang,
+            wrap_width.to_bits(),
+            looks,
+        );
+        syntax::cached(ui, key, || {
+            let mut job = highlight(text, &spans, &font, lang, ui.visuals());
+            if let Some(marks) = &marks {
+                crate::codeedit::mark(&mut job, ui, marks);
+            }
+            job.wrap.max_width = wrap_width;
+            job
+        })
     };
     let right_click = ui.input(|i| i.pointer.button_pressed(PointerButton::Secondary));
     let selected = right_click
@@ -399,20 +419,26 @@ fn selection_menu(ui: &mut egui::Ui, id: Id, text: &mut String, chars: Option<[u
         ctx.memory_mut(|m| m.request_focus(id));
         ctx.request_repaint();
     };
-    let cut = ui.add_enabled(has, egui::Button::new(t("Cut"))).clicked();
-    let copy = ui.add_enabled(has, egui::Button::new(t("Copy"))).clicked();
+    let cut = (ui.add_enabled(has, menu_item(ui, Some(icon::SCISSORS), t("Cut")))).clicked();
+    let copy = (ui.add_enabled(has, menu_item(ui, Some(icon::COPY), t("Copy")))).clicked();
     // Only the platform reads the clipboard: it answers with a paste event, which the
     // field, focused again with the selection, takes like Ctrl+V.
-    if ui.button(t("Paste")).clicked() {
+    if ui
+        .add(menu_item(ui, Some(icon::PASTE), t("Paste")))
+        .clicked()
+    {
         refocus(chars);
         ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
     }
-    if ui.button(t("Select all")).clicked() {
+    if (ui.add(menu_item(ui, Some(icon::SELECT_ALL), t("Select all")))).clicked() {
         refocus(Some([0, text.chars().count()]));
     }
     ui.separator();
-    let encode = (ui.add_enabled(has, egui::Button::new(t("Encode URI component")))).clicked();
-    let decode = (ui.add_enabled(has, egui::Button::new(t("Decode URI component")))).clicked();
+    // No icon says these exactly: their room is left blank, the text in line.
+    let encode = menu_item(ui, None, t("Encode URI component"));
+    let encode = ui.add_enabled(has, encode).clicked();
+    let decode = menu_item(ui, None, t("Decode URI component"));
+    let decode = ui.add_enabled(has, decode).clicked();
     set_as_variable(ui, selected.as_deref());
 
     let Some(selected) = selected else {
@@ -463,7 +489,8 @@ fn set_as_variable(ui: &mut egui::Ui, selected: Option<&str>) {
         let scope = env.as_deref().unwrap_or(t("Globals"));
         let mut name = None;
         ui.add_enabled_ui(selected.is_some(), |ui| {
-            ui.menu_button(tf("Set as variable in {}", &[&scope]), |ui| {
+            let title = tf("Set as variable in {}", &[&scope]);
+            ui.menu_button(menu_title(ui, icon::VARIABLE, &title), |ui| {
                 egui::ScrollArea::vertical()
                     .max_height(300.0)
                     .show(ui, |ui| {
@@ -476,7 +503,10 @@ fn set_as_variable(ui: &mut egui::Ui, selected: Option<&str>) {
                 if !names.is_empty() {
                     ui.separator();
                 }
-                if ui.button(t("New variable…")).clicked() {
+                if ui
+                    .add(menu_item(ui, Some(icon::PLUS), t("New variable…")))
+                    .clicked()
+                {
                     name = Some(None);
                 }
             })
@@ -585,7 +615,7 @@ pub fn label_menu(ui: &mut egui::Ui) {
     // First, as in Postman's and every text menu: right-click replaced the copy menu the
     // selection would otherwise have had.
     if let Some(text) = &text
-        && ui.button(t("Copy")).clicked()
+        && ui.add(menu_item(ui, Some(icon::COPY), t("Copy"))).clicked()
     {
         ui.ctx().copy_text(text.clone());
         ui.close();
@@ -626,9 +656,26 @@ fn decode_component(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// Each `{{name}}` in `text`, braces included, and whether the name is known.
+fn var_spans(text: &str, vars: &HashMap<String, String>) -> Vec<(Range<usize>, bool)> {
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(open) = text[at..].find("{{").map(|n| at + n) {
+        let Some(close) = text[open + 2..].find("}}").map(|n| open + 2 + n) else {
+            break;
+        };
+        spans.push((
+            open..close + 2,
+            is_known(text[open + 2..close].trim(), vars),
+        ));
+        at = close + 2;
+    }
+    spans
+}
+
 fn highlight(
     text: &str,
-    vars: &HashMap<String, String>,
+    spans: &[(Range<usize>, bool)],
     font: &FontId,
     lang: Option<Lang>,
     visuals: &egui::Visuals,
@@ -638,18 +685,8 @@ fn highlight(
         syntax::paint(&mut colors, text, lang, visuals);
     }
     // Variables over the code: `"{{token}}"` reads as a variable, not as a string.
-    let mut at = 0;
-    while let Some(open) = text[at..].find("{{").map(|n| at + n) {
-        let Some(close) = text[open + 2..].find("}}").map(|n| open + 2 + n) else {
-            break;
-        };
-        let color = if is_known(text[open + 2..close].trim(), vars) {
-            DEFINED
-        } else {
-            UNDEFINED
-        };
-        colors[open..close + 2].fill(color);
-        at = close + 2;
+    for (span, known) in spans {
+        colors[span.clone()].fill(if *known { DEFINED } else { UNDEFINED });
     }
     syntax::job(text, &colors, font)
 }
@@ -840,7 +877,7 @@ mod tests {
         let text = r#"{"a":"x{{v}}y{{w}}","b":"{{"}"#;
         let job = highlight(
             text,
-            &vars,
+            &var_spans(text, &vars),
             &FontId::monospace(12.0),
             Some(Lang::Json),
             &visuals,

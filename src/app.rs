@@ -3853,11 +3853,21 @@ impl eframe::App for App {
         ctx: &egui::Context,
         primitives: &[egui::ClippedPrimitive],
         must: bool,
-    ) -> bool {
+        kept: bool,
+    ) -> eframe::Paint {
         let target = ctx.input(crate::paint::Target::of);
-        let (draw, wait) = (self.painted).judge(primitives, target, must, Instant::now());
+        self.painted.clear = ctx.global_style().visuals.panel_fill;
+        let now = Instant::now();
+        let (paint, wait) = (self.painted).judge(primitives, target, must, kept, now);
         std::thread::sleep(wait);
-        draw
+        paint
+    }
+
+    /// Opaque, where eframe's is a translucent grey: a frame drawn in part clears its rect
+    /// with a rectangle (`paint::only`), which blends into what's there unless opaque. No
+    /// window here is transparent, and the panels cover all of it, so it never shows.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -4421,7 +4431,10 @@ impl App {
                 // gives way, cut short, instead.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if failed {
-                        if icon_button(ui, icon::X, t("Dismiss"), None).clicked() {
+                        if icon_button(ui, icon::X, t("Dismiss"), None)
+                            .on_hover_text(t("Dismiss"))
+                            .clicked()
+                        {
                             self.status.clear();
                         }
                         let text = RichText::new(&self.status).color(RED);
@@ -5578,7 +5591,8 @@ impl App {
                     if tab_label(ui, lit, name, unsaved).clicked() {
                         show_folder = Some(i);
                     }
-                    let x = icon_button(ui, icon::X, t("Close the folder settings"), None);
+                    let x = icon_button(ui, icon::X, t("Close the folder settings"), None)
+                        .on_hover_text(t("Close the folder settings"));
                     if x.clicked() {
                         close_folder = Some(i);
                     }
@@ -5957,7 +5971,8 @@ impl App {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Right to left: this lands to the right of Save.
-                    let more = icon_button(ui, icon::CHEVRON_DOWN, t("More save options"), None);
+                    let more = icon_button(ui, icon::CHEVRON_DOWN, t("More save options"), None)
+                        .on_hover_text(t("More save options"));
                     egui::Popup::menu(&more)
                         .id(egui::Id::new("save-more"))
                         .show(|ui| {
@@ -7495,7 +7510,7 @@ impl App {
                     ui.horizontal(|ui| {
                         let typed = !text.trim().is_empty();
                         let import = ui.add_enabled(typed, primary(t("Import"))).clicked();
-                        let chosen = (ui.button(t("Choose file…")))
+                        let chosen = icon_button(ui, icon::FILE_INPUT, t("Choose file…"), None)
                             .on_hover_text(t("Pick the exported file instead of pasting it"))
                             .clicked()
                             .then(|| {
@@ -7503,7 +7518,7 @@ impl App {
                                 pick_file("", &[(t("Collection, spec or HAR"), kinds)], false)
                             })
                             .flatten();
-                        let folder = (ui.button(t("Choose folder…")))
+                        let folder = icon_button(ui, icon::FOLDER_INPUT, t("Choose folder…"), None)
                             .on_hover_text(t(
                                 "A Postman v3 collection folder, or a Native Git workspace \
                                  with its environments and globals",
@@ -7623,14 +7638,17 @@ impl App {
                     .clicked()
                     || enter_pressed(ui);
                 if ed.env.is_some() {
-                    duplicate = ui
-                        .button(t("Duplicate…"))
+                    duplicate = icon_button(ui, icon::COPY_PLUS, t("Duplicate…"), None)
                         .on_hover_text(t(
                             "Save, then copy into a new environment (e.g. dev → prod)",
                         ))
                         .clicked();
                     // As shown, edits included; for Postman's Import > Raw text.
-                    if ui.button(t("Copy as Postman environment")).clicked() {
+                    let postman = t("Copy as Postman environment");
+                    if icon_button(ui, icon::COPY, postman, None)
+                        .on_hover_text(postman)
+                        .clicked()
+                    {
                         let name = ed.env.as_deref().unwrap_or_default();
                         let json = crate::postman::environment_json(name, &ed.shared, &ed.secret);
                         ui.ctx().copy_text(json);
@@ -8494,6 +8512,8 @@ impl App {
                 if ui
                     .add_enabled_ui(done, |ui| icon_button(ui, icon::EXPORT, label, None))
                     .inner
+                    .on_hover_text(label)
+                    .on_disabled_hover_text(label)
                     .clicked()
                 {
                     let xml = [(t("JUnit XML"), &["xml"][..])];
@@ -8820,7 +8840,11 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 let busy = matches!(update, Update::Checking | Update::Installing(_));
                                 check = ui
-                                    .add_enabled(!busy, egui::Button::new(t("Check now")))
+                                    .add_enabled_ui(!busy, |ui| {
+                                        icon_button(ui, icon::REFRESH, t("Check now"), None)
+                                            .on_hover_text(t("Check for an update now"))
+                                    })
+                                    .inner
                                     .clicked();
                                 match update {
                                     Update::Idle => {
@@ -9048,8 +9072,12 @@ impl App {
                             };
                             ui.label("");
                             ui.horizontal(|ui| {
-                                sync_now = (ui.add_enabled(why.is_none(), egui::Button::new(t("Sync now"))))
-                                    .clicked();
+                                sync_now = (ui.add_enabled_ui(why.is_none(), |ui| {
+                                    icon_button(ui, icon::REFRESH, t("Sync now"), None)
+                                        .on_hover_text(t("Sync now"))
+                                }))
+                                .inner
+                                .clicked();
                                 if let Some(why) = why {
                                     ui.weak(why);
                                 }
@@ -9350,9 +9378,8 @@ fn network_settings(ui: &mut egui::Ui, net: &mut Network, skipped: Option<&str>)
                     net.user_agent = Some(agent);
                 }
                 if reset
-                    && ui
-                        .small_button(t("Reset"))
-                        .on_hover_text(crate::net::USER_AGENT)
+                    && icon_button(ui, icon::RESET, t("Reset"), None)
+                        .on_hover_text(tf("Reset to {}", &[&crate::net::USER_AGENT]))
                         .clicked()
                 {
                     net.user_agent = None;
@@ -9432,7 +9459,10 @@ fn run_order_ui(
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let reset = t("Reset to the tree's order, all ticked");
-            if icon_button(ui, icon::RESET, reset, None).clicked() {
+            if icon_button(ui, icon::RESET, reset, None)
+                .on_hover_text(reset)
+                .clicked()
+            {
                 *order = tree.iter().map(|(p, _)| (p.clone(), true)).collect();
                 changed = true;
             }
@@ -10803,13 +10833,28 @@ fn json_editor(ui: &mut egui::Ui, text: &mut String, vars: &HashMap<String, Stri
         // Parsing it each frame is what an uneditable body can do without.
         if !text.trim().is_empty()
             && text.len() <= crate::varedit::MAX_EDIT
-            && let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(text)
+            && let Some(e) = json_error(ui.ctx(), text)
         {
             // Only a hint: `{{var}}` placeholders legitimately make the raw text invalid.
             ui.colored_label(ORANGE, tf("Not valid JSON: {}", &[&e]));
         }
     });
     code_editor(ui, "body", text, vars, Some(Lang::Json));
+}
+
+/// Why `text` isn't JSON, if it isn't. The answer for the last text asked about is kept:
+/// parsing a 112 KB body was a share of every frame the pointer moved over it.
+fn json_error(ctx: &egui::Context, text: &str) -> Option<String> {
+    let id = egui::Id::new("json-error");
+    let hash = egui::util::hash(text);
+    if let Some((seen, error)) = ctx.data(|d| d.get_temp::<(u64, Option<String>)>(id))
+        && seen == hash
+    {
+        return error;
+    }
+    let error = (serde_json::from_str::<serde::de::IgnoredAny>(text).err()).map(|e| e.to_string());
+    ctx.data_mut(|d| d.insert_temp(id, (hash, error.clone())));
+    error
 }
 
 /// A body that can only be JSON (a gRPC message, a Socket.IO auth payload), so no type
@@ -12022,7 +12067,9 @@ fn auth_editor(
                 ui.add(edit.desired_width(width));
             }
             if !reference
-                && icon_button(ui, icon::EYE, t("Show the secret"), Some(reveal)).clicked()
+                && icon_button(ui, icon::EYE, t("Show the secret"), Some(reveal))
+                    .on_hover_text(t("Show the secret"))
+                    .clicked()
             {
                 ui.data_mut(|d| d.insert_temp(shown, !reveal));
             }
@@ -12337,7 +12384,7 @@ fn auth_editor(
                 {
                     ui.ctx().copy_text(token.clone());
                 }
-                let forget = ui.button(t("Forget"));
+                let forget = icon_button(ui, icon::TRASH, t("Forget"), None);
                 if forget
                     .on_hover_text(t("The next Send signs in from the start"))
                     .clicked()
@@ -13900,13 +13947,20 @@ fn scripts_editor(
     crate::codeedit::before(ui, id, text, Some(Lang::JavaScript));
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let text = buf.as_str();
-        let mut colors = vec![ui.visuals().text_color(); text.len()];
-        crate::syntax::paint(&mut colors, text, Lang::JavaScript, ui.visuals());
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let mut job = crate::syntax::job(text, &colors, &font);
-        crate::codeedit::mark(&mut job, ui, id, text);
-        job.wrap.max_width = wrap_width;
-        ui.painter().layout_job(job)
+        let marks = crate::codeedit::found(ui.ctx(), id, text);
+        let looks = crate::syntax::looks(ui.visuals());
+        let key = (text, &marks, &font, wrap_width.to_bits(), looks);
+        crate::syntax::cached(ui, key, || {
+            let mut colors = vec![ui.visuals().text_color(); text.len()];
+            crate::syntax::paint(&mut colors, text, Lang::JavaScript, ui.visuals());
+            let mut job = crate::syntax::job(text, &colors, &font);
+            if let Some(marks) = &marks {
+                crate::codeedit::mark(&mut job, ui, marks);
+            }
+            job.wrap.max_width = wrap_width;
+            job
+        })
     };
     let output = egui::TextEdit::multiline(text)
         .id(id)
@@ -14662,7 +14716,10 @@ fn rules_ui(ui: &mut egui::Ui, rules: &mut Vec<crate::capture::Rule>) -> bool {
         rules.remove(i);
         changed = true;
     }
-    if ui.button(t("Add rule")).clicked() {
+    if icon_button(ui, icon::PLUS, t("Add rule"), None)
+        .on_hover_text(t("Add rule"))
+        .clicked()
+    {
         rules.push(crate::capture::Rule {
             on: true,
             url: String::new(),
@@ -14777,7 +14834,10 @@ fn flow_list(
         listed = under_list(ui, "capture-detail", 220.0, |ui| {
             let text = flow_text(f, *shown_as);
             ui.horizontal(|ui| {
-                    let open = ui.add_enabled(!f.tunnel(), egui::Button::new(t("Open as request")));
+                    let open = (ui.add_enabled_ui(!f.tunnel(), |ui| {
+                        icon_button(ui, icon::FILE_PLUS, t("Open as request"), None)
+                    }))
+                    .inner;
                     let open = (open.on_hover_text(t(
                         "A new request from what was sent, its answer saved as an example",
                     )))
@@ -15340,7 +15400,10 @@ fn stream_ui(
                 (true, icon::ARROW_DOWN, t("Received only")),
             ] {
                 let on = f.received == Some(dir);
-                if icon_button(ui, glyph, label, Some(on)).clicked() {
+                if icon_button(ui, glyph, label, Some(on))
+                    .on_hover_text(label)
+                    .clicked()
+                {
                     f.received = (!on).then_some(dir);
                 }
             }
@@ -15657,16 +15720,14 @@ fn saved_messages(ui: &mut egui::Ui, compose: &mut String, saved: &mut Vec<Strin
     let save = t("Save this message in the request");
     if (ui.add_enabled_ui(new, |ui| icon_button(ui, icon::BOOKMARK, save, None)))
         .inner
+        .on_hover_text(save)
+        .on_disabled_hover_text(save)
         .clicked()
     {
         saved.push(compose.clone());
     }
-    let list = icon_button(
-        ui,
-        icon::LIST,
-        &tf("Saved messages ({})", &[&saved.len()]),
-        None,
-    );
+    let label = tf("Saved messages ({})", &[&saved.len()]);
+    let list = icon_button(ui, icon::LIST, &label, None).on_hover_text(&label);
     egui::Popup::menu(&list).show(|ui| {
         if saved.is_empty() {
             ui.weak(t("None yet: type a message and press the bookmark."));
@@ -15685,7 +15746,10 @@ fn saved_messages(ui: &mut egui::Ui, compose: &mut String, saved: &mut Vec<Strin
                     *compose = message.clone();
                     ui.close();
                 }
-                if icon_button(ui, icon::X, t("Remove"), None).clicked() {
+                if icon_button(ui, icon::X, t("Remove"), None)
+                    .on_hover_text(t("Remove"))
+                    .clicked()
+                {
                     remove = Some(i);
                 }
             });
@@ -15743,7 +15807,13 @@ fn past_menu(ui: &mut egui::Ui, past: &mut Past, shown: Option<i64>) {
         }
         ui.separator();
         // Not the sidebar's "Clear history", which drops the sent requests.
-        if ui.button(t("Clear response history")).clicked() {
+        if (ui.add(menu_item(
+            ui,
+            Some(icon::TRASH),
+            t("Clear response history"),
+        )))
+        .clicked()
+        {
             past.clear = true;
         }
     });
@@ -16602,12 +16672,18 @@ fn binary_body(ui: &mut egui::Ui, view: &mut ResponseView, save_file: &mut bool)
     if view.pages > 1 {
         ui.horizontal(|ui| {
             let (page, pages) = (view.page, view.pages);
-            let back = ui.add_enabled(page > 0, egui::Button::new("‹"));
+            let back = (ui.add_enabled_ui(page > 0, |ui| {
+                icon_button(ui, icon::CHEVRON_LEFT, t("Previous page"), None)
+            }))
+            .inner;
             if back.on_hover_text(t("Previous page")).clicked() {
                 (view.page, view.image) = (page - 1, None);
             }
             ui.label(tf("Page {} of {}", &[&(page + 1), &pages]));
-            let next = ui.add_enabled(page + 1 < pages, egui::Button::new("›"));
+            let next = (ui.add_enabled_ui(page + 1 < pages, |ui| {
+                icon_button(ui, icon::CHEVRON_RIGHT, t("Next page"), None)
+            }))
+            .inner;
             if next.on_hover_text(t("Next page")).clicked() {
                 (view.page, view.image) = (page + 1, None);
             }
@@ -16936,7 +17012,7 @@ fn icon_text<'a>(ui: &egui::Ui, icon: Icon, text: impl Into<egui::WidgetText>) -
 
 /// A menu's row with its icon in front, as the Mac's menus have them. None leaves the
 /// icon's room empty, so the row's text stays in line with its neighbours'.
-fn menu_item<'a>(ui: &egui::Ui, icon: Option<Icon>, text: &str) -> egui::Button<'a> {
+pub(crate) fn menu_item<'a>(ui: &egui::Ui, icon: Option<Icon>, text: &str) -> egui::Button<'a> {
     match icon {
         Some(icon) => icon_text(ui, icon, text.to_owned()),
         None => {
@@ -16947,7 +17023,7 @@ fn menu_item<'a>(ui: &egui::Ui, icon: Option<Icon>, text: &str) -> egui::Button<
 }
 
 /// A submenu's row: its icon and name, the icon in the text's colour.
-fn menu_title(ui: &egui::Ui, icon: Icon, text: &str) -> (egui::Image<'static>, String) {
+pub(crate) fn menu_title(ui: &egui::Ui, icon: Icon, text: &str) -> (egui::Image<'static>, String) {
     let image = (icon.image(ui.ctx(), icon_size(ui))).tint(ui.visuals().text_color());
     (image, text.to_owned())
 }
@@ -24168,10 +24244,10 @@ mod ui_tests {
         shot(&mut h, "66-pdf-preview");
         h.get_by_label("200 × 100");
         h.get_by_label("Page 1 of 3");
-        h.get_by_label("›").click();
+        h.get_by_label("Next page").click();
         h.run();
         h.get_by_label("Page 2 of 3");
-        h.get_by_label("‹").click();
+        h.get_by_label("Previous page").click();
         h.run();
         h.get_by_label("Page 1 of 3");
     }
@@ -25040,6 +25116,346 @@ mod ui_tests {
         time(&mut h, "tree filtered (all open)");
     }
 
+    /// 0.163.5 feedback: 「已渲染的畫面越是豐富，滑鼠游標在上面快速移動 10 秒，一樣會飆高」.
+    /// A frame the pointer changes (a row lit, a tooltip) was rasterised whole on the VDI's
+    /// software renderer, and a richer window costs more to rasterise. Swept over a rich
+    /// one, nearly every changed frame is now drawn in part, a few percent of the window,
+    /// over the kept picture; and each part, with the picture before it, comes to the
+    /// whole frame (`check_part`; pixel for pixel on a GPU in the ignored test below).
+    #[test]
+    fn regression_fb20261127c_a_pointer_over_a_rich_window_redraws_only_what_it_changes() {
+        let ws = workspace("rich-sweep");
+        let top = ws.collections();
+        let mut first = None;
+        for f in 0..6 {
+            let dir = ws.create_folder(&top, &format!("Service {f}")).unwrap();
+            for r in 0..8 {
+                first.get_or_insert(ws.create_request(&dir, &format!("request {r}")).unwrap());
+            }
+        }
+        let mut h = harness(ws);
+        h.state_mut().tree_filter = "request".into();
+        h.state_mut().activate(first.unwrap(), true);
+        let rows: Vec<String> = (0..2_000)
+            .map(|i| format!(r#"  {{"id": {i}, "name": "item {i}"}}"#))
+            .collect();
+        let body = format!("[\n{}\n]", rows.join(",\n"));
+        show_response(&mut h, "application/json", body);
+        h.run();
+        let mut painted = crate::paint::Painted::default();
+        painted.part = true;
+        let (mut last, mut drawn, mut parts, mut area) = (Vec::new(), 0, 0, 0.0);
+        for y in (60..760).step_by(140) {
+            for x in (0..1200).step_by(20) {
+                h.event(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
+                h.step();
+                let out = h.output();
+                let prims = h.ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
+                let target = h.ctx.input(crate::paint::Target::of);
+                let must = !out.textures_delta.is_empty();
+                match painted.judge(&prims, target, must, true, Instant::now()).0 {
+                    eframe::Paint::Skip => continue,
+                    eframe::Paint::Part(part) => {
+                        let rect = part[0].clip_rect;
+                        crate::paint::check_part(&last, &prims, rect, 1.0)
+                            .unwrap_or_else(|e| panic!("pointer at {x},{y}: {e}"));
+                        (parts, area) = (parts + 1, area + rect.area());
+                    }
+                    _ => {}
+                }
+                drawn += 1;
+                last = prims;
+            }
+        }
+        assert!(drawn > 20, "the sweep changed the picture {drawn} times");
+        assert!(parts * 10 >= drawn * 8, "{parts} of {drawn} drawn in part");
+        let share = area / parts as f32 / (1200.0 * 800.0);
+        assert!(share < 0.1, "each part {:.1}% of the window", share * 100.0);
+    }
+
+    /// A frame drawn in part over the kept picture comes out, pixel for pixel, as the
+    /// same frame drawn whole, through egui-wgpu's own renderer: the pointer swept over a
+    /// rich window (tree, a 112 KB JSON body, a 1 MB response), at 100 % and at the VDI's
+    /// 175 %, whose fractional pixels test the cut to whole pixels. Needs a GPU or a
+    /// software adapter (Metal on the Mac, WARP on Windows), which CI's Linux lacks:
+    /// `cargo test --release --lib part_drawn_frames -- --ignored`
+    #[test]
+    #[ignore]
+    fn part_drawn_frames_come_out_as_whole_ones_on_the_gpu() {
+        use eframe::egui_wgpu::{self, wgpu};
+        let json = |n: usize| {
+            let rows: Vec<String> = (0..n)
+                .map(|i| format!(r#"  {{"id": {i}, "name": "item {i}", "ok": true}}"#))
+                .collect();
+            format!("[\n{}\n]", rows.join(",\n"))
+        };
+        for scale in [1.0, 1.75] {
+            // kittest hands every frame's texture changes to this renderer from the start.
+            let rs = egui_kittest::wgpu::create_render_state(
+                egui_kittest::wgpu::default_wgpu_setup(),
+                egui_wgpu::RendererOptions::PREDICTABLE,
+            );
+            let ws = workspace("part-gpu");
+            let top = ws.collections();
+            let mut first = None;
+            for f in 0..12 {
+                let dir = ws.create_folder(&top, &format!("Service {f}")).unwrap();
+                for r in 0..8 {
+                    first.get_or_insert(ws.create_request(&dir, &format!("request {r}")).unwrap());
+                }
+            }
+            let mut h = Harness::builder()
+                .with_size([1200.0, 800.0])
+                .with_pixels_per_point(scale)
+                .renderer(egui_kittest::wgpu::WgpuTestRenderer::from_render_state(
+                    rs.clone(),
+                ))
+                .build_eframe(|_| App::new(ws, "test".into()));
+            h.state_mut().tree_filter = "request".into();
+            h.state_mut().activate(first.unwrap(), true);
+            h.state_mut().open.as_mut().unwrap().draft.body = Body::Json { text: json(2_400) };
+            h.state_mut().req_tab = ReqTab::Body;
+            show_response(&mut h, "application/json", json(20_000));
+            h.run();
+            let px = |v: f32| (v * scale).round() as u32;
+            let size = wgpu::Extent3d {
+                width: px(1200.0),
+                height: px(800.0),
+                depth_or_array_layers: 1,
+            };
+            let texture = |label| {
+                rs.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: rs.target_format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            };
+            let (whole, kept) = (texture("whole"), texture("kept"));
+            let screen = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [size.width, size.height],
+                pixels_per_point: scale,
+            };
+            let clear = h.ctx.global_style().visuals.panel_fill;
+            let draw = |into: &wgpu::Texture, prims: &[egui::ClippedPrimitive], load: bool| {
+                let mut renderer = rs.renderer.write();
+                let mut encoder = rs.device.create_command_encoder(&Default::default());
+                let user =
+                    renderer.update_buffers(&rs.device, &rs.queue, &mut encoder, prims, &screen);
+                let view = into.create_view(&Default::default());
+                let c = clear.to_normalized_gamma_f32().map(f64::from);
+                let ops = wgpu::Operations {
+                    load: match load {
+                        true => wgpu::LoadOp::Load,
+                        false => wgpu::LoadOp::Clear(wgpu::Color {
+                            r: c[0],
+                            g: c[1],
+                            b: c[2],
+                            a: c[3],
+                        }),
+                    },
+                    store: wgpu::StoreOp::Store,
+                };
+                let mut pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops,
+                            depth_slice: None,
+                        })],
+                        ..Default::default()
+                    })
+                    .forget_lifetime();
+                renderer.render(&mut pass, prims, &screen);
+                drop(pass);
+                rs.queue.submit(user.into_iter().chain([encoder.finish()]));
+            };
+            let read = |from: &wgpu::Texture| -> Vec<u8> {
+                let row = (size.width * 4).div_ceil(256) * 256;
+                let buffer = rs.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: u64::from(row * size.height),
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let mut encoder = rs.device.create_command_encoder(&Default::default());
+                encoder.copy_texture_to_buffer(
+                    from.as_image_copy(),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(row),
+                            rows_per_image: None,
+                        },
+                    },
+                    size,
+                );
+                rs.queue.submit([encoder.finish()]);
+                buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+                (rs.device)
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    })
+                    .unwrap();
+                let data = buffer.slice(..).get_mapped_range().unwrap();
+                let unpadded = (size.width * 4) as usize;
+                (data.chunks_exact(row as usize))
+                    .flat_map(|r| &r[..unpadded])
+                    .copied()
+                    .collect()
+            };
+            let mut painted = crate::paint::Painted::default();
+            (painted.part, painted.clear) = (true, clear);
+            let (mut parts, mut drawn, mut seen) = (0, 0, (0, 0));
+            for y in (40..760).step_by(80) {
+                for x in (0..1200).step_by(12) {
+                    h.event(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
+                    h.step();
+                    let out = h.output();
+                    // Textures changed (kittest took the change itself): drawn whole.
+                    let textures = (
+                        h.ctx.fonts(|f| f.font_atlas_fill_ratio()).to_bits(),
+                        h.ctx.tex_manager().read().allocated().count(),
+                    );
+                    let must = textures != seen;
+                    seen = textures;
+                    let prims = h.ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
+                    let target = h.ctx.input(crate::paint::Target::of);
+                    let paint = painted.judge(&prims, target, must, true, Instant::now()).0;
+                    match &paint {
+                        eframe::Paint::Skip => {}
+                        eframe::Paint::All | eframe::Paint::Keep => draw(&kept, &prims, false),
+                        eframe::Paint::Part(part) => {
+                            draw(&kept, part, true);
+                            parts += 1;
+                        }
+                    }
+                    if matches!(paint, eframe::Paint::Skip) {
+                        continue;
+                    }
+                    drawn += 1;
+                    draw(&whole, &prims, false);
+                    let (a, b) = (read(&whole), read(&kept));
+                    let unlike = a.chunks(4).zip(b.chunks(4)).filter(|(p, q)| p != q).count();
+                    if unlike > 0 {
+                        let save = |name: &str, bytes: Vec<u8>| {
+                            let img =
+                                image::RgbaImage::from_raw(size.width, size.height, bytes).unwrap();
+                            img.save(format!("/tmp/apitool-part-{name}.png")).unwrap();
+                        };
+                        save("whole", a);
+                        save("kept", b);
+                        panic!(
+                            "at {scale}x, frame drawn {drawn} (pointer at {x},{y}): {unlike} pixels unlike; /tmp/apitool-part-*.png"
+                        );
+                    }
+                }
+            }
+            assert!(parts * 10 > drawn * 8, "{parts} of {drawn} drawn in part");
+            println!("{scale}x: {drawn} frames drawn, {parts} of them in part, each as whole");
+        }
+    }
+
+    /// Not a check: the pointer swept over the whole window, line by line, as in the
+    /// VDI report ("the richer the screen, the higher the CPU"). Per screen: what a frame
+    /// costs the app and the tessellator (every frame pays both, drawn or not), and how
+    /// many of the frames came to a new picture (each of those is rasterised on the CPU
+    /// under WARP), with the triangles a drawn one holds.
+    /// `cargo test --release --lib pointer_sweep_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn pointer_sweep_cost() {
+        let sweep = |h: &mut Harness<'_, App>, what: &str| {
+            h.run();
+            let mut painted = crate::paint::Painted::default();
+            painted.part = true;
+            let (mut ui, mut tess, mut frames, mut drawn, mut tris) =
+                (Duration::ZERO, Duration::ZERO, 0, 0, 0usize);
+            let (mut parts, mut area) = (0, 0.0);
+            for y in (40..760).step_by(40) {
+                for x in (0..1200).step_by(12) {
+                    let pos = egui::pos2(x as f32, y as f32);
+                    h.event(egui::Event::PointerMoved(pos));
+                    let start = Instant::now();
+                    h.step();
+                    ui += start.elapsed();
+                    let start = Instant::now();
+                    let out = h.output();
+                    let prims = h.ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
+                    let target = h.ctx.input(crate::paint::Target::of);
+                    let now = Instant::now();
+                    let paint = painted.judge(&prims, target, false, true, now).0;
+                    let draw = !matches!(paint, eframe::Paint::Skip);
+                    if let eframe::Paint::Part(part) = &paint {
+                        parts += 1;
+                        area += part[0].clip_rect.area();
+                    }
+                    tess += start.elapsed();
+                    frames += 1;
+                    if draw {
+                        drawn += 1;
+                        tris = tris.max(
+                            prims
+                                .iter()
+                                .map(|p| match &p.primitive {
+                                    egui::epaint::Primitive::Mesh(m) => m.indices.len() / 3,
+                                    egui::epaint::Primitive::Callback(_) => 0,
+                                })
+                                .sum(),
+                        );
+                    }
+                }
+            }
+            let per = |d: Duration| d.as_secs_f64() * 1000.0 / frames as f64;
+            let window = 1200.0 * 800.0;
+            println!(
+                "{what:<34} ui {:5.2} ms  tessellate+judge {:5.2} ms  drawn {drawn:4}/{frames}  ≤{tris} triangles; {parts} in part, {:.1}% of the window each",
+                per(ui),
+                per(tess),
+                100.0 * area / parts.max(1) as f32 / window
+            );
+        };
+        let json = |n: usize| {
+            let rows: Vec<String> = (0..n)
+                .map(|i| format!(r#"  {{"id": {i}, "name": "item {i}", "ok": true}}"#))
+                .collect();
+            format!("[\n{}\n]", rows.join(",\n"))
+        };
+        let ws = workspace("sweep-cost");
+        let top = ws.collections();
+        let mut first = None;
+        for f in 0..12 {
+            let dir = ws.create_folder(&top, &format!("Service {f}")).unwrap();
+            for r in 0..8 {
+                let id = ws.create_request(&dir, &format!("request {r}")).unwrap();
+                first.get_or_insert(id);
+            }
+        }
+        let mut h = harness(ws);
+        h.state_mut().tree_filter = "request".into();
+        h.state_mut().activate(first.unwrap(), true);
+        sweep(&mut h, "tree open, request on Params");
+        h.state_mut().open.as_mut().unwrap().draft.body = Body::Json { text: json(2_400) };
+        h.state_mut().req_tab = ReqTab::Body;
+        sweep(&mut h, "+ 112 KB JSON body, Body tab");
+        h.state_mut().req_tab = ReqTab::Headers;
+        show_response(&mut h, "application/json", json(20_000));
+        sweep(&mut h, "+ 1 MB JSON response, Pretty");
+        h.state_mut().req_tab = ReqTab::Body;
+        sweep(&mut h, "+ the body tab again");
+        h.state_mut().code = true;
+        sweep(&mut h, "+ code panel");
+    }
+
     /// Not a check: RAM after rounds of what the VDI report did (open a request, send,
     /// close its tab; open a WebSocket, connect, disconnect, close), to tell a leak (up
     /// every round) from memory the allocator keeps (flat after the first rounds).
@@ -25122,6 +25538,76 @@ mod ui_tests {
                 close(&mut h);
             }
             println!("after {:>3} of each: {} KB", round * 20, kb());
+        }
+    }
+
+    /// Not a check: RAM, egui's per-widget memory and textures over rounds of fresh
+    /// requests (a 100 KB JSON body edited, a 1 MB response viewed pretty, the tab closed,
+    /// the request deleted), as a long session visits many. Growth every round is what a
+    /// closed request leaves behind.
+    /// `cargo test --release --lib memory_over_many_requests -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn memory_over_many_requests() {
+        // Private bytes on Windows; elsewhere the address space, which says nothing.
+        let kb = || {
+            let m = memory_stats::memory_stats().unwrap();
+            (m.physical_mem >> 10, m.virtual_mem >> 10)
+        };
+        let rows = |n: usize| {
+            let rows: Vec<String> = (0..n)
+                .map(|i| format!(r#"  {{"id": {i}, "name": "item {i}", "ok": true}}"#))
+                .collect();
+            format!("[\n{}\n]", rows.join(",\n"))
+        };
+        let url = crate::http::tests::json_server(rows(20_000));
+        let ws = workspace("memory-many");
+        let top = ws.collections();
+        let mut h = harness(ws);
+        h.run();
+        let report = |h: &Harness<'_, App>, what: &str| {
+            let data = h.ctx.memory(|m| m.data.len());
+            let textures = h.ctx.tex_manager().read().allocated().count();
+            let (ram, private) = kb();
+            println!(
+                "{what:<14} RAM {ram:>7} KB  private {private:>8} KB  egui data {data:>5}  textures {textures:>3}"
+            );
+        };
+        report(&h, "start");
+        for round in 1..=8 {
+            for i in 0..20 {
+                let ws = &h.state().ws;
+                let id = ws.create_request(&top, &format!("r{round}-{i}")).unwrap();
+                let req = Request {
+                    url: url.clone(),
+                    method: "POST".into(),
+                    body: Body::Json { text: rows(2_400) },
+                    ..Default::default()
+                };
+                ws.save_request(&id, &req).unwrap();
+                h.state_mut().activate(id.clone(), true);
+                h.state_mut().req_tab = ReqTab::Body;
+                h.run();
+                let editor = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
+                editor.click();
+                h.run();
+                h.event(egui::Event::Text("x".into()));
+                h.run();
+                h.get_by_label("Send").click();
+                wait(&mut h, |app| {
+                    app.pending.is_empty() && app.response.is_some()
+                });
+                h.run();
+                h.key_press_modifiers(Modifiers::COMMAND, Key::W);
+                h.run();
+                if h.query_by_label("Discard").is_some() {
+                    h.get_by_label("Discard").click();
+                    h.run();
+                }
+                h.state().ws.delete(&id).unwrap();
+                h.run();
+            }
+            report(&h, &format!("after {:>3}", round * 20));
         }
     }
 
@@ -26507,7 +26993,8 @@ mod ui_tests {
             last.clone_from(&out.shapes);
             let primitives = h.ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
             let ctx = h.ctx.clone();
-            let drawn = eframe::App::wants_paint(h.state_mut(), &ctx, &primitives, false);
+            let paint = eframe::App::wants_paint(h.state_mut(), &ctx, &primitives, false, false);
+            let drawn = !matches!(paint, eframe::Paint::Skip);
             (drawn, changed)
         };
         let move_to = |h: &mut Harness<'_, App>, at: egui::Pos2| {

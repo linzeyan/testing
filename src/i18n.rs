@@ -579,6 +579,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ),
     ("Sync automatically", "自動同步"),
     ("Sync now", "立即同步"),
+    ("Check for an update now", "立即檢查更新"),
+    ("Reset to {}", "重設為 {}"),
     (
         "To a private repository. What isn't ticked stays on this machine.",
         "同步到私有儲存庫。沒勾選的只留在這台電腦。",

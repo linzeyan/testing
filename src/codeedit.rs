@@ -714,7 +714,7 @@ pub fn status(ctx: &egui::Context) -> Option<String> {
 }
 
 /// The find box's matches in `text`, and which one is current, for `mark`.
-fn found(ctx: &egui::Context, id: Id, text: &str) -> Option<(Vec<Range<usize>>, usize)> {
+pub fn found(ctx: &egui::Context, id: Id, text: &str) -> Option<(Vec<Range<usize>>, usize)> {
     let find: Find = ctx.data(|d| d.get_temp(id.with("find")))?;
     if !find.open || find.query.is_empty() {
         return None;
@@ -725,11 +725,9 @@ fn found(ctx: &egui::Context, id: Id, text: &str) -> Option<(Vec<Range<usize>>, 
 
 /// In the editor's layouter: the find box's matches get a background, the current one
 /// a stronger one.
-pub fn mark(job: &mut LayoutJob, ui: &egui::Ui, id: Id, text: &str) {
+pub fn mark(job: &mut LayoutJob, ui: &egui::Ui, (hits, current): &(Vec<Range<usize>>, usize)) {
     use egui::text::{ByteIndex, LayoutSection};
-    let Some((hits, current)) = found(ui.ctx(), id, text) else {
-        return;
-    };
+    let current = *current;
     let (all, now) = match ui.visuals().dark_mode {
         true => (
             Color32::from_rgba_unmultiplied(200, 160, 40, 70),
@@ -895,15 +893,16 @@ pub fn after(
                         let (enter, escape) =
                             ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
                         close |= edit.lost_focus() && escape;
-                        let one = ui
-                            .small_button(t("Replace"))
+                        let one = icon_button(ui, icon::REPLACE, t("Replace"), None)
                             .on_hover_text(t("Replace this match (Enter)"))
                             .clicked()
                             || (edit.lost_focus() && enter);
                         if edit.lost_focus() && enter {
                             edit.request_focus();
                         }
-                        let all = ui.small_button(t("Replace all")).clicked();
+                        let all = icon_button(ui, icon::REPLACE_ALL, t("Replace all"), None)
+                            .on_hover_text(t("Replace all"))
+                            .clicked();
                         if let (Ok(re), false) = (&re, found.is_empty()) {
                             if all {
                                 *text = replace(text, re, &found, &find.with, find.regex);

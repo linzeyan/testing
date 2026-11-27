@@ -132,12 +132,15 @@ fn main() -> eframe::Result {
             let software = (cc.wgpu_render_state.as_ref())
                 .is_some_and(|rs| rs.adapter.get_info().device_type == wgpu::DeviceType::Cpu);
             app.painted.gap = software.then_some(paint::SOFTWARE_GAP);
-            // For the field, as WGPU_BACKEND is: every frame drawn, as eframe does by
-            // itself, to tell a window that is behind from one that is slow.
-            app.painted.all = std::env::var("APITOOL_PAINT").is_ok_and(|v| v == "all");
+            // For the field, as WGPU_BACKEND is: `all` draws every frame, as eframe does by
+            // itself, to tell a window that is behind from one that is slow; `whole` draws
+            // each changed frame whole (as 0.163.5); `part` draws in part on a GPU too.
+            let mode = std::env::var("APITOOL_PAINT").unwrap_or_default();
+            app.painted.all = mode == "all";
+            app.painted.part = (software && mode != "whole") || mode == "part";
             app.painted.failed = unshown;
-            if app.painted.all {
-                log::info!("APITOOL_PAINT=all: every frame is drawn");
+            if !mode.is_empty() {
+                log::info!("APITOOL_PAINT={mode}");
             }
             app.in_title_bar = cfg!(target_os = "macos");
             app.auto_update();

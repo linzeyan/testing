@@ -416,7 +416,7 @@ empty tree): paste it, give its path or drop the file (or folder).
 |---|---|
 | curl | Paste it into the URL bar instead |
 | Postman v2.1 | A collection, an environment or the globals |
-| Postman v3 (Native Git, the Postman CLI) | A collection's folder of YAML, or a whole workspace folder with its collections, environments and globals ("Choose folder…"); also one v3 document. HTTP, GraphQL, gRPC, WebSocket, Socket.IO and MQTT requests, with folder auth, variables, scripts, examples and saved messages. Globals already set keep their value; MCP and LLM requests, specs, flows and mocks are listed as left out |
+| Postman v3 (Native Git, the Postman CLI) | A collection's folder of YAML, or a whole workspace folder with its collections, environments and globals (the folder icon, "Choose folder…"); also one v3 document. HTTP, GraphQL, gRPC, WebSocket, Socket.IO and MQTT requests, with folder auth, variables, scripts, examples and saved messages. Globals already set keep their value; MCP and LLM requests, specs, flows and mocks are listed as left out |
 | OpenAPI 3 / Swagger 2, JSON or YAML | A request per operation, a folder per tag, `{{baseUrl}}` from the server, auth from the security schemes, bodies and saved examples from the schemas, so the mock server answers right away |
 | Insomnia v4 JSON / v5 YAML | Folders with their headers, auth and scripts; `{{ _.x }}` as `{{x}}`; the base environment as collection variables and each sub-environment as an environment |
 | HAR from browser devtools | A folder per host, each response kept as the request's example |
@@ -498,7 +498,7 @@ every interface, so WSL, a VM or a phone can use it at this machine's network ad
 mirrored networking). Anyone who can reach the machine can then send through it, and
 Windows may ask whether apitool may accept connections. What it sends goes on with apitool's own network settings (its proxy, CA and client
 certificates) and shows as a row: time, method, status, duration, size, URL. A row opens
-underneath with both sides' headers and bodies; "Open as request" saves it as a new
+underneath with both sides' headers and bodies; the new-request icon ("Open as request") saves it as a new
 request, its answer as an example. The export icon writes every flow as HAR. HTTPS passes
 through as a tunnel, shown with its host and the bytes each way, unless "Decrypt HTTPS" is
 on: then each host gets a certificate from apitool's own CA, made once and kept in the

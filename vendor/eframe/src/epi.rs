@@ -148,6 +148,21 @@ impl CreationContext<'_> {
 
 // ----------------------------------------------------------------------------
 
+/// apitool: what [`App::wants_paint`] asks of a frame.
+pub enum Paint {
+    /// Nothing is drawn or presented: the window keeps what it shows, and texture changes
+    /// wait for the next frame that is drawn.
+    Skip,
+    /// Drawn whole, straight into the window, as eframe does by itself.
+    All,
+    /// Drawn whole into a picture that is kept, which is copied to the window: the next
+    /// frame may then draw over a part of it.
+    Keep,
+    /// These primitives (only what changed, cut to where it changed) drawn over the kept
+    /// picture, which is copied to the window. Only when the call was told `kept`.
+    Part(Vec<egui::ClippedPrimitive>),
+}
+
 /// Implement this trait to write apps that can be compiled for both web/wasm and desktop/native using [`eframe`](https://github.com/emilk/egui/tree/main/crates/eframe).
 pub trait App {
     /// Called once before each call to [`Self::ui`],
@@ -182,11 +197,12 @@ pub trait App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut Frame);
 
     /// apitool: asked once per frame of the root viewport, with what the pass came to,
-    /// before it is drawn. `false` leaves the window showing what it shows: nothing is
-    /// drawn or presented, and texture changes wait for the next frame that is.
+    /// before it is drawn: whether to draw it, and how ([`Paint`]).
     ///
-    /// `must`: the frame is drawn whatever the answer (a texture changed, or a screenshot
-    /// was asked for); the call is then only for the app's own record of what is on screen.
+    /// `must`: the frame is drawn whole whatever the answer (a texture changed, or a
+    /// screenshot was asked for); the call is then only for the app's own record of what
+    /// is on screen. `kept`: the picture the last frame drew is kept, at the window's
+    /// size, so [`Paint::Part`] may be answered.
     ///
     /// Only the wgpu renderer asks; glow draws every frame.
     fn wants_paint(
@@ -194,9 +210,10 @@ pub trait App {
         ctx: &egui::Context,
         primitives: &[egui::ClippedPrimitive],
         must: bool,
-    ) -> bool {
-        _ = (ctx, primitives, must);
-        true
+        kept: bool,
+    ) -> Paint {
+        _ = (ctx, primitives, must, kept);
+        Paint::All
     }
 
     /// Get a handle to the app.
