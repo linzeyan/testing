@@ -266,7 +266,7 @@ pub fn only(
         let primitive = match &p.primitive {
             egui::epaint::Primitive::Mesh(m) => {
                 let mut indices = Vec::new();
-                for t in m.indices.chunks_exact(3) {
+                for t in m.indices.as_chunks::<3>().0 {
                     let mut bounds = egui::Rect::NOTHING;
                     t.iter()
                         .for_each(|&i| bounds.extend_with(m.vertices[i as usize].pos));
