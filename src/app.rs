@@ -25545,7 +25545,8 @@ mod ui_tests {
     /// requests (a 100 KB JSON body edited, a 1 MB response viewed pretty, the tab closed,
     /// the request deleted), as a long session visits many. Growth every round is what a
     /// closed request leaves behind.
-    /// `cargo test --release --lib memory_over_many_requests -- --ignored --nocapture`
+    /// `cargo test --release --lib memory_over_many_requests -- --ignored --nocapture`;
+    /// on the Windows VM, `docs/scripts/win-memory.sh`.
     #[test]
     #[ignore]
     fn memory_over_many_requests() {

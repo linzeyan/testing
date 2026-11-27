@@ -40,10 +40,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      # Clippy on the Makefile's LINT_RUST, as `make check` lints: on stable, each new Rust
+      # brought lints that failed main and not the Mac (1.100, 2026-11-27). Installed before
+      # stable, which the last install leaves as the default for build and test.
+      - id: pin
+        if: matrix.check
+        shell: bash
+        run: echo "v=$(sed -n 's/^LINT_RUST *:= *//p' Makefile)" >>"$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        if: matrix.check
+        with:
+          toolchain: ${{ steps.pin.outputs.v }}
+          targets: ${{ matrix.target }}
+          components: clippy
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -79,7 +91,7 @@ jobs:
           "$dir/nats-server" --version
       - name: Clippy
         if: matrix.check
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo +${{ steps.pin.outputs.v }} clippy --locked --all-targets -- -D warnings
       - name: Test
         if: matrix.check
         shell: bash

@@ -16,8 +16,9 @@ VERSION ?=
 export CARGO_PROFILE_RELEASE_LTO           ?= false
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS ?= 16
 
-# The one pin for rustfmt and clippy here. CI's clippy still runs on stable (it lints the
-# Windows and Linux cfg code this Mac can't); bump this on purpose, with the fixes.
+# The one pin for rustfmt and clippy, here and in CI (release.yml reads this line for its
+# clippy, which lints the Windows and Linux cfg code this Mac can't; verify.sh too). Bump
+# it on purpose, with the fixes.
 LINT_RUST := 1.97
 
 .DEFAULT_GOAL := help
